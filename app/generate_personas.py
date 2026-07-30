@@ -6,10 +6,12 @@ import re
 import argparse
 import shutil
 import tempfile
-from openai import OpenAI
-
 from tts import TTSEngine, sanitize_filename
-from utils import atomic_json_write as _atomic_json_write
+from utils import (
+    atomic_json_write as _atomic_json_write,
+    load_llm_config, load_prompts_config, load_tts_config,
+    create_llm_client,
+)
 from persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT
 
 
@@ -663,21 +665,12 @@ def main():
     for speaker in samples.keys():
         narrator_context[speaker] = _collect_narrator_context(script, speaker, window)
 
-    # Load LLM config
-    config = {}
-    if os.path.exists(app_config_path):
-        try:
-            with open(app_config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to load app/config.json: {e}")
+    llm = load_llm_config()
+    base_url = llm["base_url"]
+    api_key = llm["api_key"]
+    model_name = llm["model_name"]
 
-    llm_cfg = config.get("llm", {})
-    base_url = llm_cfg.get("base_url", "http://localhost:11434/v1")
-    api_key = llm_cfg.get("api_key", "local")
-    model_name = llm_cfg.get("model_name", "richardyoung/qwen3-14b-abliterated:Q8_0")
-
-    client = OpenAI(base_url=base_url, api_key=api_key)
+    client, _ = create_llm_client()
 
     # Load persona prompts from config, fall back to defaults
     prompts_cfg = config.get("prompts", {})
@@ -697,7 +690,8 @@ def main():
     # Disable compile_codec for persona previews: compilation overhead
     # outweighs benefit for single generations, and subprocess context
     # can trigger HIP kernel errors on ROCm.
-    tts_cfg = dict(config.get("tts", {}))
+    tts_cfg = load_tts_config() or {}
+    tts_cfg = dict(tts_cfg)
     tts_cfg["compile_codec"] = False
     engine = TTSEngine({"tts": tts_cfg})
 

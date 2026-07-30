@@ -1,6 +1,5 @@
 import os
 import sys
-import gc
 import json
 import shutil
 import logging
@@ -891,7 +890,8 @@ async def generate_personas(background_tasks: BackgroundTasks, request: Generate
     if project_manager.engine is not None:
         logger.info("Unloading TTS engine for persona generation...")
         project_manager.engine = None
-        gc.collect()
+        from utils import clear_gpu_cache
+        clear_gpu_cache()
 
     command = [sys.executable, "-u", "generate_personas.py"]
     if request.advanced:
@@ -1770,7 +1770,8 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
     if project_manager.engine is not None:
         logger.info("Unloading TTS engine for LoRA training...")
         project_manager.engine = None
-        gc.collect()
+        from utils import clear_gpu_cache
+        clear_gpu_cache()
 
     # Build subprocess command
     command = [

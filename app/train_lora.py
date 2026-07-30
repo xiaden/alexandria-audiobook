@@ -19,7 +19,6 @@ Usage:
 """
 
 import argparse
-import gc
 import json
 import os
 import random
@@ -27,6 +26,7 @@ import shutil
 import sys
 import time
 import traceback
+from utils import resolve_device, setup_rocm, clear_gpu_cache
 
 
 def parse_args():
@@ -50,30 +50,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_device(device_str):
-    if device_str != "auto":
-        return device_str
-    import torch
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
 
 
-def enable_rocm_optimizations():
-    """Apply ROCm-specific optimizations. No-op on NVIDIA/CPU."""
-    import torch
-    if not (hasattr(torch.version, "hip") and torch.version.hip):
-        return
-    os.environ.setdefault("MIOPEN_FIND_MODE", "2")
-    os.environ.setdefault("MIOPEN_LOG_LEVEL", "4")
-    os.environ.setdefault("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
-    try:
-        from triton.compiler import compiler as triton_compiler
-        if not hasattr(triton_compiler, "triton_key"):
-            import triton
-            triton_compiler.triton_key = lambda: f"pytorch-triton-rocm-{triton.__version__}"
-    except ImportError:
-        pass
 
 
 # ── Data preparation ────────────────────────────────────────────────────
@@ -355,7 +333,7 @@ def train(args):
     device = resolve_device(args.device)
     dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
-    enable_rocm_optimizations()
+    setup_rocm()
 
     print(f"[TRAIN] Device: {device}, dtype: {dtype}", flush=True)
     print(f"[TRAIN] Config: epochs={args.epochs}, lr={args.lr}, lora_r={args.lora_r}, "
@@ -503,9 +481,7 @@ def train(args):
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     print(f"[TRAIN] OOM at epoch={epoch} step={step_idx}, skipping sample", flush=True)
-                    if "cuda" in device:
-                        torch.cuda.empty_cache()
-                    gc.collect()
+                    clear_gpu_cache()
                     optimizer.zero_grad()
                     continue
                 raise
@@ -519,8 +495,7 @@ def train(args):
                 optimizer.step()
                 optimizer.zero_grad()
 
-                if "cuda" in device:
-                    torch.cuda.empty_cache()
+                clear_gpu_cache()
 
             print(f"[TRAIN] epoch={epoch}/{args.epochs} step={step_idx}/{total_steps_per_epoch} "
                   f"loss={step_loss:.4f} talker_loss={step_talker_loss:.4f} "

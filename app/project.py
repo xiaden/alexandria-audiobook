@@ -8,7 +8,7 @@ import io
 import re
 import time
 import logging
-from utils import atomic_json_write
+from utils import atomic_json_write, load_json
 from tts import (
     TTSEngine,
     combine_audio_with_pauses,
@@ -109,13 +109,7 @@ class ProjectManager:
             return self.engine
 
         # Load config
-        config = {}
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-            except Exception:
-                pass
+        config = load_json(self.config_path, default={})
 
         try:
             self.engine = TTSEngine(config)
@@ -127,11 +121,7 @@ class ProjectManager:
 
     def _load_tts_config(self):
         """Load TTS config section from config.json for pause defaults."""
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("tts", {})
-        except Exception:
-            return {}
+        return load_json(self.config_path, default={}).get("tts", {})
 
     def load_chunks(self):
         if os.path.exists(self.chunks_path):

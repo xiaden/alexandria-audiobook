@@ -3,9 +3,12 @@ import sys
 import json
 import re
 import argparse
-from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
-from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+from utils import (
+    clean_json_string, repair_json_array, salvage_json_entries,
+    load_llm_config, load_generation_config, load_prompts_config,
+    create_llm_client, log_llm_response,
+)
 
 
 def _is_section_break(text):
@@ -125,18 +128,14 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
             finish_reason = choice.finish_reason
             usage = getattr(response, 'usage', None)
 
-            # Log raw response
-            log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, "review_responses.log")
-            with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"\n{'='*80}\n")
-                lf.write(f"BATCH {batch_num}/{total_batches} | attempt {attempt + 1} | finish_reason={finish_reason}\n")
-                if usage:
-                    lf.write(f"tokens: prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}\n")
-                lf.write(f"{'─'*80}\n")
-                lf.write(text)
-                lf.write(f"\n{'='*80}\n")
+            log_llm_response(
+                "review_responses.log",
+                f"BATCH {batch_num}/{total_batches}",
+                text,
+                finish_reason=finish_reason,
+                usage=usage,
+                attempt=attempt + 1,
+            )
 
             print(f"  finish_reason={finish_reason}", end="")
             if usage:
@@ -275,29 +274,17 @@ def main():
         else:
             print(f"Warning: Source file not found: {args.source}")
 
-    # Load config
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    config = {}
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to load config.json: {e}")
-    else:
-        print("Warning: config.json not found. Using defaults.")
-
-    llm_config = config.get("llm", {})
-    base_url = llm_config.get("base_url", "http://localhost:11434/v1")
-    api_key = llm_config.get("api_key", "local")
-    model_name = llm_config.get("model_name", "local-model")
+    llm = load_llm_config()
+    base_url = llm["base_url"]
+    api_key = llm["api_key"]
+    model_name = llm["model_name"]
 
     # Load custom review prompts or use defaults from review_prompts.txt
-    prompts_config = config.get("prompts", {})
+    prompts_config = load_prompts_config()
     review_sys = prompts_config.get("review_system_prompt") or REVIEW_SYSTEM_PROMPT
     review_usr = prompts_config.get("review_user_prompt") or REVIEW_USER_PROMPT
 
-    generation_config = config.get("generation", {})
+    generation_config = load_generation_config()
     batch_size = generation_config.get("review_batch_size", 25)
     max_tokens = generation_config.get("max_tokens", 8000)
     temperature = generation_config.get("temperature", 0.4)
@@ -313,7 +300,7 @@ def main():
     if banned_tokens:
         print(f"Banned tokens: {banned_tokens}")
 
-    client = OpenAI(base_url=base_url, api_key=api_key)
+    client, _ = create_llm_client()
 
     all_corrected = []
     total_stats = {

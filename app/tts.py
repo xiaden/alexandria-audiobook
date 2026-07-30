@@ -140,10 +140,8 @@ class TTSEngine:
     @staticmethod
     def _clear_gpu_cache():
         """Free GPU memory: garbage-collect Python objects, then clear CUDA cache."""
-        import gc
-        gc.collect()
-        import torch
-        torch.cuda.empty_cache()
+        from utils import clear_gpu_cache
+        clear_gpu_cache()
 
     @staticmethod
     def _reset_compile_cache():
@@ -286,16 +284,8 @@ class TTSEngine:
         """Resolve 'auto' device to the best available."""
         if self._device != "auto":
             return self._device
-
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return "cuda"
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
-        except ImportError:
-            pass
-        return "cpu"
+        from utils import resolve_device
+        return resolve_device("auto")
 
 
     def _enable_rocm_optimizations(self):
@@ -310,34 +300,8 @@ class TTSEngine:
         4. triton_key shim: Bridges pytorch-triton-rocm's get_cache_key()
            to the triton_key() that PyTorch's inductor expects.
         """
-        try:
-            import torch
-            if not (hasattr(torch.version, "hip") and torch.version.hip):
-                return  # not ROCm
-        except ImportError:
-            return
-
-        # MIOpen: use fast-find to avoid workspace allocation failures
-        os.environ.setdefault("MIOPEN_FIND_MODE", "2")
-        # Suppress MIOpen workspace warnings
-        os.environ.setdefault("MIOPEN_LOG_LEVEL", "4")
-
-        # Flash attention via Triton AMD backend
-        os.environ.setdefault("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
-
-        # Fix triton_key compatibility for torch.compile on ROCm
-        try:
-            from triton.compiler import compiler as triton_compiler
-            if not hasattr(triton_compiler, "triton_key"):
-                import triton
-                triton_compiler.triton_key = lambda: f"pytorch-triton-rocm-{triton.__version__}"
-        except ImportError:
-            pass
-
-        # Correct under-reported GPU properties on consumer RDNA2/3.
-        # ROCm reports half the CU count and warp size 32 instead of 64,
-        # causing PyTorch to under-schedule work on RX 6000/7000 GPUs.
-        self._patch_rdna_device_properties(torch)
+        from utils import setup_rocm
+        setup_rocm()
 
 
     @staticmethod
@@ -452,12 +416,8 @@ class TTSEngine:
         Uses try_to_load_from_cache to find the local snapshot directory.
         Returns the local path string if cached, or None if not cached.
         """
-        from huggingface_hub import try_to_load_from_cache
-        result = try_to_load_from_cache(model_id, "config.json")
-        if isinstance(result, str):
-            # result is the full path to config.json inside the snapshot dir
-            return os.path.dirname(result)
-        return None
+        from utils import resolve_local_model_path
+        return resolve_local_model_path(model_id)
 
     @staticmethod
     def _load_model(model_cls, model_id, load_kwargs):
@@ -469,20 +429,8 @@ class TTSEngine:
         If loading from local cache fails (e.g. incomplete snapshot), retries
         with the model ID so HF Hub can download any missing files.
         """
-        local_path = TTSEngine._resolve_local_model_path(model_id)
-        if local_path:
-            print(f"  Loading from local cache: {local_path}")
-            try:
-                return model_cls.from_pretrained(local_path, **load_kwargs)
-            except Exception as e:
-                import traceback
-                print(f"  Warning: Failed to load from local cache: {e}")
-                traceback.print_exc()
-                print(f"  Retrying with model ID (may download missing files)...")
-                return model_cls.from_pretrained(model_id, **load_kwargs)
-        else:
-            print(f"  Model not cached locally, downloading {model_id}...")
-            return model_cls.from_pretrained(model_id, **load_kwargs)
+        from utils import load_model_from_cache
+        return load_model_from_cache(model_cls, model_id, **load_kwargs)
 
     def _init_local_custom(self):
         """Load Qwen3-TTS CustomVoice model on demand."""
