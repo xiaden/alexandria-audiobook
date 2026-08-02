@@ -90,6 +90,37 @@ def load_llm_config(config_path=None):
     }
 
 
+def resolve_task_llm(task_name: str, config_path=None) -> dict:
+    """Resolve per-task LLM config. Returns {'model_name': str, 'reasoning_effort': str|None}.
+
+    Resolution order: task-specific override -> global default -> hardcoded fallback.
+    """
+    # Hardcoded fallback defaults
+    _FALLBACK_MODEL = "richardyoung/qwen3-14b-abliterated:Q8_0"
+    _FALLBACK_REASONING = None
+
+    config = load_app_config(config_path) or {}
+    llm = config.get("llm", {})
+
+    # Global defaults from config (or fallback)
+    global_model = llm.get("model_name", _FALLBACK_MODEL)
+    global_reasoning = llm.get("reasoning_effort", _FALLBACK_REASONING)
+
+    # Task-specific overrides
+    task_overrides = llm.get("task_overrides", {})
+    task_override = task_overrides.get(task_name, {}) if isinstance(task_overrides, dict) else {}
+
+    # Resolve model_name: task override -> global -> hardcoded fallback
+    override_model = task_override.get("model_name") if isinstance(task_override, dict) else None
+    model = override_model if override_model else global_model
+
+    # Resolve reasoning_effort: task override -> global -> None
+    override_reasoning = task_override.get("reasoning_effort") if isinstance(task_override, dict) else None
+    reasoning = override_reasoning if override_reasoning else global_reasoning
+
+    return {"model_name": model, "reasoning_effort": reasoning}
+
+
 def load_generation_config(config_path=None):
     """Load generation settings from config.json with fallback defaults."""
     config = load_app_config(config_path) or {}

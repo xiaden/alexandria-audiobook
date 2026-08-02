@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alexandria Audiobook</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+        .container-wide { max-width: 85%; margin-left: auto; margin-right: auto; padding-left: 12px; padding-right: 12px; }
+        .nav-link { cursor: pointer; }
+        .log-window {
+            background-color: #1e1e1e;
+            color: #00ff00;
+            font-family: 'Courier New', Courier, monospace;
+            height: 300px;
+            overflow-y: auto;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 0.9em;
+        }
+        .card { margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .step-indicator {
+            display: inline-block;
+            width: 25px;
+            height: 25px;
+            background-color: #e9ecef;
+            color: #6c757d;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 25px;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        .step-active { background-color: #0d6efd; color: white; }
+        .voice-card { border-left: 4px solid #0d6efd; }
+        /* Editor row expand/collapse */
+        .chunk-action-btn {
+            border: none;
+            background: none;
+            padding: 2px 4px;
+            cursor: pointer;
+            color: #6c757d;
+            font-size: 0.85em;
+            transition: transform 0.2s ease;
+        }
+        .chunk-row.expanded .chunk-toggle-btn {
+            transform: rotate(180deg);
+        }
+        /* Core pipeline tabs - green */
+        .nav-link.nav-pipeline { color: rgba(125, 227, 161, 0.7); }
+        .nav-link.nav-pipeline:hover { color: #7de3a1; }
+        .nav-link.nav-pipeline.active { color: #fff; background-color: #198754; border-radius: 4px; }
+        /* Advanced tabs - blue */
+        .nav-link.nav-advanced { color: rgba(130, 177, 255, 0.7); }
+        .nav-link.nav-advanced:hover { color: #82b1ff; }
+        .nav-link.nav-advanced.active { color: #fff; background-color: #0d6efd; border-radius: 4px; }
+    </style>
+  <script type="module" crossorigin src="/static/assets/index-BUoHXQyz.js"></script>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+        <div class="container">
+            <a class="navbar-brand" href="#"><i class="fas fa-book-open me-2"></i>Alexandria</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item"><a class="nav-link nav-pipeline active" data-tab="setup">1. Setup</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="script">2. Script</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="voices">3. Voices</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="editor">4. Editor</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="audio">5. Result</a></li>
+                    <li class="nav-item ms-3 border-start border-secondary ps-3"><a class="nav-link nav-advanced" data-tab="designer">Designer</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="preparer">Preparer</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="dataset-builder">Dataset</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="training">Training</a></li>
+                </ul>
+                <ul class="navbar-nav ms-auto align-items-center">
+                    <li class="nav-item small d-flex align-items-center" title="System Status">
+                        <span id="sys-gpu" class="text-light d-flex align-items-center me-3"><i class="fas fa-microchip me-1 text-secondary"></i><span id="sys-gpu-val" style="font-family: monospace;">N/A</span></span>
+                        <span id="sys-disk" class="text-light d-flex align-items-center"><i class="fas fa-hdd me-1 text-secondary"></i><span id="sys-disk-val" style="font-family: monospace;">N/A</span></span>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-wide">
+
+        <!-- Setup Tab -->
+        <div id="setup-tab" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h4><span class="step-indicator step-active">1</span>Configuration</h4>
+                </div>
+                <div class="card-body">
+                    <form id="config-form">
+                        <h5 class="mb-3">LLM Settings (Script Generation)</h5>
+                        <div class="mb-3">
+                            <label class="form-label">Base URL</label>
+                            <input type="text" class="form-control" id="llm-url" placeholder="http://localhost:1234/v1">
+                            <div class="form-text">URL for your OpenAI-compatible server (LM Studio, Ollama, etc.)</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">API Key</label>
+                            <input type="text" class="form-control" id="llm-key" value="local">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Model Name</label>
+                            <input type="text" class="form-control" id="llm-model" placeholder="local-model">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Reasoning Effort</label>
+                            <select class="form-select" id="llm-reasoning">
+                                <option value="">Default</option>
+                                <option value="none">None</option>
+                                <option value="low">Low</option>
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                            </select>
+                            <div class="form-text">Global default reasoning depth. Per-task overrides below can inherit or override it.</div>
+                        </div>
+
+                        <div class="mb-4">
+                            <h6 class="fw-bold mb-2"><i class="fas fa-microchip me-2"></i>Per-Task Model Overrides</h6>
+                            <p class="text-muted small mb-2">Override model and reasoning effort for specific LLM tasks. Leave empty to inherit the global default.</p>
+                            <div class="table-responsive">
+                                <table id="per-task-llm-table" class="table table-sm table-borderless align-middle mb-0">
+                                    <thead class="table-light">
+                                        <tr>
+                                            <th style="width: 35%">Task</th>
+                                            <th style="width: 40%">Model Name</th>
+                                            <th style="width: 25%">Reasoning Effort</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr data-task="script_generation">
+                                            <td class="fw-medium">Script Generation</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                        </tr>
+                                        <tr data-task="script_review">
+                                            <td class="fw-medium">Script Review</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                        </tr>
+                                        <tr data-task="alias_resolution">
+                                            <td class="fw-medium">Alias Resolution</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                        </tr>
+                                        <tr data-task="persona_discovery">
+                                            <td class="fw-medium">Persona Discovery</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                        </tr>
+                                        <tr data-task="persona_compilation">
+                                            <td class="fw-medium">Persona Compilation</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                        </tr>
+                                        <tr data-task="basic_persona_generation">
+                                            <td class="fw-medium">Basic Persona Gen</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <h5 class="mb-3 mt-4">TTS Settings (Voice Generation)</h5>
+                        <div class="row mb-3">
+                            <div class="col-md-3">
+                                <label class="form-label">TTS Mode</label>
+                                <select class="form-select" id="tts-mode">
+                                    <option value="external">External Server</option>
+                                    <option value="local">Local Model</option>
+                                </select>
+                                <div class="form-text">Local loads model in-process; External connects to a Gradio TTS server</div>
+                            </div>
+                            <div class="col-md-5" id="tts-url-group">
+                                <label class="form-label">TTS Server URL</label>
+                                <input type="text" class="form-control" id="tts-url" value="http://127.0.0.1:7860">
+                                <div class="form-text">URL for the Qwen3-TTS Gradio server</div>
+                            </div>
+                            <div class="col-md-4" id="tts-device-group" style="display:none;">
+                                <label class="form-label">Device</label>
+                                <select class="form-select" id="tts-device">
+                                    <option value="auto">Auto (best available)</option>
+                                    <option value="cuda:0">CUDA GPU 0</option>
+                                    <option value="cuda:1">CUDA GPU 1</option>
+                                    <option value="cpu">CPU</option>
+                                </select>
+                                <div class="form-text">Device for local model inference</div>
+                            </div>
+                            <div class="col-md-3" id="tts-language-group">
+                                <label class="form-label">TTS Language</label>
+                                <select class="form-select" id="tts-language">
+                                    <option value="Auto">Auto (detect)</option>
+                                    <option value="English" selected>English</option>
+                                    <option value="Chinese">Chinese</option>
+                                    <option value="French">French</option>
+                                    <option value="German">German</option>
+                                    <option value="Italian">Italian</option>
+                                    <option value="Japanese">Japanese</option>
+                                    <option value="Korean">Korean</option>
+                                    <option value="Portuguese">Portuguese</option>
+                                    <option value="Russian">Russian</option>
+                                    <option value="Spanish">Spanish</option>
+                                </select>
+                                <div class="form-text">Language for audio synthesis only. To generate scripts in another language, edit the prompts under Prompt Settings (Advanced).</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">Parallel Workers</label>
+                                <input type="number" class="form-control" id="parallel-workers" value="2" min="1">
+                                <div class="form-text">Concurrent TTS requests</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">Batch Seed</label>
+                                <input type="number" class="form-control" id="batch-seed" placeholder="-1 (random)">
+                                <div class="form-text">Seed for reproducibility</div>
+                            </div>
+                        </div>
+                        <div class="row mb-3" id="tts-local-options" style="display:none;">
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="compile-codec">
+                                    <label class="form-check-label" for="compile-codec">Compile Codec</label>
+                                </div>
+                                <div class="form-text">torch.compile the audio codec (~3-4x batch speed, slow first run)</div>
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="batch-group-by-type">
+                                    <label class="form-check-label" for="batch-group-by-type">Optimize Batch Order</label>
+                                </div>
+                                <div class="form-text">Group by voice type for GPU efficiency (disables sequential order)</div>
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="sub-batch-enabled" checked>
+                                    <label class="form-check-label" for="sub-batch-enabled">Sub-batching</label>
+                                </div>
+                                <div class="form-text">Split batches by text length to reduce padding waste</div>
+                            </div>
+                            <div class="col-md-2" id="sub-batch-min-group">
+                                <label class="form-label">Min Sub-batch Size</label>
+                                <input type="number" class="form-control" id="sub-batch-min-size" value="4" min="1">
+                                <div class="form-text">Min chunks before splitting</div>
+                            </div>
+                            <div class="col-md-2" id="sub-batch-ratio-group">
+                                <label class="form-label">Length Ratio</label>
+                                <input type="number" class="form-control" id="sub-batch-ratio" value="5" min="1" step="0.5">
+                                <div class="form-text">Max long/short ratio before split</div>
+                            </div>
+                            <div class="col-md-2" id="sub-batch-max-items-group">
+                                <label class="form-label">Max Items/Batch</label>
+                                <input type="number" class="form-control" id="sub-batch-max-items" value="0" min="0" step="1">
+                                <div class="form-text">Hard cap on sequences per sub-batch (0 = auto from VRAM estimate)</div>
+                            </div>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-md-2">
+                                <label class="form-label">Speaker Change Pause (ms)</label>
+                                <input type="number" class="form-control" id="pause-between-speakers" value="500" min="0" step="50">
+                                <div class="form-text">Silence between different speakers on merge</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">Same Speaker Pause (ms)</label>
+                                <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" step="50">
+                                <div class="form-text">Silence when same speaker continues on merge</div>
+                            </div>
+                        </div>
+
+                        <h5 class="mb-3 mt-4">
+                            <a class="text-decoration-none" data-bs-toggle="collapse" href="#promptSettings" role="button" aria-expanded="false">
+                                <i class="fas fa-chevron-right me-2" id="prompt-chevron"></i>Prompt Settings (Advanced)
+                            </a>
+                        </h5>
+                        <div class="collapse" id="promptSettings">
+                            <h6 class="mb-3">Generation Settings</h6>
+                            <div class="row mb-3">
+                                <div class="col-md-6">
+                                    <label class="form-label">Chunk Size (characters)</label>
+                                    <input type="number" class="form-control" id="chunk-size" value="3000" min="500">
+                                    <div class="form-text">Size of text chunks sent to LLM (characters). Smaller = more precise, larger = more context.</div>
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label">Max Tokens (response)</label>
+                                    <input type="number" class="form-control" id="max-tokens" value="4096" min="256">
+                                    <div class="form-text">Maximum tokens for LLM response. Increase if output is being truncated.</div>
+                                </div>
+                            </div>
+                            <h6 class="mb-3">LLM Sampling Parameters</h6>
+                            <div class="row mb-3">
+                                <div class="col">
+                                    <label class="form-label">Temperature</label>
+                                    <input type="number" class="form-control" id="temperature" value="0.6" min="0" max="2" step="0.05">
+                                    <div class="form-text">Randomness (0 = deterministic)</div>
+                                </div>
+                                <div class="col">
+                                    <label class="form-label">Top P</label>
+                                    <input type="number" class="form-control" id="top-p" value="0.8" min="0" max="1" step="0.05">
+                                    <div class="form-text">Nucleus sampling threshold</div>
+                                </div>
+                                <div class="col">
+                                    <label class="form-label">Top K</label>
+                                    <input type="number" class="form-control" id="top-k" value="0" min="0" max="200" step="1">
+                                    <div class="form-text">Top-K token filtering (0 = disabled)</div>
+                                </div>
+                                <div class="col">
+                                    <label class="form-label">Min P</label>
+                                    <input type="number" class="form-control" id="min-p" value="0" min="0" max="1" step="0.01">
+                                    <div class="form-text">Minimum probability cutoff (0 = disabled)</div>
+                                </div>
+                                <div class="col">
+                                    <label class="form-label">Presence Penalty</label>
+                                    <input type="number" class="form-control" id="presence-penalty" value="0" min="-2" max="2" step="0.1">
+                                    <div class="form-text">Penalize repeated topics</div>
+                                </div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Banned Tokens</label>
+                                <input type="text" class="form-control" id="banned-tokens" placeholder="e.g. <think>, <reasoning>">
+                                <div class="form-text">Comma-separated tokens the LLM is forbidden from generating. Use to disable thinking mode (e.g. <code>&lt;think&gt;</code>).</div>
+                            </div>
+                            <div class="mb-3 form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="merge-narrators">
+                                <label class="form-check-label" for="merge-narrators">Merge consecutive narrator lines</label>
+                                <div class="form-text">During script review, combine adjacent NARRATOR entries that share the same instruct into a single longer entry. Disable for better per-line voice direction control.</div>
+                            </div>
+                            <hr>
+                            <h6 class="mb-3">Prompt Customization</h6>
+                            <div class="mb-3">
+                                <label class="form-label">System Prompt</label>
+                                <textarea class="form-control font-monospace" id="system-prompt" rows="12" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Instructions for the LLM on how to convert text to script. Defines output format, rules, and style guidelines.</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">User Prompt Template</label>
+                                <textarea class="form-control font-monospace" id="user-prompt" rows="4" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Template for each chunk. Use <code>{context}</code> for chunk context and <code>{chunk}</code> for the text content.</div>
+                            </div>
+                            <hr>
+                            <h6 class="mb-3">Review Prompt Customization</h6>
+                            <div class="mb-3">
+                                <label class="form-label">Review System Prompt</label>
+                                <textarea class="form-control font-monospace" id="review-system-prompt" rows="12" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Instructions for the LLM during the script review pass. Defines what errors to fix and how.</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Review User Prompt Template</label>
+                                <textarea class="form-control font-monospace" id="review-user-prompt" rows="4" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Template for each review batch. Use <code>{context}</code> for batch context and <code>{batch}</code> for the script entries.</div>
+                            </div>
+                            <hr>
+                            <h6 class="mb-3">Persona Prompt Customization</h6>
+                            <div class="mb-3">
+                                <label class="form-label">Persona System Prompt</label>
+                                <textarea class="form-control font-monospace" id="persona-system-prompt" rows="4" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">System instruction for the LLM during persona generation. Shared by basic and advanced modes.</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Persona User Prompt Template</label>
+                                <textarea class="form-control font-monospace" id="persona-user-prompt" rows="8" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Template for basic per-speaker persona generation. Use <code>{speaker}</code> for character name, <code>{narrator_context}</code> for surrounding narration, <code>{sample_lines}</code> for dialogue samples.</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Persona Advanced Compilation Prompt</label>
+                                <textarea class="form-control font-monospace" id="persona-advanced-prompt" rows="8" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Template for advanced mode final compilation. Use <code>{character_ref}</code> for the accumulated character reference data.</div>
+                            </div>
+                            <button type="button" class="btn btn-outline-secondary btn-sm mb-3" id="btn-reset-prompts">
+                                <i class="fas fa-undo me-1"></i>Reset to Defaults
+                            </button>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary"><i class="fas fa-save me-2"></i>Save Configuration</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- Script Tab -->
+        <div id="script-tab" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <h4><span class="step-indicator step-active">2</span>Generate Script</h4>
+                </div>
+                <div class="card-body">
+                    <div class="mb-4">
+                        <label class="form-label">Select Book/Novel (Text, Markdown, or EPUB)</label>
+                        <input type="file" class="form-control" id="file-upload" accept=".txt,.md,.epub">
+                        <div id="upload-status" class="mt-2"></div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" id="single-speaker-toggle">
+                            <label class="form-check-label" for="single-speaker-toggle">
+                                Single speaker mode <span class="text-muted">— skip the LLM, narrate the whole text with one voice</span>
+                            </label>
+                        </div>
+                        <div id="single-speaker-options" class="mt-2 ps-4" style="display:none;">
+                            <div class="input-group input-group-sm mb-1">
+                                <span class="input-group-text" style="min-width:130px;">Speaker name</span>
+                                <input type="text" class="form-control" id="single-speaker-name" value="Narrator">
+                            </div>
+                            <div class="input-group input-group-sm">
+                                <span class="input-group-text" style="min-width:130px;">Voice direction</span>
+                                <input type="text" class="form-control" id="single-speaker-instruct" value="Neutral narration.">
+                            </div>
+                            <small class="text-muted">Useful for first-person memoirs, non-fiction, or anything without distinct characters.</small>
+                        </div>
+                    </div>
+
+                    <div class="d-grid gap-2">
+                        <button class="btn btn-success btn-lg" id="btn-gen-script">
+                            <i class="fas fa-magic me-2"></i>Generate Annotated Script
+                        </button>
+                        <small class="text-muted" id="btn-gen-script-hint">Sends the book to your LLM to split it into annotated chunks with speaker labels and voice directions.</small>
+                        <button class="btn btn-outline-secondary btn-lg" id="btn-review-script">
+                            <i class="fas fa-check-double me-2"></i>Review Script (Optional)
+                        </button>
+                        <small class="text-muted">Runs a second LLM pass to fix speaker misattributions or formatting issues. Only needed if the generated script has problems.</small>
+                        <div class="input-group mt-1">
+                            <span class="input-group-text">Context Window</span>
+                            <input type="number" class="form-control" id="review-context-window" value="4" min="1" max="12">
+                            <button class="btn btn-outline-primary" id="btn-review-script-contextual" type="button">
+                                <i class="fas fa-crosshairs me-2"></i>Contextual Review (+/- N)
+                            </button>
+                        </div>
+                        <small class="text-muted" id="review-context-estimate">Contextual review runs in batched LLM calls and will show an estimate after you start it.</small>
+                        <small class="text-muted">Reviews each dialog with N entries before and after to fix missed segmentation and wrong speaker labels in difficult author styles.</small>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="m-0">Saved Scripts</h5>
+                </div>
+                <div class="card-body">
+                    <div class="input-group mb-3">
+                        <input type="text" class="form-control" id="save-script-name" placeholder="Script name (e.g. The Great Gatsby)">
+                        <button class="btn btn-outline-primary" id="btn-save-script"><i class="fas fa-save me-1"></i>Save Current</button>
+                    </div>
+                    <div id="saved-scripts-list">
+                        <p class="text-muted mb-0">No saved scripts yet.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">Generation Logs</div>
+                <div class="card-body p-0">
+                    <div id="script-logs" class="log-window"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Voices Tab -->
+        <div id="voices-tab" class="tab-content" style="display:none;">
+            <div class="card mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h4 class="m-0"><span class="step-indicator step-active">3</span>Voice Configuration</h4>
+                    <span id="voice-save-status" class="text-muted small"></span>
+                </div>
+                <div class="card-body">
+                    <p>Voices are detected from the generated script. Changes are saved automatically.</p>
+                    <div class="d-flex align-items-center gap-3 mb-2 flex-wrap">
+                        <button class="btn btn-outline-primary" id="btn-gen-personas"><i class="fas fa-user-robot me-1"></i>Generate Personas</button>
+                        <div class="form-check form-switch m-0">
+                            <input class="form-check-input" type="checkbox" id="advanced-persona-toggle">
+                            <label class="form-check-label" for="advanced-persona-toggle">Advanced</label>
+                        </div>
+                        <div class="input-group input-group-sm" id="advanced-persona-options" style="width: 135px; display:none;">
+                            <span class="input-group-text">Batch</span>
+                            <input class="form-control" id="persona-batch-size" type="number" min="1" max="200" value="40">
+                        </div>
+                        <button class="btn btn-outline-danger" id="btn-cancel-personas" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
+                        <span id="persona-status" class="text-muted small"></span>
+                    </div>
+                    <div id="voices-list"></div>
+                </div>
+            </div>
+
+             <div class="card">
+                <div class="card-header">Voice Parsing Logs</div>
+                <div class="card-body p-0">
+                    <div id="voices-logs" class="log-window" style="height: 150px;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Designer Tab -->
+        <div id="designer-tab" class="tab-content" style="display:none;">
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h4><span class="step-indicator step-active">4</span>Voice Designer</h4>
+                </div>
+                <div class="card-body">
+                    <p>Design new voices from text descriptions. Generated voices can be saved and used as clone sources in the Voices tab.</p>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Voice Description</label>
+                            <textarea class="form-control" id="design-description" rows="3" placeholder="A warm, mature female voice with a British accent. Speaks clearly with gentle authority."></textarea>
+                            <div class="form-text">Describe the voice characteristics you want</div>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Sample Text</label>
+                            <textarea class="form-control" id="design-sample-text" rows="3" placeholder="The ancient library stood at the crossroads of two forgotten paths, its weathered stone walls covered in ivy.">The ancient library stood at the crossroads of two forgotten paths, its weathered stone walls covered in ivy that had been growing for centuries.</textarea>
+                            <div class="form-text">Text to synthesize with the designed voice</div>
+                        </div>
+                    </div>
+
+                    <div class="d-flex align-items-center gap-3 mb-3">
+                        <button class="btn btn-primary" id="btn-design-preview">
+                            <i class="fas fa-magic me-1"></i>Generate Preview
+                        </button>
+                        <span id="design-status" class="text-muted"></span>
+                    </div>
+
+                    <div id="design-preview-container" style="display:none;">
+                        <div class="card bg-light mb-3">
+                            <div class="card-body py-2">
+                                <label class="form-label fw-bold mb-1">Preview</label>
+                                <audio id="design-preview-audio" controls class="w-100"></audio>
+                            </div>
+                        </div>
+
+                        <div class="row g-2 align-items-end">
+                            <div class="col-md-4">
+                                <label class="form-label">Voice Name</label>
+                                <input type="text" class="form-control" id="design-voice-name" placeholder="e.g. Lady Narrator">
+                                <input type="hidden" id="design-source-name" value="">
+                                <label class="form-label small mt-2">Alias of</label>
+                                <select id="design-alias-select" class="form-select form-select-sm">
+                                    <option value="">-- None --</option>
+                                </select>
+                            </div>
+                            <div class="col-md-2">
+                                <button class="btn btn-success w-100" id="btn-save-designed-voice">
+                                    <i class="fas fa-save me-1"></i>Save Voice
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="m-0">Saved Voices</h5>
+                    <button class="btn btn-sm btn-outline-primary" id="btn-refresh-designed-voices"><i class="fas fa-sync me-1"></i>Refresh</button>
+                </div>
+                <div class="card-body">
+                    <div id="designed-voices-list">
+                        <p class="text-muted mb-0">No designed voices yet. Generate and save a preview above.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Preparer Tab -->
+        <div id="preparer-tab" class="tab-content" style="display:none;">
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h4><span class="step-indicator step-active">D</span>Voice Training Dataset Builder</h4>
+                </div>
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <p class="mb-0">Build LoRA voice training datasets from audio you own — your own recordings, Creative Commons narrations, or permissively licensed audio. Transcribes and segments into <code>metadata.jsonl</code> + WAV chunks ready for training.</p>
+                        <div class="form-check form-switch ms-3 flex-shrink-0">
+                            <input class="form-check-input" type="checkbox" id="prep-batch-mode">
+                            <label class="form-check-label" for="prep-batch-mode">Batch Mode</label>
+                        </div>
+                    </div>
+
+                    <!-- Single Mode -->
+                    <div id="prep-single-area">
+                        <div class="row g-3 mb-4">
+                            <div class="col-md-6">
+                                <label class="form-label">Select Audio File (WAV/MP3)</label>
+                                <input type="file" class="form-control" id="prep-audio-file" accept=".wav,.mp3">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Batch Mode -->
+                    <div id="prep-batch-area" style="display:none;">
+                        <div class="alert alert-info py-2 small mb-3">
+                            <i class="fas fa-info-circle me-1"></i><strong>Batch Mode:</strong>
+                            Select multiple audio files you have the rights to process. Each will be transcribed and packaged into a separate training dataset ZIP.
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Select Audio Files (WAV/MP3)</label>
+                            <input type="file" class="form-control" id="prep-batch-files" accept=".wav,.mp3" multiple>
+                        </div>
+                        <div id="prep-batch-queue-container" class="mb-4" style="display:none;">
+                            <h6>Processing Queue</h6>
+                            <div class="table-responsive border rounded bg-white">
+                                <table class="table table-sm table-hover mb-0" style="font-size:0.85rem;">
+                                    <thead class="table-light">
+                                        <tr><th>Audio File</th><th>Status</th></tr>
+                                    </thead>
+                                    <tbody id="prep-batch-queue-body"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <h5 class="mb-3">Configuration</h5>
+                    <div class="row g-3 mb-4">
+                        <div class="col-md-3">
+                            <label class="form-label">Output Filename</label>
+                            <input type="text" class="form-control" id="prep-output" value="my_dataset.zip">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Language</label>
+                            <select class="form-select" id="prep-lang">
+                                <option value="en">English</option>
+                                <option value="zh">Chinese</option>
+                                <option value="fr">French</option>
+                                <option value="de">German</option>
+                                <option value="ja">Japanese</option>
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Confidence</label>
+                            <input type="number" class="form-control" id="prep-confidence" value="0.85" step="0.01" min="0" max="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Min SNR</label>
+                            <input type="number" class="form-control" id="prep-snr" value="25" min="0">
+                        </div>
+                    </div>
+
+                    <div class="d-grid gap-2 d-md-flex mb-2">
+                        <button class="btn btn-success btn-lg flex-grow-1" id="btn-prep-start">
+                            <i class="fas fa-cogs me-2"></i>Start Preparation
+                        </button>
+                        <button class="btn btn-outline-danger" id="btn-prep-cancel" style="display:none;">
+                            <i class="fas fa-stop me-1"></i>Cancel
+                        </button>
+                    </div>
+                    <div id="prep-status-msg" class="text-center text-muted small"></div>
+
+                    <div id="preparer-progress-section" class="mt-4" style="display:none;">
+                        <hr>
+                        <h5 class="mb-2">Execution Logs</h5>
+                        <div id="preparer-logs" class="log-window" style="height:300px;overflow-y:auto;background:#1e1e1e;color:#ddd;padding:10px;font-family:monospace;font-size:0.8rem;border-radius:4px;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Training Tab -->
+        <div id="training-tab" class="tab-content" style="display:none;">
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h4><span class="step-indicator step-active">5</span>LoRA Training</h4>
+                </div>
+                <div class="card-body">
+                    <p>Train LoRA adapters on the Base model to create custom voice identities. Upload a dataset (ZIP with WAV files + metadata.jsonl), configure training, and run.</p>
+
+                    <!-- Dataset Upload -->
+                    <h5 class="mb-3">Dataset</h5>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <div class="input-group">
+                                <input type="file" class="form-control" id="lora-dataset-file" accept=".zip">
+                                <button class="btn btn-outline-primary" id="btn-upload-lora-dataset"><i class="fas fa-upload me-1"></i>Upload ZIP</button>
+                            </div>
+                            <div class="form-text">ZIP containing WAV files (24kHz mono) and metadata.jsonl with audio_filepath and text fields</div>
+                        </div>
+                        <div class="col-md-6">
+                            <div id="lora-datasets-list" class="border rounded p-2" style="min-height: 60px;">
+                                <span class="text-muted">No datasets uploaded yet.</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Build New Dataset -->
+                    <div class="mb-3">
+                        <button class="btn btn-outline-primary" id="btn-build-dataset">
+                            <i class="fas fa-flask me-1"></i>Build New Dataset
+                        </button>
+                        <span class="text-muted small ms-2">Open the Dataset Builder to create training datasets with per-line preview and generation.</span>
+                    </div>
+
+                    <hr>
+
+                    <!-- Training Config -->
+                    <h5 class="mb-3">Training Configuration</h5>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-3">
+                            <label class="form-label">Adapter Name</label>
+                            <input type="text" class="form-control" id="lora-adapter-name" placeholder="e.g. narrator_warm">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Dataset</label>
+                            <select class="form-select" id="lora-dataset-select">
+                                <option value="">-- Select dataset --</option>
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Epochs</label>
+                            <input type="number" class="form-control" id="lora-epochs" value="5" min="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Learning Rate</label>
+                            <input type="text" class="form-control" id="lora-lr" value="5e-6">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Batch Size</label>
+                            <input type="number" class="form-control" id="lora-batch-size" value="1" min="1">
+                        </div>
+                    </div>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-2">
+                            <label class="form-label">LoRA Rank</label>
+                            <input type="number" class="form-control" id="lora-rank" value="32" min="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">LoRA Alpha</label>
+                            <input type="number" class="form-control" id="lora-alpha" value="128" min="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Grad Accum Steps</label>
+                            <input type="number" class="form-control" id="lora-grad-accum" value="8" min="1">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Language</label>
+                            <select class="form-select" id="lora-language">
+                                <option value="english" selected>English</option>
+                                <option value="chinese">Chinese</option>
+                                <option value="german">German</option>
+                                <option value="italian">Italian</option>
+                                <option value="portuguese">Portuguese</option>
+                                <option value="spanish">Spanish</option>
+                                <option value="japanese">Japanese</option>
+                                <option value="korean">Korean</option>
+                                <option value="french">French</option>
+                                <option value="russian">Russian</option>
+                            </select>
+                        </div>
+                        <div class="col-md-6 d-flex align-items-end">
+                            <button class="btn btn-success btn-lg" id="btn-lora-train">
+                                <i class="fas fa-dumbbell me-1"></i>Start Training
+                            </button>
+                            <span id="lora-train-status" class="ms-3 text-muted"></span>
+                        </div>
+                    </div>
+
+                    <!-- Settings Info Panel -->
+                    <div class="card mb-3 border-info">
+                        <div class="card-header py-2 bg-info bg-opacity-10 d-flex justify-content-between align-items-center" style="cursor:pointer;" id="lora-info-toggle">
+                            <strong><i class="fas fa-info-circle me-1"></i>How Settings Affect LoRA Voice Quality</strong>
+                            <i class="fas fa-chevron-down"></i>
+                        </div>
+                        <div class="card-body d-none small">
+                            <dl class="row mb-0">
+                                <dt class="col-sm-3">LoRA Rank</dt>
+                                <dd class="col-sm-9">Controls adapter capacity. <strong>High rank (64+)</strong> captures voice identity strongly but can override the model's ability to follow instruct/style prompts, producing flat delivery. <strong>Low rank (8-16)</strong> preserves expressiveness and instruct-following but captures less voice detail. Start with 16-32 for a balance.</dd>
+                                <dt class="col-sm-3">LoRA Alpha</dt>
+                                <dd class="col-sm-9">Scaling factor for LoRA weights. Effective strength = alpha / rank. Higher alpha relative to rank means the adapter has more influence. A common starting point is alpha = 2x rank.</dd>
+                                <dt class="col-sm-3">Epochs</dt>
+                                <dd class="col-sm-9">Number of full passes over the dataset. <strong>Too few</strong>: voice identity won't converge. <strong>Too many</strong>: overfitting, stuttering, repetition artifacts. 15-30 epochs is a good range for 20+ samples.</dd>
+                                <dt class="col-sm-3">Learning Rate</dt>
+                                <dd class="col-sm-9">Step size for weight updates. Default 5e-6 is conservative. Higher (1e-5) trains faster but risks instability. Lower (1e-6) is safer for longer training runs.</dd>
+                                <dt class="col-sm-3">Batch Size</dt>
+                                <dd class="col-sm-9">Samples processed per step. Limited by VRAM. Batch 1 with gradient accumulation is typical for 24GB cards.</dd>
+                                <dt class="col-sm-3">Grad Accum Steps</dt>
+                                <dd class="col-sm-9">Simulates larger batches by accumulating gradients over N steps before updating. Effective batch = batch_size x grad_accum. Higher values give smoother training at the cost of speed.</dd>
+                                <dt class="col-sm-3">Language</dt>
+                                <dd class="col-sm-9">Sets the codec language prefix token used during training. Must match the language of your training audio. For unsupported languages, try "english" as a proxy.</dd>
+                            </dl>
+                            <hr class="my-2">
+                            <p class="mb-0"><strong>Training data tip:</strong> For expressive voices, include samples with varied emotions (happy, sad, angry, calm). Neutral-only training data will produce a flat voice that resists instruct prompting.</p>
+                        </div>
+                    </div>
+
+                    <!-- Training Progress -->
+                    <div id="lora-progress-section" style="display:none;">
+                        <hr>
+                        <h5 class="mb-2">Training Progress</h5>
+                        <div class="row g-3 mb-2">
+                            <div class="col-md-4">
+                                <div class="d-flex justify-content-between">
+                                    <span>Epoch: <strong id="lora-epoch-display">0/0</strong></span>
+                                    <span>Loss: <strong id="lora-loss-display">--</strong></span>
+                                </div>
+                                <div class="progress mt-1" style="height: 20px;">
+                                    <div id="lora-progress-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-info" role="progressbar" style="width: 0%">0%</div>
+                                </div>
+                            </div>
+                            <div class="col-md-8">
+                                <div id="lora-train-logs" class="log-window" style="height: 200px;"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Trained Adapters -->
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="m-0">Trained Adapters</h5>
+                    <button class="btn btn-sm btn-outline-primary" id="btn-refresh-lora-models"><i class="fas fa-sync me-1"></i>Refresh</button>
+                </div>
+                <div class="card-body">
+                    <div id="lora-models-list">
+                        <p class="text-muted mb-0">No trained adapters yet.</p>
+                    </div>
+
+                    <!-- Test Voice Form -->
+                    <div id="lora-test-form" class="mt-3 pt-3 border-top" style="display:none;">
+                        <h6>Test Voice</h6>
+                        <div class="row g-2 mb-2">
+                            <div class="col-md-4">
+                                <label class="form-label small">Adapter</label>
+                                <select id="lora-test-adapter" class="form-select form-select-sm"></select>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small">Text</label>
+                                <input type="text" id="lora-test-text" class="form-control form-control-sm" value="The ancient library stood at the crossroads of two forgotten paths.">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small">Instruct</label>
+                                <input type="text" id="lora-test-instruct" class="form-control form-control-sm" placeholder="e.g. Warm, gentle narration">
+                            </div>
+                        </div>
+                        <div class="d-flex align-items-center gap-2">
+                            <button class="btn btn-sm btn-primary" id="btn-lora-test-generate"><i class="fas fa-play me-1"></i>Generate</button>
+                            <span id="lora-test-status" class="text-muted small"></span>
+                        </div>
+                        <div id="lora-test-audio" class="mt-2"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dataset Builder Tab -->
+        <div id="dataset-builder-tab" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <h4><span class="step-indicator step-active">6</span>Dataset Builder</h4>
+                    <p class="text-muted mb-0">Build LoRA training datasets with per-sample generation, preview, and re-generation.</p>
+                </div>
+                <div class="card-body">
+                    <!-- Project Selector -->
+                    <div class="d-flex align-items-center gap-2 mb-3">
+                        <select class="form-select" id="dsb-project-select" style="max-width: 300px;">
+                            <option value="">-- Select project --</option>
+                        </select>
+                        <button class="btn btn-primary btn-sm" id="dsb-btn-create-project"><i class="fas fa-plus me-1"></i>New Dataset</button>
+                        <button class="btn btn-outline-danger btn-sm" id="dsb-btn-delete-project" style="display:none;"><i class="fas fa-trash me-1"></i>Delete</button>
+                    </div>
+
+                    <!-- Dataset Config (shown when project selected) -->
+                    <div id="dsb-form-area" style="display:none;">
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-9">
+                            <label class="form-label">Root Voice Description</label>
+                            <input type="text" class="form-control" id="dsb-description" placeholder="e.g. A male tenor with a steady, clean tone, light nasal resonance, and even delivery">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Global Seed</label>
+                            <input type="number" class="form-control" id="dsb-global-seed" placeholder="Random" min="-1" value="">
+                            <div class="text-muted" style="font-size: 0.7rem;">Empty = random. Same seed = same voice.</div>
+                        </div>
+                    </div>
+
+                    <!-- Toolbar -->
+                    <div class="d-flex align-items-center gap-2 mb-3">
+                        <button class="btn btn-sm btn-outline-secondary" id="dsb-btn-add-row"><i class="fas fa-plus me-1"></i>Add Row</button>
+                        <label class="btn btn-sm btn-outline-info mb-0">
+                            <i class="fas fa-file-import me-1"></i>Import JSON
+                            <input type="file" accept=".json" id="dsb-import-file" style="display:none;">
+                        </label>
+                        <button class="btn btn-sm btn-outline-info" id="dsb-btn-export"><i class="fas fa-file-export me-1"></i>Export JSON</button>
+                        <div class="ms-auto d-flex gap-2">
+                            <button class="btn btn-sm btn-success" id="dsb-btn-gen-all"><i class="fas fa-play me-1"></i>Generate Pending</button>
+                            <button class="btn btn-sm btn-outline-success" id="dsb-btn-regen-all"><i class="fas fa-redo me-1"></i>Regen All</button>
+                            <button class="btn btn-sm btn-danger" id="dsb-btn-cancel" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
+                        </div>
+                    </div>
+
+                    <!-- Progress bar -->
+                    <div class="progress mb-3" style="height: 22px; display: none;" id="dsb-progress-wrap">
+                        <div id="dsb-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+                    </div>
+
+                    <!-- Spreadsheet table -->
+                    <div class="table-responsive">
+                        <table class="table table-bordered table-hover table-sm">
+                            <thead class="table-light">
+                                <tr>
+                                    <th width="4%">#</th>
+                                    <th width="16%">Emotion / Style</th>
+                                    <th width="34%">Text</th>
+                                    <th width="7%">Seed</th>
+                                    <th width="7%">Status</th>
+                                    <th width="32%">Audio / Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dsb-table-body">
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Save section -->
+                    <div class="card mt-3">
+                        <div class="card-body d-flex align-items-center gap-3">
+                            <button class="btn btn-primary" id="dsb-btn-save"><i class="fas fa-save me-1"></i>Save as Training Dataset</button>
+                            <div>
+                                <label class="form-label mb-0 me-2">Reference Sample:</label>
+                                <select class="form-select form-select-sm d-inline-block" id="dsb-ref-select" style="width: auto;">
+                                    <option value="0">First completed sample</option>
+                                </select>
+                            </div>
+                            <span id="dsb-save-status" class="text-muted small"></span>
+                        </div>
+                        <div class="text-muted small px-3 pb-2"><i class="fas fa-info-circle me-1"></i>The reference sample is used as the speaker embedding (<code>ref.wav</code>) during LoRA training. Pick a clear, representative line.</div>
+                    </div>
+
+                    <!-- Logs -->
+                    <pre id="dsb-logs" class="bg-dark text-light p-2 rounded mt-3" style="max-height: 150px; overflow-y: auto; font-size: 0.8rem; display: none;"></pre>
+                    </div><!-- /dsb-form-area -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Editor Tab -->
+        <div id="editor-tab" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                     <h4 class="m-0"><span class="step-indicator step-active">4</span>Audio Editor</h4>
+                     <table class="mb-0" style="border-collapse:separate; border-spacing:8px 0;">
+                        <tr>
+                            <td class="text-center align-top" style="min-width:110px;"><button class="btn btn-primary btn-sm w-100" id="btn-play-seq"><i class="fas fa-play me-1"></i>Play Sequence</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-success btn-sm w-100" id="btn-batch-fast"><i class="fas fa-bolt me-1"></i>Render Pending</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-outline-success btn-sm w-100" id="btn-regen-all"><i class="fas fa-redo me-1"></i>Regenerate All</button></td>
+                            <td class="text-center align-top"><button class="btn btn-danger btn-sm w-100" id="btn-cancel-render" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:100px;"><button class="btn btn-warning btn-sm w-100" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button></td>
+                        </tr>
+                        <tr>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Preview generated audio</td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Generate audio for all unrendered chunks</td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Re-render everything from scratch</td>
+                            <td></td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Combine all chunks into final audiobook</td>
+                        </tr>
+                     </table>
+                </div>
+                <div class="card-body">
+                     <!-- Full Progress Bar -->
+                     <div class="progress mb-3" style="height: 25px;">
+                         <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+                     </div>
+
+                     <div class="table-responsive">
+                         <table class="table table-bordered table-hover">
+                             <thead>
+                                 <tr>
+                                     <th width="3%"></th>
+                                     <th width="9%">Speaker</th>
+                                     <th width="40%">Text</th>
+                                     <th width="14%">Emotion / Style</th>
+                                     <th width="7%">Status</th>
+                                     <th width="27%">Audio / Actions</th>
+                                 </tr>
+                             </thead>
+                             <tbody id="chunks-table-body">
+                                 <!-- Rows will be injected here -->
+                             </tbody>
+                         </table>
+                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Audio Result Tab -->
+        <div id="audio-tab" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <h4><span class="step-indicator step-active">5</span>Final Result</h4>
+                </div>
+                <div class="card-body">
+                    <div id="audio-player-container" class="text-center" style="display:none;">
+                        <h5>Your Audiobook</h5>
+                        <audio id="main-audio" controls class="w-100 mt-2">
+                            <source src="" type="audio/mpeg">
+                            Your browser does not support the audio element.
+                        </audio>
+                        <a id="download-link" href="#" class="btn btn-outline-dark mt-3" download="audiobook.mp3">
+                            <i class="fas fa-download me-2"></i>Download MP3
+                        </a>
+                        <button class="btn btn-outline-primary mt-3 ms-2" id="btn-export-audacity">
+                            <i class="fas fa-headphones me-2"></i>Export to Audacity
+                        </button>
+                        <span id="audacity-status" class="ms-2 mt-3 d-inline-block"></span>
+                        <div class="w-100 mt-3">
+                            <a class="text-decoration-none" data-bs-toggle="collapse" href="#m4b-options" role="button" aria-expanded="false">
+                                <i class="fas fa-book-reader me-1"></i>M4B Export Options <i class="fas fa-chevron-down fa-xs ms-1"></i>
+                            </a>
+                            <div class="collapse mt-2" id="m4b-options">
+                                <div class="border rounded p-3" style="background: var(--bs-light, #f8f9fa);">
+                                    <div class="row g-2">
+                                        <div class="col-md-6">
+                                            <label class="form-label small mb-1">Title</label>
+                                            <input type="text" class="form-control form-control-sm" id="m4b-title" placeholder="Book title">
+                                        </div>
+                                        <div class="col-md-6">
+                                            <label class="form-label small mb-1">Author</label>
+                                            <input type="text" class="form-control form-control-sm" id="m4b-author" placeholder="Author name">
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label class="form-label small mb-1">Narrator</label>
+                                            <input type="text" class="form-control form-control-sm" id="m4b-narrator" placeholder="Narrator name">
+                                        </div>
+                                        <div class="col-md-2">
+                                            <label class="form-label small mb-1">Year</label>
+                                            <input type="text" class="form-control form-control-sm" id="m4b-year" placeholder="2025">
+                                        </div>
+                                        <div class="col-md-6">
+                                            <label class="form-label small mb-1">Description</label>
+                                            <input type="text" class="form-control form-control-sm" id="m4b-description" placeholder="Short description">
+                                        </div>
+                                        <div class="col-md-6">
+                                            <label class="form-label small mb-1">Cover Image</label>
+                                            <div class="d-flex align-items-center gap-2">
+                                                <input type="file" class="form-control form-control-sm" id="m4b-cover-input" accept="image/*">
+                                                <span id="m4b-cover-status" class="small text-muted"></span>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6 d-flex align-items-end">
+                                            <label class="form-check d-inline-flex align-items-center mb-0" title="Creates a chapter for every chunk instead of grouping by detected headings">
+                                                <input type="checkbox" class="form-check-input me-1" id="m4b-per-chunk">
+                                                <small class="text-muted">Per-chunk chapters</small>
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="mt-2">
+                                        <button class="btn btn-outline-success btn-sm" id="btn-export-m4b">
+                                            <i class="fas fa-book-reader me-1"></i>Export M4B
+                                        </button>
+                                        <span id="m4b-status" class="ms-2 d-inline-block"></span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">Generation Logs</div>
+                <div class="card-body p-0">
+                    <div id="audio-logs" class="log-window"></div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Toast container -->
+    <div id="toast-container" class="position-fixed bottom-0 end-0 p-3" style="z-index: 1090;"></div>
+
+    <!-- Confirm modal -->
+    <div class="modal fade" id="confirmModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-body fs-6" id="confirmModalBody"></div>
+                <div class="modal-footer py-2">
+                    <button type="button" class="btn btn-secondary btn-sm" id="confirmModalCancel" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary btn-sm" id="confirmModalOk">OK</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

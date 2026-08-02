@@ -3,11 +3,12 @@ import sys
 import json
 import re
 import argparse
+from typing import Optional
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from utils import (
     clean_json_string, repair_json_array, salvage_json_entries,
     load_llm_config, load_generation_config, load_prompts_config,
-    create_llm_client, log_llm_response,
+    create_llm_client, log_llm_response, resolve_task_llm,
 )
 
 
@@ -80,8 +81,45 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  previous_tail=None, source_context=None, max_retries=2,
                  system_prompt=None, user_prompt_template=None,
                  max_tokens=8000, temperature=0.4, top_p=0.8, top_k=20,
-                 min_p=0, presence_penalty=0.0, banned_tokens=None):
-    """Send a batch of script entries through the LLM for review and correction."""
+                 min_p=0, presence_penalty=0.0, banned_tokens=None,
+                 reasoning_effort: Optional[str] = None):
+    """Send a batch of script entries to the LLM for review and correction.
+
+    Serialises the batch as JSON, wraps it in a review prompt with optional
+    context from the previous batch tail and source text, then retries up to
+    ``max_retries`` times on failure. Includes a last-resort regex salvage
+    step for malformed JSON responses.
+
+    Args:
+        client: OpenAI-compatible chat completion client.
+        model_name: Model identifier to pass to the API.
+        batch_entries: List of script entry dicts to review.
+        batch_num: 1-based index of this batch within the full review run.
+        total_batches: Total number of review batches.
+        previous_tail: Last few entries from the prior batch, included in the
+            prompt for continuity.
+        source_context: Additional review context (e.g. source text snippet).
+        max_retries: Number of retry attempts on API or parse failure.
+        system_prompt: Override for the system prompt. Falls back to
+            ``REVIEW_SYSTEM_PROMPT`` when ``None``.
+        user_prompt_template: Override for the user prompt template. Must
+            contain ``{context}`` and ``{batch}`` placeholders. Falls back
+            to ``REVIEW_USER_PROMPT`` when ``None``.
+        max_tokens: Maximum tokens in the LLM response.
+        temperature: Sampling temperature.
+        top_p: Nucleus sampling threshold.
+        top_k: Top-k sampling limit.
+        min_p: Minimum probability threshold.
+        presence_penalty: Presence penalty factor.
+        banned_tokens: List of token strings the model should avoid.
+        reasoning_effort: Controls the model's reasoning depth
+            (e.g. ``'low'``, ``'medium'``, ``'high'`` for OpenAI-compatible
+            providers). ``None`` means use the provider default. Passed via
+            ``extra_body``.
+
+    Returns:
+        List of corrected script entry dicts, or ``None`` if all retries fail.
+    """
     sys_prompt = system_prompt or REVIEW_SYSTEM_PROMPT
     usr_template = user_prompt_template or REVIEW_USER_PROMPT
 
@@ -119,6 +157,7 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                         "top_k": top_k,
                         "min_p": min_p,
                         "banned_tokens": banned_tokens if banned_tokens else None,
+                        "reasoning_effort": reasoning_effort,
                     }.items() if v is not None
                 }
             )
@@ -274,10 +313,14 @@ def main():
         else:
             print(f"Warning: Source file not found: {args.source}")
 
+    # Resolve per-task LLM config
+    resolved = resolve_task_llm("script_review")
+    model_name = resolved["model_name"]
+    reasoning_effort = resolved["reasoning_effort"]
+
+    # Load LLM config for base_url (client encapsulates api_key/base_url)
     llm = load_llm_config()
     base_url = llm["base_url"]
-    api_key = llm["api_key"]
-    model_name = llm["model_name"]
 
     # Load custom review prompts or use defaults from review_prompts.txt
     prompts_config = load_prompts_config()
@@ -350,7 +393,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                reasoning_effort=reasoning_effort,
             )
 
             if corrected is None:
@@ -422,7 +466,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                reasoning_effort=reasoning_effort,
             )
 
             if corrected is None:

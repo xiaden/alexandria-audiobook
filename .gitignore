@@ -1,5 +1,6 @@
 ENVIRONMENT
 node_modules
+!app/static/dist/
 venv
 env
 app/env/

@@ -1,0 +1,45 @@
+name: Frontend Build
+
+# Ensures the committed build output in app/static/dist/ stays in sync
+# with the frontend source. Triggers on any change under frontend/**.
+
+on:
+  push:
+    paths:
+      - 'frontend/**'
+    branches:
+      - main
+  pull_request:
+    paths:
+      - 'frontend/**'
+
+jobs:
+  build:
+    name: Frontend Build Verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Verify committed dist is up to date
+        run: |
+          if ! git diff --exit-code app/static/dist/; then
+            echo "::error::Built output in app/static/dist/ is out of sync with the committed version."
+            echo "::error::Run 'cd frontend && npm run build' and commit the changes to app/static/dist/."
+            exit 1
+          fi
+          echo "✓ app/static/dist/ is up to date."

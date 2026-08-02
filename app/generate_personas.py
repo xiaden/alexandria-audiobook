@@ -9,8 +9,8 @@ import tempfile
 from tts import TTSEngine, sanitize_filename
 from utils import (
     atomic_json_write as _atomic_json_write,
-    load_llm_config, load_prompts_config, load_tts_config,
-    create_llm_client,
+    load_prompts_config, load_tts_config,
+    create_llm_client, resolve_task_llm,
 )
 from persona_prompts import PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT
 
@@ -160,7 +160,7 @@ def _collect_narrator_context(script, speaker, window=4):
     return context_lines
 
 
-def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
+def _resolve_aliases_batch(client, speakers_info, existing_names):
     """Resolve aliases for all speakers in a single one-shot LLM call.
 
     speakers_info is a dict:
@@ -175,6 +175,10 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
     """
     if not speakers_info:
         return {}
+
+    resolved = resolve_task_llm("alias_resolution")
+    model_name = resolved["model_name"]
+    reasoning_effort = resolved["reasoning_effort"]
 
     prompt_items = []
     for speaker, info in speakers_info.items():
@@ -211,15 +215,18 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
     )
 
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
+        create_kwargs = {
+            "model": model_name,
+            "messages": [
                 {"role": "system", "content": "You are a precise casting director. You output ONLY valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
-            max_tokens=max(1500, len(speakers_info) * 80),
-        )
+            "temperature": 0.1,
+            "max_tokens": max(1500, len(speakers_info) * 80),
+        }
+        if reasoning_effort:
+            create_kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
+        response = client.chat.completions.create(**create_kwargs)
         result = extract_json_object(response.choices[0].message.content.strip())
         if isinstance(result, dict):
             # Normalize keys and values to match exact input names casing
@@ -523,12 +530,46 @@ def _save_generated_preview(root, engine, voice_config, speaker, description, re
         return False
 
 
-def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None):
+def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, engine, root, args, system_prompt=None, advanced_prompt=None):
+    """Run the two-phase advanced persona generation pipeline.
+
+    Phase 1 (discovery) batches the full annotated script and asks the LLM
+    to extract per-character traits for each batch, accumulating character
+    reference files on disk under ``persona_refs/``. Phase 2 (compilation)
+    condenses each character's reference file into a final voice persona
+    (description + reference text) and writes a voice preview.
+
+    Each phase resolves its own LLM config via ``resolve_task_llm``
+    (``persona_discovery`` and ``persona_compilation`` respectively), so
+    model and reasoning effort can be tuned independently per phase.
+
+    Args:
+        script: Full list of annotated script entry dicts.
+        selected_speakers: Canonical speaker labels to generate personas for.
+        samples: Dict mapping speaker labels to lists of sample dialogue lines.
+        voice_config: Mutable voice configuration dict — updated in place with
+            each speaker's ``persona_ref`` path.
+        client: OpenAI-compatible chat completion client.
+        engine: TTS engine instance used to generate voice previews.
+        root: Project root directory (persona_refs/ is created here).
+        args: Parsed CLI arguments; ``args.batch_size`` controls discovery
+            batch size.
+        system_prompt: Override system prompt for the compilation phase.
+            Defaults to ``"You produce concise JSON only."`` when ``None``.
+        advanced_prompt: Custom compilation prompt template. Passed through
+            to ``_compile_character_prompt``.
+    """
     ref_dir = os.path.join(root, "persona_refs")
     os.makedirs(ref_dir, exist_ok=True)
 
     selected_set = set(selected_speakers)
     batches = list(_batch_entries(script, args.batch_size))
+
+    # Resolve per-task LLM config for discovery phase
+    resolved = resolve_task_llm("persona_discovery")
+    model_name = resolved["model_name"]
+    reasoning_effort = resolved["reasoning_effort"]
+
     print(f"Advanced persona generation enabled.")
     print(f"Writing per-character reference files to: {ref_dir}")
     print(f"Processing {len(script)} script entries in {len(batches)} batches of up to {max(1, int(args.batch_size or 40))}")
@@ -537,15 +578,18 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
         prompt = _build_batch_discovery_prompt(batch_start, batch, selected_speakers)
         print(f"Advanced discovery batch {batch_number}/{len(batches)} ({len(batch)} entries)")
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
+            create_kwargs = {
+                "model": model_name,
+                "messages": [
                     {"role": "system", "content": "You produce concise JSON only."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2,
-                max_tokens=4000,
-            )
+                "temperature": 0.2,
+                "max_tokens": 4000,
+            }
+            if reasoning_effort:
+                create_kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
+            response = client.chat.completions.create(**create_kwargs)
             raw_content = response.choices[0].message.content.strip()
             parsed = extract_json_object(raw_content)
             characters = []
@@ -581,6 +625,12 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
             _append_character_ref(ref_dir, canonical_speaker, batch_number, character)
 
     print("Compiling character reference files into final voice personas.")
+
+    # Resolve per-task LLM config for compilation phase
+    resolved = resolve_task_llm("persona_compilation")
+    model_name = resolved["model_name"]
+    reasoning_effort = resolved["reasoning_effort"]
+
     for speaker in selected_speakers:
         ref = _load_character_ref(ref_dir, speaker)
         if not ref.get("sample_lines"):
@@ -591,15 +641,18 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
         description = ""
         ref_text = ""
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
+            create_kwargs = {
+                "model": model_name,
+                "messages": [
                     {"role": "system", "content": system_prompt or "You produce concise JSON only."},
                     {"role": "user", "content": _compile_character_prompt(ref, advanced_prompt)}
                 ],
-                temperature=0.25,
-                max_tokens=600,
-            )
+                "temperature": 0.25,
+                "max_tokens": 600,
+            }
+            if reasoning_effort:
+                create_kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
+            response = client.chat.completions.create(**create_kwargs)
             parsed = extract_json_object(response.choices[0].message.content.strip())
             if parsed:
                 description = str(parsed.get("description", "") or "").strip()
@@ -665,10 +718,8 @@ def main():
     for speaker in samples.keys():
         narrator_context[speaker] = _collect_narrator_context(script, speaker, window)
 
-    llm = load_llm_config()
-    base_url = llm["base_url"]
-    api_key = llm["api_key"]
-    model_name = llm["model_name"]
+    # Per-task LLM config is resolved at each sub-task call site
+    # (alias_resolution, persona_discovery, persona_compilation, basic_persona_generation)
 
     client, _ = create_llm_client()
 
@@ -713,7 +764,6 @@ def main():
             samples=samples,
             voice_config=voice_config,
             client=client,
-            model_name=model_name,
             engine=engine,
             root=root,
             args=args,
@@ -774,7 +824,7 @@ def main():
             existing_configured = list(voice_config.keys()) + list(batch_mapping.values())
             
             print(f"Resolving alias batch {idx//chunk_size + 1} ({len(chunk)} speakers)...")
-            chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured)
+            chunk_mapping = _resolve_aliases_batch(client, speakers_info, existing_configured)
             batch_mapping.update(chunk_mapping)
 
         # Build case-insensitive normalized lookup mapping to survive LLM key casing changes
@@ -809,6 +859,11 @@ def main():
     unique_speakers = [s for s in remaining_speakers if s not in resolved_aliases]
     print(f"Generating personas for {len(unique_speakers)} unique speakers...")
 
+    # Resolve per-task LLM config for basic persona generation
+    resolved = resolve_task_llm("basic_persona_generation")
+    model_name = resolved["model_name"]
+    reasoning_effort = resolved["reasoning_effort"]
+
     for speaker in unique_speakers:
         lines = samples.get(speaker, [])
         try:
@@ -824,15 +879,18 @@ def main():
                 sample_lines=sample_text
             )
 
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
+            create_kwargs = {
+                "model": model_name,
+                "messages": [
                     {"role": "system", "content": persona_system},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3,
-                max_tokens=400,
-            )
+                "temperature": 0.3,
+                "max_tokens": 400,
+            }
+            if reasoning_effort:
+                create_kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
+            response = client.chat.completions.create(**create_kwargs)
 
             text = response.choices[0].message.content.strip()
             parsed = extract_json_object(text)

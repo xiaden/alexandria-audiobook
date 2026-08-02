@@ -64,7 +64,7 @@ os.makedirs(DATASET_BUILDER_DIR, exist_ok=True)
 os.makedirs(PREPARER_OUTPUT_DIR, exist_ok=True)
 
 # Mount static files with absolute path
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+STATIC_DIR = os.path.join(BASE_DIR, "static", "dist")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -191,10 +191,43 @@ async def get_system_stats():
     }
 
 # Data Models
+class TaskLLMConfig(BaseModel):
+    """Per-task LLM override. Both fields optional — None means 'inherit global default'."""
+    model_name: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+
+class LLMTaskOverrides(BaseModel):
+    """Per-task LLM configuration overrides. Each field is a TaskLLMConfig instance."""
+    script_generation: TaskLLMConfig = TaskLLMConfig()
+    script_review: TaskLLMConfig = TaskLLMConfig()
+    alias_resolution: TaskLLMConfig = TaskLLMConfig()
+    persona_discovery: TaskLLMConfig = TaskLLMConfig()
+    persona_compilation: TaskLLMConfig = TaskLLMConfig()
+    basic_persona_generation: TaskLLMConfig = TaskLLMConfig()
+
 class LLMConfig(BaseModel):
+    """LLM connection and model settings for the application.
+
+    Holds the base URL, API key, and default model for all LLM calls,
+    plus optional per-task overrides. Resolution order for each task is:
+    task-specific override (``task_overrides.<task>``) → global default
+    (``model_name`` / ``reasoning_effort`` here) → hardcoded fallback.
+
+    Attributes:
+        base_url: OpenAI-compatible API endpoint.
+        api_key: API key for authentication.
+        model_name: Default model identifier used when no task override is set.
+        reasoning_effort: Global default reasoning depth passed to the provider
+            (e.g. ``'low'``, ``'medium'``, ``'high'``). ``None`` means use the
+            provider's default.
+        task_overrides: Per-task model and reasoning overrides keyed by task name
+            (e.g. ``script_generation``, ``persona_discovery``).
+    """
     base_url: str
     api_key: str
     model_name: str
+    reasoning_effort: Optional[str] = None  # Global default reasoning effort
+    task_overrides: LLMTaskOverrides = LLMTaskOverrides()  # Per-task overrides
 
 class TTSConfig(BaseModel):
     mode: str = "local"  # "local" or "external"
@@ -467,6 +500,22 @@ async def read_favicon():
 
 @app.get("/api/config")
 async def get_config():
+    """Return the full application configuration as JSON.
+
+    Reads ``config.json`` from disk (or builds a default when the file is
+    missing), fills in any missing prompt fields from their respective
+    prompt files, and materialises Pydantic defaults via
+    ``AppConfig.model_validate`` so that new optional fields such as
+    ``task_overrides`` and ``reasoning_effort`` are always present in the
+    response — even when absent from the on-disk config.
+
+    Also attaches ``current_file`` (the basename of the loaded input file)
+    when ``state.json`` references one that still exists.
+
+    Returns:
+        Dict matching the ``AppConfig`` schema, plus an optional
+        ``current_file`` key.
+    """
     default_config = {
         "llm": {
             "base_url": "http://localhost:11434/v1",
@@ -554,17 +603,27 @@ async def get_config():
 
     # Include current input file info if available
     state_path = os.path.join(ROOT_DIR, "state.json")
+    current_file = None
     if os.path.exists(state_path):
         try:
             with open(state_path, "r", encoding="utf-8") as sf:
                 state = json.load(sf)
             input_path = state.get("input_file_path", "")
             if input_path and os.path.exists(input_path):
-                config["current_file"] = os.path.basename(input_path)
+                current_file = os.path.basename(input_path)
         except (json.JSONDecodeError, ValueError):
             pass
 
-    return config
+    # Materialize Pydantic defaults so new optional fields (task_overrides,
+    # reasoning_effort) are present even when absent from config.json on disk.
+    # This is the H1 fix — without it the frontend per-task table would receive
+    # a config dict missing the task_overrides key entirely.
+    validated = AppConfig.model_validate(config)
+    result = validated.model_dump()
+    if current_file is not None:
+        result["current_file"] = current_file
+
+    return result
 
 @app.get("/api/default_prompts")
 async def get_default_prompts():

@@ -3,11 +3,12 @@ import sys
 import json
 import re
 import argparse
+from typing import Optional
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 from utils import (
     clean_json_string, repair_json_array, salvage_json_entries,
     load_llm_config, load_generation_config, load_prompts_config,
-    create_llm_client, log_llm_response,
+    create_llm_client, log_llm_response, resolve_task_llm,
 )
 
 # Cap for single-speaker mode: entries at this size pass through
@@ -70,8 +71,44 @@ def split_into_chunks(text, max_size=3000):
 
     return chunks
 
-def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None):
-    """Process a text chunk and return JSON script entries"""
+def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None, reasoning_effort: Optional[str] = None):
+    """Send a text chunk to the LLM and return parsed script entries.
+
+    Builds a prompt that includes positional context (beginning/middle/end),
+    a character roster from previous chunks for name consistency, and the
+    last few entries for style continuity. Retries on failure up to
+    ``max_retries`` times, attempting JSON repair on malformed responses.
+
+    Args:
+        client: OpenAI-compatible chat completion client.
+        model_name: Model identifier to pass to the API.
+        chunk: Raw text of the chunk to process.
+        chunk_num: 1-based index of this chunk within the full text.
+        total_chunks: Total number of chunks the source text was split into.
+        previous_entries: Script entries from earlier chunks, used to build
+            character roster and style continuity context.
+        max_retries: Number of retry attempts on API or parse failure.
+        system_prompt: Override for the system prompt. Falls back to
+            ``DEFAULT_SYSTEM_PROMPT`` when ``None``.
+        user_prompt_template: Override for the user prompt template. Must
+            contain ``{context}`` and ``{chunk}`` placeholders. Falls back
+            to ``DEFAULT_USER_PROMPT`` when ``None``.
+        max_tokens: Maximum tokens in the LLM response.
+        temperature: Sampling temperature.
+        top_p: Nucleus sampling threshold.
+        top_k: Top-k sampling limit. ``0`` means unset (omitted from request).
+        min_p: Minimum probability threshold. ``0`` means unset.
+        presence_penalty: Presence penalty factor.
+        banned_tokens: List of token strings the model should avoid.
+        reasoning_effort: Controls the model's reasoning depth
+            (e.g. ``'low'``, ``'medium'``, ``'high'`` for OpenAI-compatible
+            providers). ``None`` means use the provider default. Passed via
+            ``extra_body``.
+
+    Returns:
+        List of script entry dicts (each with ``speaker``, ``text``, and
+        optionally ``instruct`` keys), or an empty list if all retries fail.
+    """
     # Use provided prompts or fall back to defaults
     sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
     usr_template = user_prompt_template or DEFAULT_USER_PROMPT
@@ -120,6 +157,7 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                         "top_k": top_k if top_k else None,
                         "min_p": min_p if min_p else None,
                         "banned_tokens": banned_tokens if banned_tokens else None,
+                        "reasoning_effort": reasoning_effort,
                     }.items() if v is not None
                 }
             )
@@ -253,11 +291,14 @@ def main():
         run_single_speaker(book_content, args.speaker_name, args.instruct)
         return
 
-    # Load LLM config
+    # Resolve per-task LLM config
+    resolved = resolve_task_llm("script_generation")
+    model_name = resolved["model_name"]
+    reasoning_effort = resolved["reasoning_effort"]
+
+    # Load LLM config for base_url (client encapsulates api_key/base_url)
     llm = load_llm_config()
     base_url = llm["base_url"]
-    api_key = llm["api_key"]
-    model_name = llm["model_name"]
 
     # Load custom prompts or use defaults
     prompts_config = load_prompts_config()
@@ -306,7 +347,8 @@ def main():
             top_k=top_k,
             min_p=min_p,
             presence_penalty=presence_penalty,
-            banned_tokens=banned_tokens
+            banned_tokens=banned_tokens,
+            reasoning_effort=reasoning_effort,
         )
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")
