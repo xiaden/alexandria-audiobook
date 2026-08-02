@@ -24,6 +24,7 @@ jobs:
       contents: read
       packages: write       # Push image + attestations to GHCR
       id-token: write       # Required for cosign keyless signing (Sigstore)
+      attestations: write   # Persist SLSA provenance attestation (attest-build-provenance)
     outputs:
       image: ${{ steps.meta.outputs.tags }}
       digest: ${{ steps.build.outputs.digest }}
