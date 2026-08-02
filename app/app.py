@@ -222,6 +222,7 @@ class GenerationConfig(BaseModel):
     presence_penalty: float = 0.0
     banned_tokens: List[str] = []
     merge_narrators: bool = False
+    review_batch_size: int = 25
 
 class PromptConfig(BaseModel):
     system_prompt: Optional[str] = None
