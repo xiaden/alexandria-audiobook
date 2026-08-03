@@ -198,13 +198,17 @@ class TaskLLMConfig(BaseModel):
     temperature: Optional[float] = None
 
 class LLMTaskOverrides(BaseModel):
-    """Per-task LLM configuration overrides. Each field is a TaskLLMConfig instance."""
-    script_generation: TaskLLMConfig = TaskLLMConfig()
-    script_review: TaskLLMConfig = TaskLLMConfig()
-    alias_resolution: TaskLLMConfig = TaskLLMConfig()
-    persona_discovery: TaskLLMConfig = TaskLLMConfig()
-    persona_compilation: TaskLLMConfig = TaskLLMConfig()
-    basic_persona_generation: TaskLLMConfig = TaskLLMConfig()
+    """Per-task LLM configuration overrides for the 9 walk tasks.
+    Each field is a TaskLLMConfig instance — all fields optional, inherit global."""
+    scene_segmentation: TaskLLMConfig = TaskLLMConfig()
+    character_discovery: TaskLLMConfig = TaskLLMConfig()
+    script_alias_resolution: TaskLLMConfig = TaskLLMConfig()
+    scene_presence: TaskLLMConfig = TaskLLMConfig()
+    span_attribution: TaskLLMConfig = TaskLLMConfig()
+    character_description: TaskLLMConfig = TaskLLMConfig()
+    voice_audition: TaskLLMConfig = TaskLLMConfig()
+    voice_assignment: TaskLLMConfig = TaskLLMConfig()
+    delivery: TaskLLMConfig = TaskLLMConfig()
 
 class LLMConfig(BaseModel):
     """LLM connection and model settings for the application.

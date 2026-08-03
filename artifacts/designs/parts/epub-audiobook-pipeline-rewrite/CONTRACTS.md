@@ -34,6 +34,12 @@ class InMemorySQLiteAdapter(PipelineStorage):
 ```python
 def get_pipeline_db() -> PipelineStorage
 # Module-level factory, returns configured adapter
+# Backend: PIPELINE_DB_BACKEND env ('sqlite' default | 'memory')
+# Path: PIPELINE_DB_PATH env (default ./data/pipeline.db)
+# Cached module-level singleton. IMPLEMENTED (Plan A)
+
+def reset_pipeline_db() -> None
+# Close + discard cached adapter; for test teardown. IMPLEMENTED (Plan A)
 ```
 
 ## Schema (Graph1 TREE)
@@ -92,14 +98,19 @@ def extract_epub_text(epub_path: str, book_id: str, storage: PipelineStorage) ->
 ```python
 def populate_initial_spine(series_id: str, book_id: str, chapters_data: list, storage: PipelineStorage) -> None
 # Creates series, book (version=1), chapters, paragraphs, spans
-# Creates chapter_paragraph edges (temporary until Walk 2a creates scenes)
+# DEVIATION (Plan B): NO chapter_paragraph edge table exists in schema.
+# Instead creates ONE PLACEHOLDER SCENE per chapter, linking all paragraphs
+# via scene_paragraph edges. Walk 2a insert_scene redistributes paragraphs
+# from placeholder scenes to real scenes. Schema intact. IMPLEMENTED (Plan B)
 ```
 
 ### insert_scene
 ```python
 def insert_scene(scene_id: str, chapter_id: str, paragraph_ids: list, storage: PipelineStorage) -> None
 # Creates scene, chapter_scene edge, scene_paragraph edges
-# Removes old chapter_paragraph edges for those paragraphs
+# Redistributes paragraphs from placeholder scenes (per Plan B deviation).
+# NOTE: paragraph.text column added via ALTER TABLE in populate.py (Plan B
+# deviation — not in schema.py). IMPLEMENTED (Plan B)
 ```
 
 ## Operation Executor
@@ -144,6 +155,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('character_discovery') → temperature=0.1, LOCAL
 # Creates character entities, character_scene + character_span junctions
+# IMPLEMENTED (Plan C, Phase 1)
 ```
 
 ### Walk 2c: Alias Resolution
@@ -151,6 +163,10 @@ def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('script_alias_resolution') → temperature=0.1, GLOBAL scope
 # Merges duplicate characters, consolidates aliases
+# IMPLEMENTED (Plan C, Phase 2)
+# DEVIATION: junction 'source' column is CHECK-constrained to walk|human|derived (not free-form walk name);
+#   get_review_items walk_name filter uses source LIKE %walk_name% as a lightweight heuristic —
+#   true per-walk provenance needs an annotation/metadata table in a downstream plan.
 ```
 
 ### Walk 2d: Scene Presence
@@ -205,6 +221,9 @@ class CharacterLedger:
     def get_characters_for_scene(self, scene_id: str) -> list[dict]
     def get_characters_for_span(self, span_id: str) -> list[dict]
     def get_review_items(self, book_id: str, walk_name: str = None) -> list[dict]
+# IMPLEMENTED (Plan C, Phase 3)
+# DEVIATION: get_review_items confidence filter uses ≥0.5 AND <0.7 (0.5 inclusive, 0.7 exclusive),
+#   consistent with walk confidence-filter behavior (plan said '0.5-0.7' inclusively).
 ```
 
 ## Assembly + Export

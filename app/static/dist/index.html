@@ -182,8 +182,8 @@
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        <tr data-task="script_generation">
-                                            <td class="fw-medium">Script Generation</td>
+                                        <tr data-task="scene_segmentation">
+                                            <td class="fw-medium">Scene Segmentation</td>
                                             <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
                                             <td>
                                                 <select class="form-select form-select-sm" data-field="reasoning_effort">
@@ -196,8 +196,8 @@
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
-                                        <tr data-task="script_review">
-                                            <td class="fw-medium">Script Review</td>
+                                        <tr data-task="character_discovery">
+                                            <td class="fw-medium">Character Discovery</td>
                                             <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
                                             <td>
                                                 <select class="form-select form-select-sm" data-field="reasoning_effort">
@@ -210,7 +210,7 @@
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
-                                        <tr data-task="alias_resolution">
+                                        <tr data-task="script_alias_resolution">
                                             <td class="fw-medium">Alias Resolution</td>
                                             <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
                                             <td>
@@ -224,8 +224,8 @@
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
-                                        <tr data-task="persona_discovery">
-                                            <td class="fw-medium">Persona Discovery</td>
+                                        <tr data-task="scene_presence">
+                                            <td class="fw-medium">Scene Presence</td>
                                             <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
                                             <td>
                                                 <select class="form-select form-select-sm" data-field="reasoning_effort">
@@ -238,8 +238,8 @@
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
-                                        <tr data-task="persona_compilation">
-                                            <td class="fw-medium">Persona Compilation</td>
+                                        <tr data-task="span_attribution">
+                                            <td class="fw-medium">Span Attribution</td>
                                             <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
                                             <td>
                                                 <select class="form-select form-select-sm" data-field="reasoning_effort">
@@ -252,8 +252,50 @@
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
-                                        <tr data-task="basic_persona_generation">
-                                            <td class="fw-medium">Basic Persona Gen</td>
+                                        <tr data-task="character_description">
+                                            <td class="fw-medium">Character Description</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                        </tr>
+                                        <tr data-task="voice_audition">
+                                            <td class="fw-medium">Voice Audition</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                        </tr>
+                                        <tr data-task="voice_assignment">
+                                            <td class="fw-medium">Voice Assignment</td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
+                                            <td>
+                                                <select class="form-select form-select-sm" data-field="reasoning_effort">
+                                                    <option value="">Inherit</option>
+                                                    <option value="none">None</option>
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                </select>
+                                            </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                        </tr>
+                                        <tr data-task="delivery">
+                                            <td class="fw-medium">Delivery</td>
                                             <td><input type="text" class="form-control form-control-sm" data-field="model_name" placeholder="Inherit global"></td>
                                             <td>
                                                 <select class="form-select form-select-sm" data-field="reasoning_effort">
