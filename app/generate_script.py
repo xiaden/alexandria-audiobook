@@ -9,6 +9,7 @@ from utils import (
     clean_json_string, repair_json_array, salvage_json_entries,
     load_llm_config, load_generation_config, load_prompts_config,
     create_llm_client, log_llm_response, resolve_task_llm,
+    PARA_MARKER, CHAP_MARKER,
 )
 
 # Cap for single-speaker mode: entries at this size pass through
@@ -36,38 +37,48 @@ def fix_mojibake(text):
     return text
 
 def split_into_chunks(text, max_size=3000):
-    """Split text into chunks at paragraph/sentence boundaries."""
-    paragraphs = re.split(r'\n\s*\n', text)
+    """Split text into chunks at paragraph boundaries, never crossing chapters.
 
+    The flattened EPUB text carries two structural markers (see utils.py):
+    PARA_MARKER (``<[para]>``) is a soft boundary - consecutive paragraphs merge
+    into a chunk up to ``max_size``. CHAP_MARKER (``<[chap]>``) is a hard
+    boundary - a chunk never spans two chapters. Both markers are stripped, so
+    chunk text is clean prose. Oversized paragraphs (> ``max_size``) fall back to
+    splitting at sentence boundaries.
+    """
     chunks = []
-    current_chunk = ""
 
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
+    # Hard-split on chapter markers first so a chunk never crosses a chapter seam.
+    for chapter in re.split(re.escape(CHAP_MARKER), text):
+        current_chunk = ""
 
-        if len(current_chunk) + len(para) + 2 > max_size:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-                current_chunk = ""
+        # Soft-split on paragraph markers; consecutive paragraphs merge below max_size.
+        for para in re.split(re.escape(PARA_MARKER), chapter):
+            para = para.strip()
+            if not para:
+                continue
 
-            if len(para) > max_size:
-                sentences = re.split(r'(?<=[.!?])\s+', para)
-                for sentence in sentences:
-                    if len(current_chunk) + len(sentence) + 1 > max_size:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = sentence
-                    else:
-                        current_chunk += " " + sentence if current_chunk else sentence
+            if len(current_chunk) + len(para) + 2 > max_size:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+
+                if len(para) > max_size:
+                    sentences = re.split(r'(?<=[.!?])\s+', para)
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) + 1 > max_size:
+                            if current_chunk:
+                                chunks.append(current_chunk.strip())
+                            current_chunk = sentence
+                        else:
+                            current_chunk += " " + sentence if current_chunk else sentence
+                else:
+                    current_chunk = para
             else:
-                current_chunk = para
-        else:
-            current_chunk += "\n\n" + para if current_chunk else para
+                current_chunk += "\n\n" + para if current_chunk else para
 
-    if current_chunk:
-        chunks.append(current_chunk.strip())
+        if current_chunk:
+            chunks.append(current_chunk.strip())
 
     return chunks
 

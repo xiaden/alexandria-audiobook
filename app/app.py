@@ -16,7 +16,7 @@ import threading
 import zipfile
 import subprocess
 import aiofiles
-from utils import atomic_json_write
+from utils import atomic_json_write, PARA_MARKER, CHAP_MARKER
 from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 from math import ceil
@@ -663,7 +663,12 @@ async def save_config(config: AppConfig):
     return {"status": "saved"}
 
 class _HTMLTextExtractor(HTMLParser):
-    """Strip HTML tags from EPUB content, preserving block-level structure."""
+    """Strip HTML tags from EPUB content, preserving block-level structure.
+
+    Block elements are separated by a ``<[para]>`` marker (PARA_MARKER) so that
+    paragraph boundaries survive the flattening to plain text and are recoverable
+    by the chunker (see generate_script.split_into_chunks).
+    """
     BLOCK_TAGS = frozenset({
         'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
         'li', 'blockquote', 'br', 'hr', 'tr', 'section', 'article',
@@ -691,7 +696,7 @@ class _HTMLTextExtractor(HTMLParser):
         if self._skip_depth > 0:
             return
         if self._pending_newline and self.parts:
-            self.parts.append('\n')
+            self.parts.append('\n' + PARA_MARKER + '\n')
             self._pending_newline = False
         self.parts.append(data)
 
@@ -704,6 +709,10 @@ def extract_epub_text(epub_path: str) -> str:
 
     Parses the EPUB ZIP structure directly using stdlib only:
     META-INF/container.xml -> .opf manifest+spine -> XHTML content files.
+
+    Chapter seams are marked with a ``<[chap]>`` marker (CHAP_MARKER); paragraph
+    seams within a chapter with ``<[para]>`` (PARA_MARKER). Both are stripped by
+    the chunker before text reaches the LLM.
     """
     with zipfile.ZipFile(epub_path, 'r') as zf:
         # 1. Find the OPF file path from container.xml
@@ -755,7 +764,7 @@ def extract_epub_text(epub_path: str) -> str:
             if text:
                 chapters.append(text)
 
-    return '\n\n'.join(chapters)
+    return ('\n' + CHAP_MARKER + '\n').join(chapters)
 
 
 @app.post("/api/upload")

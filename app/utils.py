@@ -4,6 +4,15 @@ import time
 import tempfile
 
 
+# Structure markers for flattened EPUB text (emitted by app.py extract_epub_text /
+# _HTMLTextExtractor, consumed by generate_script.split_into_chunks).
+# PARA_MARKER is a soft boundary: consecutive paragraphs merge into one chunk up to
+# max_size. CHAP_MARKER is a hard boundary: a chunk never spans two chapters.
+# Both are stripped before text reaches the LLM.
+PARA_MARKER = "<[para]>"
+CHAP_MARKER = "<[chap]>"
+
+
 def atomic_json_write(data, target_path, max_retries=5):
     """Atomically write JSON data using a temp file and os.replace.
 
