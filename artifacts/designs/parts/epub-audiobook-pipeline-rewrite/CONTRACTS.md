@@ -248,10 +248,11 @@ def export_annotated_script(book_id: str, storage: PipelineStorage) -> list[dict
 
 ### render_audiobook
 ```python
-def render_audiobook(book_id: str, storage: PipelineStorage, tts_engine: TTSEngine) -> str
+def render_audiobook(book_id: str, storage: PipelineStorage, tts_engine: object, *, use_batch: bool = True, output_dir: str | None = None, batch_seed: int = -1) -> str
 # Bridges pipeline output to TTSEngine
 # Maps speaker to voice config, NARRATOR fallback
 # Preserves TTSEngine's parallel/batch behavior when configured
+# tts_engine is duck-typed (must have generate_batch and generate_voice methods)
 # Returns job_id
 ```
 
