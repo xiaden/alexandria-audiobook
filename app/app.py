@@ -289,6 +289,7 @@ class VoiceConfigItem(BaseModel):
     adapter_id: Optional[str] = None
     adapter_path: Optional[str] = None
     description: Optional[str] = ""  # voice description (for design type)
+    alias_of: Optional[str] = None  # canonical speaker this voice aliases (clone routing)
 
 class ChunkUpdate(BaseModel):
     text: Optional[str] = None
@@ -1006,10 +1007,17 @@ async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
             except (json.JSONDecodeError, ValueError):
                 pass
 
-    # Update current config with new data
+    # Update current config with new data. Merge (not replace) so fields the
+    # frontend does not re-send on every card save -- e.g. persona metadata
+    # (description/character_style) and alias_of on aliased voices -- are
+    # preserved rather than silently dropped. exclude_unset=True means only
+    # fields the client actually sent are merged, so Pydantic defaults (None or
+    # empty-string) do not clobber existing values; explicit empty values the
+    # client sent are still applied (clearing a field works).
     for voice_name, config in config_data.items():
-        # Convert Pydantic model to dict
-        current_config[voice_name] = config.model_dump()
+        entry = dict(current_config.get(voice_name, {}) or {})
+        entry.update(config.model_dump(exclude_unset=True))
+        current_config[voice_name] = entry
 
     atomic_json_write(current_config, VOICE_CONFIG_PATH)
 
