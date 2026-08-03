@@ -41,5 +41,5 @@ def load_default_prompts():
     return prompts
 
 
-# Cached at import time — used by generate_script.py (subprocess, fresh each run)
+# Cached at import time — used by script generation (subprocess, fresh each run)
 DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT = load_default_prompts()

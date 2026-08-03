@@ -26,5 +26,5 @@ def load_review_prompts():
     return parts[0].strip(), parts[1].strip()
 
 
-# Cached at import time — used by review_script.py (subprocess, fresh each run)
+# Cached at import time — used by script review (subprocess, fresh each run)
 REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT = load_review_prompts()

@@ -103,15 +103,24 @@ class SQLiteAdapter(PipelineStorage):
         return [dict(row) for row in rows]
 
     def execute_insert(self, sql: str, params: tuple = ()) -> int:
+        was_in_transaction = self._conn.in_transaction
         cursor = self._conn.execute(sql, params)
+        if not was_in_transaction:
+            self._conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
     def execute_update(self, sql: str, params: tuple = ()) -> int:
+        was_in_transaction = self._conn.in_transaction
         cursor = self._conn.execute(sql, params)
+        if not was_in_transaction:
+            self._conn.commit()
         return cursor.rowcount
 
     def execute_delete(self, sql: str, params: tuple = ()) -> int:
+        was_in_transaction = self._conn.in_transaction
         cursor = self._conn.execute(sql, params)
+        if not was_in_transaction:
+            self._conn.commit()
         return cursor.rowcount
 
 
@@ -128,7 +137,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
     """
 
     def __init__(self) -> None:
-        self._conn = sqlite3.connect(":memory:")
+        self._conn = sqlite3.connect(":memory:", check_same_thread=False)
         self._conn.execute("PRAGMA foreign_keys = ON")
 
     # -- PipelineStorage interface ------------------------------------------
@@ -149,13 +158,22 @@ class InMemorySQLiteAdapter(PipelineStorage):
         return [dict(row) for row in rows]
 
     def execute_insert(self, sql: str, params: tuple = ()) -> int:
+        was_in_transaction = self._conn.in_transaction
         cursor = self._conn.execute(sql, params)
+        if not was_in_transaction:
+            self._conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
     def execute_update(self, sql: str, params: tuple = ()) -> int:
+        was_in_transaction = self._conn.in_transaction
         cursor = self._conn.execute(sql, params)
+        if not was_in_transaction:
+            self._conn.commit()
         return cursor.rowcount
 
     def execute_delete(self, sql: str, params: tuple = ()) -> int:
+        was_in_transaction = self._conn.in_transaction
         cursor = self._conn.execute(sql, params)
+        if not was_in_transaction:
+            self._conn.commit()
         return cursor.rowcount

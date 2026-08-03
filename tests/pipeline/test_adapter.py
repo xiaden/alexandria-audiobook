@@ -23,7 +23,6 @@ from app.pipeline.adapter import (
     PipelineStorage,
     SQLiteAdapter,
 )
-from app.pipeline.db import get_pipeline_db, reset_pipeline_db
 
 
 # ---------------------------------------------------------------------------
@@ -445,73 +444,156 @@ class TestExecuteDelete:
             adapter.execute_delete("DELETE FROM series WHERE id = ?", ("s1",))
 
 
+
 # ---------------------------------------------------------------------------
-# P2-S4: get_pipeline_db() factory
+# Persistence — writes survive across connections
 # ---------------------------------------------------------------------------
 
 
-class TestGetPipelineDB:
-    """get_pipeline_db() factory behavior."""
+class TestSQLiteAdapterPersistence:
+    """SQLiteAdapter writes must be durable across connections."""
 
-    def setup_method(self):
-        """Reset singleton before each test."""
-        reset_pipeline_db()
+    # -- helpers ------------------------------------------------------------
 
-    def teardown_method(self):
-        """Reset singleton after each test."""
-        reset_pipeline_db()
+    @staticmethod
+    def _init_and_populate(adapter: SQLiteAdapter) -> None:
+        """Create a series row that tests can read back."""
+        adapter.init_db()
+        adapter.execute_insert(
+            "INSERT INTO series (id) VALUES (?)", ("series-persist",)
+        )
 
-    def test_returns_pipeline_storage(self, tmp_path, monkeypatch):
-        db_path = str(tmp_path / "test.db")
-        monkeypatch.setenv("PIPELINE_DB_BACKEND", "sqlite")
-        monkeypatch.setenv("PIPELINE_DB_PATH", db_path)
-        adapter = get_pipeline_db()
-        assert isinstance(adapter, PipelineStorage)
-        assert isinstance(adapter, SQLiteAdapter)
+    @staticmethod
+    def _open_connection(db_path: str) -> sqlite3.Connection:
+        """Open a fresh read-only connection to verify persisted state."""
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
 
-    def test_memory_backend(self, monkeypatch):
-        monkeypatch.setenv("PIPELINE_DB_BACKEND", "memory")
-        adapter = get_pipeline_db()
-        assert isinstance(adapter, InMemorySQLiteAdapter)
+    # -- insert persistence -------------------------------------------------
 
-    def test_singleton_behavior(self, tmp_path, monkeypatch):
-        db_path = str(tmp_path / "test.db")
-        monkeypatch.setenv("PIPELINE_DB_BACKEND", "sqlite")
-        monkeypatch.setenv("PIPELINE_DB_PATH", db_path)
-        a1 = get_pipeline_db()
-        a2 = get_pipeline_db()
-        assert a1 is a2
+    def test_insert_survives_new_connection(self, tmp_path):
+        """A row inserted through the adapter must be visible from a
+        second, independent connection."""
+        db_path = str(tmp_path / "persist.db")
 
-    def test_schema_created_on_init(self, tmp_path, monkeypatch):
-        db_path = str(tmp_path / "test.db")
-        monkeypatch.setenv("PIPELINE_DB_BACKEND", "sqlite")
-        monkeypatch.setenv("PIPELINE_DB_PATH", db_path)
-        adapter = get_pipeline_db()
-        conn = adapter.get_connection()
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        adapter = SQLiteAdapter(db_path=db_path)
+        self._init_and_populate(adapter)
+        adapter.close()
+
+        # Open a fresh connection — inserted row must be durable.
+        conn = self._open_connection(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT id FROM series").fetchall()
+            assert len(rows) == 1
+            assert rows[0]["id"] == "series-persist"
+        finally:
+            conn.close()
+    def test_insert_survives_using_adapter(self, tmp_path):
+        """Same as above but reads back through a second SQLiteAdapter
+        instance (not just a raw connection)."""
+        db_path = str(tmp_path / "persist2.db")
+
+        adapter1 = SQLiteAdapter(db_path=db_path)
+        self._init_and_populate(adapter1)
+        adapter1.close()
+
+        # Second adapter on the same file — should see the committed row.
+        adapter2 = SQLiteAdapter(db_path=db_path)
+        try:
+            adapter2.init_db()
+            rows = adapter2.execute_query("SELECT id FROM series")
+            assert len(rows) == 1
+            assert rows[0]["id"] == "series-persist"
+        finally:
+            adapter2.close()
+
+    # -- update persistence -------------------------------------------------
+
+    def test_update_survives_new_connection(self, tmp_path):
+        """An update committed through the adapter must be visible from
+        a second connection."""
+        db_path = str(tmp_path / "update_persist.db")
+
+        adapter = SQLiteAdapter(db_path=db_path)
+        self._init_and_populate(adapter)
+        adapter.execute_update(
+            "UPDATE series SET id = ? WHERE id = ?",
+            ("series-updated", "series-persist"),
+        )
+        adapter.close()
+
+        conn = self._open_connection(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT id FROM series").fetchall()
+            assert len(rows) == 1
+            assert rows[0]["id"] == "series-updated"
+            # The old value must be gone.
+            old = conn.execute(
+                "SELECT id FROM series WHERE id = ?", ("series-persist",)
             ).fetchall()
-        }
-        assert "series" in tables
-        assert "span" in tables
+            assert len(old) == 0
+        finally:
+            conn.close()
 
-    def test_reset_closes_and_clears(self, tmp_path, monkeypatch):
-        db_path = str(tmp_path / "test.db")
-        monkeypatch.setenv("PIPELINE_DB_BACKEND", "sqlite")
-        monkeypatch.setenv("PIPELINE_DB_PATH", db_path)
-        adapter = get_pipeline_db()
-        reset_pipeline_db()
-        # After reset, a new call should return a different instance
-        adapter2 = get_pipeline_db()
-        assert adapter2 is not adapter
+    # -- delete persistence -------------------------------------------------
 
-    def test_default_backend_is_sqlite(self, tmp_path, monkeypatch):
-        """Without env vars, default should be sqlite."""
-        monkeypatch.delenv("PIPELINE_DB_BACKEND", raising=False)
-        # Use a temp path so we don't pollute the workspace
-        db_path = str(tmp_path / "default.db")
-        monkeypatch.setenv("PIPELINE_DB_PATH", db_path)
-        adapter = get_pipeline_db()
-        assert isinstance(adapter, SQLiteAdapter)
+    def test_delete_survives_new_connection(self, tmp_path):
+        """A delete committed through the adapter must be visible from
+        a second connection."""
+        db_path = str(tmp_path / "delete_persist.db")
+
+        adapter = SQLiteAdapter(db_path=db_path)
+        self._init_and_populate(adapter)
+        count = adapter.execute_delete(
+            "DELETE FROM series WHERE id = ?", ("series-persist",)
+        )
+        assert count == 1
+        adapter.close()
+
+        conn = self._open_connection(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT id FROM series").fetchall()
+            assert len(rows) == 0
+        finally:
+            conn.close()
+
+    # -- atomicity: failure must not commit partial data --------------------
+
+    def test_fk_violation_does_not_commit(self, tmp_path):
+        """When an INSERT violates a foreign key, the transaction must
+        NOT be committed — no partial data should persist."""
+        db_path = str(tmp_path / "fk_atomic.db")
+
+        adapter = SQLiteAdapter(db_path=db_path)
+        adapter.init_db()
+
+        # First insert some valid data.
+        adapter.execute_insert(
+            "INSERT INTO series (id) VALUES (?)", ("series-ok",)
+        )
+
+        # Now attempt an FK-violating insert.
+        with pytest.raises(sqlite3.IntegrityError):
+            adapter.execute_insert(
+                "INSERT INTO book (id, series_id, book_number) VALUES (?, ?, ?)",
+                ("book-bad", "no-such-series", 1),
+            )
+
+        adapter.close()
+
+        # Only the valid data should survive — no book row.
+        conn = self._open_connection(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            series_rows = conn.execute("SELECT id FROM series").fetchall()
+            assert len(series_rows) == 1
+            assert series_rows[0]["id"] == "series-ok"
+
+            book_rows = conn.execute("SELECT id FROM book").fetchall()
+            assert len(book_rows) == 0
+        finally:
+            conn.close()

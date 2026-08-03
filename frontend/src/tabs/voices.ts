@@ -1,151 +1,264 @@
 /**
- * Voices tab module — Voice configuration, persona generation, and auto-save
- * Ported from app/static/index.html lines 1604-1961 (JS logic)
+ * Voices tab module — Voice configuration, character ledger display, and auto-save.
+ *
+ * When state.pipelineEnabled is true:
+ *   - Loads characters from GET /api/pipeline/characters/{book_id}
+ *   - Displays character ledger with name, aliases, voice assignment, confidence
+ *   - Provides voice assignment dropdown per character
+ *
+ * When state.pipelineEnabled is false:
+ *   - Shows a notice to enable pipeline mode (old persona endpoints removed)
+ *   - Still loads available TTS voices from /api/voices for cache population
+ *
+ * Ported from app/static/index.html lines 1604-1961 (JS logic).
+ * Phase 5: Connected to pipeline character ledger.
  */
 
 import * as API from '../api';
-import { showToast } from '../utils';
+import { showToast, escapeHtml } from '../utils';
 import { state, type Voice, type VoiceConfig } from '../state';
 import { createVoiceCard } from '../templates';
 
-/** Status response from /api/status/persona */
-interface PersonaStatus {
-  running: boolean;
-  logs: string[];
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Character from the pipeline character ledger. */
+export interface Character {
+  id: string;
+  name: string;
+  /** JSON string of alias names, e.g. '["John","Johnny"]' */
+  aliases: string;
+  /** Confidence score for character detection (0.0–1.0) */
+  confidence: number;
 }
 
 /** Voice config shape for save endpoint */
 type VoiceConfigMap = Record<string, VoiceConfig & { alias_of?: string; seed?: string }>;
 
+/** Character voice assignment stored in local state */
+export interface CharacterVoiceAssignment {
+  characterId: string;
+  voiceName: string;
+}
+
+// ---------------------------------------------------------------------------
+// Module-level state
+// ---------------------------------------------------------------------------
+
 /** Debounce timer for voice config save */
 let voiceSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** Cached characters loaded from the pipeline */
+let cachedCharacters: Character[] = [];
+
+/** Local voice assignments for characters (characterId → voiceName) */
+let characterVoiceAssignments: Map<string, string> = new Map();
+
+// ---------------------------------------------------------------------------
+// Pipeline API functions
+// ---------------------------------------------------------------------------
+
 /**
- * Toggle advanced persona options visibility.
- * Shows/hides the batch size input based on the advanced toggle checkbox.
+ * Load characters from the pipeline character ledger.
+ * GET /api/pipeline/characters/{book_id}
+ * @param bookId - Book UUID from the last successful onboard
+ * @returns Array of character objects with id, name, aliases, confidence
  */
-function toggleAdvancedPersonaOptions(): void {
-  const advanced = document.getElementById('advanced-persona-toggle') as HTMLInputElement;
-  const options = document.getElementById('advanced-persona-options');
-  if (advanced && options) {
-    options.style.display = advanced.checked ? 'flex' : 'none';
-  }
+export async function pipelineCharacters(bookId: string): Promise<Character[]> {
+  return API.get<Character[]>(`/api/pipeline/characters/${bookId}`);
 }
 
-/**
- * Generate personas via the backend.
- * POSTs to /api/generate_personas with advanced flag and batch_size.
- * Starts polling for persona status after successful submission.
- */
-async function generatePersonas(): Promise<void> {
-  const statusSpan = document.getElementById('persona-status');
-  const cancelButton = document.getElementById('btn-cancel-personas');
-  const advancedToggle = document.getElementById('advanced-persona-toggle') as HTMLInputElement;
-  const batchInput = document.getElementById('persona-batch-size') as HTMLInputElement;
-  const advanced = !!(advancedToggle && advancedToggle.checked);
-  const batchSize = Math.max(1, Math.min(parseInt(batchInput?.value || '40', 10) || 40, 200));
+// ---------------------------------------------------------------------------
+// Character ledger display
+// ---------------------------------------------------------------------------
 
+/**
+ * Parse the aliases JSON string into an array of strings.
+ * Handles malformed JSON gracefully by returning an empty array.
+ * @param aliasesJson - JSON string of aliases, e.g. '["John","Johnny"]'
+ * @returns Array of alias strings
+ */
+export function parseAliases(aliasesJson: string): string[] {
   try {
-    if (statusSpan) {
-      statusSpan.innerHTML = `<i class="fas fa-spinner fa-spin me-1"></i>${advanced ? 'Starting advanced...' : 'Starting...'}`;
+    const parsed = JSON.parse(aliasesJson);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((a): a is string => typeof a === 'string');
     }
-    if (cancelButton) {
-      cancelButton.style.display = '';
-    }
-    await API.post('/api/generate_personas', { advanced, batch_size: batchSize });
-    pollPersonaStatus();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    showToast('Failed to start persona generation: ' + msg, 'error');
-    if (statusSpan) {
-      statusSpan.innerText = '';
-    }
-    if (cancelButton) {
-      cancelButton.style.display = 'none';
-    }
+    return [];
+  } catch {
+    return [];
   }
 }
 
 /**
- * Cancel ongoing persona generation.
- * POSTs to /api/cancel_persona to stop the current persona generation task.
+ * Format a confidence score as a percentage string.
+ * @param confidence - Confidence value between 0.0 and 1.0
+ * @returns Formatted string like "85%"
  */
-async function cancelPersonas(): Promise<void> {
-  try {
-    await API.post('/api/cancel_persona', {});
-    const statusSpan = document.getElementById('persona-status');
-    if (statusSpan) {
-      statusSpan.innerText = 'Cancelling...';
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    showToast('Failed to cancel persona generation: ' + msg, 'error');
+export function formatConfidence(confidence: number): string {
+  return `${Math.round(confidence * 100)}%`;
+}
+
+/**
+ * Get the confidence badge CSS class based on the confidence score.
+ * @param confidence - Confidence value between 0.0 and 1.0
+ * @returns Bootstrap badge class name
+ */
+export function getConfidenceBadgeClass(confidence: number): string {
+  if (confidence >= 0.8) return 'bg-success';
+  if (confidence >= 0.6) return 'bg-warning text-dark';
+  return 'bg-danger';
+}
+
+/**
+ * Create HTML for a character card in the ledger display.
+ * Shows character name, aliases, voice assignment dropdown, and confidence.
+ * @param character - Character object from the pipeline
+ * @param index - Index for unique element naming
+ * @returns HTML string for the character card
+ */
+export function createCharacterCard(character: Character, index: number): string {
+  const aliases = parseAliases(character.aliases);
+  const confidence = character.confidence ?? 0;
+  const confidenceBadgeClass = getConfidenceBadgeClass(confidence);
+  const assignedVoice = characterVoiceAssignments.get(character.id) || '';
+
+  const aliasesHtml = aliases.length > 0
+    ? aliases.map(a => `<span class="badge bg-light text-dark border me-1">${escapeHtml(a)}</span>`).join('')
+    : '<span class="text-muted small">No aliases</span>';
+
+  // Build voice options from available voices
+  const voiceOptions = state.voicesNames.map(v =>
+    `<option value="${escapeHtml(v)}" ${v === assignedVoice ? 'selected' : ''}>${escapeHtml(v)}</option>`
+  ).join('');
+
+  return `
+    <div class="card character-card mb-3" data-character-id="${escapeHtml(character.id)}">
+      <div class="card-body">
+        <div class="row align-items-center">
+          <div class="col-md-3">
+            <h5 class="card-title mb-1">${escapeHtml(character.name)}</h5>
+            <span class="badge ${confidenceBadgeClass}" title="Character detection confidence">
+              ${formatConfidence(confidence)}
+            </span>
+          </div>
+          <div class="col-md-4">
+            <div class="form-text small text-muted mb-1">Aliases:</div>
+            <div class="character-aliases">${aliasesHtml}</div>
+          </div>
+          <div class="col-md-3">
+            <label class="form-text small text-muted mb-1 d-block">Voice Assignment:</label>
+            <select class="form-select form-select-sm character-voice-select"
+                    data-character-id="${escapeHtml(character.id)}"
+                    data-action="character-voice-change">
+              <option value="">-- Unassigned --</option>
+              ${voiceOptions}
+            </select>
+          </div>
+          <div class="col-md-2 text-end">
+            ${assignedVoice
+              ? `<span class="badge bg-info" title="Assigned voice">${escapeHtml(assignedVoice)}</span>`
+              : '<span class="text-muted small">Unassigned</span>'}
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/**
+ * Render the character ledger into the #character-ledger container.
+ * Displays all characters with their aliases, voice assignments, and confidence.
+ * @param characters - Array of character objects from the pipeline
+ */
+export function renderCharacterLedger(characters: Character[]): void {
+  const container = document.getElementById('character-ledger');
+  if (!container) return;
+
+  cachedCharacters = characters;
+
+  if (characters.length === 0) {
+    container.innerHTML = '<div class="alert alert-info">No characters found. Run the character discovery walks first.</div>';
+    return;
   }
+
+  container.innerHTML = characters.map((c, i) => createCharacterCard(c, i)).join('');
 }
 
-/**
- * Poll persona generation status from the server.
- * Polls GET /api/status/persona every 1.5s until the task is no longer running.
- * Updates status text, cancel button visibility, and logs display.
- * Refreshes voice caches and voices list when complete.
- */
-function pollPersonaStatus(): void {
-  const logEl = document.getElementById('voices-logs');
-  const statusSpan = document.getElementById('persona-status');
-  const cancelButton = document.getElementById('btn-cancel-personas');
-
-  const interval = setInterval(async () => {
-    try {
-      const status = await API.get<PersonaStatus>('/api/status/persona');
-      const advanced = !!(document.getElementById('advanced-persona-toggle') as HTMLInputElement)?.checked;
-
-      if (statusSpan) {
-        statusSpan.innerText = status.running ? (advanced ? 'Advanced running...' : 'Running...') : 'Finished';
-      }
-      if (cancelButton) {
-        cancelButton.style.display = status.running ? '' : 'none';
-      }
-      if (logEl) {
-        logEl.innerText = (status.logs || []).join('\n');
-        logEl.scrollTop = logEl.scrollHeight;
-      }
-
-      if (!status.running) {
-        clearInterval(interval);
-        // Refresh voices and caches
-        try { await loadVoices(); } catch (e) { /* ignore */ }
-        try { state.designedVoices = await API.get('/api/voice_design/list'); } catch (e) { /* ignore */ }
-        try { state.cloneVoices = await API.get('/api/clone_voices/list'); } catch (e) { /* ignore */ }
-        showToast('Persona generation finished', 'success');
-        if (statusSpan) {
-          statusSpan.innerText = '';
-        }
-        if (cancelButton) {
-          cancelButton.style.display = 'none';
-        }
-      }
-    } catch (e) {
-      clearInterval(interval);
-      const msg = e instanceof Error ? e.message : String(e);
-      showToast('Persona status poll failed: ' + msg, 'error');
-      if (statusSpan) {
-        statusSpan.innerText = '';
-      }
-      if (cancelButton) {
-        cancelButton.style.display = 'none';
-      }
-    }
-  }, 1500);
-}
+// ---------------------------------------------------------------------------
+// Voice loading (branches on pipelineEnabled)
+// ---------------------------------------------------------------------------
 
 /**
- * Load voices from the server and render voice cards.
- * Fetches voice caches (designed voices, clone voices, LoRA models) and voices list.
- * Renders voice cards using createVoiceCard template function.
- * Triggers auto-save if any voice has no saved config.
+ * Load voices from the server and render voice cards or character ledger.
+ *
+ * When pipelineEnabled is true:
+ *   - Loads available TTS voices from /api/voices (for dropdown population)
+ *   - Loads characters from /api/pipeline/characters/{book_id}
+ *   - Renders character ledger with voice assignment dropdowns
+ *
+ * When pipelineEnabled is false:
+ *   - Loads voice caches (designed voices, clone voices, LoRA models)
+ *   - Loads voices from /api/voices
+ *   - Renders voice cards using createVoiceCard template
  */
 export async function loadVoices(): Promise<void> {
-  // Refresh voice caches so dropdowns are populated
+  // Always load available TTS voices for dropdown population
+  const voices = await API.get<Voice[]>('/api/voices');
+  state.voicesNames = voices.map(v => v.name);
+
+  if (state.pipelineEnabled) {
+    // Pipeline mode: load characters from the ledger
+    await loadPipelineCharacters();
+  } else {
+    // Legacy mode: load voice caches and render voice cards
+    await loadLegacyVoices(voices);
+  }
+}
+
+/**
+ * Load characters from the pipeline and render the character ledger.
+ * Called when state.pipelineEnabled is true.
+ */
+async function loadPipelineCharacters(): Promise<void> {
+  const pipelineNotice = document.getElementById('pipeline-voices-disabled-notice');
+  const pipelineSection = document.getElementById('pipeline-voices-section');
+  const legacySection = document.getElementById('legacy-voices-section');
+
+  // Show pipeline section, hide legacy
+  if (pipelineNotice) pipelineNotice.style.display = 'none';
+  if (pipelineSection) pipelineSection.style.display = '';
+  if (legacySection) legacySection.style.display = 'none';
+
+  const bookId = state.pipelineBookId;
+  if (!bookId) {
+    const container = document.getElementById('character-ledger');
+    if (container) {
+      container.innerHTML = '<div class="alert alert-warning">No book onboarded yet. Please onboard an EPUB in the Script tab first.</div>';
+    }
+    return;
+  }
+
+  try {
+    const characters = await pipelineCharacters(bookId);
+    renderCharacterLedger(characters);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast('Failed to load characters: ' + msg, 'error');
+    const container = document.getElementById('character-ledger');
+    if (container) {
+      container.innerHTML = `<div class="alert alert-danger">Failed to load characters: ${escapeHtml(msg)}</div>`;
+    }
+  }
+}
+
+/**
+ * Load legacy voice caches and render voice cards.
+ * Called when state.pipelineEnabled is false.
+ * @param voices - Pre-loaded voices from /api/voices
+ */
+async function loadLegacyVoices(voices: Voice[]): Promise<void> {
+  // Load voice caches for dropdowns
   try {
     state.designedVoices = await API.get('/api/voice_design/list');
   } catch (e) { /* ignore if designer not available */ }
@@ -156,9 +269,14 @@ export async function loadVoices(): Promise<void> {
     state.loraModels = await API.get('/api/lora/models');
   } catch (e) { /* ignore if no adapters */ }
 
-  const voices = await API.get<Voice[]>('/api/voices');
-  // Cache voice names for alias dropdowns
-  state.voicesNames = voices.map(v => v.name);
+  const pipelineNotice = document.getElementById('pipeline-voices-disabled-notice');
+  const pipelineSection = document.getElementById('pipeline-voices-section');
+  const legacySection = document.getElementById('legacy-voices-section');
+
+  // Show legacy section, hide pipeline
+  if (pipelineNotice) pipelineNotice.style.display = '';
+  if (pipelineSection) pipelineSection.style.display = 'none';
+  if (legacySection) legacySection.style.display = '';
 
   const container = document.getElementById('voices-list');
   if (!container) return;
@@ -175,6 +293,10 @@ export async function loadVoices(): Promise<void> {
     debouncedSaveVoices();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Voice config collection and saving (preserved from previous version)
+// ---------------------------------------------------------------------------
 
 /**
  * Collect voice configuration from all voice cards in the DOM.
@@ -293,6 +415,60 @@ export function debouncedSaveVoices(): void {
   }, 800);
 }
 
+// ---------------------------------------------------------------------------
+// Character voice assignment handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle a character voice assignment change.
+ * Updates the local assignment map and re-renders the character card.
+ * @param characterId - The character ID
+ * @param voiceName - The selected voice name (empty string = unassigned)
+ */
+export function handleCharacterVoiceChange(characterId: string, voiceName: string): void {
+  if (voiceName) {
+    characterVoiceAssignments.set(characterId, voiceName);
+  } else {
+    characterVoiceAssignments.delete(characterId);
+  }
+
+  // Update the card's assigned voice display
+  const card = document.querySelector(`.character-card[data-character-id="${characterId}"]`);
+  if (card) {
+    const voiceBadge = card.querySelector('.col-md-2');
+    if (voiceBadge) {
+      if (voiceName) {
+        voiceBadge.innerHTML = `<span class="badge bg-info" title="Assigned voice">${escapeHtml(voiceName)}</span>`;
+      } else {
+        voiceBadge.innerHTML = '<span class="text-muted small">Unassigned</span>';
+      }
+    }
+  }
+
+  // Trigger debounced save
+  debouncedSaveVoices();
+}
+
+/**
+ * Get the current character voice assignments.
+ * @returns Map of characterId → voiceName
+ */
+export function getCharacterVoiceAssignments(): Map<string, string> {
+  return new Map(characterVoiceAssignments);
+}
+
+/**
+ * Get the cached characters.
+ * @returns Array of characters from the last pipeline load
+ */
+export function getCachedCharacters(): Character[] {
+  return [...cachedCharacters];
+}
+
+// ---------------------------------------------------------------------------
+// Voice type toggle (preserved for legacy voice cards)
+// ---------------------------------------------------------------------------
+
 /**
  * Toggle voice type options visibility within a voice card.
  * Shows/hides the appropriate options section based on the selected voice type.
@@ -318,39 +494,38 @@ function toggleVoiceType(radio: HTMLInputElement): void {
   debouncedSaveVoices();
 }
 
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+
 /**
  * Initialize the Voices tab.
- * Attaches event listeners for persona generation buttons, advanced toggle,
- * voice type radio buttons, and auto-save on voice card changes.
- * Loads voices on init.
+ * Attaches event listeners for:
+ *   - Character voice assignment dropdowns (pipeline mode)
+ *   - Voice type radio buttons (legacy mode)
+ *   - Auto-save on voice card changes (legacy mode)
+ *
+ * Shows character ledger when state.pipelineEnabled is true;
+ * otherwise shows legacy voice cards with a notice about pipeline mode.
  */
 export function initVoices(): void {
   document.addEventListener('DOMContentLoaded', () => {
-    // Generate personas button
-    const btnGenPersonas = document.getElementById('btn-gen-personas');
-    if (btnGenPersonas) {
-      // Remove inline onclick if present
-      btnGenPersonas.removeAttribute('onclick');
-      btnGenPersonas.addEventListener('click', () => generatePersonas());
+    // ----- Pipeline mode: character voice assignment -----
+    const characterLedger = document.getElementById('character-ledger');
+    if (characterLedger) {
+      characterLedger.addEventListener('change', (e) => {
+        const target = e.target as HTMLElement;
+        const select = target.closest('.character-voice-select') as HTMLSelectElement;
+        if (select) {
+          const characterId = select.dataset.characterId;
+          if (characterId) {
+            handleCharacterVoiceChange(characterId, select.value);
+          }
+        }
+      });
     }
 
-    // Cancel personas button
-    const btnCancelPersonas = document.getElementById('btn-cancel-personas');
-    if (btnCancelPersonas) {
-      // Remove inline onclick if present
-      btnCancelPersonas.removeAttribute('onclick');
-      btnCancelPersonas.addEventListener('click', () => cancelPersonas());
-    }
-
-    // Advanced persona toggle
-    const advancedToggle = document.getElementById('advanced-persona-toggle');
-    if (advancedToggle) {
-      // Remove inline onchange if present
-      advancedToggle.removeAttribute('onchange');
-      advancedToggle.addEventListener('change', () => toggleAdvancedPersonaOptions());
-    }
-
-    // Voice type radio buttons and clone/design actions: event delegation on voices-list container
+    // ----- Legacy mode: voice type radio buttons and clone/design actions -----
     const voicesList = document.getElementById('voices-list');
     if (voicesList) {
       voicesList.addEventListener('change', (e) => {

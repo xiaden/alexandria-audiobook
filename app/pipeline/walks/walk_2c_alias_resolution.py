@@ -29,11 +29,13 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    from app.pipeline.adapter import PipelineStorage
+from ._llm_helpers import chat_completion
+
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from app.pipeline.adapter import PipelineStorage
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -110,12 +112,16 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
 
     # Call LLM
     try:
-        response_text = _call_llm(
+        response_text = chat_completion(
             client=client,
             model_name=model_name,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
-            prompt=prompt,
+            system_prompt=(
+                "You are a literary analyst specializing in character identity "
+                "resolution across long narratives."
+            ),
+            user_prompt=prompt,
         )
     except Exception as e:
         logger.error("LLM call failed for book %s: %s", book_id, e)
@@ -236,39 +242,6 @@ Return ONLY a JSON array, no other text. Example:
 If no characters should be merged, return an empty array: []
 """
     return prompt
-
-
-def _call_llm(
-    client: Any,
-    model_name: str,
-    temperature: float,
-    reasoning_effort: str | None,
-    prompt: str,
-) -> str:
-    """Call the LLM and return the response text."""
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a literary analyst specializing in character identity "
-                "resolution across long narratives."
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
-
-    extra_body = {}
-    if reasoning_effort is not None:
-        extra_body["reasoning_effort"] = reasoning_effort
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        temperature=temperature,
-        extra_body=extra_body if extra_body else None,
-    )
-
-    return response.choices[0].message.content.strip()
 
 
 def _parse_llm_response(

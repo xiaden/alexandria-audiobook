@@ -115,6 +115,10 @@ export interface AppState {
   isPlayingSequence: boolean;
   /** Editor: rendering all flag */
   isRenderingAll: boolean;
+  /** Setup: pipeline mode enabled (toggle switch in Setup tab) */
+  pipelineEnabled: boolean;
+  /** Pipeline: current book ID from successful onboard (shared across tabs) */
+  pipelineBookId: string | null;
 }
 
 /** Module-level state singleton */
@@ -132,6 +136,8 @@ export const state: AppState = {
   cachedChunks: [],
   isPlayingSequence: false,
   isRenderingAll: false,
+  pipelineEnabled: false,
+  pipelineBookId: null,
 };
 
 /** Available built-in voices for custom voice selection */

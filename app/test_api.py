@@ -1048,44 +1048,6 @@ def test_get_audacity_export():
     assert_status(r, 200)
 
 
-# ── Section 14: Full Tests — Generation ─────────────────────
-
-def test_generate_script():
-    r = post("/api/generate_script")
-    if r.status_code == 400:
-        raise TestFailure("SKIP: prerequisite not met (no uploaded file or already running)")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
-
-
-def test_generate_script_single_speaker():
-    r = post("/api/generate_script", json={
-        "single_speaker": True,
-        "speaker_name": "Narrator",
-        "instruct": "Neutral narration."
-    })
-    if r.status_code == 400:
-        raise TestFailure("SKIP: prerequisite not met (no uploaded file or already running)")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
-
-
-def test_review_script():
-    if not shared.get("has_script"):
-        raise TestFailure("SKIP: no annotated script loaded")
-    r = post("/api/review_script")
-    if r.status_code == 400:
-        raise TestFailure("SKIP: already running")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
-
-
 
 def test_generate_chunk():
     if not shared.get("has_chunks"):
@@ -1303,10 +1265,6 @@ def run_all_tests():
     run_test("get_audiobook_m4b", test_get_audiobook_m4b)
     run_test("get_audacity_export", test_get_audacity_export)
 
-    section("Generation (TTS/LLM)")
-    run_test("generate_script", test_generate_script, requires_full=True)
-    run_test("generate_script_single_speaker", test_generate_script_single_speaker, requires_full=True)
-    run_test("review_script", test_review_script, requires_full=True)
     run_test("generate_chunk", test_generate_chunk, requires_full=True)
     run_test("generate_batch", test_generate_batch, requires_full=True)
     run_test("generate_batch_fast", test_generate_batch_fast, requires_full=True)

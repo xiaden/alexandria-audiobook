@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.walks.walk_2c_alias_resolution import (
@@ -40,7 +39,8 @@ from app.pipeline.walks.walk_2c_alias_resolution import (
 
 def _patch_llm(monkeypatch, response_text: str):
     """Patch resolve_task_llm (in app.utils), create_llm_client (in app.utils),
-    and _call_llm so walk_2c uses our mocked response.
+    and chat_completion (imported locally in walk_2c) so walk_2c uses our
+    mocked response.
 
     Critical: resolve_task_llm / create_llm_client are imported *inside*
     execute() from ``app.utils``, so we patch the source module.
@@ -65,11 +65,11 @@ def _patch_llm(monkeypatch, response_text: str):
         mock_create_client,
     )
 
-    def mock_call_llm(client, model_name, temperature, reasoning_effort, prompt):
+    def mock_call_llm(client, model_name, temperature, reasoning_effort, system_prompt, user_prompt):
         return response_text
 
     monkeypatch.setattr(
-        "app.pipeline.walks.walk_2c_alias_resolution._call_llm",
+        "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
         mock_call_llm,
     )
 
@@ -162,14 +162,14 @@ class TestExecuteSummary:
         def mock_create_client(config_path=None):
             return object(), None
 
-        def mock_call_llm(client, model_name, temperature, reasoning_effort, prompt):
+        def mock_call_llm(client, model_name, temperature, reasoning_effort, system_prompt, user_prompt):
             llm_called.append(True)
             return "[]"
 
         monkeypatch.setattr("app.utils.resolve_task_llm", mock_resolve)
         monkeypatch.setattr("app.utils.create_llm_client", mock_create_client)
         monkeypatch.setattr(
-            "app.pipeline.walks.walk_2c_alias_resolution._call_llm",
+            "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
             mock_call_llm,
         )
 
@@ -230,8 +230,8 @@ class TestLLMInteraction:
 
         captured_prompt = []
 
-        def mock_call_llm(client, model_name, temperature, reasoning_effort, prompt):
-            captured_prompt.append(prompt)
+        def mock_call_llm(client, model_name, temperature, reasoning_effort, system_prompt, user_prompt):
+            captured_prompt.append(user_prompt)
             return "[]"
 
         monkeypatch.setattr(
@@ -246,7 +246,7 @@ class TestLLMInteraction:
             lambda config_path=None: (object(), None),
         )
         monkeypatch.setattr(
-            "app.pipeline.walks.walk_2c_alias_resolution._call_llm",
+            "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
             mock_call_llm,
         )
 
@@ -280,7 +280,7 @@ class TestLLMInteraction:
             "app.utils.create_llm_client", lambda config_path=None: (object(), None)
         )
         monkeypatch.setattr(
-            "app.pipeline.walks.walk_2c_alias_resolution._call_llm",
+            "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
             lambda *a, **kw: "[]",
         )
 
@@ -864,7 +864,7 @@ class TestConfidenceFiltering:
 
 class TestLLMErrorHandling:
     def test_llm_exception_returns_error(self, monkeypatch):
-        """If _call_llm raises an exception, execute() returns gracefully."""
+        """If chat_completion raises an exception, execute() returns gracefully."""
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
@@ -882,7 +882,7 @@ class TestLLMErrorHandling:
             "app.utils.create_llm_client", lambda config_path=None: (object(), None)
         )
         monkeypatch.setattr(
-            "app.pipeline.walks.walk_2c_alias_resolution._call_llm",
+            "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("LLM failed")),
         )
 

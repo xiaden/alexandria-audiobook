@@ -15,43 +15,43 @@ DELETE the old pipeline files (generate_script.py, review_script.py, generate_pe
 ## Phases
 
 ### Phase 1: Old Pipeline Deletion
-- [ ] DELETE `app/generate_script.py` entirely from the repository
-- [ ] DELETE `app/review_script.py` entirely from the repository
-- [ ] DELETE `app/generate_personas.py` entirely from the repository
-- [ ] DELETE their associated test files (any script-specific tests under tests/)
-- [ ] REMOVE all imports and references to these files from `app.py` — including any 410 fallback logic. No import-reachable old code remains.
-- [ ] Remove any documentation references (README.md, inline docs) to the deleted files
-- [ ] Write `tests/pipeline/test_old_pipeline_removed.py` — **temporary verification artifact**: spec-first: verify the three files are absent from the repo, verify no dangling imports in app.py, verify no test files reference the deleted modules. This file exists solely for one-time cutover verification and will be deleted after it passes.
-- [ ] Verify: run `pytest tests/pipeline/test_old_pipeline_removed.py -v` — all tests pass
-- [ ] DELETE `tests/pipeline/test_old_pipeline_removed.py` — it has served its one-time verification purpose; it is a throwaway artifact, not a permanent test file
+- [x] DELETE `app/generate_script.py` entirely from the repository
+- [x] DELETE `app/review_script.py` entirely from the repository
+- [x] DELETE `app/generate_personas.py` entirely from the repository
+- [x] DELETE their associated test files (any script-specific tests under tests/)
+- [x] REMOVE all imports and references to these files from `app.py` — including any 410 fallback logic. No import-reachable old code remains.
+- [x] Remove any documentation references (README.md, inline docs) to the deleted files
+- [x] Write `tests/pipeline/test_old_pipeline_removed.py` — **temporary verification artifact**: spec-first: verify the three files are absent from the repo, verify no dangling imports in app.py, verify no test files reference the deleted modules. This file exists solely for one-time cutover verification and will be deleted after it passes.
+- [x] Verify: run `pytest tests/pipeline/test_old_pipeline_removed.py -v` — all tests pass
+- [x] DELETE `tests/pipeline/test_old_pipeline_removed.py` — it has served its one-time verification purpose; it is a throwaway artifact, not a permanent test file
 
 ### Phase 2: End-to-End Integration Tests
-- [ ] Create `tests/pipeline/test_e2e.py` with integration tests that exercise the full pipeline
-- [ ] Test 1: Onboard EPUB → run all 9 walks → export annotated script → verify output format
-- [ ] Test 2: Onboard EPUB → run walks 2a-2c → verify character ledger → run walks 2d-2f → verify speaker attributions → run walks 2g-2i → verify voice assignments and instruct fields
-- [ ] Test 3: Onboard EPUB → run all walks → perform operation (split/merge/move/delete) → verify presentation indices updated correctly
-- [ ] Test 4: Onboard EPUB → run all walks → re-onboard → verify version incremented, walk outputs cleared
-- [ ] Test 5: Onboard EPUB → run all walks → export → render via TTS integration → verify TTSEngine called with correct parameters
-- [ ] Use in-memory SQLite adapter for all tests (per DD: in-memory SQLite per test session)
-- [ ] Verify: run `pytest tests/pipeline/test_e2e.py -v` — all tests pass
+- [x] Create `tests/pipeline/test_e2e.py` with integration tests that exercise the full pipeline
+- [x] Test 1: Onboard EPUB → run all 9 walks → export annotated script → verify output format
+- [x] Test 2: Onboard EPUB → run walks 2a-2c → verify character ledger → run walks 2d-2f → verify speaker attributions → run walks 2g-2i → verify voice assignments and instruct fields
+- [x] Test 3: Onboard EPUB → run all walks → perform operation (split/merge/move/delete) → verify presentation indices updated correctly
+- [x] Test 4: Onboard EPUB → run all walks → re-onboard → verify version incremented, walk outputs cleared
+- [x] Test 5: Onboard EPUB → run all walks → export → render via TTS integration → verify TTSEngine called with correct parameters
+- [x] Use in-memory SQLite adapter for all tests (per DD: in-memory SQLite per test session)
+- [x] Verify: run `pytest tests/pipeline/test_e2e.py -v` — all tests pass
 
 ### Phase 3: Presentation Ordering Tests
-- [ ] Create `tests/pipeline/test_presentation.py` with tests for span_presentation VIEW ordering
-- [ ] Test 1: Verify global_index is correct for nested sort (book.position, chapter.position, paragraph.position, span.position)
-- [ ] Test 2: Verify ordering across multiple books in a series
-- [ ] Test 3: Verify ordering after operations (split/merge/move/delete renumber positions correctly)
-- [ ] Test 4: Verify ordering after re-onboarding (new version, same ordering)
-- [ ] Write `tests/pipeline/test_presentation.py` — spec-first: test nested sort correctness, operation renumbering, multi-book ordering
-- [ ] Verify: run `pytest tests/pipeline/test_presentation.py -v` — all tests pass
+- [x] Create `tests/pipeline/test_presentation.py` with tests for span_presentation VIEW ordering
+- [x] Test 1: Verify global_index is correct for nested sort (book.position, chapter.position, paragraph.position, span.position)
+- [x] Test 2: Verify ordering across multiple books in a series
+- [x] Test 3: Verify ordering after operations (split/merge/move/delete renumber positions correctly)
+- [x] Test 4: Verify ordering after re-onboarding (new version, same ordering)
+- [x] Write `tests/pipeline/test_presentation.py` — spec-first: test nested sort correctness, operation renumbering, multi-book ordering
+- [x] Verify: run `pytest tests/pipeline/test_presentation.py -v` — all tests pass
 
 ### Phase 4: Final Cleanup
-- [ ] Remove any temporary code or markers from development (e.g., debug prints, TODO comments that are now resolved)
-- [ ] Verify all tests pass: `pytest tests/pipeline/ -v`
-- [ ] Verify code coverage meets targets: storage 100%, operation executor 100%, walks 80%, frontend 60%
-- [ ] Update CONTRACTS.md with final method signatures
-- [ ] Update README.md with final plan structure and dependency graph
-- [ ] Archive old v2 design artifacts (if not already archived)
-- [ ] Log final planner observations about v3 migration
+- [x] Remove any temporary code or markers from development (e.g., debug prints, TODO comments that are now resolved)
+- [x] Verify all tests pass: `pytest tests/pipeline/ -v`
+- [x] Verify code coverage meets targets: storage 100%, operation executor 100%, walks 80%, frontend 60%
+- [x] Update CONTRACTS.md with final method signatures
+- [x] Update README.md with final plan structure and dependency graph
+- [x] Archive old v2 design artifacts (if not already archived)
+- [x] Log final planner observations about v3 migration
 
 ## Completion Criteria
 - Old pipeline files (generate_script.py, review_script.py, generate_personas.py) DELETED — not deprecated, not kept for reference

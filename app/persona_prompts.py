@@ -27,5 +27,5 @@ def load_persona_prompts():
     return parts[0].strip(), parts[1].strip(), parts[2].strip()
 
 
-# Cached at import time — used by generate_personas.py (subprocess, fresh each run)
+# Cached at import time — used by persona generation (subprocess, fresh each run)
 PERSONA_SYSTEM_PROMPT, PERSONA_USER_PROMPT, PERSONA_ADVANCED_PROMPT = load_persona_prompts()

@@ -5,7 +5,7 @@ import tempfile
 
 
 # Structure markers for flattened EPUB text (emitted by app.py extract_epub_text /
-# _HTMLTextExtractor, consumed by generate_script.split_into_chunks).
+# _HTMLTextExtractor, consumed by the pipeline chunker).
 # PARA_MARKER is a soft boundary: consecutive paragraphs merge into one chunk up to
 # max_size. CHAP_MARKER is a hard boundary: a chunk never spans two chapters.
 # Both are stripped before text reaches the LLM.
@@ -181,7 +181,7 @@ def log_llm_response(log_name, label, text, finish_reason=None, usage=None, atte
         f.write(f"\n{'='*80}\n")
 
 
-# ── JSON Cleaning / Repair (moved from generate_script.py) ──
+# ── JSON Cleaning / Repair ──
 
 def clean_json_string(text):
     """Clean and extract valid JSON array from LLM response."""

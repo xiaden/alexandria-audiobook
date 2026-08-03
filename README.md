@@ -514,23 +514,27 @@ curl -X POST http://127.0.0.1:4200/api/config \
   }'
 ```
 
-### Script Generation
+### Pipeline (Script Generation)
 ```bash
-# Upload text file (supports .txt, .md, .epub)
-curl -X POST http://127.0.0.1:4200/api/upload \
+# Onboard an EPUB — extracts text, populates spine, returns book_id
+curl -X POST http://127.0.0.1:4200/api/pipeline/onboard \
   -F "file=@mybook.epub"
 
-# Generate script (returns task ID)
-curl -X POST http://127.0.0.1:4200/api/generate_script
+# Run all annotation walks (replace <book_id> with the ID returned by onboard)
+curl -X POST http://127.0.0.1:4200/api/pipeline/run_all_walks \
+  -H "Content-Type: application/json" \
+  -d '{"book_id": "<book_id>"}'
 
-# Check status
-curl http://127.0.0.1:4200/api/status/script_generation
+# Check walk status
+curl http://127.0.0.1:4200/api/pipeline/walk_status/<book_id>
 
-# Review script (fix attribution tags, misattributed lines, etc.)
-curl -X POST http://127.0.0.1:4200/api/review_script
+# Review items (low-confidence annotations needing human review)
+curl http://127.0.0.1:4200/api/pipeline/review/<book_id>
 
-# Check review status
-curl http://127.0.0.1:4200/api/status/review
+# Accept a review item
+curl -X POST http://127.0.0.1:4200/api/pipeline/review/accept \
+  -H "Content-Type: application/json" \
+  -d '{"item_id": "<item_id>"}'
 ```
 
 ### Voice Management
@@ -590,21 +594,10 @@ curl -X POST http://127.0.0.1:4200/api/scripts/load \
   -d '{"name": "my-novel"}'
 ```
 
-### Persona Generation
+### Character Ledger
 ```bash
-# Generate personas (LLM + VoiceDesign, assigns clone voices automatically)
-curl -X POST http://127.0.0.1:4200/api/generate_personas
-
-# Generate personas in advanced mode with custom batch size
-curl -X POST http://127.0.0.1:4200/api/generate_personas \
-  -H "Content-Type: application/json" \
-  -d '{"advanced": true, "batch_size": 40}'
-
-# Check persona generation status
-curl http://127.0.0.1:4200/api/status/persona
-
-# Cancel persona generation
-curl -X POST http://127.0.0.1:4200/api/cancel_persona
+# View characters extracted during pipeline walks (voices, roles, descriptions)
+curl http://127.0.0.1:4200/api/pipeline/characters/<book_id>
 ```
 
 ### Voice Designer
@@ -732,17 +725,20 @@ import requests
 
 BASE = "http://127.0.0.1:4200"
 
-# Upload and generate script
-with open("mybook.txt", "rb") as f:
-    requests.post(f"{BASE}/api/upload", files={"file": f})
-
-requests.post(f"{BASE}/api/generate_script")
-
-# Poll for completion
+# Onboard EPUB — extracts text, populates spine, returns book_id
 import time
+
+with open("mybook.epub", "rb") as f:
+    onboard = requests.post(f"{BASE}/api/pipeline/onboard", files={"file": f}).json()
+book_id = onboard["book_id"]
+
+# Run all annotation walks
+requests.post(f"{BASE}/api/pipeline/run_all_walks", json={"book_id": book_id})
+
+# Poll until all walks complete
 while True:
-    status = requests.get(f"{BASE}/api/status/script_generation").json()
-    if status.get("status") in ["completed", "error"]:
+    statuses = requests.get(f"{BASE}/api/pipeline/walk_status/{book_id}").json()
+    if all(s in ("completed", "error") for s in statuses.values()):
         break
     time.sleep(2)
 
@@ -776,24 +772,29 @@ with open("audacity_export.zip", "wb") as f:
 ```javascript
 const BASE = "http://127.0.0.1:4200";
 
-// Upload file
+// Onboard EPUB — extracts text, populates spine, returns book_id
 const formData = new FormData();
 formData.append("file", fileInput.files[0]);
-await fetch(`${BASE}/api/upload`, { method: "POST", body: formData });
+const onboard = await fetch(`${BASE}/api/pipeline/onboard`, { method: "POST", body: formData });
+const { book_id: bookId } = await onboard.json();
 
-// Generate script
-await fetch(`${BASE}/api/generate_script`, { method: "POST" });
+// Run all annotation walks
+await fetch(`${BASE}/api/pipeline/run_all_walks`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ book_id: bookId }),
+});
 
-// Poll for completion
-async function waitForTask(taskName) {
+// Poll until all walks complete
+async function waitForWalks(bookId) {
   while (true) {
-    const res = await fetch(`${BASE}/api/status/${taskName}`);
-    const data = await res.json();
-    if (data.status === "completed" || data.status === "error") return data;
+    const res = await fetch(`${BASE}/api/pipeline/walk_status/${bookId}`);
+    const statuses = await res.json();
+    if (Object.values(statuses).every(s => s === "completed" || s === "error")) return statuses;
     await new Promise(r => setTimeout(r, 2000));
   }
 }
-await waitForTask("script_generation");
+await waitForWalks(bookId);
 
 // Configure and generate
 await fetch(`${BASE}/api/save_voice_config`, {
@@ -910,9 +911,27 @@ Alexandria/
 │   ├── app.py                 # FastAPI server
 │   ├── tts.py                 # TTS engine (local + external backends)
 │   ├── train_lora.py          # LoRA training subprocess script
-│   ├── generate_script.py     # LLM script annotation
-│   ├── generate_personas.py   # LLM persona generation + VoiceDesign voice assignment
-│   ├── review_script.py       # LLM script review (second pass)
+│   ├── pipeline/              # v3 Annotation Pipeline (SQLite-WAL, two-graph model)
+│   │   ├── api.py             # Pipeline REST endpoints (/api/pipeline/*)
+│   │   ├── adapter.py         # Pipeline adapter + schema init
+│   │   ├── extract.py         # EPUB text extraction
+│   │   ├── populate.py        # Spine population
+│   │   ├── ledger.py          # Character ledger
+│   │   ├── operations.py      # Operation executor (split/merge/move/delete)
+│   │   ├── review.py          # Review manager (low-confidence items)
+│   │   ├── assembly.py        # Script assembly + export
+│   │   ├── tts_integration.py # TTS integration (render_audiobook)
+│   │   ├── schema.py          # SQL schema + span_presentation VIEW
+│   │   └── walks/             # 9-walk serial DAG (2a→2b→…→2i)
+│   │       ├── walk_2a_scene_segmentation.py
+│   │       ├── walk_2b_character_discovery.py
+│   │       ├── walk_2c_alias_resolution.py
+│   │       ├── walk_2d_scene_presence.py
+│   │       ├── walk_2e_span_attribution.py
+│   │       ├── walk_2f_character_description.py
+│   │       ├── walk_2g_voice_audition.py
+│   │       ├── walk_2h_voice_assignment.py
+│   │       └── walk_2i_delivery.py
 │   ├── utils.py               # Shared utilities (atomic JSON writes)
 │   ├── default_prompts.py     # Generation prompt loader (reads default_prompts.txt)
 │   ├── review_prompts.py      # Review prompt loader (reads review_prompts.txt)

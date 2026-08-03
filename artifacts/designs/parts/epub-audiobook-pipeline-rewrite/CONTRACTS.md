@@ -30,16 +30,11 @@ class InMemorySQLiteAdapter(PipelineStorage):
     # For testing — same schema, no disk
 ```
 
-### get_pipeline_db()
+### Production storage dependency
 ```python
-def get_pipeline_db() -> PipelineStorage
-# Module-level factory, returns configured adapter
-# Backend: PIPELINE_DB_BACKEND env ('sqlite' default | 'memory')
-# Path: PIPELINE_DB_PATH env (default ./data/pipeline.db)
-# Cached module-level singleton. IMPLEMENTED (Plan A)
-
-def reset_pipeline_db() -> None
-# Close + discard cached adapter; for test teardown. IMPLEMENTED (Plan A)
+def get_storage() -> PipelineStorage
+# FastAPI dependency backed by the process-level SQLiteAdapter.
+# Tests override this dependency with InMemorySQLiteAdapter.
 ```
 
 ## Schema (Graph1 TREE)

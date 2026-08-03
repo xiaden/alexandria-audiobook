@@ -20,6 +20,8 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from ._llm_helpers import chat_completion
+
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
 
@@ -137,12 +139,13 @@ def _process_chapter(
     prompt = _build_scene_segmentation_prompt(paragraphs)
 
     # Call LLM
-    response_text = _call_llm(
+    response_text = chat_completion(
         client=client,
         model_name=model_name,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
-        prompt=prompt,
+        system_prompt="You are a literary analyst specializing in narrative structure.",
+        user_prompt=prompt,
     )
 
     # Parse response
@@ -200,33 +203,6 @@ Return ONLY a JSON array, no other text. Example:
 ]
 """
     return prompt
-
-
-def _call_llm(
-    client: Any,
-    model_name: str,
-    temperature: float,
-    reasoning_effort: str | None,
-    prompt: str,
-) -> str:
-    """Call the LLM and return the response text."""
-    messages = [
-        {"role": "system", "content": "You are a literary analyst specializing in narrative structure."},
-        {"role": "user", "content": prompt},
-    ]
-
-    extra_body = {}
-    if reasoning_effort is not None:
-        extra_body["reasoning_effort"] = reasoning_effort
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        temperature=temperature,
-        extra_body=extra_body if extra_body else None,
-    )
-
-    return response.choices[0].message.content.strip()
 
 
 def _parse_llm_response(response_text: str, paragraphs: list[dict]) -> list[dict]:

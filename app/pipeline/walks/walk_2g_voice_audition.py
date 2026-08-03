@@ -29,6 +29,8 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from ._llm_helpers import chat_completion
+
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
 
@@ -240,12 +242,13 @@ def _process_character(
     )
 
     # Call LLM
-    response_text = _call_llm(
+    response_text = chat_completion(
         client=client,
         model_name=model_name,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
-        prompt=prompt,
+        system_prompt="You are a voice casting specialist for audiobook production, analyzing characters to suggest appropriate voice profiles.",
+        user_prompt=prompt,
     )
 
     # Parse response
@@ -363,36 +366,6 @@ Example:
 {{"voice_profile": {{"age": "middle-aged", "gender": "male", "tone": "authoritative but warm", "accent": "British RP", "pitch": "medium-low", "pace": "measured"}}, "confidence": 0.85}}
 """
     return prompt
-
-
-def _call_llm(
-    client: Any,
-    model_name: str,
-    temperature: float,
-    reasoning_effort: str | None,
-    prompt: str,
-) -> str:
-    """Call the LLM and return the response text."""
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a voice casting specialist for audiobook production, analyzing characters to suggest appropriate voice profiles.",
-        },
-        {"role": "user", "content": prompt},
-    ]
-
-    extra_body = {}
-    if reasoning_effort is not None:
-        extra_body["reasoning_effort"] = reasoning_effort
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        temperature=temperature,
-        extra_body=extra_body if extra_body else None,
-    )
-
-    return response.choices[0].message.content.strip()
 
 
 def _parse_llm_response(response_text: str) -> dict:

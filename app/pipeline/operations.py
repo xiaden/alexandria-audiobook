@@ -165,16 +165,22 @@ class OperationExecutor:
     def execute_split(self, presentation_index: int, split_point: int) -> None:
         """Split a span into two at the given text offset.
 
-        The left span (original) keeps existing character_span memberships.
-        The right span (new) gets a copy of all character_span memberships.
+        The left span (original) keeps existing character_span memberships
+        and its instruct value.  The right span (new) gets a copy of all
+        character_span memberships and NULL instruct.
 
         Parameters
         ----------
         presentation_index:
             Global index from span_presentation VIEW
         split_point:
-            Character offset at which to split (not used for DB operations,
-            but represents the text split point)
+            Character offset at which to split.  Must be a strict interior
+            offset: ``0 < split_point < len(span.text)``.
+
+        Raises
+        ------
+        ValueError
+            If *split_point* is out of range or the span has NULL text.
         """
         conn = self._storage.get_connection()
         conn.execute("SAVEPOINT split_op")
@@ -184,24 +190,48 @@ class OperationExecutor:
                 conn, presentation_index
             )
 
-            # Get span details
+            # Get span details including text and instruct
             span_row = conn.execute(
-                "SELECT span_type FROM span WHERE id = ?", (span_id,)
+                "SELECT span_type, instruct, text FROM span WHERE id = ?",
+                (span_id,),
             ).fetchone()
             if span_row is None:
                 raise ValueError(f"Span {span_id} not found")
-            span_type = span_row[0]
+            span_type, instruct, span_text = span_row
+
+            # Validate split_point as a strict interior offset
+            if span_text is None:
+                raise ValueError(
+                    f"Cannot split span {span_id}: text is NULL"
+                )
+            if split_point <= 0 or split_point >= len(span_text):
+                raise ValueError(
+                    f"split_point {split_point} must satisfy "
+                    f"0 < split_point < {len(span_text)} "
+                    f"for span {span_id}"
+                )
+
+            # Split the text
+            left_text = span_text[:split_point]
+            right_text = span_text[split_point:]
+
+            # Update original span with left text
+            conn.execute(
+                "UPDATE span SET text = ? WHERE id = ?",
+                (left_text, span_id),
+            )
 
             # Phase 1: shift positions > old_position up by 1
             self._two_phase_reindex(
                 conn, "paragraph_span", parent_id, old_position, delta=1
             )
 
-            # Create new span
+            # Create new span with right text
             new_span_id = str(uuid.uuid4())
             conn.execute(
-                "INSERT INTO span (id, span_type, instruct) VALUES (?, ?, NULL)",
-                (new_span_id, span_type),
+                "INSERT INTO span (id, span_type, instruct, text) "
+                "VALUES (?, ?, NULL, ?)",
+                (new_span_id, span_type, right_text),
             )
 
             # Insert new paragraph_span edge at old_position + 1

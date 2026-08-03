@@ -50,13 +50,13 @@ def main():
             "temperature": 0.6,
             "task_overrides": {
                 "scene_segmentation": {"temperature": 0.1},
-                "delivery_context": {"temperature": 0.3},
+                "delivery": {"temperature": 0.3},
             },
         }
     }
     path = _write_config(cfg)
     check("task override 0.1", resolve_task_llm("scene_segmentation", path)["temperature"], 0.1)
-    check("task override 0.3", resolve_task_llm("delivery_context", path)["temperature"], 0.3)
+    check("task override 0.3", resolve_task_llm("delivery", path)["temperature"], 0.3)
 
     # 3. Unlisted task inherits global default.
     check("global default", resolve_task_llm("unknown_task", path)["temperature"], 0.6)

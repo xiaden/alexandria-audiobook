@@ -129,6 +129,22 @@ def _get_character_memberships(
     return [(r[0], r[1], r[2]) for r in rows]
 
 
+def _get_span_text(conn: sqlite3.Connection, span_id: str) -> str | None:
+    """Return text for a span, or None."""
+    row = conn.execute(
+        "SELECT text FROM span WHERE id = ?", (span_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _get_span_instruct(conn: sqlite3.Connection, span_id: str) -> str | None:
+    """Return instruct for a span, or None."""
+    row = conn.execute(
+        "SELECT instruct FROM span WHERE id = ?", (span_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
 # ---------------------------------------------------------------------------
 # execute_split tests
 # ---------------------------------------------------------------------------
@@ -140,7 +156,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         # Should now have 5 spans (was 4, added 1)
         rows = conn.execute("SELECT COUNT(*) FROM span").fetchone()
@@ -151,7 +167,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         # sp2 is quotation, new span should also be quotation
         new_span = conn.execute(
@@ -164,7 +180,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         positions = _get_span_positions(conn, "p1")
         # sp1=1, sp2=2, new_span=3, sp3=4
@@ -178,7 +194,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         order = _get_presentation_order(conn)
         # sp1, sp2, new_span, sp3, sp4
@@ -195,7 +211,7 @@ class TestExecuteSplit:
         _add_character(conn, "ch1", "Alice")
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
 
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         # sp2 (left) should still have ch1 membership
         memberships = _get_character_memberships(conn, "sp2")
@@ -211,7 +227,7 @@ class TestExecuteSplit:
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
         _add_character_span(conn, "ch2", "sp2", "mentioned", confidence=0.7)
 
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         # Find new span
         new_span_id = conn.execute(
@@ -230,7 +246,7 @@ class TestExecuteSplit:
         _populate_test_spine(conn)
 
         # sp2 has no memberships
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         # Should succeed without error
         order = _get_presentation_order(conn)
@@ -243,6 +259,136 @@ class TestExecuteSplit:
 
         with pytest.raises(ValueError, match="Presentation index .* not found"):
             executor.execute_split(presentation_index=999, split_point=5)
+
+    def test_split_sets_left_text(self, storage, executor):
+        """Left span (original) text is truncated at split_point."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        executor.execute_split(presentation_index=2, split_point=2)
+
+        assert _get_span_text(conn, "sp2") == "He"
+
+    def test_split_sets_right_text(self, storage, executor):
+        """Right span (new) text starts from split_point."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        executor.execute_split(presentation_index=2, split_point=2)
+
+        new_id = conn.execute(
+            "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
+        ).fetchone()[0]
+        assert _get_span_text(conn, new_id) == "llo"
+
+    def test_split_preserves_instruct_on_left(self, storage, executor):
+        """Left span (original) keeps its instruct value."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        executor.execute_split(presentation_index=2, split_point=2)
+
+        assert _get_span_instruct(conn, "sp2") == "angrily"
+
+    def test_split_null_instruct_on_right(self, storage, executor):
+        """Right span (new) gets NULL instruct."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        executor.execute_split(presentation_index=2, split_point=2)
+
+        new_id = conn.execute(
+            "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
+        ).fetchone()[0]
+        assert _get_span_instruct(conn, new_id) is None
+
+    def test_split_invalid_offset_zero(self, storage, executor):
+        """split_point=0 raises ValueError (not a strict interior offset)."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        with pytest.raises(ValueError, match="split_point"):
+            executor.execute_split(presentation_index=2, split_point=0)
+
+    def test_split_invalid_offset_negative(self, storage, executor):
+        """split_point < 0 raises ValueError."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        with pytest.raises(ValueError, match="split_point"):
+            executor.execute_split(presentation_index=2, split_point=-1)
+
+    def test_split_invalid_offset_past_end(self, storage, executor):
+        """split_point >= len(text) raises ValueError."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        with pytest.raises(ValueError, match="split_point"):
+            executor.execute_split(presentation_index=2, split_point=5)
+
+    def test_split_invalid_offset_equal_length(self, storage, executor):
+        """split_point == len(text) raises ValueError (not strict interior)."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        # sp2 text is "Hello" (5 chars). 5 is not interior.
+        with pytest.raises(ValueError, match="split_point"):
+            executor.execute_split(presentation_index=2, split_point=5)
+
+    def test_split_null_text_raises_error(self, storage, executor):
+        """Cannot split a span with NULL text."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        # sp1 has NULL text
+        with pytest.raises(ValueError, match="text"):
+            executor.execute_split(presentation_index=1, split_point=2)
+
+    def test_split_rollback_on_invalid_offset(self, storage, executor):
+        """Invalid split_point leaves no changes (full rollback)."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        span_count_before = conn.execute("SELECT COUNT(*) FROM span").fetchone()[0]
+        text_before = _get_span_text(conn, "sp2")
+        positions_before = _get_span_positions(conn, "p1")
+
+        try:
+            executor.execute_split(presentation_index=2, split_point=0)
+        except ValueError:
+            pass
+
+        # Nothing should have changed
+        span_count_after = conn.execute("SELECT COUNT(*) FROM span").fetchone()[0]
+        assert span_count_after == span_count_before
+        assert _get_span_text(conn, "sp2") == text_before
+        assert _get_span_positions(conn, "p1") == positions_before
+
+    def test_split_boundary_first_char(self, storage, executor):
+        """split_point=1 splits after first character."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        executor.execute_split(presentation_index=2, split_point=1)
+
+        assert _get_span_text(conn, "sp2") == "H"
+        new_id = conn.execute(
+            "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
+        ).fetchone()[0]
+        assert _get_span_text(conn, new_id) == "ello"
+
+    def test_split_boundary_last_char(self, storage, executor):
+        """split_point=4 on 5-char text splits before last character."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        executor.execute_split(presentation_index=2, split_point=4)
+
+        assert _get_span_text(conn, "sp2") == "Hell"
+        new_id = conn.execute(
+            "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
+        ).fetchone()[0]
+        assert _get_span_text(conn, new_id) == "o"
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +689,7 @@ class TestEdgeCases:
         _populate_test_spine(conn)
 
         # Split sp2
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
         # Now: sp1, sp2, new_span, sp3, sp4
 
         # Delete new_span (now at index 3)
@@ -561,7 +707,7 @@ class TestEdgeCases:
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
 
         # Split sp2
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
         # Now: sp1, sp2, new_span, sp3, sp4
 
         # Merge sp2 and new_span
@@ -597,7 +743,7 @@ class TestEdgeCases:
         _add_character_span(conn, "ch2", "sp2", "mentioned", confidence=0.7)
         _add_character_span(conn, "ch3", "sp2", "present", confidence=0.8)
 
-        executor.execute_split(presentation_index=2, split_point=5)
+        executor.execute_split(presentation_index=2, split_point=2)
 
         # Find new span
         new_span_id = conn.execute(

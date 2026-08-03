@@ -87,7 +87,7 @@ app/pipeline/
 ├── __init__.py
 ├── schema.py          # Graph1 + Graph2 DDL
 ├── adapter.py         # PipelineStorage ABC + SQLiteAdapter + InMemorySQLiteAdapter
-├── db.py              # get_pipeline_db() factory
+├── api.py              # storage dependency and /api/pipeline/* router
 ├── operations.py      # OperationExecutor (split/merge/move/delete)
 ├── extract.py         # extract_epub_text()
 ├── populate.py        # populate_initial_spine(), insert_scene()
@@ -95,7 +95,6 @@ app/pipeline/
 ├── assembly.py        # export_annotated_script()
 ├── tts_integration.py # render_audiobook()
 ├── review.py          # ReviewManager
-├── api.py             # /api/pipeline/* FastAPI router
 └── walks/
     ├── __init__.py
     ├── runner.py      # WalkRunner

@@ -5,6 +5,25 @@
 
 import * as API from '../api';
 import { showToast } from '../utils';
+import { state } from '../state';
+
+/**
+ * Canonical walk task names matching WalkRunner.WALK_ORDER in runner.py.
+ * These are the data-task attribute values used in the per-task LLM overrides
+ * table. The short names (without walk_2x_ prefix) match what the backend
+ * walks pass to resolve_task_llm().
+ */
+export const WALK_TASK_NAMES: readonly string[] = [
+  'scene_segmentation',
+  'character_discovery',
+  'script_alias_resolution',
+  'scene_presence',
+  'span_attribution',
+  'character_description',
+  'voice_audition',
+  'voice_assignment',
+  'delivery',
+] as const;
 
 /** Config shape returned by GET /api/config */
 interface TaskOverride {
@@ -78,10 +97,6 @@ interface DefaultPrompts {
   persona_advanced_prompt?: string;
 }
 
-/**
- * Toggle TTS mode between local and external server.
- * Shows/hides relevant form groups based on selected mode.
- */
 /** Human-readable label for a reasoning_effort value ('' / null = 'Default'). */
 function reasoningLabel(value: string | null | undefined): string {
   switch (value) {
@@ -93,6 +108,10 @@ function reasoningLabel(value: string | null | undefined): string {
   }
 }
 
+/**
+ * Toggle TTS mode between local and external server.
+ * Shows/hides relevant form groups based on selected mode.
+ */
 function toggleTTSMode(): void {
   const mode = (document.getElementById('tts-mode') as HTMLSelectElement).value;
   const urlGroup = document.getElementById('tts-url-group');
@@ -109,7 +128,7 @@ function toggleTTSMode(): void {
  * Fetches GET /api/config, populates LLM, TTS, prompts, and generation settings.
  * Also populates the per-task LLM override table.
  */
-async function loadConfig(): Promise<void> {
+export async function loadConfig(): Promise<void> {
   // Set defaults before fetching
   const chunkSizeEl = document.getElementById('chunk-size') as HTMLInputElement;
   const maxTokensEl = document.getElementById('max-tokens') as HTMLInputElement;
@@ -135,10 +154,11 @@ async function loadConfig(): Promise<void> {
       llmTemperatureEl.value = String(config.llm.temperature);
     }
 
-    // Populate per-task LLM overrides
+    // Populate per-task LLM overrides for the 9 walk task names
     const taskRows = document.querySelectorAll<HTMLTableRowElement>('#per-task-llm-table tbody tr');
     taskRows.forEach(row => {
       const taskName = row.getAttribute('data-task');
+      if (!taskName || !WALK_TASK_NAMES.includes(taskName)) return;
       const taskConfig = config.llm?.task_overrides?.[taskName as string];
       const modelInput = row.querySelector<HTMLInputElement>('[data-field="model_name"]');
       const reasoningSelect = row.querySelector<HTMLSelectElement>('[data-field="reasoning_effort"]');
@@ -349,25 +369,25 @@ async function resetPrompts(): Promise<void> {
  * Collect per-task LLM overrides from the table rows.
  * Iterates #per-task-llm-table tbody tr, reads data-task and data-field attributes,
  * builds task_overrides object with {model_name, reasoning_effort, temperature} per task.
+ * Only collects overrides for known walk task names (WALK_TASK_NAMES).
  */
-function collectTaskOverrides(): Record<string, TaskOverride> {
+export function collectTaskOverrides(): Record<string, TaskOverride> {
   const taskOverrides: Record<string, TaskOverride> = {};
   const overrideRows = document.querySelectorAll<HTMLTableRowElement>('#per-task-llm-table tbody tr');
   overrideRows.forEach(row => {
     const taskName = row.getAttribute('data-task');
+    if (!taskName || !WALK_TASK_NAMES.includes(taskName)) return;
     const modelInput = row.querySelector<HTMLInputElement>('[data-field="model_name"]');
     const reasoningSelect = row.querySelector<HTMLSelectElement>('[data-field="reasoning_effort"]');
     const temperatureInput = row.querySelector<HTMLInputElement>('[data-field="temperature"]');
-    if (taskName) {
-      const override: TaskOverride = {
-        model_name: modelInput ? (modelInput.value.trim() || null) : null,
-        reasoning_effort: reasoningSelect ? (reasoningSelect.value || null) : null,
-      };
-      const tempRaw = temperatureInput ? temperatureInput.value.trim() : '';
-      const temp = tempRaw !== '' ? parseFloat(tempRaw) : NaN;
-      override.temperature = isNaN(temp) ? null : temp;
-      taskOverrides[taskName] = override;
-    }
+    const override: TaskOverride = {
+      model_name: modelInput ? (modelInput.value.trim() || null) : null,
+      reasoning_effort: reasoningSelect ? (reasoningSelect.value || null) : null,
+    };
+    const tempRaw = temperatureInput ? temperatureInput.value.trim() : '';
+    const temp = tempRaw !== '' ? parseFloat(tempRaw) : NaN;
+    override.temperature = isNaN(temp) ? null : temp;
+    taskOverrides[taskName] = override;
   });
   return taskOverrides;
 }
@@ -488,9 +508,20 @@ async function handleConfigSubmit(e: Event): Promise<void> {
 }
 
 /**
+ * Handle pipeline toggle switch change.
+ * Updates the global AppState.pipelineEnabled flag.
+ */
+function handlePipelineToggle(): void {
+  const toggleEl = document.getElementById('pipeline-toggle') as HTMLInputElement;
+  if (toggleEl) {
+    state.pipelineEnabled = toggleEl.checked;
+  }
+}
+
+/**
  * Initialize the Setup tab.
  * Attaches event listeners for config form submission, TTS mode toggle,
- * prompt reset, and collapse chevron. Loads config on init.
+ * pipeline toggle, prompt reset, and collapse chevron. Loads config on init.
  */
 export function initSetup(): void {
   document.addEventListener('DOMContentLoaded', () => {
@@ -506,6 +537,12 @@ export function initSetup(): void {
     const ttsModeEl = document.getElementById('tts-mode');
     if (ttsModeEl) {
       ttsModeEl.addEventListener('change', () => toggleTTSMode());
+    }
+
+    // Pipeline mode toggle
+    const pipelineToggle = document.getElementById('pipeline-toggle');
+    if (pipelineToggle) {
+      pipelineToggle.addEventListener('change', () => handlePipelineToggle());
     }
 
     // Reset prompts button

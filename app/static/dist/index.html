@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-BzseeDAl.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-CZUE8oHY.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -137,6 +137,18 @@
                 </div>
                 <div class="card-body">
                     <form id="config-form">
+                        <!-- Pipeline Mode Toggle -->
+                        <div class="mb-4 d-flex align-items-center justify-content-between p-3 bg-body-tertiary rounded border">
+                            <div>
+                                <h6 class="mb-0 fw-bold"><i class="fas fa-stream me-2"></i>Pipeline Mode</h6>
+                                <small class="text-muted">Enable the EPUB-to-M4B pipeline workflow</small>
+                            </div>
+                            <div class="form-check form-switch mb-0">
+                                <input class="form-check-input" type="checkbox" role="switch" id="pipeline-toggle">
+                                <label class="form-check-label" for="pipeline-toggle">Enabled</label>
+                            </div>
+                        </div>
+
                         <h5 class="mb-3">LLM Settings (Script Generation)</h5>
                         <div class="mb-3">
                             <label class="form-label">Base URL</label>
@@ -528,55 +540,73 @@
 
         <!-- Script Tab -->
         <div id="script-tab" class="tab-content" style="display:none;">
-            <div class="card">
-                <div class="card-header">
-                    <h4><span class="step-indicator step-active">2</span>Generate Script</h4>
-                </div>
-                <div class="card-body">
-                    <div class="mb-4">
-                        <label class="form-label">Select Book/Novel (Text, Markdown, or EPUB)</label>
-                        <input type="file" class="form-control" id="file-upload" accept=".txt,.md,.epub">
-                        <div id="upload-status" class="mt-2"></div>
-                    </div>
+            <!-- Pipeline disabled notice -->
+            <div id="pipeline-disabled-notice" class="alert alert-warning" style="display:none;">
+                <h5><i class="fas fa-exclamation-triangle me-2"></i>Pipeline Mode Not Enabled</h5>
+                <p class="mb-0">The Script tab requires pipeline mode. Go to the <strong>Setup</strong> tab and enable the <em>Pipeline Mode</em> toggle to use the new EPUB onboard and walk execution workflow.</p>
+            </div>
 
-                    <div class="mb-3">
-                        <div class="form-check form-switch">
-                            <input class="form-check-input" type="checkbox" id="single-speaker-toggle">
-                            <label class="form-check-label" for="single-speaker-toggle">
-                                Single speaker mode <span class="text-muted">— skip the LLM, narrate the whole text with one voice</span>
-                            </label>
-                        </div>
-                        <div id="single-speaker-options" class="mt-2 ps-4" style="display:none;">
-                            <div class="input-group input-group-sm mb-1">
-                                <span class="input-group-text" style="min-width:130px;">Speaker name</span>
-                                <input type="text" class="form-control" id="single-speaker-name" value="Narrator">
-                            </div>
-                            <div class="input-group input-group-sm">
-                                <span class="input-group-text" style="min-width:130px;">Voice direction</span>
-                                <input type="text" class="form-control" id="single-speaker-instruct" value="Neutral narration.">
-                            </div>
-                            <small class="text-muted">Useful for first-person memoirs, non-fiction, or anything without distinct characters.</small>
-                        </div>
+            <!-- Pipeline section (visible when state.pipelineEnabled is true) -->
+            <div id="pipeline-section" style="display:none;">
+                <div class="card">
+                    <div class="card-header">
+                        <h4><span class="step-indicator step-active">2</span>Pipeline — Onboard &amp; Walks</h4>
                     </div>
+                    <div class="card-body">
+                        <div class="mb-4">
+                            <label class="form-label">Select EPUB File</label>
+                            <input type="file" class="form-control" id="file-upload" accept=".epub">
+                            <div id="upload-status" class="mt-2"></div>
+                        </div>
 
-                    <div class="d-grid gap-2">
-                        <button class="btn btn-success btn-lg" id="btn-gen-script">
-                            <i class="fas fa-magic me-2"></i>Generate Annotated Script
-                        </button>
-                        <small class="text-muted" id="btn-gen-script-hint">Sends the book to your LLM to split it into annotated chunks with speaker labels and voice directions.</small>
-                        <button class="btn btn-outline-secondary btn-lg" id="btn-review-script">
-                            <i class="fas fa-check-double me-2"></i>Review Script (Optional)
-                        </button>
-                        <small class="text-muted">Runs a second LLM pass to fix speaker misattributions or formatting issues. Only needed if the generated script has problems.</small>
-                        <div class="input-group mt-1">
-                            <span class="input-group-text">Context Window</span>
-                            <input type="number" class="form-control" id="review-context-window" value="4" min="1" max="12">
-                            <button class="btn btn-outline-primary" id="btn-review-script-contextual" type="button">
-                                <i class="fas fa-crosshairs me-2"></i>Contextual Review (+/- N)
+                        <div class="d-grid gap-2 mb-3">
+                            <button class="btn btn-success btn-lg" id="btn-onboard-epub">
+                                <i class="fas fa-book-open me-2"></i>Onboard EPUB
                             </button>
+                            <small class="text-muted">Extracts text from the EPUB, populates the document spine, and returns a book ID for walk execution.</small>
                         </div>
-                        <small class="text-muted" id="review-context-estimate">Contextual review runs in batched LLM calls and will show an estimate after you start it.</small>
-                        <small class="text-muted">Reviews each dialog with N entries before and after to fix missed segmentation and wrong speaker labels in difficult author styles.</small>
+
+                        <!-- Walk execution section (shown after successful onboard) -->
+                        <div id="walk-execution-section" style="display:none;">
+                            <hr>
+                            <h5><i class="fas fa-shoe-prints me-2"></i>Walk Execution</h5>
+                            <p class="text-muted small">Run individual walks or all 9 walks in sequence. Walks process the book through scene segmentation, character discovery, voice assignment, and more.</p>
+
+                            <div class="d-flex gap-2 mb-3">
+                                <button class="btn btn-primary" id="btn-run-all-walks">
+                                    <i class="fas fa-play me-2"></i>Run All Walks
+                                </button>
+                                <button class="btn btn-outline-warning" id="btn-reonboard">
+                                    <i class="fas fa-redo me-2"></i>Re-onboard
+                                </button>
+                            </div>
+
+                            <div class="card mb-3">
+                                <div class="card-header py-2">
+                                    <h6 class="m-0">Walk Status</h6>
+                                </div>
+                                <div class="card-body p-2">
+                                    <div id="walk-status-container">
+                                        <!-- Populated by renderWalkStatuses() -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Legacy section (hidden — old endpoints removed) -->
+            <div id="legacy-script-section" style="display:none;">
+                <div class="card">
+                    <div class="card-header">
+                        <h4><span class="step-indicator step-active">2</span>Generate Script</h4>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info mb-0">
+                            <i class="fas fa-info-circle me-2"></i>
+                            Legacy script generation endpoints have been removed. Enable Pipeline Mode in the Setup tab to use the new workflow.
+                        </div>
                     </div>
                 </div>
             </div>
@@ -612,21 +642,24 @@
                     <span id="voice-save-status" class="text-muted small"></span>
                 </div>
                 <div class="card-body">
-                    <p>Voices are detected from the generated script. Changes are saved automatically.</p>
-                    <div class="d-flex align-items-center gap-3 mb-2 flex-wrap">
-                        <button class="btn btn-outline-primary" id="btn-gen-personas"><i class="fas fa-user-robot me-1"></i>Generate Personas</button>
-                        <div class="form-check form-switch m-0">
-                            <input class="form-check-input" type="checkbox" id="advanced-persona-toggle">
-                            <label class="form-check-label" for="advanced-persona-toggle">Advanced</label>
-                        </div>
-                        <div class="input-group input-group-sm" id="advanced-persona-options" style="width: 135px; display:none;">
-                            <span class="input-group-text">Batch</span>
-                            <input class="form-control" id="persona-batch-size" type="number" min="1" max="200" value="40">
-                        </div>
-                        <button class="btn btn-outline-danger" id="btn-cancel-personas" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
-                        <span id="persona-status" class="text-muted small"></span>
+                    <!-- Pipeline disabled notice -->
+                    <div id="pipeline-voices-disabled-notice" class="alert alert-warning" style="display:none;">
+                        <i class="fas fa-exclamation-triangle me-2"></i>
+                        Pipeline mode is not enabled. Enable it in the <strong>Setup</strong> tab to use the character ledger for voice assignment.
+                        The old persona generation endpoints have been removed.
                     </div>
-                    <div id="voices-list"></div>
+
+                    <!-- Pipeline mode: character ledger -->
+                    <div id="pipeline-voices-section" style="display:none;">
+                        <p>Characters are detected from the pipeline walks. Assign TTS voices to each character. Changes are saved automatically.</p>
+                        <div id="character-ledger"></div>
+                    </div>
+
+                    <!-- Legacy mode: voice cards -->
+                    <div id="legacy-voices-section">
+                        <p>Voices are detected from the generated script. Changes are saved automatically.</p>
+                        <div id="voices-list"></div>
+                    </div>
                 </div>
             </div>
 
@@ -1080,55 +1113,119 @@
 
         <!-- Editor Tab -->
         <div id="editor-tab" class="tab-content" style="display:none;">
-            <div class="card">
-                <div class="card-header d-flex justify-content-between align-items-center">
-                     <h4 class="m-0"><span class="step-indicator step-active">4</span>Audio Editor</h4>
-                     <table class="mb-0" style="border-collapse:separate; border-spacing:8px 0;">
-                        <tr>
-                            <td class="text-center align-top" style="min-width:110px;"><button class="btn btn-primary btn-sm w-100" id="btn-play-seq"><i class="fas fa-play me-1"></i>Play Sequence</button></td>
-                            <td class="align-middle text-muted px-1">|</td>
-                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-success btn-sm w-100" id="btn-batch-fast"><i class="fas fa-bolt me-1"></i>Render Pending</button></td>
-                            <td class="align-middle text-muted px-1">|</td>
-                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-outline-success btn-sm w-100" id="btn-regen-all"><i class="fas fa-redo me-1"></i>Regenerate All</button></td>
-                            <td class="text-center align-top"><button class="btn btn-danger btn-sm w-100" id="btn-cancel-render" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button></td>
-                            <td class="align-middle text-muted px-1">|</td>
-                            <td class="text-center align-top" style="min-width:100px;"><button class="btn btn-warning btn-sm w-100" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button></td>
-                        </tr>
-                        <tr>
-                            <td class="text-center text-muted" style="font-size:0.7rem;">Preview generated audio</td>
-                            <td></td>
-                            <td class="text-center text-muted" style="font-size:0.7rem;">Generate audio for all unrendered chunks</td>
-                            <td></td>
-                            <td class="text-center text-muted" style="font-size:0.7rem;">Re-render everything from scratch</td>
-                            <td></td>
-                            <td></td>
-                            <td class="text-center text-muted" style="font-size:0.7rem;">Combine all chunks into final audiobook</td>
-                        </tr>
-                     </table>
-                </div>
-                <div class="card-body">
-                     <!-- Full Progress Bar -->
-                     <div class="progress mb-3" style="height: 25px;">
-                         <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
-                     </div>
+            <!-- Pipeline disabled notice -->
+            <div id="editor-pipeline-disabled-notice" class="alert alert-warning" style="display:none;">
+                <i class="fas fa-exclamation-triangle me-2"></i>
+                <strong>Pipeline mode is disabled.</strong> Enable the pipeline in the Setup tab to use span-based editing with operations and confidence review.
+                The legacy chunk editor is shown below.
+            </div>
 
-                     <div class="table-responsive">
-                         <table class="table table-bordered table-hover">
-                             <thead>
-                                 <tr>
-                                     <th width="3%"></th>
-                                     <th width="9%">Speaker</th>
-                                     <th width="40%">Text</th>
-                                     <th width="14%">Emotion / Style</th>
-                                     <th width="7%">Status</th>
-                                     <th width="27%">Audio / Actions</th>
-                                 </tr>
-                             </thead>
-                             <tbody id="chunks-table-body">
-                                 <!-- Rows will be injected here -->
-                             </tbody>
+            <!-- Pipeline editor section -->
+            <div id="pipeline-editor-section" style="display:none;">
+                <div class="card mb-3">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h4 class="m-0"><span class="step-indicator step-active">4</span>Span Editor <small class="text-muted">(Pipeline Mode)</small></h4>
+                        <div class="d-flex gap-2 align-items-center">
+                            <button class="btn btn-info btn-sm" id="btn-pipeline-merge" disabled title="Select exactly 2 adjacent spans to merge">
+                                <i class="fas fa-compress-alt me-1"></i>Merge Selected
+                            </button>
+                            <button class="btn btn-success btn-sm" id="btn-pipeline-render"><i class="fas fa-bolt me-1"></i>Render</button>
+                            <button class="btn btn-outline-success btn-sm" id="btn-pipeline-regen"><i class="fas fa-redo me-1"></i>Re-render All</button>
+                            <button class="btn btn-danger btn-sm" id="btn-pipeline-cancel" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
+                            <button class="btn btn-warning btn-sm" id="btn-pipeline-merge-audiobook"><i class="fas fa-file-audio me-1"></i>Merge Audiobook</button>
+                            <span id="pipeline-render-job" class="badge bg-info d-none"></span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <!-- Full Progress Bar -->
+                        <div class="progress mb-3" style="height: 25px;">
+                            <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+                        </div>
+
+                        <div class="table-responsive">
+                            <table class="table table-bordered table-hover">
+                                <thead>
+                                    <tr>
+                                        <th width="8%">Index / Select</th>
+                                        <th width="10%">Speaker</th>
+                                        <th width="42%">Text</th>
+                                        <th width="15%">Instruct</th>
+                                        <th width="25%">Operations</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="spans-table-body">
+                                    <!-- Pipeline span rows injected here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Confidence Review Section -->
+                <div class="card mb-3">
+                    <div class="card-header">
+                        <h5 class="m-0"><i class="fas fa-search me-2"></i>Confidence Review</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="review-items-container">
+                            <p class="text-muted mb-0">Loading review items...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Legacy chunk editor section -->
+            <div id="legacy-editor-section">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                         <h4 class="m-0"><span class="step-indicator step-active">4</span>Audio Editor</h4>
+                         <table class="mb-0" style="border-collapse:separate; border-spacing:8px 0;">
+                            <tr>
+                                <td class="text-center align-top" style="min-width:110px;"><button class="btn btn-primary btn-sm w-100" id="btn-play-seq"><i class="fas fa-play me-1"></i>Play Sequence</button></td>
+                                <td class="align-middle text-muted px-1">|</td>
+                                <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-success btn-sm w-100" id="btn-batch-fast-legacy"><i class="fas fa-bolt me-1"></i>Render Pending</button></td>
+                                <td class="align-middle text-muted px-1">|</td>
+                                <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-outline-success btn-sm w-100" id="btn-regen-all-legacy"><i class="fas fa-redo me-1"></i>Regenerate All</button></td>
+                                <td class="text-center align-top"><button class="btn btn-danger btn-sm w-100" id="btn-cancel-render-legacy" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button></td>
+                                <td class="align-middle text-muted px-1">|</td>
+                                <td class="text-center align-top" style="min-width:100px;"><button class="btn btn-warning btn-sm w-100" id="btn-merge-legacy"><i class="fas fa-file-audio me-1"></i>Merge All</button></td>
+                            </tr>
+                            <tr>
+                                <td class="text-center text-muted" style="font-size:0.7rem;">Preview generated audio</td>
+                                <td></td>
+                                <td class="text-center text-muted" style="font-size:0.7rem;">Generate audio for all unrendered chunks</td>
+                                <td></td>
+                                <td class="text-center text-muted" style="font-size:0.7rem;">Re-render everything from scratch</td>
+                                <td></td>
+                                <td></td>
+                                <td class="text-center text-muted" style="font-size:0.7rem;">Combine all chunks into final audiobook</td>
+                            </tr>
                          </table>
-                     </div>
+                    </div>
+                    <div class="card-body">
+                         <!-- Full Progress Bar -->
+                         <div class="progress mb-3" style="height: 25px;">
+                             <div id="legacy-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+                         </div>
+
+                         <div class="table-responsive">
+                             <table class="table table-bordered table-hover">
+                                 <thead>
+                                     <tr>
+                                         <th width="3%"></th>
+                                         <th width="9%">Speaker</th>
+                                         <th width="40%">Text</th>
+                                         <th width="14%">Emotion / Style</th>
+                                         <th width="7%">Status</th>
+                                         <th width="27%">Audio / Actions</th>
+                                     </tr>
+                                 </thead>
+                                 <tbody id="chunks-table-body">
+                                     <!-- Rows will be injected here -->
+                                 </tbody>
+                             </table>
+                         </div>
+                    </div>
                 </div>
             </div>
         </div>

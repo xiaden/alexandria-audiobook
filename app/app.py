@@ -19,7 +19,6 @@ import aiofiles
 from utils import atomic_json_write, PARA_MARKER, CHAP_MARKER
 from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
-from math import ceil
 
 # Import ProjectManager
 from project import ProjectManager
@@ -27,6 +26,9 @@ from default_prompts import load_default_prompts
 from review_prompts import load_review_prompts
 from persona_prompts import load_persona_prompts
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
+
+# Pipeline API router (Phase 1 of pipeline rewrite)
+from app.pipeline.api import router as pipeline_router
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -113,6 +115,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount pipeline API router
+app.include_router(pipeline_router)
 
 # --- System Helpers ---
 
@@ -372,13 +377,6 @@ class DatasetBuilderUpdateMetaRequest(BaseModel):
 class DatasetBuilderUpdateRowsRequest(BaseModel):
     name: str
     rows: List[dict]  # [{emotion, text, seed}]
-
-class ContextualReviewRequest(BaseModel):
-    window_size: int = 4
-
-class GeneratePersonasRequest(BaseModel):
-    advanced: bool = False
-    batch_size: int = 40
 
 class PreparerConfig(BaseModel):
     audio_filename: str
@@ -672,7 +670,7 @@ class _HTMLTextExtractor(HTMLParser):
 
     Block elements are separated by a ``<[para]>`` marker (PARA_MARKER) so that
     paragraph boundaries survive the flattening to plain text and are recoverable
-    by the chunker (see generate_script.split_into_chunks).
+    by the pipeline chunker.
     """
     BLOCK_TAGS = frozenset({
         'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -810,88 +808,6 @@ async def upload_file(file: UploadFile = File(...)):
 
     return {"filename": file.filename, "path": file_path}
 
-class GenerateScriptRequest(BaseModel):
-    single_speaker: bool = False
-    speaker_name: str = "Narrator"
-    instruct: str = "Neutral narration."
-
-@app.post("/api/generate_script")
-async def generate_script(background_tasks: BackgroundTasks, request: GenerateScriptRequest = GenerateScriptRequest()):
-    # Get input file from state.json
-    state_path = os.path.join(ROOT_DIR, "state.json")
-    if not os.path.exists(state_path):
-        raise HTTPException(status_code=400, detail="No input file selected")
-
-    with open(state_path, "r", encoding="utf-8") as f:
-        state = json.load(f)
-        input_file = state.get("input_file_path")
-
-    if not input_file:
-         raise HTTPException(status_code=400, detail="No input file found in state")
-
-    if process_state["script"]["running"]:
-         raise HTTPException(status_code=400, detail="Script generation already running")
-
-    cmd = [sys.executable, "-u", "generate_script.py", input_file]
-    if request.single_speaker:
-        cmd += [
-            "--single-speaker",
-            "--speaker-name", request.speaker_name or "Narrator",
-            "--instruct", request.instruct or "Neutral narration.",
-        ]
-    background_tasks.add_task(run_process, cmd, "script")
-    return {"status": "started"}
-
-@app.post("/api/review_script")
-async def review_script(background_tasks: BackgroundTasks):
-    if not os.path.exists(SCRIPT_PATH):
-        raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
-
-    if process_state["review"]["running"]:
-        raise HTTPException(status_code=400, detail="Script review already running")
-
-    background_tasks.add_task(run_process, [sys.executable, "-u", "review_script.py"], "review")
-    return {"status": "started"}
-
-@app.post("/api/review_script_contextual")
-async def review_script_contextual(request: ContextualReviewRequest, background_tasks: BackgroundTasks):
-    if not os.path.exists(SCRIPT_PATH):
-        raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
-
-    if process_state["review"]["running"]:
-        raise HTTPException(status_code=400, detail="Script review already running")
-
-    window_size = max(1, min(int(request.window_size or 4), 12))
-    total_entries = 0
-    try:
-        with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
-            total_entries = len(json.load(f))
-    except (json.JSONDecodeError, ValueError, OSError):
-        total_entries = 0
-
-    review_batch_size = 25
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                review_batch_size = max(1, int(cfg.get("generation", {}).get("review_batch_size", 25)))
-        except (json.JSONDecodeError, ValueError, TypeError, OSError):
-            review_batch_size = 25
-
-    estimated_calls = ceil(total_entries / review_batch_size) if total_entries else 0
-    background_tasks.add_task(
-        run_process,
-        [sys.executable, "-u", "review_script.py", "--context-window", str(window_size)],
-        "review"
-    )
-    return {
-        "status": "started",
-        "mode": "contextual",
-        "window_size": window_size,
-        "batch_size": review_batch_size,
-        "total_entries": total_entries,
-        "estimated_calls": estimated_calls,
-    }
 
 @app.get("/api/annotated_script")
 async def get_annotated_script():
@@ -949,36 +865,6 @@ async def get_voices():
             "persona_pending": voice_name in missing_speakers
         })
     return result
-
-
-@app.post("/api/generate_personas")
-async def generate_personas(background_tasks: BackgroundTasks, request: GeneratePersonasRequest = GeneratePersonasRequest()):
-    """Generate LLM-derived voice persona descriptions and VoiceDesign previews.
-
-    This runs `app/generate_personas.py` which:
-    - reads `annotated_script.json`,
-    - asks the configured LLM to produce a short `description` and `ref_text` for each character,
-    - uses the VoiceDesign model to synthesize a preview and saves it,
-    - updates `voice_config.json` with a clone-style reference for each character.
-    """
-    if process_state["persona"]["running"]:
-        raise HTTPException(status_code=400, detail="Persona generation already running")
-
-    process_state["persona"]["cancel"] = False
-
-    # Unload TTS engine to free GPU for the subprocess
-    if project_manager.engine is not None:
-        logger.info("Unloading TTS engine for persona generation...")
-        project_manager.engine = None
-        from utils import clear_gpu_cache
-        clear_gpu_cache()
-
-    command = [sys.executable, "-u", "generate_personas.py"]
-    if request.advanced:
-        batch_size = max(1, min(int(request.batch_size or 40), 200))
-        command.extend(["--advanced", "--batch-size", str(batch_size)])
-    background_tasks.add_task(run_process, command, "persona")
-    return {"status": "started", "advanced": request.advanced}
 
 
 @app.post("/api/cancel_persona")
