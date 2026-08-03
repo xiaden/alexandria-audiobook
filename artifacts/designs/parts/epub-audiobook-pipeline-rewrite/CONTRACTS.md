@@ -202,21 +202,24 @@ def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 ```python
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('voice_audition') → temperature=0.3, LOCAL (interpretive)
-# Generates voice profiles, stores in character_metadata
+# Generates voice profiles, stores in character_metadata (key='voice_profile')
+# IMPLEMENTED (Plan E, Phase 1)
 ```
 
 ### Walk 2h: Voice Assignment
 ```python
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('voice_assignment') → temperature=0.1, LOCAL
-# Assigns voice_assignment_id in character table (NOT locked)
+# Assigns voice_assignment_id in character table (NOT locked); NULL if no voice match (NARRATOR/manual)
+# IMPLEMENTED (Plan E, Phase 2)
 ```
 
 ### Walk 2i: Delivery
 ```python
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('delivery') → temperature=0.3, LOCAL (interpretive, MUST LLM)
-# Generates instruct field per span, stores in span.instruct or span_metadata
+# Generates instruct field per span, stores in span.instruct column (existed in schema)
+# IMPLEMENTED (Plan E, Phase 3)
 ```
 
 ## Character Ledger

@@ -162,6 +162,98 @@ def _verify_walk_2f(book_id: str, storage: "PipelineStorage") -> bool:
     return description_count > 0
 
 
+def _verify_walk_2g(book_id: str, storage: "PipelineStorage") -> bool:
+    """Verify that walk_2g_voice_audition produced voice profiles.
+
+    Checks that at least one character has a voice_profile stored in
+    character_metadata. Empty books (no characters) are acceptable.
+    """
+    # Check if any characters exist for this book
+    character_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character_book WHERE book_id = ?",
+        (book_id,),
+    )
+    character_count = character_rows[0]["cnt"] if character_rows else 0
+
+    # If no characters exist, that's fine (empty book)
+    if character_count == 0:
+        return True
+
+    # If characters exist, at least one should have a voice_profile
+    profile_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character_metadata cm "
+        "JOIN character_book cb ON cm.character_id = cb.character_id "
+        "WHERE cb.book_id = ? AND cm.key = 'voice_profile'",
+        (book_id,),
+    )
+    profile_count = profile_rows[0]["cnt"] if profile_rows else 0
+    return profile_count > 0
+
+
+def _verify_walk_2h(book_id: str, storage: "PipelineStorage") -> bool:
+    """Verify that walk_2h_voice_assignment produced voice assignments.
+
+    Checks that at least one character for the book has a non-NULL
+    voice_assignment_id. Empty books (no characters) are acceptable.
+    """
+    # Check if any characters exist for this book
+    character_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character_book WHERE book_id = ?",
+        (book_id,),
+    )
+    character_count = character_rows[0]["cnt"] if character_rows else 0
+
+    # If no characters exist, that's fine (empty book)
+    if character_count == 0:
+        return True
+
+    # If characters exist, at least one should have a voice assignment
+    assignment_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character c "
+        "JOIN character_book cb ON c.id = cb.character_id "
+        "WHERE cb.book_id = ? AND c.voice_assignment_id IS NOT NULL",
+        (book_id,),
+    )
+    assignment_count = assignment_rows[0]["cnt"] if assignment_rows else 0
+    return assignment_count > 0
+
+
+def _verify_walk_2i(book_id: str, storage: "PipelineStorage") -> bool:
+    """Verify that walk_2i_delivery produced delivery instructions.
+
+    Checks that at least one span for the book has a non-NULL instruct
+    column. Empty books (no spans) are acceptable.
+    """
+    # Check if any spans exist for this book
+    span_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM span s "
+        "JOIN paragraph_span ps ON ps.child_id = s.id "
+        "JOIN scene_paragraph sp ON sp.child_id = ps.parent_id "
+        "JOIN chapter_scene cs ON cs.child_id = sp.parent_id "
+        "JOIN chapter c ON c.id = cs.parent_id "
+        "WHERE c.book_id = ?",
+        (book_id,),
+    )
+    span_count = span_rows[0]["cnt"] if span_rows else 0
+
+    # If no spans exist, that's fine (empty book)
+    if span_count == 0:
+        return True
+
+    # If spans exist, at least one should have an instruct value
+    instruct_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM span s "
+        "JOIN paragraph_span ps ON ps.child_id = s.id "
+        "JOIN scene_paragraph sp ON sp.child_id = ps.parent_id "
+        "JOIN chapter_scene cs ON cs.child_id = sp.parent_id "
+        "JOIN chapter c ON c.id = cs.parent_id "
+        "WHERE c.book_id = ? AND s.instruct IS NOT NULL",
+        (book_id,),
+    )
+    instruct_count = instruct_rows[0]["cnt"] if instruct_rows else 0
+    return instruct_count > 0
+
+
 # Per-walk verification registry.
 # Maps walk_name -> verification function.
 # A verification function returns True if the walk's output is valid.
@@ -172,6 +264,9 @@ _VERIFICATIONS: dict[str, VerifyFn] = {
     "walk_2d_scene_presence": _verify_walk_2d,
     "walk_2e_span_attribution": _verify_walk_2e,
     "walk_2f_character_description": _verify_walk_2f,
+    "walk_2g_voice_audition": _verify_walk_2g,
+    "walk_2h_voice_assignment": _verify_walk_2h,
+    "walk_2i_delivery": _verify_walk_2i,
 }
 
 
@@ -195,6 +290,9 @@ class WalkRunner:
         "walk_2d_scene_presence",
         "walk_2e_span_attribution",
         "walk_2f_character_description",
+        "walk_2g_voice_audition",
+        "walk_2h_voice_assignment",
+        "walk_2i_delivery",
     ]
 
     def __init__(self, storage: PipelineStorage) -> None:
