@@ -7,7 +7,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { background-color: #f8f9fa; }
+        body { background-color: var(--bs-body-bg); color: var(--bs-body-color); }
         .container-wide { max-width: 85%; margin-left: auto; margin-right: auto; padding-left: 12px; padding-right: 12px; }
         .nav-link { cursor: pointer; }
         .log-window {
@@ -25,8 +25,8 @@
             display: inline-block;
             width: 25px;
             height: 25px;
-            background-color: #e9ecef;
-            color: #6c757d;
+            background-color: var(--bs-secondary-bg);
+            color: var(--bs-secondary-color);
             border-radius: 50%;
             text-align: center;
             line-height: 25px;
@@ -41,7 +41,7 @@
             background: none;
             padding: 2px 4px;
             cursor: pointer;
-            color: #6c757d;
+            color: var(--bs-secondary-color);
             font-size: 0.85em;
             transition: transform 0.2s ease;
         }
@@ -56,7 +56,41 @@
         .nav-link.nav-advanced { color: rgba(130, 177, 255, 0.7); }
         .nav-link.nav-advanced:hover { color: #82b1ff; }
         .nav-link.nav-advanced.active { color: #fff; background-color: #0d6efd; border-radius: 4px; }
+
+        /* ---------- Dark mode ---------- */
+        /* Bootstrap 5.3 theming is driven by data-bs-theme="dark" on <html>.
+           The overrides below handle the few hardcoded/custom elements. */
+        [data-bs-theme="dark"] body { color-scheme: dark; }
+        [data-bs-theme="dark"] .card {
+            box-shadow: 0 2px 4px rgba(0,0,0,0.6);
+            background-color: var(--bs-card-bg);
+            border-color: var(--bs-border-color);
+        }
+        [data-bs-theme="dark"] .card-header {
+            background-color: var(--bs-tertiary-bg);
+            border-color: var(--bs-border-color);
+        }
+        [data-bs-theme="dark"] .step-indicator {
+            background-color: var(--bs-secondary-bg);
+            color: var(--bs-secondary-color);
+        }
+        [data-bs-theme="dark"] .step-active { background-color: #0d6efd; color: white; }
+        [data-bs-theme="dark"] hr { border-color: var(--bs-border-color); }
+        [data-bs-theme="dark"] .chunk-action-btn { color: var(--bs-secondary-color); }
+        /* Keep the trash icon red in both themes */
+        [data-bs-theme="dark"] .chunk-action-btn i.fa-trash { color: #dc3545; }
     </style>
+    <script>
+        // Apply saved theme before first paint to avoid flash-of-wrong-theme (FOUC).
+        (function () {
+            try {
+                var t = localStorage.getItem('alexandria-theme');
+                if (t === 'dark' || (t === null && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                    document.documentElement.setAttribute('data-bs-theme', 'dark');
+                }
+            } catch (e) { /* localStorage unavailable; default to light */ }
+        })();
+    </script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -81,6 +115,11 @@
                     <li class="nav-item small d-flex align-items-center" title="System Status">
                         <span id="sys-gpu" class="text-light d-flex align-items-center me-3"><i class="fas fa-microchip me-1 text-secondary"></i><span id="sys-gpu-val" style="font-family: monospace;">N/A</span></span>
                         <span id="sys-disk" class="text-light d-flex align-items-center"><i class="fas fa-hdd me-1 text-secondary"></i><span id="sys-disk-val" style="font-family: monospace;">N/A</span></span>
+                    </li>
+                    <li class="nav-item ms-2">
+                        <button id="theme-toggle" class="btn btn-sm btn-outline-light d-flex align-items-center" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
+                            <i class="fas fa-sun" id="theme-toggle-icon"></i>
+                        </button>
                     </li>
                 </ul>
             </div>

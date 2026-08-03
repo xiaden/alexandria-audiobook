@@ -8,6 +8,7 @@ import './api';
 import './state';
 import './utils';
 import './templates';
+import { initTheme } from './theme';
 
 // Import tab modules
 import { initSetup } from './tabs/setup';
@@ -22,6 +23,7 @@ import { initAudio } from './tabs/audio';
 
 // Initialize all tabs after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
+    initTheme();
     initSetup();
     initScript();
     initVoices();
