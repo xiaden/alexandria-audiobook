@@ -62,10 +62,10 @@ def _populate_test_spine(conn: sqlite3.Connection) -> dict:
     conn.execute("INSERT INTO scene VALUES ('sc1')")
     conn.execute("INSERT INTO paragraph VALUES ('p1')")
     conn.execute("INSERT INTO paragraph VALUES ('p2')")
-    conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp2', 'quotation', 'angrily')")
-    conn.execute("INSERT INTO span VALUES ('sp3', 'sentence', NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp4', 'sentence', NULL)")
+    conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
+    conn.execute("INSERT INTO span VALUES ('sp2', 'quotation', 'angrily', 'Hello')")
+    conn.execute("INSERT INTO span VALUES ('sp3', 'sentence', NULL, NULL)")
+    conn.execute("INSERT INTO span VALUES ('sp4', 'sentence', NULL, NULL)")
 
     # Edge tables
     conn.execute("INSERT INTO book_chapter VALUES ('c1', 'b1', 1)")

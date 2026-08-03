@@ -174,6 +174,8 @@ def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('scene_presence') → temperature=0.1, LOCAL
 # Refines character_scene junctions (relation_type=present)
+# IMPLEMENTED (Plan D, Phase 1)
+# DEVIATION: refines walk_2b's character_scene junctions (checks existing to avoid duplicates, adds missed)
 ```
 
 ### Walk 2e: Span Speaker Attribution
@@ -181,13 +183,19 @@ def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('span_attribution') → temperature=0.1, LOCAL
 # Creates character_span junctions with relation_type=speaker for quotations
+# IMPLEMENTED (Plan D, Phase 2)
+# SCHEMA ADDITION: span.text TEXT column added (DDL in schema.py + migration in populate.py) —
+#   needed to store quotation text for LLM attribution prompts.
+# UNKNOWN speakers left unattributed (no junction); resolved to NARRATOR at TTS boundary.
 ```
 
 ### Walk 2f: Character Description
 ```python
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('character_description') → temperature=0.1, LOCAL
-# Generates character descriptions, stores in character_metadata
+# Generates character descriptions, stores in character_metadata (key='description') via UPSERT
+# IMPLEMENTED (Plan D, Phase 3)
+# NOTE: per plan, description lives in character_metadata not character.description (takes precedence over CONTRACTS listing)
 ```
 
 ### Walk 2g: Voice Audition

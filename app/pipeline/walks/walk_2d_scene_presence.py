@@ -1,0 +1,385 @@
+"""Walk 2d: Scene presence refinement.
+
+Refines ``character_scene`` junctions by re-checking character presence in each
+scene with additional context.  Walk 2b created initial ``character_scene``
+junctions with ``relation_type='present'`` during character discovery.  Walk 2d
+re-evaluates presence with the full list of known characters (names + UUIDs)
+so the LLM can identify characters that Walk 2b missed.
+
+For each scene, the walk:
+1. Queries existing characters for the book (name + UUID).
+2. Queries scene paragraphs (text).
+3. Sends both to the LLM asking which characters are present.
+4. Parses the response (list of character UUIDs with confidence).
+5. Creates missing ``character_scene`` junctions (skips existing ones).
+
+Confidence filter:
+- ≥0.7: auto-accept (junction created)
+- <0.5: auto-reject (junction skipped)
+- 0.5–0.7: flagged for user review (junction created but tracked)
+
+LLM configuration is resolved via ``resolve_task_llm('scene_presence')``
+with temperature=0.1 for format stability.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.pipeline.adapter import PipelineStorage
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> dict:
+    """Run Walk 2d scene presence refinement for a book.
+
+    Queries scenes for the book, sends each scene's paragraph text along with
+    the list of existing characters to an LLM for presence identification,
+    parses the response, and creates missing ``character_scene`` junctions.
+
+    Parameters
+    ----------
+    book_id:
+        UUID of the book to process.
+    storage:
+        Pipeline storage adapter.
+    config:
+        App config dict (passed to ``resolve_task_llm``).
+
+    Returns
+    -------
+    dict:
+        Summary with keys: ``book_id``, ``scenes_processed``,
+        ``junctions_created``, ``junctions_for_review``, ``errors``.
+    """
+    from app.utils import create_llm_client, resolve_task_llm
+
+    result: dict[str, Any] = {
+        "book_id": book_id,
+        "scenes_processed": 0,
+        "junctions_created": 0,
+        "junctions_for_review": 0,
+        "errors": [],
+    }
+
+    # Resolve LLM config for scene presence
+    llm_config = resolve_task_llm("scene_presence", config_path=None)
+    client, _ = create_llm_client(config_path=None)
+    model_name = llm_config["model_name"]
+    temperature = llm_config["temperature"]
+    reasoning_effort = llm_config.get("reasoning_effort")
+
+    # Look up book existence
+    book_rows = storage.execute_query(
+        "SELECT series_id FROM book WHERE id = ?", (book_id,)
+    )
+    if not book_rows:
+        logger.error(f"Book {book_id} not found")
+        result["errors"].append({"book_id": book_id, "error": "Book not found"})
+        return result
+
+    # Load existing characters for this book (name + UUID)
+    existing_characters = _load_existing_characters(book_id, storage)
+
+    # Query scenes for this book (ordered by chapter, then position)
+    scenes = storage.execute_query(
+        """
+        SELECT cs.child_id AS scene_id
+        FROM chapter_scene cs
+        JOIN chapter c ON cs.parent_id = c.id
+        WHERE c.book_id = ?
+        ORDER BY c.id, cs.position
+        """,
+        (book_id,),
+    )
+
+    for scene_row in scenes:
+        scene_id = scene_row["scene_id"]
+        result["scenes_processed"] += 1
+
+        try:
+            _process_scene(
+                scene_id=scene_id,
+                book_id=book_id,
+                storage=storage,
+                client=client,
+                model_name=model_name,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                existing_characters=existing_characters,
+                result=result,
+            )
+        except Exception as e:
+            logger.error(f"Error processing scene {scene_id}: {e}")
+            result["errors"].append({"scene_id": scene_id, "error": str(e)})
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_existing_characters(
+    book_id: str, storage: PipelineStorage
+) -> list[dict[str, str]]:
+    """Load existing character id + name mappings for this book."""
+    rows = storage.execute_query(
+        """
+        SELECT c.id, c.name
+        FROM character c
+        JOIN character_book cb ON cb.character_id = c.id
+        WHERE cb.book_id = ?
+        ORDER BY c.name
+        """,
+        (book_id,),
+    )
+    return [{"id": row["id"], "name": row["name"]} for row in rows]
+
+
+def _load_existing_junctions(
+    scene_id: str, storage: PipelineStorage
+) -> set[str]:
+    """Load existing character_ids that already have a character_scene junction for this scene."""
+    rows = storage.execute_query(
+        "SELECT character_id FROM character_scene WHERE scene_id = ?",
+        (scene_id,),
+    )
+    return {row["character_id"] for row in rows}
+
+
+def _process_scene(
+    scene_id: str,
+    book_id: str,
+    storage: PipelineStorage,
+    client: Any,
+    model_name: str,
+    temperature: float,
+    reasoning_effort: str | None,
+    existing_characters: list[dict[str, str]],
+    result: dict,
+) -> None:
+    """Process a single scene: query paragraphs, call LLM, create junctions."""
+    # Query paragraphs for this scene
+    paragraphs = storage.execute_query(
+        """
+        SELECT p.id AS paragraph_id, p.text
+        FROM paragraph p
+        JOIN scene_paragraph sp ON sp.child_id = p.id
+        WHERE sp.parent_id = ?
+        ORDER BY sp.position
+        """,
+        (scene_id,),
+    )
+
+    if not paragraphs:
+        logger.warning(f"No paragraphs found for scene {scene_id}")
+        return
+
+    # Load existing character_scene junctions for this scene
+    existing_junctions = _load_existing_junctions(scene_id, storage)
+
+    # Build LLM prompt with existing characters + scene text
+    prompt = _build_prompt(paragraphs, existing_characters)
+
+    # Call LLM
+    response_text = _call_llm(
+        client=client,
+        model_name=model_name,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        prompt=prompt,
+    )
+
+    # Parse response
+    presence_list = _parse_llm_response(response_text)
+
+    # Process each character presence
+    conn = storage.get_connection()
+    conn.execute("SAVEPOINT walk_2d_scene")
+    try:
+        for presence_data in presence_list:
+            _process_presence(
+                presence_data=presence_data,
+                scene_id=scene_id,
+                storage=storage,
+                existing_junctions=existing_junctions,
+                result=result,
+            )
+        conn.execute("RELEASE SAVEPOINT walk_2d_scene")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT walk_2d_scene")
+        raise
+
+
+def _process_presence(
+    presence_data: dict,
+    scene_id: str,
+    storage: PipelineStorage,
+    existing_junctions: set[str],
+    result: dict,
+) -> None:
+    """Process a single character presence from the LLM response.
+
+    Applies confidence filter and creates character_scene junction if needed.
+    """
+    character_id = presence_data.get("character_id", "").strip()
+    if not character_id:
+        return
+
+    confidence = presence_data.get("confidence", 0.8)
+    if not isinstance(confidence, (int, float)):
+        confidence = 0.8
+    # Clamp to [0, 1]
+    confidence = max(0.0, min(1.0, float(confidence)))
+
+    # Confidence filter
+    if confidence < 0.5:
+        # Auto-reject
+        return
+
+    is_review = 0.5 <= confidence < 0.7
+
+    # Skip if junction already exists for this character+scene
+    if character_id in existing_junctions:
+        return
+
+    # Create character_scene junction with relation_type='present'
+    storage.execute_insert(
+        "INSERT INTO character_scene "
+        "(character_id, scene_id, relation_type, source, confidence, human_override) "
+        "VALUES (?, ?, 'present', 'walk', ?, 0)",
+        (character_id, scene_id, confidence),
+    )
+
+    # Track this junction so we don't create duplicates within this walk
+    existing_junctions.add(character_id)
+    result["junctions_created"] += 1
+
+    if is_review:
+        result["junctions_for_review"] += 1
+
+
+def _build_prompt(
+    paragraphs: list[dict], existing_characters: list[dict[str, str]]
+) -> str:
+    """Build the LLM prompt for scene presence identification.
+
+    Includes the list of existing characters (name + UUID) and the scene text.
+    """
+    paragraph_lines = []
+    for idx, para in enumerate(paragraphs, start=1):
+        text = (para.get("text") or "").strip()
+        if text:
+            paragraph_lines.append(f"[P{idx}] {text}")
+
+    paragraphs_text = "\n".join(paragraph_lines)
+
+    # Build character list
+    character_lines = []
+    for char in existing_characters:
+        character_lines.append(f"- {char['name']} (UUID: {char['id']})")
+
+    characters_text = "\n".join(character_lines) if character_lines else "(no characters yet)"
+
+    prompt = f"""You are analyzing a scene from a novel to identify which characters are present.
+
+Here are the characters that exist in this book:
+{characters_text}
+
+Here are the paragraphs in this scene:
+
+{paragraphs_text}
+
+For the following scene text, which of the listed characters are present? Return a JSON array with character_ids (array of UUIDs) and confidence. Return ONLY a JSON array.
+
+Example:
+[
+  {{"character_id": "uuid-here", "confidence": 0.95}},
+  {{"character_id": "uuid-there", "confidence": 0.8}}
+]
+"""
+    return prompt
+
+
+def _call_llm(
+    client: Any,
+    model_name: str,
+    temperature: float,
+    reasoning_effort: str | None,
+    prompt: str,
+) -> str:
+    """Call the LLM and return the response text."""
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a literary analyst specializing in character presence in narrative scenes.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    extra_body = {}
+    if reasoning_effort is not None:
+        extra_body["reasoning_effort"] = reasoning_effort
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=temperature,
+        extra_body=extra_body if extra_body else None,
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+def _parse_llm_response(response_text: str) -> list[dict]:
+    """Parse the LLM response into a list of presence dicts."""
+    # Try json.loads first
+    try:
+        presence_list = json.loads(response_text)
+    except json.JSONDecodeError:
+        # Try to find JSON array in response with regex fallback
+        match = re.search(r"\[[\s\S]*\]", response_text)
+        if match:
+            try:
+                presence_list = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                logger.error(
+                    f"Failed to parse LLM response as JSON: {response_text[:200]}"
+                )
+                return []
+        else:
+            logger.error(f"No JSON array found in LLM response: {response_text[:200]}")
+            return []
+
+    if not isinstance(presence_list, list):
+        logger.error(f"LLM response is not a list: {type(presence_list)}")
+        return []
+
+    # Validate and normalize entries
+    result = []
+    for entry in presence_list:
+        if not isinstance(entry, dict):
+            continue
+        character_id = entry.get("character_id", "")
+        if not isinstance(character_id, str) or not character_id.strip():
+            continue
+        result.append(
+            {
+                "character_id": character_id.strip(),
+                "confidence": entry.get("confidence", 0.8),
+            }
+        )
+
+    return result

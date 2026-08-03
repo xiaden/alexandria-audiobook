@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS paragraph (
 CREATE TABLE IF NOT EXISTS span (
     id TEXT PRIMARY KEY,
     span_type TEXT NOT NULL CHECK (span_type IN ('sentence', 'quotation')),
-    instruct TEXT
+    instruct TEXT,
+    text TEXT
 );
 """
 

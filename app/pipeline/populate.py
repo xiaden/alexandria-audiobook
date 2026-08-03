@@ -71,6 +71,7 @@ def populate_initial_spine(
         Pipeline storage adapter.
     """
     _ensure_paragraph_text_column(storage)
+    _ensure_span_text_column(storage)
     conn = storage.get_connection()
     conn.execute("SAVEPOINT populate_spine")
     try:
@@ -184,7 +185,7 @@ def _insert_paragraphs_and_spans(
         para_text = _reconstruct_paragraph_text(paragraph.get("spans", []))
         _insert_paragraph(paragraph_id, scene_id, para_idx, para_text, storage)
         for span_idx, span in enumerate(paragraph["spans"], start=1):
-            _insert_span(span["id"], span["span_type"], paragraph_id, span_idx, storage)
+            _insert_span(span["id"], span["span_type"], paragraph_id, span_idx, storage, span.get("text", ""))
 
 
 def _insert_paragraph(
@@ -206,12 +207,12 @@ def _insert_paragraph(
 
 
 def _insert_span(
-    span_id: str, span_type: str, paragraph_id: str, position: int, storage: PipelineStorage
+    span_id: str, span_type: str, paragraph_id: str, position: int, storage: PipelineStorage, span_text: str = ""
 ) -> None:
     """Insert span row and paragraph_span edge."""
     storage.execute_insert(
-        "INSERT INTO span (id, span_type, instruct) VALUES (?, ?, NULL)",
-        (span_id, span_type),
+        "INSERT INTO span (id, span_type, instruct, text) VALUES (?, ?, NULL, ?)",
+        (span_id, span_type, span_text),
     )
     storage.execute_insert(
         "INSERT INTO paragraph_span (child_id, parent_id, position) VALUES (?, ?, ?)",
@@ -282,6 +283,28 @@ def _ensure_paragraph_text_column(storage: PipelineStorage) -> None:
         cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(paragraph)").fetchall()
+        }
+        if "text" not in cols:
+            raise
+
+
+def _ensure_span_text_column(storage: PipelineStorage) -> None:
+    """Add ``text TEXT`` column to span table if it does not exist.
+
+    Walk 2e needs span text for LLM prompts (quotation attribution). The schema
+    module now includes this column, but existing databases need the migration.
+    """
+    conn = storage.get_connection()
+    try:
+        conn.execute(
+            "ALTER TABLE span ADD COLUMN text TEXT"
+        )
+    except sqlite3.OperationalError:
+        # Column already exists or SQLite version doesn't support IF NOT EXISTS.
+        # Verify the column is present; if not, re-raise.
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(span)").fetchall()
         }
         if "text" not in cols:
             raise

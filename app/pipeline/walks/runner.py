@@ -77,6 +77,91 @@ def _verify_walk_2c(book_id: str, storage: "PipelineStorage") -> bool:
     return orphan_count == 0
 
 
+def _verify_walk_2d(book_id: str, storage: "PipelineStorage") -> bool:
+    """Verify that walk_2d_scene_presence produced character_scene junctions.
+
+    Checks that at least one character_scene junction exists for the book's
+    scenes.  Walk 2d refines walk 2b's junctions, so if walk 2b created any,
+    walk 2d's verification should pass.
+    """
+    rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character_scene cs "
+        "JOIN chapter_scene cscene ON cs.scene_id = cscene.child_id "
+        "JOIN chapter c ON cscene.parent_id = c.id "
+        "WHERE c.book_id = ?",
+        (book_id,),
+    )
+    junction_count = rows[0]["cnt"] if rows else 0
+    return junction_count > 0
+
+
+def _verify_walk_2e(book_id: str, storage: "PipelineStorage") -> bool:
+    """Verify that walk_2e_span_attribution produced speaker attributions.
+
+    Checks that quotation spans exist for the book. If quotations exist, at
+    least one should have a character_span junction with relation_type='speaker'.
+    Empty books (no quotations) are acceptable.
+    """
+    # Check if any quotation spans exist for this book
+    quotation_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM span s "
+        "JOIN paragraph_span ps ON ps.child_id = s.id "
+        "JOIN scene_paragraph sp ON sp.child_id = ps.parent_id "
+        "JOIN chapter_scene cs ON cs.child_id = sp.parent_id "
+        "JOIN chapter c ON c.id = cs.parent_id "
+        "WHERE c.book_id = ? AND s.span_type = 'quotation'",
+        (book_id,),
+    )
+    quotation_count = quotation_rows[0]["cnt"] if quotation_rows else 0
+
+    # If no quotations exist, that's fine (empty book)
+    if quotation_count == 0:
+        return True
+
+    # If quotations exist, at least one should have a speaker junction
+    speaker_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character_span cs "
+        "JOIN span s ON cs.span_id = s.id "
+        "JOIN paragraph_span ps ON ps.child_id = s.id "
+        "JOIN scene_paragraph sp ON sp.child_id = ps.parent_id "
+        "JOIN chapter_scene cscene ON cscene.child_id = sp.parent_id "
+        "JOIN chapter c ON c.id = cscene.parent_id "
+        "WHERE c.book_id = ? AND s.span_type = 'quotation' "
+        "AND cs.relation_type = 'speaker'",
+        (book_id,),
+    )
+    speaker_count = speaker_rows[0]["cnt"] if speaker_rows else 0
+    return speaker_count > 0
+
+
+def _verify_walk_2f(book_id: str, storage: "PipelineStorage") -> bool:
+    """Verify that walk_2f_character_description produced character descriptions.
+
+    Checks that at least one character has a description stored in
+    character_metadata. Empty books (no characters) are acceptable.
+    """
+    # Check if any characters exist for this book
+    character_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character_book WHERE book_id = ?",
+        (book_id,),
+    )
+    character_count = character_rows[0]["cnt"] if character_rows else 0
+
+    # If no characters exist, that's fine (empty book)
+    if character_count == 0:
+        return True
+
+    # If characters exist, at least one should have a description
+    description_rows = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM character_metadata cm "
+        "JOIN character_book cb ON cm.character_id = cb.character_id "
+        "WHERE cb.book_id = ? AND cm.key = 'description'",
+        (book_id,),
+    )
+    description_count = description_rows[0]["cnt"] if description_rows else 0
+    return description_count > 0
+
+
 # Per-walk verification registry.
 # Maps walk_name -> verification function.
 # A verification function returns True if the walk's output is valid.
@@ -84,6 +169,9 @@ _VERIFICATIONS: dict[str, VerifyFn] = {
     "walk_2a_scene_segmentation": _verify_walk_2a,
     "walk_2b_character_discovery": _verify_walk_2b,
     "walk_2c_alias_resolution": _verify_walk_2c,
+    "walk_2d_scene_presence": _verify_walk_2d,
+    "walk_2e_span_attribution": _verify_walk_2e,
+    "walk_2f_character_description": _verify_walk_2f,
 }
 
 
@@ -104,6 +192,9 @@ class WalkRunner:
         "walk_2a_scene_segmentation",
         "walk_2b_character_discovery",
         "walk_2c_alias_resolution",
+        "walk_2d_scene_presence",
+        "walk_2e_span_attribution",
+        "walk_2f_character_description",
     ]
 
     def __init__(self, storage: PipelineStorage) -> None:
