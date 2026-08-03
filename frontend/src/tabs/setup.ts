@@ -10,6 +10,7 @@ import { showToast } from '../utils';
 interface TaskOverride {
   model_name: string | null;
   reasoning_effort: string | null;
+  temperature?: number | null;
 }
 
 interface LLMConfig {
@@ -17,6 +18,7 @@ interface LLMConfig {
   api_key: string;
   model_name: string;
   reasoning_effort?: string | null;
+  temperature?: number;
   task_overrides?: Record<string, TaskOverride>;
 }
 
@@ -128,6 +130,11 @@ async function loadConfig(): Promise<void> {
     const llmReasoningEl = document.getElementById('llm-reasoning') as HTMLSelectElement;
     if (llmReasoningEl) llmReasoningEl.value = config.llm.reasoning_effort || '';
 
+    const llmTemperatureEl = document.getElementById('llm-temperature') as HTMLInputElement;
+    if (llmTemperatureEl && config.llm.temperature != null) {
+      llmTemperatureEl.value = String(config.llm.temperature);
+    }
+
     // Populate per-task LLM overrides
     const taskRows = document.querySelectorAll<HTMLTableRowElement>('#per-task-llm-table tbody tr');
     taskRows.forEach(row => {
@@ -135,6 +142,7 @@ async function loadConfig(): Promise<void> {
       const taskConfig = config.llm?.task_overrides?.[taskName as string];
       const modelInput = row.querySelector<HTMLInputElement>('[data-field="model_name"]');
       const reasoningSelect = row.querySelector<HTMLSelectElement>('[data-field="reasoning_effort"]');
+      const temperatureInput = row.querySelector<HTMLInputElement>('[data-field="temperature"]');
       if (modelInput) {
         modelInput.value = (taskConfig && taskConfig.model_name) ? taskConfig.model_name : '';
         // Surface the inherited global model so per-task inheritance is visible
@@ -145,6 +153,11 @@ async function loadConfig(): Promise<void> {
         // Label the Inherit option with the resolved global reasoning value
         const inheritOpt = reasoningSelect.querySelector<HTMLOptionElement>('option[value=""]');
         if (inheritOpt) inheritOpt.textContent = `Inherit (${reasoningLabel(config.llm.reasoning_effort)})`;
+      }
+      if (temperatureInput) {
+        temperatureInput.value = (taskConfig && taskConfig.temperature != null) ? String(taskConfig.temperature) : '';
+        // Surface the inherited global temperature so per-task inheritance is visible
+        temperatureInput.placeholder = `Inherit: ${config.llm.temperature != null ? config.llm.temperature : 0.6}`;
       }
     });
 
@@ -335,7 +348,7 @@ async function resetPrompts(): Promise<void> {
 /**
  * Collect per-task LLM overrides from the table rows.
  * Iterates #per-task-llm-table tbody tr, reads data-task and data-field attributes,
- * builds task_overrides object with {model_name, reasoning_effort} per task.
+ * builds task_overrides object with {model_name, reasoning_effort, temperature} per task.
  */
 function collectTaskOverrides(): Record<string, TaskOverride> {
   const taskOverrides: Record<string, TaskOverride> = {};
@@ -344,11 +357,16 @@ function collectTaskOverrides(): Record<string, TaskOverride> {
     const taskName = row.getAttribute('data-task');
     const modelInput = row.querySelector<HTMLInputElement>('[data-field="model_name"]');
     const reasoningSelect = row.querySelector<HTMLSelectElement>('[data-field="reasoning_effort"]');
+    const temperatureInput = row.querySelector<HTMLInputElement>('[data-field="temperature"]');
     if (taskName) {
-      taskOverrides[taskName] = {
+      const override: TaskOverride = {
         model_name: modelInput ? (modelInput.value.trim() || null) : null,
         reasoning_effort: reasoningSelect ? (reasoningSelect.value || null) : null,
       };
+      const tempRaw = temperatureInput ? temperatureInput.value.trim() : '';
+      const temp = tempRaw !== '' ? parseFloat(tempRaw) : NaN;
+      override.temperature = isNaN(temp) ? null : temp;
+      taskOverrides[taskName] = override;
     }
   });
   return taskOverrides;
@@ -380,6 +398,7 @@ async function handleConfigSubmit(e: Event): Promise<void> {
   const llmKeyEl = document.getElementById('llm-key') as HTMLInputElement;
   const llmModelEl = document.getElementById('llm-model') as HTMLInputElement;
   const llmReasoningEl = document.getElementById('llm-reasoning') as HTMLSelectElement;
+  const llmTemperatureEl = document.getElementById('llm-temperature') as HTMLInputElement;
   const ttsModeEl = document.getElementById('tts-mode') as HTMLSelectElement;
   const ttsUrlEl = document.getElementById('tts-url') as HTMLInputElement;
   const ttsDeviceEl = document.getElementById('tts-device') as HTMLSelectElement;
@@ -416,6 +435,7 @@ async function handleConfigSubmit(e: Event): Promise<void> {
       api_key: llmKeyEl?.value || '',
       model_name: llmModelEl?.value || '',
       reasoning_effort: llmReasoningEl?.value || null,
+      temperature: parseFloat(llmTemperatureEl?.value || '0.6'),
       task_overrides: taskOverrides,
     },
     tts: {

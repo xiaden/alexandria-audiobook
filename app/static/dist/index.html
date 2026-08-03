@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-BRZl3mO8.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-BzseeDAl.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -162,6 +162,11 @@
                             </select>
                             <div class="form-text">Global default reasoning depth. Per-task overrides below can inherit or override it.</div>
                         </div>
+                        <div class="mb-3">
+                            <label class="form-label">Temperature</label>
+                            <input type="number" class="form-control" id="llm-temperature" placeholder="0.6" min="0" max="2" step="0.1">
+                            <div class="form-text">Global default sampling temperature. Per-task overrides below can inherit or override it.</div>
+                        </div>
 
                         <div class="mb-4">
                             <h6 class="fw-bold mb-2"><i class="fas fa-microchip me-2"></i>Per-Task Model Overrides</h6>
@@ -170,9 +175,10 @@
                                 <table id="per-task-llm-table" class="table table-sm table-borderless align-middle mb-0">
                                     <thead class="table-light">
                                         <tr>
-                                            <th style="width: 35%">Task</th>
-                                            <th style="width: 40%">Model Name</th>
-                                            <th style="width: 25%">Reasoning Effort</th>
+                                            <th style="width: 30%">Task</th>
+                                            <th style="width: 35%">Model Name</th>
+                                            <th style="width: 20%">Reasoning Effort</th>
+                                            <th style="width: 15%">Temperature</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -188,6 +194,7 @@
                                                     <option value="high">High</option>
                                                 </select>
                                             </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
                                         <tr data-task="script_review">
                                             <td class="fw-medium">Script Review</td>
@@ -201,6 +208,7 @@
                                                     <option value="high">High</option>
                                                 </select>
                                             </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
                                         <tr data-task="alias_resolution">
                                             <td class="fw-medium">Alias Resolution</td>
@@ -214,6 +222,7 @@
                                                     <option value="high">High</option>
                                                 </select>
                                             </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
                                         <tr data-task="persona_discovery">
                                             <td class="fw-medium">Persona Discovery</td>
@@ -227,6 +236,7 @@
                                                     <option value="high">High</option>
                                                 </select>
                                             </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
                                         <tr data-task="persona_compilation">
                                             <td class="fw-medium">Persona Compilation</td>
@@ -240,6 +250,7 @@
                                                     <option value="high">High</option>
                                                 </select>
                                             </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
                                         <tr data-task="basic_persona_generation">
                                             <td class="fw-medium">Basic Persona Gen</td>
@@ -253,6 +264,7 @@
                                                     <option value="high">High</option>
                                                 </select>
                                             </td>
+                                            <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
                                         </tr>
                                     </tbody>
                                 </table>

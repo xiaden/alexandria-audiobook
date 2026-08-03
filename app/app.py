@@ -192,9 +192,10 @@ async def get_system_stats():
 
 # Data Models
 class TaskLLMConfig(BaseModel):
-    """Per-task LLM override. Both fields optional — None means 'inherit global default'."""
+    """Per-task LLM override. All fields optional — None means 'inherit global default'."""
     model_name: Optional[str] = None
     reasoning_effort: Optional[str] = None
+    temperature: Optional[float] = None
 
 class LLMTaskOverrides(BaseModel):
     """Per-task LLM configuration overrides. Each field is a TaskLLMConfig instance."""
@@ -211,7 +212,8 @@ class LLMConfig(BaseModel):
     Holds the base URL, API key, and default model for all LLM calls,
     plus optional per-task overrides. Resolution order for each task is:
     task-specific override (``task_overrides.<task>``) → global default
-    (``model_name`` / ``reasoning_effort`` here) → hardcoded fallback.
+    (``model_name`` / ``reasoning_effort`` / ``temperature`` here) →
+    hardcoded fallback.
 
     Attributes:
         base_url: OpenAI-compatible API endpoint.
@@ -220,13 +222,17 @@ class LLMConfig(BaseModel):
         reasoning_effort: Global default reasoning depth passed to the provider
             (e.g. ``'low'``, ``'medium'``, ``'high'``). ``None`` means use the
             provider's default.
-        task_overrides: Per-task model and reasoning overrides keyed by task name
-            (e.g. ``script_generation``, ``persona_discovery``).
+        temperature: Global default sampling temperature. Used when a task
+            override does not set its own ``temperature``.
+        task_overrides: Per-task model, reasoning, and temperature overrides
+            keyed by task name (e.g. ``script_generation``,
+            ``persona_discovery``).
     """
     base_url: str
     api_key: str
     model_name: str
     reasoning_effort: Optional[str] = None  # Global default reasoning effort
+    temperature: float = 0.6  # Global default sampling temperature
     task_overrides: LLMTaskOverrides = LLMTaskOverrides()  # Per-task overrides
 
 class TTSConfig(BaseModel):

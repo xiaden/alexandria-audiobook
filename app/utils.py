@@ -91,13 +91,16 @@ def load_llm_config(config_path=None):
 
 
 def resolve_task_llm(task_name: str, config_path=None) -> dict:
-    """Resolve per-task LLM config. Returns {'model_name': str, 'reasoning_effort': str|None}.
+    """Resolve per-task LLM config.
+
+    Returns ``{'model_name': str, 'reasoning_effort': str|None, 'temperature': float}``.
 
     Resolution order: task-specific override -> global default -> hardcoded fallback.
     """
     # Hardcoded fallback defaults
     _FALLBACK_MODEL = "richardyoung/qwen3-14b-abliterated:Q8_0"
     _FALLBACK_REASONING = None
+    _FALLBACK_TEMPERATURE = 0.6
 
     config = load_app_config(config_path) or {}
     llm = config.get("llm", {})
@@ -105,6 +108,7 @@ def resolve_task_llm(task_name: str, config_path=None) -> dict:
     # Global defaults from config (or fallback)
     global_model = llm.get("model_name", _FALLBACK_MODEL)
     global_reasoning = llm.get("reasoning_effort", _FALLBACK_REASONING)
+    global_temperature = llm.get("temperature", _FALLBACK_TEMPERATURE)
 
     # Task-specific overrides
     task_overrides = llm.get("task_overrides", {})
@@ -118,7 +122,12 @@ def resolve_task_llm(task_name: str, config_path=None) -> dict:
     override_reasoning = task_override.get("reasoning_effort") if isinstance(task_override, dict) else None
     reasoning = override_reasoning if override_reasoning else global_reasoning
 
-    return {"model_name": model, "reasoning_effort": reasoning}
+    # Resolve temperature: task override -> global -> hardcoded fallback.
+    # Uses `is not None` (not truthiness) so an explicit 0.0 is honored.
+    override_temperature = task_override.get("temperature") if isinstance(task_override, dict) else None
+    temperature = override_temperature if override_temperature is not None else global_temperature
+
+    return {"model_name": model, "reasoning_effort": reasoning, "temperature": temperature}
 
 
 def load_generation_config(config_path=None):
