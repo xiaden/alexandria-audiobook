@@ -23,6 +23,7 @@ import { state } from '../state';
 import { loadChunks } from './editor';
 import { loadVoices } from './voices';
 import { resetDesignerForm, loadDesignedVoices } from './designer';
+import { WALK_ORDER, WALK_DISPLAY_NAMES } from '../pipeline/walks';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -62,41 +63,6 @@ interface ReonboardResult {
 
 /** Walk status map: walk_name → 'pending' | 'running' | 'completed' | 'failed' */
 type WalkStatusMap = Record<string, string>;
-
-// ---------------------------------------------------------------------------
-// Constants — canonical walk names matching WalkRunner.WALK_ORDER
-// ---------------------------------------------------------------------------
-
-/**
- * Canonical walk names in execution order.
- * Must match app/pipeline/walks/runner.py WalkRunner.WALK_ORDER.
- */
-export const WALK_NAMES: readonly string[] = [
-  'walk_2a_scene_segmentation',
-  'walk_2b_character_discovery',
-  'walk_2c_alias_resolution',
-  'walk_2d_scene_presence',
-  'walk_2e_span_attribution',
-  'walk_2f_character_description',
-  'walk_2g_voice_audition',
-  'walk_2h_voice_assignment',
-  'walk_2i_delivery',
-] as const;
-
-/**
- * Human-readable labels for each walk, keyed by walk name.
- */
-export const WALK_LABELS: Record<string, string> = {
-  walk_2a_scene_segmentation: 'Scene Segmentation',
-  walk_2b_character_discovery: 'Character Discovery',
-  walk_2c_alias_resolution: 'Alias Resolution',
-  walk_2d_scene_presence: 'Scene Presence',
-  walk_2e_span_attribution: 'Span Attribution',
-  walk_2f_character_description: 'Character Description',
-  walk_2g_voice_audition: 'Voice Audition',
-  walk_2h_voice_assignment: 'Voice Assignment',
-  walk_2i_delivery: 'Delivery',
-};
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -201,9 +167,9 @@ export function renderWalkStatuses(statuses: WalkStatusMap): void {
   const container = document.getElementById('walk-status-container');
   if (!container) return;
 
-  container.innerHTML = WALK_NAMES.map(walkName => {
+  container.innerHTML = WALK_ORDER.map(walkName => {
     const status = statuses[walkName] || 'pending';
-    const label = WALK_LABELS[walkName] || walkName;
+    const label = WALK_DISPLAY_NAMES[walkName] || walkName;
     const badgeClass =
       status === 'completed' ? 'bg-success' :
       status === 'running' ? 'bg-warning text-dark' :
@@ -271,7 +237,7 @@ export function stopWalkPolling(): void {
  * A walk button is disabled if that walk is currently 'running'.
  */
 function updateWalkButtons(statuses: WalkStatusMap): void {
-  for (const walkName of WALK_NAMES) {
+  for (const walkName of WALK_ORDER) {
     const btn = document.querySelector(
       `button[data-walk-run="${walkName}"]`,
     ) as HTMLButtonElement | null;
@@ -363,7 +329,7 @@ function showWalkExecutionUI(): void {
 
   // Render initial walk statuses (all pending)
   const initialStatuses: WalkStatusMap = {};
-  for (const walkName of WALK_NAMES) {
+  for (const walkName of WALK_ORDER) {
     initialStatuses[walkName] = 'pending';
   }
   renderWalkStatuses(initialStatuses);
@@ -379,7 +345,7 @@ async function handleRunWalk(walkName: string): Promise<void> {
     return;
   }
 
-  const label = WALK_LABELS[walkName] || walkName;
+  const label = WALK_DISPLAY_NAMES[walkName] || walkName;
   const btn = document.querySelector(
     `button[data-walk-run="${walkName}"]`,
   ) as HTMLButtonElement | null;
@@ -442,7 +408,7 @@ async function handleReonboard(): Promise<void> {
 
     // Reset walk status display
     const initialStatuses: WalkStatusMap = {};
-    for (const walkName of WALK_NAMES) {
+    for (const walkName of WALK_ORDER) {
       initialStatuses[walkName] = 'pending';
     }
     renderWalkStatuses(initialStatuses);

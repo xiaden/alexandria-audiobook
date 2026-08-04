@@ -37,6 +37,7 @@ from app.pipeline.api import (
 from app.pipeline.ledger import CharacterLedger
 from app.pipeline.operations import OperationExecutor
 from app.pipeline.review import ReviewManager
+from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import WalkRunner
 
 
@@ -197,8 +198,8 @@ class TestOnboardEndpoint:
     def test_onboard_accepts_epub(self, client, storage):
         """EPUB files are accepted and processed."""
         # Mock extract_epub_text and populate_spine
-        with patch("app.pipeline.api.extract_epub_text") as mock_extract, patch(
-            "app.pipeline.api.populate_spine"
+        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract, patch(
+            "app.pipeline.api_onboard.populate_spine"
         ) as mock_populate:
             mock_extract.return_value = {
                 "series_id": "s-test",
@@ -223,7 +224,7 @@ class TestOnboardEndpoint:
 
     def test_onboard_handles_extraction_failure(self, client):
         """Extraction failures return 400."""
-        with patch("app.pipeline.api.extract_epub_text") as mock_extract:
+        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract:
             mock_extract.side_effect = Exception("Invalid EPUB")
 
             response = client.post(
@@ -233,6 +234,26 @@ class TestOnboardEndpoint:
 
             assert response.status_code == 400
             assert "Failed to extract EPUB" in response.json()["detail"]
+
+    def test_onboard_handles_populate_spine_failure(self, client):
+        """populate_spine failures return 500."""
+        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract, patch(
+            "app.pipeline.api_onboard.populate_spine"
+        ) as mock_populate:
+            mock_extract.return_value = {
+                "series_id": "s-test",
+                "book_id": "b-test",
+                "chapters": [{"id": "ch1", "title": "Chapter 1"}],
+            }
+            mock_populate.side_effect = Exception("DB constraint violation")
+
+            response = client.post(
+                "/api/pipeline/onboard",
+                files={"file": ("test.epub", b"fake epub content", "application/epub+zip")},
+            )
+
+            assert response.status_code == 500
+            assert "Failed to populate spine" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +272,13 @@ class TestRunWalkEndpoint:
         assert "Unknown walk" in response.json()["detail"]
 
     def test_run_walk_valid(self, client, walk_runner):
-        """Valid walk names are executed."""
+        """Valid walk names are executed and return full result structure."""
         # Mock the walk module loading
         with patch.object(walk_runner, "_load_walk_module") as mock_load:
             mock_module = MagicMock()
-            mock_module.execute = MagicMock(return_value={"status": "completed"})
+            mock_module.execute = MagicMock(
+                return_value={"status": "completed", "walk": "walk_2a_scene_segmentation"}
+            )
             mock_load.return_value = mock_module
 
             response = client.post(
@@ -269,7 +292,30 @@ class TestRunWalkEndpoint:
 
             assert response.status_code == 200
             result = response.json()
-            assert "status" in result
+            assert result["status"] == "completed"
+            assert result["walk"] == "walk_2a_scene_segmentation"
+            mock_load.assert_called_once_with("walk_2a_scene_segmentation")
+
+    def test_run_walk_execution_failure(self, client, walk_runner):
+        """Walk execution errors are caught and returned as failed status."""
+        with patch.object(walk_runner, "_load_walk_module") as mock_load:
+            mock_module = MagicMock()
+            mock_module.execute = MagicMock(side_effect=RuntimeError("Walk crashed"))
+            mock_load.return_value = mock_module
+
+            response = client.post(
+                "/api/pipeline/run_walk",
+                json={
+                    "walk_name": "walk_2a_scene_segmentation",
+                    "book_id": "b1",
+                    "config": {},
+                },
+            )
+
+            assert response.status_code == 200
+            result = response.json()
+            assert result["status"] == "failed"
+            assert "Walk crashed" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +325,10 @@ class TestRunWalkEndpoint:
 
 class TestRunAllWalksEndpoint:
     def test_run_all_walks(self, client, walk_runner):
-        """All walks are executed serially."""
-        # Mock the walk module loading to avoid actual walk execution
-        with patch.object(walk_runner, "_load_walk_module") as mock_load:
+        """All walks are executed serially and results keyed by walk name."""
+        # Mock the walk module loading and verification to avoid actual walk execution
+        with patch.object(walk_runner, "_load_walk_module") as mock_load, \
+             patch.object(walk_runner, "_run_verification", return_value=True):
             mock_module = MagicMock()
             mock_module.execute = MagicMock(return_value={"status": "completed"})
             mock_load.return_value = mock_module
@@ -293,8 +340,11 @@ class TestRunAllWalksEndpoint:
 
             assert response.status_code == 200
             result = response.json()
-            # Should have results for each walk
             assert isinstance(result, dict)
+            # All walks should be present with completed status
+            for walk_name in WALK_ORDER:
+                assert walk_name in result
+                assert result[walk_name]["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +360,11 @@ class TestWalkStatusEndpoint:
         result = response.json()
         assert isinstance(result, dict)
         # Should have entries for all walks
-        assert len(result) == len(WalkRunner.WALK_ORDER)
+        assert len(result) == len(WALK_ORDER)
+        # Each walk name should be a key with a valid status value
+        for walk_name in WALK_ORDER:
+            assert walk_name in result
+            assert result[walk_name] in ("pending", "running", "completed", "failed")
 
 
 # ---------------------------------------------------------------------------
@@ -347,11 +401,20 @@ class TestCharactersEndpoint:
 
 class TestReviewEndpoint:
     def test_review_returns_list(self, client):
-        """Review endpoint returns a list of review items."""
+        """Review endpoint returns a list of review items with expected fields."""
         response = client.get("/api/pipeline/review/b1")
         assert response.status_code == 200
         result = response.json()
         assert isinstance(result, list)
+        # Should have at least one review item (from _populate_storage)
+        assert len(result) > 0
+        # Each item should have the required review fields
+        for item in result:
+            assert "item_id" in item
+            assert "character_id" in item
+            assert "character_name" in item
+            assert "confidence" in item
+            assert 0.5 <= item["confidence"] < 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -384,8 +447,10 @@ class TestReviewAcceptEndpoint:
             "/api/pipeline/review/accept",
             json={"item_id": "invalid:item:id"},
         )
-        # Should either succeed (if parsing is lenient) or return 400
-        assert response.status_code in [200, 400]
+        assert response.status_code == 400
+        # Error can be either format error or unknown junction table
+        detail = response.json()["detail"]
+        assert "Invalid item_id format" in detail or "Unknown junction table" in detail
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +476,17 @@ class TestReviewRejectEndpoint:
         assert result["status"] == "rejected"
         assert result["item_id"] == item_id
 
+    def test_reject_invalid_item(self, client):
+        """Rejecting an invalid item_id returns 400."""
+        response = client.post(
+            "/api/pipeline/review/reject",
+            json={"item_id": "invalid:item:id"},
+        )
+        assert response.status_code == 400
+        # Error can be either format error or unknown junction table
+        detail = response.json()["detail"]
+        assert "Invalid item_id format" in detail or "Unknown junction table" in detail
+
 
 # ---------------------------------------------------------------------------
 # P1-S10: POST /api/pipeline/review/override
@@ -434,6 +510,17 @@ class TestReviewOverrideEndpoint:
         result = response.json()
         assert result["status"] == "overridden"
         assert result["item_id"] == item_id
+
+    def test_override_invalid_item(self, client):
+        """Overriding an invalid item_id returns 400."""
+        response = client.post(
+            "/api/pipeline/review/override",
+            json={"item_id": "invalid:item:id", "new_value": {"relation_type": "speaker"}},
+        )
+        assert response.status_code == 400
+        # Error can be either format error or unknown junction table
+        detail = response.json()["detail"]
+        assert "Invalid item_id format" in detail or "Unknown junction table" in detail
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +596,120 @@ class TestOperationEndpoint:
         assert response.status_code == 400
         assert "delete requires" in response.json()["detail"]
 
+    def test_xxx_operation_split_ok(self, client):
+        """Split operation with valid params returns 200 with full response."""
+        response = client.post(
+            "/api/pipeline/operation",
+            json={
+                "operation": "split",
+                "book_id": "b1",
+                "presentation_index": 1,
+                "split_point": 5,
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "ok"
+        assert result["operation"] == "split"
+        # Verify no extra unexpected keys
+        assert set(result.keys()) == {"status", "operation"}
+
+    def test_xxx_operation_merge_ok(self, client, storage):
+        """Merge operation with valid params returns 200."""
+        # Add a second adjacent span so merge has two spans to combine
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp_merge', 'quotation', ' world', NULL)"
+        )
+        storage.execute_insert(
+            "INSERT INTO paragraph_span (child_id, parent_id, position) "
+            "VALUES ('sp_merge', 'p1', 2)"
+        )
+
+        response = client.post(
+            "/api/pipeline/operation",
+            json={
+                "operation": "merge",
+                "book_id": "b1",
+                "presentation_index_left": 1,
+                "presentation_index_right": 2,
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "ok"
+        assert result["operation"] == "merge"
+
+    def test_xxx_operation_move_ok(self, client, storage):
+        """Move operation with valid params returns 200."""
+        # Add a second span in the same paragraph so move has a target
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp_move', 'sentence', 'Second span', NULL)"
+        )
+        storage.execute_insert(
+            "INSERT INTO paragraph_span (child_id, parent_id, position) "
+            "VALUES ('sp_move', 'p1', 2)"
+        )
+
+        response = client.post(
+            "/api/pipeline/operation",
+            json={
+                "operation": "move",
+                "book_id": "b1",
+                "presentation_index_from": 1,
+                "presentation_index_to": 2,
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "ok"
+        assert result["operation"] == "move"
+
+    def test_xxx_operation_delete_ok(self, client):
+        """Delete operation with valid params returns 200 with full response."""
+        response = client.post(
+            "/api/pipeline/operation",
+            json={
+                "operation": "delete",
+                "book_id": "b1",
+                "presentation_index": 1,
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "ok"
+        assert result["operation"] == "delete"
+        assert set(result.keys()) == {"status", "operation"}
+
+    def test_operation_split_invalid_index(self, client):
+        """Split with non-existent presentation index returns 400."""
+        response = client.post(
+            "/api/pipeline/operation",
+            json={
+                "operation": "split",
+                "book_id": "b1",
+                "presentation_index": 9999,
+                "split_point": 5,
+            },
+        )
+        assert response.status_code == 400
+        # Should report the missing index
+        assert "not found" in response.json()["detail"].lower() or "9999" in response.json()["detail"]
+
+    def test_operation_delete_invalid_index(self, client):
+        """Delete with non-existent presentation index returns 400."""
+        response = client.post(
+            "/api/pipeline/operation",
+            json={
+                "operation": "delete",
+                "book_id": "b1",
+                "presentation_index": 9999,
+            },
+        )
+        assert response.status_code == 400
+        assert "not found" in response.json()["detail"].lower() or "9999" in response.json()["detail"]
+
 
 # ---------------------------------------------------------------------------
 # P1-S12: GET /api/pipeline/export/{book_id}
@@ -568,6 +769,27 @@ class TestRenderEndpoint:
         assert response.status_code == 200
         result = response.json()
         assert "job_id" in result
+        # job_id should be a non-empty string (UUID format)
+        assert isinstance(result["job_id"], str)
+        assert len(result["job_id"]) > 0
+        # Verify response structure
+        assert set(result.keys()) == {"job_id"}
+
+    def test_render_failure(self, client, tts_engine):
+        """Render failure returns 500 with error detail."""
+        from app.pipeline import api_export
+
+        with patch.object(api_export, "render_audiobook") as mock_render:
+            mock_render.side_effect = RuntimeError("TTS engine crashed")
+
+            response = client.post(
+                "/api/pipeline/render",
+                json={"book_id": "b1", "use_batch": True},
+            )
+            assert response.status_code == 500
+            result = response.json()
+            assert "Render failed" in result["detail"]
+            assert "TTS engine crashed" in result["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -594,8 +816,8 @@ class TestReonboardEndpoint:
             "/api/pipeline/reonboard",
             json={"book_id": "nonexistent"},
         )
-        # May return 404 or succeed with no changes
-        assert response.status_code in [200, 404]
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower() or "nonexistent" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

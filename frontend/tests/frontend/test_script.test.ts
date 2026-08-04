@@ -12,8 +12,6 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  WALK_NAMES,
-  WALK_LABELS,
   pipelineOnboard,
   pipelineRunWalk,
   pipelineRunAllWalks,
@@ -24,6 +22,7 @@ import {
   stopWalkPolling,
   initScript,
 } from '../../src/tabs/script';
+import { WALK_ORDER, WALK_DISPLAY_NAMES } from '../../src/pipeline/walks';
 import { state } from '../../src/state';
 import * as API from '../../src/api';
 
@@ -63,13 +62,13 @@ global.fetch = mockFetch;
 // Constants
 // ---------------------------------------------------------------------------
 
-describe('WALK_NAMES', () => {
+describe('WALK_ORDER', () => {
   it('should contain exactly 9 walk names', () => {
-    expect(WALK_NAMES).toHaveLength(9);
+    expect(WALK_ORDER).toHaveLength(9);
   });
 
-  it('should contain walk names in canonical order matching WalkRunner.WALK_ORDER', () => {
-    expect(WALK_NAMES).toEqual([
+  it('should contain walk names in canonical order matching backend WALK_ORDER', () => {
+    expect(WALK_ORDER).toEqual([
       'walk_2a_scene_segmentation',
       'walk_2b_character_discovery',
       'walk_2c_alias_resolution',
@@ -83,23 +82,23 @@ describe('WALK_NAMES', () => {
   });
 
   it('should be a readonly array', () => {
-    expect(Array.isArray(WALK_NAMES)).toBe(true);
+    expect(Array.isArray(WALK_ORDER)).toBe(true);
   });
 });
 
-describe('WALK_LABELS', () => {
+describe('WALK_DISPLAY_NAMES', () => {
   it('should have a label for every walk name', () => {
-    for (const walkName of WALK_NAMES) {
-      expect(WALK_LABELS).toHaveProperty(walkName);
-      expect(typeof WALK_LABELS[walkName]).toBe('string');
-      expect(WALK_LABELS[walkName].length).toBeGreaterThan(0);
+    for (const walkName of WALK_ORDER) {
+      expect(WALK_DISPLAY_NAMES).toHaveProperty(walkName);
+      expect(typeof WALK_DISPLAY_NAMES[walkName]).toBe('string');
+      expect(WALK_DISPLAY_NAMES[walkName].length).toBeGreaterThan(0);
     }
   });
 
   it('should have human-readable labels (not raw walk names)', () => {
-    expect(WALK_LABELS['walk_2a_scene_segmentation']).toBe('Scene Segmentation');
-    expect(WALK_LABELS['walk_2b_character_discovery']).toBe('Character Discovery');
-    expect(WALK_LABELS['walk_2i_delivery']).toBe('Delivery');
+    expect(WALK_DISPLAY_NAMES['walk_2a_scene_segmentation']).toBe('Scene Segmentation');
+    expect(WALK_DISPLAY_NAMES['walk_2b_character_discovery']).toBe('Character Discovery');
+    expect(WALK_DISPLAY_NAMES['walk_2i_delivery']).toBe('Delivery');
   });
 });
 
@@ -271,7 +270,7 @@ describe('renderWalkStatuses', () => {
 
   it('should render all 9 walks in the container', () => {
     const statuses: Record<string, string> = {};
-    for (const name of WALK_NAMES) {
+    for (const name of WALK_ORDER) {
       statuses[name] = 'pending';
     }
 
@@ -285,7 +284,7 @@ describe('renderWalkStatuses', () => {
 
   it('should show "pending" status with bg-secondary badge for pending walks', () => {
     const statuses: Record<string, string> = {};
-    for (const name of WALK_NAMES) {
+    for (const name of WALK_ORDER) {
       statuses[name] = 'pending';
     }
 
@@ -300,7 +299,7 @@ describe('renderWalkStatuses', () => {
 
   it('should show "completed" status with bg-success badge', () => {
     const statuses: Record<string, string> = {};
-    for (const name of WALK_NAMES) {
+    for (const name of WALK_ORDER) {
       statuses[name] = 'completed';
     }
 
@@ -315,7 +314,7 @@ describe('renderWalkStatuses', () => {
 
   it('should show "running" status with bg-warning badge and spinner icon', () => {
     const statuses: Record<string, string> = {};
-    for (const name of WALK_NAMES) {
+    for (const name of WALK_ORDER) {
       statuses[name] = 'running';
     }
 
@@ -330,7 +329,7 @@ describe('renderWalkStatuses', () => {
 
   it('should show "failed" status with bg-danger badge', () => {
     const statuses: Record<string, string> = {};
-    for (const name of WALK_NAMES) {
+    for (const name of WALK_ORDER) {
       statuses[name] = 'failed';
     }
 
@@ -342,9 +341,9 @@ describe('renderWalkStatuses', () => {
     expect(badge!.classList.contains('bg-danger')).toBe(true);
   });
 
-  it('should use human-readable labels from WALK_LABELS', () => {
+  it('should use human-readable labels from WALK_DISPLAY_NAMES', () => {
     const statuses: Record<string, string> = {};
-    for (const name of WALK_NAMES) {
+    for (const name of WALK_ORDER) {
       statuses[name] = 'pending';
     }
 
@@ -397,7 +396,7 @@ describe('startWalkPolling / stopWalkPolling', () => {
 
   it('should stop polling when no walks are running', async () => {
     const statuses: Record<string, string> = {};
-    for (const name of WALK_NAMES) {
+    for (const name of WALK_ORDER) {
       statuses[name] = 'completed';
     }
     vi.mocked(API.get).mockResolvedValue(statuses);

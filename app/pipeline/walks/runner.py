@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
 
+from .order import WALK_ORDER
+
 logger = logging.getLogger(__name__)
 
 # Type alias for verification functions.
@@ -282,19 +284,6 @@ class WalkRunner:
         Pipeline storage adapter for database operations.
     """
 
-    # Canonical walk execution order.
-    WALK_ORDER: list[str] = [
-        "walk_2a_scene_segmentation",
-        "walk_2b_character_discovery",
-        "walk_2c_alias_resolution",
-        "walk_2d_scene_presence",
-        "walk_2e_span_attribution",
-        "walk_2f_character_description",
-        "walk_2g_voice_audition",
-        "walk_2h_voice_assignment",
-        "walk_2i_delivery",
-    ]
-
     def __init__(self, storage: PipelineStorage) -> None:
         self._storage = storage
         # {book_id: OrderedDict(walk_name -> status)}
@@ -379,7 +368,7 @@ class WalkRunner:
         """
         self._ensure_book(book_id)
         results: dict[str, dict] = {}
-        for walk_name in self.WALK_ORDER:
+        for walk_name in WALK_ORDER:
             result = self.run_walk(walk_name, book_id, config)
             results[walk_name] = result
             if result.get("status") == "failed":
@@ -405,7 +394,7 @@ class WalkRunner:
         """Initialize status tracking for a book if not already present."""
         if book_id not in self._status:
             statuses: OrderedDict[str, str] = OrderedDict()
-            for walk_name in self.WALK_ORDER:
+            for walk_name in WALK_ORDER:
                 statuses[walk_name] = "pending"
             self._status[book_id] = statuses
 

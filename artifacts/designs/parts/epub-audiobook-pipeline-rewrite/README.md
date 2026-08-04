@@ -21,7 +21,21 @@ Plan F (Assembly + Export + TTS + Review)
     ↓
 Plan G (API Endpoints + Frontend Rewiring)
     ↓
-Plan H (Deprecation + Integration Tests + Cleanup)
+Plan H (Deprecation + Integration Tests + Cleanup) ← INCOMPLETE: e2e and presentation tests missing
+    ↓
+Plan I (Verification Tests — e2e + presentation)
+    ↓
+Plan J (Book-Scoping Fix for Operations)
+    ↓
+Plan K (Walk JSON Extraction Deduplication)
+    ↓
+Plan L (Walk-Order Canonical Contract)
+    ↓
+Plan M (Frontend Legacy Code Cleanup)
+    ↓
+Plan N (Pipeline API Split by Responsibility)
+    ↓
+Plan O (Voice Workflow Parity Restoration) ← NEW: restores voice catalog, assignment, preview
 ```
 
 ## Plan List
@@ -36,14 +50,23 @@ Plan H (Deprecation + Integration Tests + Cleanup)
 | F | Assembly, Export, TTS Integration, Confidence Review | 4 | 29 | ~22K |
 | G | API Endpoints, Frontend Rewiring | 6 | 47 | ~26K |
 | H | Deprecation, Integration Tests, Final Cleanup | 4 | 29 | ~13K |
+| I | Verification Tests (E2E + Presentation) | 3 | 12 | ~15K |
+| J | Book-Scoping Fix for Operations and Presentation | 5 | 18 | ~20K |
+| K | Walk JSON Extraction Deduplication | 3 | 19 | ~12K |
+| L | Walk-Order Canonical Contract | 5 | 16 | ~14K |
+| M | Frontend Legacy Code Cleanup | 5 | 16 | ~18K |
+| N | Pipeline API Split by Responsibility | 4 | 16 | ~16K |
+| O | Voice Workflow Parity Restoration | 8 | 38 | ~28K |
 
-**Total:** 8 plans, 31 phases, 237 steps, ~170K weighted chars
+**Total:** 15 plans, 62 phases, 347 steps, ~273K weighted chars
 
 ## Execution Order
 
-Plans are sequentially ordered A→H. Each plan depends on all prior plans. No parallel execution of plans (each builds on the previous).
+Plans are sequentially ordered A→N. Each plan depends on all prior plans. No parallel execution of plans (each builds on the previous).
 
 **Recommended execution:** Sequential, one plan at a time. Each plan should be validated (all tests pass) before proceeding to the next.
+
+**Plan H status:** INCOMPLETE — Phases 2 and 3 (e2e and presentation tests) were never created despite being marked complete. Plan I addresses this gap.
 
 ## Key Design Decisions (from DD v3)
 
@@ -123,8 +146,10 @@ tests/pipeline/
 ├── test_reonboard.py
 ├── test_api.py
 ├── test_deprecation.py
-├── test_e2e.py
-└── test_presentation.py
+├── test_e2e.py              ← Plan I (missing, to be created)
+├── test_presentation.py     ← Plan I (missing, to be created)
+├── test_walk_helpers.py     ← Plan K (new)
+└── test_walk_order_sync.py  ← Plan L (new)
 ```
 
 ## Superseded Artifacts (v2 — DO NOT USE)

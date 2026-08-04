@@ -6,6 +6,7 @@ Covers:
 - execute_move: position renumbering, same-parent validation
 - execute_delete: position renumbering, character_span cleanup
 - Edge cases: invalid indices, non-adjacent merge, cross-parent move, empty memberships
+- Cross-book isolation: operations on one book don't affect spans in other books
 - 100% operation executor coverage target
 """
 
@@ -118,6 +119,48 @@ def _get_span_positions(conn: sqlite3.Connection, parent_id: str) -> dict[str, i
     return {r[0]: r[1] for r in rows}
 
 
+def _add_second_book(conn: sqlite3.Connection) -> None:
+    """Add a second book 'b2' with its own spans for cross-book testing.
+
+    Structure:
+      series s1 (shared with b1)
+        book b2 (position=2)
+          chapter c2 (position=1)
+            scene sc2 (position=1)
+              paragraph p2b (position=1)
+                span sp2_1 (position=1, sentence) - b2 global_index=1
+    """
+    conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2)")
+    conn.execute("INSERT INTO chapter VALUES ('c2', 'b2')")
+    conn.execute("INSERT INTO scene VALUES ('sc2')")
+    conn.execute("INSERT INTO paragraph VALUES ('p2b')")
+    conn.execute("INSERT INTO span VALUES ('sp2_1', 'sentence', NULL, 'Book 2 text')")
+    conn.execute("INSERT INTO book_chapter VALUES ('c2', 'b2', 1)")
+    conn.execute("INSERT INTO chapter_scene VALUES ('sc2', 'c2', 1)")
+    conn.execute("INSERT INTO scene_paragraph VALUES ('p2b', 'sc2', 1)")
+    conn.execute("INSERT INTO paragraph_span VALUES ('sp2_1', 'p2b', 1)")
+
+
+def _count_book_spans(conn: sqlite3.Connection, book_id: str) -> int:
+    """Count spans belonging to a specific book via the book-scoped query."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT span.id FROM span"
+        "  JOIN paragraph_span AS span_edge ON span.id = span_edge.child_id"
+        "  JOIN scene_paragraph AS paragraph_edge"
+        "    ON span_edge.parent_id = paragraph_edge.child_id"
+        "  JOIN chapter_scene AS scene_edge"
+        "    ON paragraph_edge.parent_id = scene_edge.child_id"
+        "  JOIN book_chapter AS chapter_edge"
+        "    ON scene_edge.parent_id = chapter_edge.child_id"
+        "  JOIN book ON chapter_edge.parent_id = book.id"
+        "  WHERE book.id = ?"
+        ")",
+        (book_id,),
+    ).fetchone()
+    return row[0]
+
+
 def _get_character_memberships(
     conn: sqlite3.Connection, span_id: str
 ) -> list[tuple[str, str, float]]:
@@ -156,7 +199,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         # Should now have 5 spans (was 4, added 1)
         rows = conn.execute("SELECT COUNT(*) FROM span").fetchone()
@@ -167,7 +210,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         # sp2 is quotation, new span should also be quotation
         new_span = conn.execute(
@@ -180,7 +223,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         positions = _get_span_positions(conn, "p1")
         # sp1=1, sp2=2, new_span=3, sp3=4
@@ -194,7 +237,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         order = _get_presentation_order(conn)
         # sp1, sp2, new_span, sp3, sp4
@@ -211,7 +254,7 @@ class TestExecuteSplit:
         _add_character(conn, "ch1", "Alice")
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         # sp2 (left) should still have ch1 membership
         memberships = _get_character_memberships(conn, "sp2")
@@ -227,7 +270,7 @@ class TestExecuteSplit:
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
         _add_character_span(conn, "ch2", "sp2", "mentioned", confidence=0.7)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         # Find new span
         new_span_id = conn.execute(
@@ -246,7 +289,7 @@ class TestExecuteSplit:
         _populate_test_spine(conn)
 
         # sp2 has no memberships
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         # Should succeed without error
         order = _get_presentation_order(conn)
@@ -258,14 +301,14 @@ class TestExecuteSplit:
         _populate_test_spine(conn)
 
         with pytest.raises(ValueError, match="Presentation index .* not found"):
-            executor.execute_split(presentation_index=999, split_point=5)
+            executor.execute_split(book_id="b1", presentation_index=999, split_point=5)
 
     def test_split_sets_left_text(self, storage, executor):
         """Left span (original) text is truncated at split_point."""
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         assert _get_span_text(conn, "sp2") == "He"
 
@@ -274,7 +317,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         new_id = conn.execute(
             "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
@@ -286,7 +329,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         assert _get_span_instruct(conn, "sp2") == "angrily"
 
@@ -295,7 +338,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         new_id = conn.execute(
             "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
@@ -308,7 +351,7 @@ class TestExecuteSplit:
         _populate_test_spine(conn)
 
         with pytest.raises(ValueError, match="split_point"):
-            executor.execute_split(presentation_index=2, split_point=0)
+            executor.execute_split(book_id="b1", presentation_index=2, split_point=0)
 
     def test_split_invalid_offset_negative(self, storage, executor):
         """split_point < 0 raises ValueError."""
@@ -316,7 +359,7 @@ class TestExecuteSplit:
         _populate_test_spine(conn)
 
         with pytest.raises(ValueError, match="split_point"):
-            executor.execute_split(presentation_index=2, split_point=-1)
+            executor.execute_split(book_id="b1", presentation_index=2, split_point=-1)
 
     def test_split_invalid_offset_past_end(self, storage, executor):
         """split_point >= len(text) raises ValueError."""
@@ -324,7 +367,7 @@ class TestExecuteSplit:
         _populate_test_spine(conn)
 
         with pytest.raises(ValueError, match="split_point"):
-            executor.execute_split(presentation_index=2, split_point=5)
+            executor.execute_split(book_id="b1", presentation_index=2, split_point=5)
 
     def test_split_invalid_offset_equal_length(self, storage, executor):
         """split_point == len(text) raises ValueError (not strict interior)."""
@@ -333,7 +376,7 @@ class TestExecuteSplit:
 
         # sp2 text is "Hello" (5 chars). 5 is not interior.
         with pytest.raises(ValueError, match="split_point"):
-            executor.execute_split(presentation_index=2, split_point=5)
+            executor.execute_split(book_id="b1", presentation_index=2, split_point=5)
 
     def test_split_null_text_raises_error(self, storage, executor):
         """Cannot split a span with NULL text."""
@@ -342,7 +385,7 @@ class TestExecuteSplit:
 
         # sp1 has NULL text
         with pytest.raises(ValueError, match="text"):
-            executor.execute_split(presentation_index=1, split_point=2)
+            executor.execute_split(book_id="b1", presentation_index=1, split_point=2)
 
     def test_split_rollback_on_invalid_offset(self, storage, executor):
         """Invalid split_point leaves no changes (full rollback)."""
@@ -354,7 +397,7 @@ class TestExecuteSplit:
         positions_before = _get_span_positions(conn, "p1")
 
         try:
-            executor.execute_split(presentation_index=2, split_point=0)
+            executor.execute_split(book_id="b1", presentation_index=2, split_point=0)
         except ValueError:
             pass
 
@@ -369,7 +412,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=1)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=1)
 
         assert _get_span_text(conn, "sp2") == "H"
         new_id = conn.execute(
@@ -382,7 +425,7 @@ class TestExecuteSplit:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_split(presentation_index=2, split_point=4)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=4)
 
         assert _get_span_text(conn, "sp2") == "Hell"
         new_id = conn.execute(
@@ -402,7 +445,7 @@ class TestExecuteMerge:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
 
         # sp2 should be deleted
         rows = conn.execute("SELECT COUNT(*) FROM span").fetchone()
@@ -413,7 +456,7 @@ class TestExecuteMerge:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
 
         positions = _get_span_positions(conn, "p1")
         # sp1=1, sp3=2 (was 3)
@@ -426,7 +469,7 @@ class TestExecuteMerge:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
 
         order = _get_presentation_order(conn)
         # sp1, sp3, sp4
@@ -441,7 +484,7 @@ class TestExecuteMerge:
         _add_character_span(conn, "ch1", "sp1", "speaker", confidence=0.9)
         _add_character_span(conn, "ch2", "sp2", "mentioned", confidence=0.7)
 
-        executor.execute_merge(presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
 
         # sp1 should have both memberships
         memberships = _get_character_memberships(conn, "sp1")
@@ -457,7 +500,7 @@ class TestExecuteMerge:
         _add_character_span(conn, "ch1", "sp1", "speaker", confidence=0.6)
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
 
-        executor.execute_merge(presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
 
         # sp1 should have ch1 with confidence 0.9 (higher)
         memberships = _get_character_memberships(conn, "sp1")
@@ -470,7 +513,7 @@ class TestExecuteMerge:
         _populate_test_spine(conn)
 
         with pytest.raises(ValueError, match="Cannot merge non-adjacent spans"):
-            executor.execute_merge(presentation_index_left=1, presentation_index_right=3)
+            executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=3)
 
     def test_merge_different_parents_error(self, storage, executor):
         """Merge raises ValueError for spans with different parents."""
@@ -479,14 +522,14 @@ class TestExecuteMerge:
 
         # sp1 (p1) and sp4 (p2) have different parents
         with pytest.raises(ValueError, match="Cannot merge spans with different parents"):
-            executor.execute_merge(presentation_index_left=1, presentation_index_right=4)
+            executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=4)
 
     def test_merge_no_memberships(self, storage, executor):
         """Merge works when spans have no character_span memberships."""
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
 
         # Should succeed without error
         order = _get_presentation_order(conn)
@@ -505,7 +548,7 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         # Move sp1 (position 1) to position 3
-        executor.execute_move(presentation_index_from=1, presentation_index_to=3)
+        executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=3)
 
         positions = _get_span_positions(conn, "p1")
         # sp2=1, sp3=2, sp1=3
@@ -519,7 +562,7 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         # Move sp3 (position 3) to position 1
-        executor.execute_move(presentation_index_from=3, presentation_index_to=1)
+        executor.execute_move(book_id="b1", presentation_index_from=3, presentation_index_to=1)
 
         positions = _get_span_positions(conn, "p1")
         # sp3=1, sp1=2, sp2=3
@@ -533,7 +576,7 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         positions_before = _get_span_positions(conn, "p1")
-        executor.execute_move(presentation_index_from=2, presentation_index_to=2)
+        executor.execute_move(book_id="b1", presentation_index_from=2, presentation_index_to=2)
         positions_after = _get_span_positions(conn, "p1")
 
         assert positions_before == positions_after
@@ -544,7 +587,7 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         # Move sp1 to position 3
-        executor.execute_move(presentation_index_from=1, presentation_index_to=3)
+        executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=3)
 
         order = _get_presentation_order(conn)
         # sp2, sp3, sp1, sp4
@@ -557,7 +600,7 @@ class TestExecuteMove:
 
         # sp1 (p1) cannot move to sp4's position (p2)
         with pytest.raises(ValueError, match="Cannot move span to different parent"):
-            executor.execute_move(presentation_index_from=1, presentation_index_to=4)
+            executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=4)
 
     def test_move_preserves_memberships(self, storage, executor):
         """Move does not affect character_span memberships."""
@@ -566,7 +609,7 @@ class TestExecuteMove:
         _add_character(conn, "ch1", "Alice")
         _add_character_span(conn, "ch1", "sp1", "speaker", confidence=0.9)
 
-        executor.execute_move(presentation_index_from=1, presentation_index_to=3)
+        executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=3)
 
         memberships = _get_character_memberships(conn, "sp1")
         assert len(memberships) == 1
@@ -584,7 +627,7 @@ class TestExecuteDelete:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_delete(presentation_index=2)
+        executor.execute_delete(book_id="b1", presentation_index=2)
 
         rows = conn.execute("SELECT COUNT(*) FROM span").fetchone()
         assert rows[0] == 3  # sp1, sp3, sp4
@@ -594,7 +637,7 @@ class TestExecuteDelete:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_delete(presentation_index=2)
+        executor.execute_delete(book_id="b1", presentation_index=2)
 
         positions = _get_span_positions(conn, "p1")
         # sp1=1, sp3=2 (was 3)
@@ -607,7 +650,7 @@ class TestExecuteDelete:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_delete(presentation_index=2)
+        executor.execute_delete(book_id="b1", presentation_index=2)
 
         order = _get_presentation_order(conn)
         # sp1, sp3, sp4
@@ -620,7 +663,7 @@ class TestExecuteDelete:
         _add_character(conn, "ch1", "Alice")
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
 
-        executor.execute_delete(presentation_index=2)
+        executor.execute_delete(book_id="b1", presentation_index=2)
 
         # sp2 is deleted, so no memberships should exist
         rows = conn.execute(
@@ -637,7 +680,7 @@ class TestExecuteDelete:
         _add_character_span(conn, "ch1", "sp1", "speaker", confidence=0.9)
         _add_character_span(conn, "ch2", "sp2", "mentioned", confidence=0.7)
 
-        executor.execute_delete(presentation_index=2)
+        executor.execute_delete(book_id="b1", presentation_index=2)
 
         # sp1 should still have ch1 membership
         memberships = _get_character_memberships(conn, "sp1")
@@ -649,7 +692,7 @@ class TestExecuteDelete:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_delete(presentation_index=2)
+        executor.execute_delete(book_id="b1", presentation_index=2)
 
         # Should succeed without error
         order = _get_presentation_order(conn)
@@ -660,7 +703,7 @@ class TestExecuteDelete:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_delete(presentation_index=3)
+        executor.execute_delete(book_id="b1", presentation_index=3)
 
         positions = _get_span_positions(conn, "p1")
         # sp1=1, sp2=2
@@ -674,7 +717,7 @@ class TestExecuteDelete:
         _populate_test_spine(conn)
 
         with pytest.raises(ValueError, match="Presentation index .* not found"):
-            executor.execute_delete(presentation_index=999)
+            executor.execute_delete(book_id="b1", presentation_index=999)
 
 
 # ---------------------------------------------------------------------------
@@ -689,11 +732,11 @@ class TestEdgeCases:
         _populate_test_spine(conn)
 
         # Split sp2
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
         # Now: sp1, sp2, new_span, sp3, sp4
 
         # Delete new_span (now at index 3)
-        executor.execute_delete(presentation_index=3)
+        executor.execute_delete(book_id="b1", presentation_index=3)
         # Now: sp1, sp2, sp3, sp4
 
         order = _get_presentation_order(conn)
@@ -707,11 +750,11 @@ class TestEdgeCases:
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
 
         # Split sp2
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
         # Now: sp1, sp2, new_span, sp3, sp4
 
         # Merge sp2 and new_span
-        executor.execute_merge(presentation_index_left=2, presentation_index_right=3)
+        executor.execute_merge(book_id="b1", presentation_index_left=2, presentation_index_right=3)
         # Now: sp1, sp2, sp3, sp4
 
         order = _get_presentation_order(conn)
@@ -726,7 +769,7 @@ class TestEdgeCases:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_delete(presentation_index=1)
+        executor.execute_delete(book_id="b1", presentation_index=1)
 
         # p2 should be unaffected
         positions_p2 = _get_span_positions(conn, "p2")
@@ -743,7 +786,7 @@ class TestEdgeCases:
         _add_character_span(conn, "ch2", "sp2", "mentioned", confidence=0.7)
         _add_character_span(conn, "ch3", "sp2", "present", confidence=0.8)
 
-        executor.execute_split(presentation_index=2, split_point=2)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
 
         # Find new span
         new_span_id = conn.execute(
@@ -756,3 +799,50 @@ class TestEdgeCases:
 
         assert len(sp2_memberships) == 3
         assert len(new_memberships) == 3
+
+    def test_operations_respect_book_scoping(self, storage, executor):
+        """Operations on book b1 do NOT affect spans in book b2.
+
+        Negative test: verifies that book-scoping isolation works correctly.
+        Creates two books (b1 with 4 spans, b2 with 1 span), deletes a span
+        from b1, and verifies b2's spans are untouched.
+        """
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        _add_second_book(conn)
+
+        # Verify initial state: b1 has 4 spans, b2 has 1 span
+        assert _count_book_spans(conn, "b1") == 4
+        assert _count_book_spans(conn, "b2") == 1
+
+        # Verify b2's span exists before the operation
+        b2_span = conn.execute(
+            "SELECT id, text FROM span WHERE id = 'sp2_1'"
+        ).fetchone()
+        assert b2_span is not None
+        assert b2_span[1] == "Book 2 text"
+
+        # Execute delete on book b1's span at presentation_index=1
+        executor.execute_delete(book_id="b1", presentation_index=1)
+
+        # b1 should now have 3 spans (was 4, deleted 1)
+        assert _count_book_spans(conn, "b1") == 3
+
+        # b2 must still have exactly 1 span — unaffected
+        assert _count_book_spans(conn, "b2") == 1
+
+        # b2's span must still exist in the database with original text
+        b2_span_after = conn.execute(
+            "SELECT id, text FROM span WHERE id = 'sp2_1'"
+        ).fetchone()
+        assert b2_span_after is not None
+        assert b2_span_after[1] == "Book 2 text"
+
+        # b2's paragraph_span edge must still exist
+        b2_edge = conn.execute(
+            "SELECT child_id, parent_id, position FROM paragraph_span WHERE child_id = 'sp2_1'"
+        ).fetchone()
+        assert b2_edge is not None
+        assert b2_edge[0] == "sp2_1"
+        assert b2_edge[1] == "p2b"
+        assert b2_edge[2] == 1

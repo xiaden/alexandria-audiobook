@@ -20,11 +20,10 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from ._llm_helpers import chat_completion
+from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
@@ -352,23 +351,12 @@ Return ONLY a JSON array, no other text. Example:
 
 def _parse_llm_response(response_text: str) -> list[dict]:
     """Parse the LLM response into a list of character dicts."""
-    # Use clean_json_string pattern to extract JSON array
-    try:
-        characters = json.loads(response_text)
-    except json.JSONDecodeError:
-        # Try to find JSON array in response
-        match = re.search(r"\[[\s\S]*\]", response_text)
-        if match:
-            try:
-                characters = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                logger.error(
-                    f"Failed to parse LLM response as JSON: {response_text[:200]}"
-                )
-                return []
-        else:
-            logger.error(f"No JSON array found in LLM response: {response_text[:200]}")
-            return []
+    characters = extract_json_from_llm_response(response_text, expected_type="list")
+    if characters is None:
+        logger.error(
+            f"Failed to parse LLM response as JSON: {response_text[:200]}"
+        )
+        return []
 
     if not isinstance(characters, list):
         logger.error(f"LLM response is not a list: {type(characters)}")

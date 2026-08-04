@@ -25,10 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any
 
-from ._llm_helpers import chat_completion
+from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
@@ -346,23 +345,12 @@ def _parse_llm_response(response_text: str) -> dict:
     Returns a dict with description and confidence. If parsing fails,
     returns empty dict.
     """
-    # Try json.loads first
-    try:
-        description_data = json.loads(response_text)
-    except json.JSONDecodeError:
-        # Try to find JSON object in response with regex fallback
-        match = re.search(r"\{[\s\S]*\}", response_text)
-        if match:
-            try:
-                description_data = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                logger.error(
-                    f"Failed to parse LLM response as JSON: {response_text[:200]}"
-                )
-                return {}
-        else:
-            logger.error(f"No JSON object found in LLM response: {response_text[:200]}")
-            return {}
+    description_data = extract_json_from_llm_response(response_text, expected_type="dict")
+    if description_data is None:
+        logger.error(
+            f"Failed to parse LLM response as JSON: {response_text[:200]}"
+        )
+        return {}
 
     if not isinstance(description_data, dict):
         logger.error(f"LLM response is not a dict: {type(description_data)}")

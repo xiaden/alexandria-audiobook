@@ -5,6 +5,8 @@
 **Author:** rnd-dd-author  
 **Date:** 2026-08-03
 
+> **Implementation progress:** Plans I through M have been completed. The 8-phase migration strategy is now in Phase 8 (Deprecation). Frontend legacy code has been isolated to `editor-legacy.ts` (Plan M). Backend legacy endpoints remain active pending deprecation.
+
 ## Problem Statement
 
 The current pipeline sends 3000-char chunks to an LLM with only positional context and a character roster built from previous entries' speaker labels. This produces cascading misattributions: early mislabels propagate, late-introduced characters are assigned to earlier speakers, scene boundaries are invisible, and there is no way to re-attribute a character without re-running the entire script. The dual-write bridge between `annotated_script.json` and the LLM's output creates TOCTOU hazards and makes re-attribution a full re-extraction.
@@ -149,7 +151,7 @@ Each walk produces a verification report: row counts, confidence distribution, s
 5. **Phase 5: Walk 2g + 2h + 2i** — voice audition, voice assignment, delivery (instruct)
 6. **Phase 6: Assembly + Export** — deterministic assembly, overwrite-in-place export, `instruct` field included
 7. **Phase 7: Frontend Rewiring** — 4 tabs rewired to `/api/pipeline/*`
-8. **Phase 8: Deprecation** — old pipeline deprecated, `annotated_script.json` becomes derived-only
+8. **Phase 8: Deprecation** — IN PROGRESS. Frontend legacy code isolated to `frontend/src/tabs/editor-legacy.ts` (Plan M). Backend legacy endpoints (/api/chunks/*, /api/generate_batch, /api/generate_batch_fast, /api/merge) remain active in `app/app.py` pending backend deprecation. `annotated_script.json` is derived-only.
 
 Each phase is independently testable. Schema versioning allows migration without data loss.
 

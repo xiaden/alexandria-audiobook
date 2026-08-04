@@ -24,12 +24,10 @@ with temperature=0.1 for format stability.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any
 
-from ._llm_helpers import chat_completion
+from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
@@ -318,23 +316,12 @@ Example:
 
 def _parse_llm_response(response_text: str) -> list[dict]:
     """Parse the LLM response into a list of presence dicts."""
-    # Try json.loads first
-    try:
-        presence_list = json.loads(response_text)
-    except json.JSONDecodeError:
-        # Try to find JSON array in response with regex fallback
-        match = re.search(r"\[[\s\S]*\]", response_text)
-        if match:
-            try:
-                presence_list = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                logger.error(
-                    f"Failed to parse LLM response as JSON: {response_text[:200]}"
-                )
-                return []
-        else:
-            logger.error(f"No JSON array found in LLM response: {response_text[:200]}")
-            return []
+    presence_list = extract_json_from_llm_response(response_text, expected_type="list")
+    if presence_list is None:
+        logger.error(
+            f"Failed to parse LLM response as JSON: {response_text[:200]}"
+        )
+        return []
 
     if not isinstance(presence_list, list):
         logger.error(f"LLM response is not a list: {type(presence_list)}")

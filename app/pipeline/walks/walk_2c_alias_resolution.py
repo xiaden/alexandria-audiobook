@@ -26,10 +26,9 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any
 
-from ._llm_helpers import chat_completion
+from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 
 logger = logging.getLogger(__name__)
@@ -254,24 +253,13 @@ def _parse_llm_response(
     """
     valid_ids = {char["id"] for char in characters}
 
-    try:
-        groups = json.loads(response_text)
-    except json.JSONDecodeError:
-        match = re.search(r"\[[\s\S]*\]", response_text)
-        if match:
-            try:
-                groups = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                logger.error(
-                    "Failed to parse LLM response as JSON: %s",
-                    response_text[:200],
-                )
-                return []
-        else:
-            logger.error(
-                "No JSON array found in LLM response: %s", response_text[:200]
-            )
-            return []
+    groups = extract_json_from_llm_response(response_text, expected_type="list")
+    if groups is None:
+        logger.error(
+            "Failed to parse LLM response as JSON: %s",
+            response_text[:200],
+        )
+        return []
 
     if not isinstance(groups, list):
         logger.error("LLM response is not a list: %s", type(groups))

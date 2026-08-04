@@ -35,6 +35,7 @@ import {
   handleReviewReject,
   handleReviewOverride,
   pipelineRenderAll,
+  cancelPipelineRender,
   getCachedSpans,
   getCachedReviewItems,
   getSelectedIndices,
@@ -407,7 +408,7 @@ describe('Editor Tab — Span Display', () => {
     it('should fetch spans and render to #spans-table-body', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
 
-      await loadSpans(true);
+      await loadSpans();
 
       expect(API.get).toHaveBeenCalledWith('/api/pipeline/export/book-123');
       const tbody = document.getElementById('spans-table-body');
@@ -437,7 +438,7 @@ describe('Editor Tab — Span Display', () => {
     it('should update cached spans', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
 
-      await loadSpans(true);
+      await loadSpans();
 
       const cached = getCachedSpans();
       expect(cached).toHaveLength(3);
@@ -462,7 +463,7 @@ describe('Editor Tab — Pipeline Operations', () => {
   describe('handleSplit', () => {
     it('should prompt for split point and call pipelineOperation', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       global.prompt = vi.fn().mockReturnValue('10');
       vi.mocked(API.post).mockResolvedValue({ status: 'ok', operation: 'split' });
@@ -489,7 +490,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
     it('should show error for invalid split point', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       global.prompt = vi.fn().mockReturnValue('999');
       const { showToast } = await import('../../src/utils');
@@ -502,7 +503,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
     it('should not proceed if user cancels prompt', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       global.prompt = vi.fn().mockReturnValue(null);
 
@@ -515,7 +516,7 @@ describe('Editor Tab — Pipeline Operations', () => {
   describe('handleMerge', () => {
     it('should merge two adjacent selected spans', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       toggleSpanSelection(0);
       toggleSpanSelection(1);
@@ -533,7 +534,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
     it('should show warning if not exactly 2 spans selected', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       toggleSpanSelection(0);
       const { showToast } = await import('../../src/utils');
@@ -546,7 +547,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
     it('should show warning if spans are not adjacent', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       toggleSpanSelection(0);
       toggleSpanSelection(2);
@@ -562,7 +563,7 @@ describe('Editor Tab — Pipeline Operations', () => {
   describe('handleMove', () => {
     it('should move selected span to target position', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       toggleSpanSelection(0);
       vi.mocked(API.post).mockResolvedValue({ status: 'ok', operation: 'move' });
@@ -579,7 +580,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
     it('should show warning if not exactly 1 span selected', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       const { showToast } = await import('../../src/utils');
 
@@ -591,7 +592,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
     it('should show info if moving to same position', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       toggleSpanSelection(2);
       const { showToast } = await import('../../src/utils');
@@ -606,7 +607,7 @@ describe('Editor Tab — Pipeline Operations', () => {
   describe('handleDelete', () => {
     it('should confirm and delete span', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       const { showConfirm } = await import('../../src/utils');
       vi.mocked(showConfirm).mockResolvedValue(true);
@@ -624,7 +625,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
     it('should not delete if user cancels confirmation', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
-      await loadSpans(true);
+      await loadSpans();
 
       const { showConfirm } = await import('../../src/utils');
       vi.mocked(showConfirm).mockResolvedValue(false);
@@ -851,6 +852,10 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
   });
 
   describe('pipelineRenderAll', () => {
+    afterEach(async () => {
+      await cancelPipelineRender(true);
+    });
+
     it('should call pipelineRenderAudiobook and display job_id', async () => {
       vi.mocked(API.post).mockResolvedValue({ job_id: 'job-abc-123' });
 
@@ -960,7 +965,7 @@ describe('Editor Tab — Testability Exports', () => {
   it('getCachedSpans should return current cached spans', async () => {
     vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
 
-    await loadSpans(true);
+    await loadSpans();
 
     const cached = getCachedSpans();
     expect(cached).toHaveLength(3);

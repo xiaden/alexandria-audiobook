@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
+from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import WalkRunner
 
 
@@ -68,8 +69,8 @@ class TestWalkRunnerInit:
 
     def test_walk_order_is_class_constant(self):
         """WALK_ORDER is a class-level list of walk names."""
-        assert isinstance(WalkRunner.WALK_ORDER, list)
-        assert "walk_2a_scene_segmentation" in WalkRunner.WALK_ORDER
+        assert isinstance(WALK_ORDER, list)
+        assert "walk_2a_scene_segmentation" in WALK_ORDER
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +312,8 @@ class TestRunAllWalks:
         ):
             results = runner.run_all_walks("book-1", {})
         # Should have one result per walk in WALK_ORDER
-        assert len(results) == len(WalkRunner.WALK_ORDER)
-        for walk_name in WalkRunner.WALK_ORDER:
+        assert len(results) == len(WALK_ORDER)
+        for walk_name in WALK_ORDER:
             assert walk_name in results
 
     def test_run_all_walks_aborts_on_failure(self, runner):
@@ -329,7 +330,7 @@ class TestRunAllWalks:
         # First walk failed, so only one call
         assert call_count[0] == 1
         # First walk result should be failed
-        first_walk = WalkRunner.WALK_ORDER[0]
+        first_walk = WALK_ORDER[0]
         assert results[first_walk]["status"] == "failed"
 
     def test_run_all_walks_returns_results_dict(self, runner):
@@ -343,7 +344,7 @@ class TestRunAllWalks:
         ):
             results = runner.run_all_walks("book-1", {})
         assert isinstance(results, dict)
-        for walk_name in WalkRunner.WALK_ORDER:
+        for walk_name in WALK_ORDER:
             assert results[walk_name]["status"] == "completed"
 
 

@@ -15,12 +15,11 @@ with temperature=0.1 for format stability.
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from ._llm_helpers import chat_completion
+from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
@@ -216,22 +215,10 @@ def _parse_llm_response(response_text: str, paragraphs: list[dict]) -> list[dict
         index_to_id[f"P{idx}"] = para["paragraph_id"]
 
     # Try to extract JSON from response
-    try:
-        # Try direct parse
-        scenes = json.loads(response_text)
-    except json.JSONDecodeError:
-        # Try to find JSON array in response
-        import re
-        match = re.search(r'\[[\s\S]*\]', response_text)
-        if match:
-            try:
-                scenes = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
-                return []
-        else:
-            logger.error(f"No JSON array found in LLM response: {response_text[:200]}")
-            return []
+    scenes = extract_json_from_llm_response(response_text, expected_type="list")
+    if scenes is None:
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
+        return []
 
     if not isinstance(scenes, list):
         logger.error(f"LLM response is not a list: {type(scenes)}")

@@ -1,7 +1,13 @@
 """Operation executor for the audiobook pipeline.
 
 Provides ``OperationExecutor`` which implements split/merge/move/delete
-operations on spans using presentation indices (via ``span_presentation`` VIEW).
+operations on spans using presentation indices.  Two resolution paths exist:
+
+* **Book-scoped path** — when ``book_id`` is provided, a per-book
+  ``ROW_NUMBER()`` query (``_BOOK_SPAN_POSITION_SQL``) computes presentation
+  order at call time, scoped to a single book.
+* **Legacy path** — when ``book_id`` is ``None``, the ``span_presentation``
+  VIEW is used (global, unfiltered).
 
 All operations use a single connection + SAVEPOINT for atomicity and employ
 the negative-space two-phase reindex to avoid UNIQUE(parent_id, position)
@@ -18,12 +24,58 @@ if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
 
 
+_BOOK_SPAN_POSITION_SQL = """
+SELECT span.id AS span_id,
+       span_edge.parent_id,
+       span_edge.position,
+       ROW_NUMBER() OVER (
+           ORDER BY book.position,
+                    chapter_edge.position,
+                    scene_edge.position,
+                    paragraph_edge.position,
+                    span_edge.position
+       ) AS global_index
+FROM span
+JOIN paragraph_span AS span_edge ON span.id = span_edge.child_id
+JOIN scene_paragraph AS paragraph_edge ON span_edge.parent_id = paragraph_edge.child_id
+JOIN chapter_scene AS scene_edge ON paragraph_edge.parent_id = scene_edge.child_id
+JOIN book_chapter AS chapter_edge ON scene_edge.parent_id = chapter_edge.child_id
+JOIN book ON chapter_edge.parent_id = book.id
+WHERE book.id = ?
+"""
+
+
+def get_book_span_position(
+    conn: sqlite3.Connection, book_id: str, presentation_index: int
+) -> tuple[str, str, int]:
+    """Resolve a presentation index to (span_id, parent_id, position) within a book.
+
+    Uses ROW_NUMBER() over the full presentation-order join filtered by book.id.
+    SQLite does not support parameterised VIEWs, so this is evaluated per-call.
+
+    Returns (span_id, parent_id, position).
+    Raises ValueError if the presentation_index is not found for this book.
+    """
+    row = conn.execute(
+        f"SELECT span_id, parent_id, position FROM ({_BOOK_SPAN_POSITION_SQL}) "
+        "WHERE global_index = ?",
+        (book_id, presentation_index),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"Presentation index {presentation_index} not found in book {book_id}"
+        )
+    return (row[0], row[1], row[2])
+
+
 class OperationExecutor:
     """Executes structural operations on the document spine.
 
-    All operations use presentation indices (global_index from span_presentation
-    VIEW) rather than direct span IDs. The LLM emits intent on indices; this
-    executor performs the assembly.
+    All operations use presentation indices.  When ``book_id`` is provided
+    (book-scoped path), a per-book ``ROW_NUMBER()`` query computes presentation
+    order at call time.  When ``book_id`` is ``None`` (legacy path), the
+    ``span_presentation`` VIEW is used.  The LLM emits intent on indices;
+    this executor performs the assembly.
 
     Parameters
     ----------
@@ -39,12 +91,24 @@ class OperationExecutor:
     # -----------------------------------------------------------------------
 
     def _get_span_position(
-        self, conn: sqlite3.Connection, presentation_index: int
+        self,
+        conn: sqlite3.Connection,
+        presentation_index: int,
+        *,
+        book_id: str | None = None,
     ) -> tuple[str, str, int]:
         """Resolve a presentation index to (span_id, parent_id, position).
 
-        Queries span_presentation to get span_id, then paragraph_span to get
-        the parent paragraph and current position.
+        Parameters
+        ----------
+        conn:
+            Active SQLite connection.
+        presentation_index:
+            1-based presentation order index.
+        book_id:
+            When provided, resolves the index within the given book using the
+            book-scoped ``ROW_NUMBER()`` query.  When ``None``, falls back to
+            the legacy ``span_presentation`` VIEW (global).
 
         Returns
         -------
@@ -56,6 +120,9 @@ class OperationExecutor:
         ValueError
             If the presentation_index does not exist.
         """
+        if book_id is not None:
+            return get_book_span_position(conn, book_id, presentation_index)
+
         row = conn.execute(
             "SELECT id FROM span_presentation WHERE global_index = ?",
             (presentation_index,),
@@ -162,7 +229,9 @@ class OperationExecutor:
     # Operations
     # -----------------------------------------------------------------------
 
-    def execute_split(self, presentation_index: int, split_point: int) -> None:
+    def execute_split(
+        self, book_id: str, presentation_index: int, split_point: int
+    ) -> None:
         """Split a span into two at the given text offset.
 
         The left span (original) keeps existing character_span memberships
@@ -171,8 +240,10 @@ class OperationExecutor:
 
         Parameters
         ----------
+        book_id:
+            Book that scopes the presentation index.
         presentation_index:
-            Global index from span_presentation VIEW
+            Index from span_presentation (book-scoped when *book_id* is given).
         split_point:
             Character offset at which to split.  Must be a strict interior
             offset: ``0 < split_point < len(span.text)``.
@@ -187,7 +258,7 @@ class OperationExecutor:
         try:
             # Resolve span and position
             span_id, parent_id, old_position = self._get_span_position(
-                conn, presentation_index
+                conn, presentation_index, book_id=book_id
             )
 
             # Get span details including text and instruct
@@ -256,7 +327,10 @@ class OperationExecutor:
             raise
 
     def execute_merge(
-        self, presentation_index_left: int, presentation_index_right: int
+        self,
+        book_id: str,
+        presentation_index_left: int,
+        presentation_index_right: int,
     ) -> None:
         """Merge two adjacent spans into one.
 
@@ -265,10 +339,12 @@ class OperationExecutor:
 
         Parameters
         ----------
+        book_id:
+            Book that scopes the presentation indices.
         presentation_index_left:
-            Global index of the left span
+            Index of the left span
         presentation_index_right:
-            Global index of the right span (must be adjacent to left)
+            Index of the right span (must be adjacent to left)
 
         Raises
         ------
@@ -282,10 +358,10 @@ class OperationExecutor:
         try:
             # Resolve both spans
             left_span_id, left_parent_id, left_position = self._get_span_position(
-                conn, presentation_index_left
+                conn, presentation_index_left, book_id=book_id
             )
             right_span_id, right_parent_id, right_position = self._get_span_position(
-                conn, presentation_index_right
+                conn, presentation_index_right, book_id=book_id
             )
 
             # Verify same parent
@@ -369,16 +445,21 @@ class OperationExecutor:
             raise
 
     def execute_move(
-        self, presentation_index_from: int, presentation_index_to: int
+        self,
+        book_id: str,
+        presentation_index_from: int,
+        presentation_index_to: int,
     ) -> None:
         """Move a span to a new position within the same parent paragraph.
 
         Parameters
         ----------
+        book_id:
+            Book that scopes the presentation indices.
         presentation_index_from:
-            Current global index of the span
+            Current index of the span
         presentation_index_to:
-            Target global index (must be within same parent paragraph)
+            Target index (must be within same parent paragraph)
 
         Raises
         ------
@@ -390,12 +471,12 @@ class OperationExecutor:
         try:
             # Resolve source span
             span_id, parent_id, old_position = self._get_span_position(
-                conn, presentation_index_from
+                conn, presentation_index_from, book_id=book_id
             )
 
             # Resolve target position
             target_span_id, target_parent_id, target_position = (
-                self._get_span_position(conn, presentation_index_to)
+                self._get_span_position(conn, presentation_index_to, book_id=book_id)
             )
 
             # Verify same parent
@@ -448,20 +529,22 @@ class OperationExecutor:
             conn.execute("ROLLBACK TO SAVEPOINT move_op")
             raise
 
-    def execute_delete(self, presentation_index: int) -> None:
+    def execute_delete(self, book_id: str, presentation_index: int) -> None:
         """Remove a span and its memberships, renumbering positions.
 
         Parameters
         ----------
+        book_id:
+            Book that scopes the presentation index.
         presentation_index:
-            Global index of the span to delete
+            Index of the span to delete
         """
         conn = self._storage.get_connection()
         conn.execute("SAVEPOINT delete_op")
         try:
             # Resolve span and position
             span_id, parent_id, position = self._get_span_position(
-                conn, presentation_index
+                conn, presentation_index, book_id=book_id
             )
 
             # Delete character_span memberships
