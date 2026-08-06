@@ -7,6 +7,11 @@ Covers:
 - POST /api/pipeline/voices — rejects invalid voice type
 - PUT /api/pipeline/voices/{id} — partial update of an existing voice config
 - PUT /api/pipeline/voices/{id} — returns 404 for non-existent id
+- DELETE /api/pipeline/voices/{id} — deletes a voice config
+- DELETE /api/pipeline/voices/{id} — returns 404 for non-existent id
+- POST /api/pipeline/voices/{id}/preview — generates a TTS audio preview
+- POST /api/pipeline/voices/{id}/preview — returns 404 for non-existent id
+- CRUD integration — full POST → GET → PUT → DELETE lifecycle
 """
 
 from __future__ import annotations
@@ -754,9 +759,26 @@ class TestPreviewVoiceEndpoint:
         call = fake_engine.voice_calls[0]
         assert call["text"] == "Hello, this is a test."
         assert call["speaker"] == "test-voice"
-        assert "test-voice" in call["voice_config"]
-        assert call["voice_config"]["test-voice"]["type"] == "custom"
-        assert call["voice_config"]["test-voice"]["voice"] == "TestVoice"
+        # The full voice_config dict (all 10 generated fields) matches the
+        # seeded row: id='test-voice', name='TestVoice', description='A test
+        # voice', type='custom', voice='TestVoice', character_style='cheerful',
+        # seed='-1', and NULL ref_audio/ref_text/adapter_id/adapter_path/alias_of.
+        assert call["voice_config"] == {
+            "test-voice": {
+                "type": "custom",
+                "voice": "TestVoice",
+                "description": "A test voice",
+                "ref_audio": None,
+                "ref_text": None,
+                "adapter_id": None,
+                "adapter_path": None,
+                "character_style": "cheerful",
+                "seed": "-1",
+                "alias_of": None,
+            }
+        }
+        # The endpoint always passes an empty instruct_text to generate_voice
+        assert call["instruct_text"] == ""
 
     def test_preview_tts_engine_none_returns_503(self, preview_storage):
         """When TTS engine is None, preview returns 503."""

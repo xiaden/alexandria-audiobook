@@ -238,6 +238,39 @@ describe('createCharacterCard', () => {
     expect(html).toContain('data-character-id="char-002"');
     expect(html).toContain('character-card');
   });
+
+  it('excludes the NARRATOR pseudo-row from the voice dropdown options', async () => {
+    // Drive module state through loadVoices: the NARRATOR row's name is
+    // remembered as narratorRowName and filtered out of the dropdown.
+    state.pipelineBookId = 'book-abc';
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') {
+        return Promise.resolve([
+          { id: 'NARRATOR', name: 'NARRATOR', voice: 'Ryan' },
+          { id: 'alice', name: 'Alice', voice: 'Alice' },
+          { id: 'bob', name: 'Bob', voice: 'Bob' },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    await loadVoices();
+
+    const html = createCharacterCard(MOCK_CHARACTERS[0], 0);
+    expect(html).toContain('<option value="Alice"');
+    expect(html).not.toContain('value="NARRATOR"');
+  });
+
+  it('marks the assigned voice option as selected', () => {
+    handleCharacterVoiceChange('char-001', 'Alice');
+    const html = createCharacterCard(MOCK_CHARACTERS[0], 0);
+    expect(html).toContain('<option value="Alice" selected>');
+  });
+
+  it('renders the warning confidence badge for mid-range confidence', () => {
+    const html = createCharacterCard({ ...MOCK_CHARACTERS[0], confidence: 0.7 }, 0);
+    expect(html).toContain('bg-warning text-dark');
+    expect(html).toContain('70%');
+  });
 });
 
 describe('renderCharacterLedger', () => {
@@ -327,6 +360,30 @@ describe('handleCharacterVoiceChange', () => {
     const assignments2 = getCharacterVoiceAssignments();
     expect(assignments1).not.toBe(assignments2);
     expect(assignments1).toEqual(assignments2);
+  });
+
+  it('shows a success toast when the assignment PUT resolves', async () => {
+    vi.clearAllMocks();
+    // API.put's default mock implementation resolves (see vi.mock factory)
+    handleCharacterVoiceChange('char-001', 'Alice');
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith('Voice assigned: Alice', 'success');
+    });
+  });
+
+  it('shows an error toast when the assignment PUT rejects', async () => {
+    vi.clearAllMocks();
+    vi.mocked(API.put).mockRejectedValueOnce(new Error('Server error'));
+
+    handleCharacterVoiceChange('char-001', 'Alice');
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith('Failed to save voice assignment: Server error', 'error');
+    });
+    // The optimistic local assignment is retained after a failed persist
+    // (matches the narrator-selector convention — no rollback is implemented).
+    expect(getCharacterVoiceAssignments().get('char-001')).toBe('Alice');
   });
 });
 
@@ -624,6 +681,38 @@ describe('narrator voice selector', () => {
     expect(options).toContain('Ryan');
     expect(options).toContain('Alice');
   });
+
+  it('appends the current narrator voice to the options when it is missing from the catalog', async () => {
+    state.pipelineBookId = 'book-abc';
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') {
+        return Promise.resolve([
+          { id: 'NARRATOR', name: 'NARRATOR', voice: 'Zoe' }, // narrator = Zoe, absent from catalog
+          { id: 'alice', name: 'Alice', voice: 'Alice' },
+          { id: 'bob', name: 'Bob', voice: 'Bob' },
+        ]);
+      }
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+
+    await loadVoices();
+
+    const select = document.getElementById('narrator-voice-select') as HTMLSelectElement;
+    const options = Array.from(select.options).map(o => o.value);
+    // 'Zoe' is the current narrator voice but is absent from the catalog —
+    // the selector appends it so the dropdown never shows an empty selection
+    expect(options).toContain('Zoe');
+    expect(select.value).toBe('Zoe');
+    expect(getCurrentNarratorVoice()).toBe('Zoe');
+  });
+
+  it('rejects an empty narrator voice selection without persisting', () => {
+    handleNarratorVoiceChange('');
+
+    expect(API.put).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -693,6 +782,11 @@ describe('voice catalog (Phase 23)', () => {
   it('does nothing when #voice-catalog is absent', () => {
     document.body.innerHTML = '';
     expect(() => renderVoiceCatalog(CATALOG_VOICES)).not.toThrow();
+  });
+
+  it('falls back to an "unknown" type badge when the voice row has no type', () => {
+    const html = createVoiceCard({ id: 'mystery', name: 'Mystery', voice: 'Mystery' });
+    expect(html).toContain('>unknown<');
   });
 });
 

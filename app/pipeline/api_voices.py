@@ -5,6 +5,7 @@ Provides HTTP endpoints for managing the voice catalog:
 - POST /api/pipeline/voices — create a new voice config
 - PUT /api/pipeline/voices/{id} — partial update of an existing voice config
 - DELETE /api/pipeline/voices/{id} — delete a voice config
+- POST /api/pipeline/voices/{id}/preview — generate a TTS audio preview
 
 Uses dependency injection for storage so tests can inject InMemorySQLiteAdapter.
 """
@@ -34,8 +35,6 @@ _PREVIEWS_DIR = os.path.join(
 # Pydantic request models
 # ---------------------------------------------------------------------------
 
-# Valid voice types accepted by the TTS engine dispatch logic.
-_VALID_VOICE_TYPES = ("custom", "clone", "builtin_lora", "lora", "design")
 VoiceType = Literal["custom", "clone", "builtin_lora", "lora", "design"]
 
 

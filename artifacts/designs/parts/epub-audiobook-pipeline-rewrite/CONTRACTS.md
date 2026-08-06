@@ -79,7 +79,7 @@ JOIN book ON book_chapter.parent_id = book.id;
 - `character_scene(character_id FK, scene_id FK, relation_type CHECK(present|speaker), source, confidence, human_override)`
 - `character_span(character_id FK, span_id FK, relation_type CHECK(speaker|mentioned|present), source, confidence, human_override)`
 - `voice_config(id TEXT PK, name TEXT, description TEXT, type TEXT DEFAULT 'custom', voice TEXT, character_style TEXT, seed TEXT DEFAULT '-1', ref_audio TEXT, ref_text TEXT, adapter_id TEXT, adapter_path TEXT, alias_of TEXT)`
-  **Notes:** Schema extended in Plan O (Voice Workflow Parity) from 3 columns (id, name, description) to 12 columns. The 12 DB columns map to the `VoiceConfigItem` Pydantic model (11 fields) plus `id` and `name` which are DB-only. `default_style` is a backward-compat Pydantic alias for `character_style` and is NOT stored in the DB. Supports 5 voice types: custom, clone, builtin_lora, lora, design. Migration: `scripts/migrate_voice_config_schema.py` (idempotent ALTER TABLE).
+  **Notes:** Schema extended in Plan O (Voice Workflow Parity) from 3 columns (id, name, description) to 12 columns. The 12 DB columns map 1:1 to the `VoiceCreateRequest` Pydantic model fields (app/pipeline/api_voices.py); `VoiceUpdateRequest` is the same set minus `id`, which is the PUT path parameter. `default_style` is a backward-compat Pydantic alias for `character_style` and is NOT stored in the DB. Supports 5 voice types: custom, clone, builtin_lora, lora, design. Migration: `scripts/migrate_voice_config_schema.py` (idempotent ALTER TABLE).
 
 ## Extraction
 
@@ -593,6 +593,7 @@ GET    /api/pipeline/voices          — list all voice configs (optional type f
 POST   /api/pipeline/voices          — create a new voice config
 PUT    /api/pipeline/voices/{id}     — partial update of an existing voice config
 DELETE /api/pipeline/voices/{id}     — delete a voice config
+POST   /api/pipeline/voices/{id}/preview — generate TTS audio preview
 ```
 
 Request/Response shapes:
