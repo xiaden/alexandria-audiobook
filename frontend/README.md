@@ -9,7 +9,7 @@ The frontend is organized into core pipeline tabs (script, voices, editor, setup
 | Tab | Module | Purpose |
 |-----|--------|---------|
 | Setup | `src/tabs/setup.ts` | LLM endpoint config (base URL / API key / model / reasoning / temperature) and TTS settings (mode, device, language, parallel workers, batch seed, codec compilation, sub-batching, pauses) |
-| Script | `src/tabs/script.ts` | Book onboarding (`POST /api/pipeline/onboard`), run walks (`POST /api/pipeline/run_walks`, `run_all_walks`), walk status polling (`GET /api/pipeline/walk_status/{book_id}`), cancel walks, re-onboard |
+| Script | `src/tabs/script.ts` | Book onboarding (`POST /api/pipeline/onboard`), run walks (`POST /api/pipeline/run_walk`, `run_all_walks`), walk status polling (`GET /api/pipeline/walk_status/{book_id}`), cancel walks, re-onboard |
 | Voices | `src/tabs/voices.ts` | Character list with voice assignment dropdowns (`GET /api/pipeline/characters/{book_id}`, `PUT /api/pipeline/characters/{id}/voice`) and voice catalog management (`GET/POST/PUT/DELETE /api/pipeline/voices`, preview) |
 | Editor | `src/tabs/editor.ts` + `src/tabs/editor-pipeline.ts` | Span-based editing against `/api/pipeline/*` endpoints: structural operations, inline span text edits, confidence review, render, merge, download |
 | Designer | `src/tabs/designer.ts` | Voice Designer — describe a voice, generate and preview it, save to the library (`/api/voice_design/*`) |

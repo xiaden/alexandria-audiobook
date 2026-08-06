@@ -79,7 +79,7 @@ JOIN book ON book_chapter.parent_id = book.id;
 - `character_scene(character_id FK, scene_id FK, relation_type CHECK(present|speaker), source, confidence, human_override)`
 - `character_span(character_id FK, span_id FK, relation_type CHECK(speaker|mentioned|present), source, confidence, human_override)`
 - `voice_config(id TEXT PK, name TEXT, description TEXT, type TEXT DEFAULT 'custom', voice TEXT, character_style TEXT, seed TEXT DEFAULT '-1', ref_audio TEXT, ref_text TEXT, adapter_id TEXT, adapter_path TEXT, alias_of TEXT)`
-  **Notes:** Schema extended in Plan O (Voice Workflow Parity) from 3 columns (id, name, description) to 12 columns. The 12 DB columns map 1:1 to the `VoiceCreateRequest` Pydantic model fields (app/pipeline/api_voices.py); `VoiceUpdateRequest` is the same set minus `id`, which is the PUT path parameter. `default_style` is a backward-compat Pydantic alias for `character_style` and is NOT stored in the DB. Supports 5 voice types: custom, clone, builtin_lora, lora, design. Migration: `scripts/migrate_voice_config_schema.py` (idempotent ALTER TABLE).
+  **Notes:** Schema extended in Plan O (Voice Workflow Parity) from 3 columns (id, name, description) to 12 columns. The 12 DB columns map 1:1 to the `VoiceCreateRequest` Pydantic model fields (app/pipeline/api_voices.py); `VoiceUpdateRequest` is the same set minus `id`, which is the PUT path parameter. `default_style` is NOT a field on either request model (removed in Plan O) — it survives only as a read-side fallback: the TTS engine falls back from `character_style` to `default_style` when reading legacy voice data (app/tts.py) and the frontend voice-config state type still carries an optional `default_style` (frontend/src/state.ts). It is never stored in the DB and is not accepted by the voice API. Supports 5 voice types: custom, clone, builtin_lora, lora, design. Migration: `scripts/migrate_voice_config_schema.py` (idempotent ALTER TABLE).
 
 ## Extraction
 
@@ -254,7 +254,7 @@ def render_audiobook(book_id: str, storage: PipelineStorage, tts_engine: object,
 # Returns job_id
 ```
 
-**_build_voice_config behavior (Plan D, Phase 1):** Queries all 12 columns from `voice_config` table (id, name, description, type, voice, character_style, seed, ref_audio, ref_text, adapter_id, adapter_path, alias_of) and returns complete voice config dicts. Voice type is no longer hardcoded to "custom" — it comes from the DB `type` column, enabling TTSEngine to route to clone/design/LoRA/builtin_lora/custom methods based on actual voice configuration.
+**_build_voice_config behavior (Plan D, Phase 1):** Queries `voice_config` columns and returns complete voice config dicts — the character path selects all 12 columns (id, name, description, type, voice, character_style, seed, ref_audio, ref_text, adapter_id, adapter_path, alias_of); the NARRATOR path selects 10 of the 12, omitting id and name (not needed for the NARRATOR config dict). Voice type is no longer hardcoded to "custom" — it comes from the DB `type` column, enabling TTSEngine to route to clone/design/LoRA/builtin_lora/custom methods based on actual voice configuration.
 
 **Narrator voice configurability (Plan F, Phase 2):** The NARRATOR voice is configurable via the `voice_config` table. `_build_voice_config` queries for `id='NARRATOR'` and uses the DB row if present (all 10 voice config fields). Falls back to the hardcoded `NARRATOR_VOICE` constant (type=custom, voice=Ryan) if no DB row exists. The seed script `scripts/seed_voice_catalog.py` inserts a NARRATOR row by default (configurable via `--narrator-voice` flag).
 
@@ -350,7 +350,9 @@ Set or clear a character's voice assignment.
 - Registered in `app/pipeline/api.py` via `include_router`
 
 **Frontend integration:** `frontend/src/tabs/voices.ts` `handleCharacterVoiceChange`
-- Always calls `API.put('/api/pipeline/characters/{characterId}/voice', { voice_assignment_id: voiceName || null })`
+- The character-card dropdown value is the voice NAME; the handler resolves the name to the voice_config **id** via the module-level `voiceNameToId` Map (populated by the exported `registerVoiceCatalog()`, called from `loadVoices()`) before PUT
+- PUTs `API.put('/api/pipeline/characters/{characterId}/voice', { voice_assignment_id: <resolved id> })`; an empty/null selection clears the assignment (sends `null`)
+- An unresolvable name shows an error toast ("Voice 'X' not found in voice catalog") and does NOT PUT and does not optimistically update
 - Shows success toast on success, error toast on failure
 - Local assignment Map update and character-card badge update preserved for immediate UX feedback
 
@@ -478,9 +480,7 @@ class OperationRequest(BaseModel):
 
 ### API Split by Responsibility (Plan N)
 
-The API is split into 5 responsibility modules, each defining its own
-`APIRouter(prefix="/api/pipeline", tags=["pipeline"])` and its own
-FastAPI dependency injection functions (`get_*()`).
+The API is split into 7 responsibility modules (api_onboard, api_walks, api_operations, api_review, api_export, api_characters, api_voices), each defining its own `APIRouter(prefix="/api/pipeline", tags=["pipeline"])` and its own FastAPI dependency injection functions (`get_*()`). `app/pipeline/api.py` aggregates all 7 sub-routers into one combined router.
 
 #### Module: `app/pipeline/api_onboard.py`
 Owns the production storage singleton and onboarding endpoints.
@@ -509,6 +509,7 @@ Endpoints:
 ```
 POST /api/pipeline/run_walk          — run a single walk for a book
 POST /api/pipeline/run_all_walks     — run all 9 walks serially for a book
+POST /api/pipeline/cancel_walks      — cancel a running walk cycle
 GET  /api/pipeline/walk_status/{book_id} — per-walk status for a book
 GET  /api/pipeline/characters/{book_id}  — character ledger for a book
 ```
@@ -529,6 +530,7 @@ Endpoints:
 ```
 POST /api/pipeline/operation — dispatches by request.operation field
                                (split | merge | move | delete)
+PUT  /api/pipeline/span/{span_id}/text — inline edit a span's text
 ```
 
 Dependency injection:
@@ -561,6 +563,10 @@ Endpoints:
 ```
 GET  /api/pipeline/export/{book_id} — export annotated script for a book
 POST /api/pipeline/render           — render an audiobook from the pipeline's script
+GET  /api/pipeline/render_status/{job_id} — poll a render job's progress
+POST /api/pipeline/cancel_render    — cancel a running render job
+GET  /api/pipeline/download/{job_id} — download the merged M4B (or a ZIP of raw chunks)
+POST /api/pipeline/merge            — merge rendered chunks into audiobook.m4b
 ```
 
 Dependency injection:
@@ -693,6 +699,33 @@ Dependency injection:
 # Tests override via FastAPI dependency_overrides with InMemorySQLiteAdapter
 ```
 
+#### Module: `app/pipeline/api_characters.py`
+Character voice-assignment endpoint (Plan O).
+
+Endpoints:
+```
+PUT /api/pipeline/characters/{character_id}/voice — set or clear a character's voice assignment
+```
+
+Request/Response shapes:
+```python
+# PUT /api/pipeline/characters/{character_id}/voice
+# Request body: CharacterVoiceUpdateRequest
+{
+    "voice_assignment_id": "voice-id"   # Required; null clears the assignment
+}
+# Response: 200 OK — the updated character row
+# (id, name, aliases, voice_assignment_id, description)
+# Error: 404 Not Found — if the character does not exist
+# Error: 400 Bad Request — if voice_assignment_id references a non-existent voice config
+```
+
+Dependency injection:
+```python
+# Uses get_storage from api_onboard (same as other pipeline modules)
+# Tests override via FastAPI dependency_overrides with InMemorySQLiteAdapter
+```
+
 #### Thin entry point: `app/pipeline/api.py`
 
 `api.py` is the thin entry point that combines all sub-routers into a
@@ -775,7 +808,11 @@ method names below are authoritative.
   render half in `TestCloneVoiceIntegration` above.)
 - `TestUpdateCharacterVoice::test_clear_voice_assignment` — empty assignment
   clears the DB column; `test_invalid_voice_id_returns_400` — unknown voice id →
-  400; `test_returns_all_character_fields` — response contains the full
+  400; `test_seeded_voice_id_is_accepted` — a seeded voice_config row's id
+  (e.g. `ryan`) is accepted and stored; `test_voice_name_is_rejected` — the
+  display name (`Ryan`) is NOT a valid assignment id → 400, row unchanged;
+  confirms the id contract that the frontend must resolve name→id before PUT;
+  `test_returns_all_character_fields` — response contains the full
   character shape.
 - `TestUpdateCharacterVoiceNotFound` — 404 for a nonexistent character, checked
   before voice validation.
@@ -832,7 +869,12 @@ method names below are authoritative.
   /api/pipeline/characters/{id}/voice` (`frontend/src/tabs/voices.ts`), whose DB
   persistence is proven by `TestUpdateCharacterVoice` above. `initVoices`
   attaches the change listener to `#character-ledger`; `createCharacterCard`
-  renders the per-character voice dropdown with all available voices.
+  renders the per-character voice dropdown with all available voices. Dropdown
+  values are voice names — resolved to voice_config ids via
+  `registerVoiceCatalog` before the PUT; an unresolvable name shows an error
+  toast and does NOT PUT (covered by `frontend/tests/frontend/test_voices.test.ts`
+  "shows an error toast and does NOT PUT when the voice name is not in the
+  catalog").
 - Narrator voice selector (Phase 19) — dropdown renders all available voices
   (excluding the `NARRATOR` pseudo-row) with the `NARRATOR` row's `voice`
   selected; change → `PUT /api/pipeline/voices/NARRATOR` with `{voice}`;

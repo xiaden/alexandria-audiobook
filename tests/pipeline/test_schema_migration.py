@@ -9,14 +9,9 @@ Tests verify:
 from __future__ import annotations
 
 import sqlite3
-import sys
 from pathlib import Path
 
 import pytest
-
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from scripts.migrate_voice_config_schema import (

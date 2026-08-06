@@ -7,6 +7,11 @@ Usage:
     python test_api.py --url http://host:port
 """
 
+# This is an opt-in live-server harness, not a pytest suite. Keep it runnable
+# via ``python app/test_api.py`` without collecting network tests in the
+# repository test run.
+__test__ = False
+
 import argparse
 import io
 import json

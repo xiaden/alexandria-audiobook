@@ -5,6 +5,8 @@ Covers:
 - PUT /api/pipeline/characters/{id}/voice — clear voice assignment (null)
 - PUT /api/pipeline/characters/{id}/voice — invalid voice id returns 400
 - PUT /api/pipeline/characters/{id}/voice — non-existent character returns 404
+- PUT /api/pipeline/characters/{id}/voice — seed-script id ('ryan') accepted (id contract)
+- PUT /api/pipeline/characters/{id}/voice — voice NAME ('Ryan') rejected with 400
 """
 
 from __future__ import annotations
@@ -31,6 +33,14 @@ def _populate_voice(storage: InMemorySQLiteAdapter) -> None:
     )
 
 
+def _populate_seeded_voice(storage: InMemorySQLiteAdapter) -> None:
+    """Insert a voice row mirroring scripts/seed_voice_catalog.py (id 'ryan', name 'Ryan')."""
+    storage.execute_insert(
+        "INSERT INTO voice_config (id, name, description, type, voice) "
+        "VALUES ('ryan', 'Ryan', 'Default custom voice', 'custom', 'Ryan')"
+    )
+
+
 def _populate_character(storage: InMemorySQLiteAdapter) -> None:
     """Insert a test character with no voice assignment."""
     storage.execute_insert(
@@ -50,6 +60,7 @@ def storage():
     adapter = InMemorySQLiteAdapter()
     adapter.init_db()
     _populate_voice(adapter)
+    _populate_seeded_voice(adapter)
     _populate_character(adapter)
     return adapter
 
@@ -119,6 +130,49 @@ class TestUpdateCharacterVoice:
         response = client.put(
             "/api/pipeline/characters/char-1/voice",
             json={"voice_assignment_id": "nonexistent-voice"},
+        )
+        assert response.status_code == 400
+        assert "not found" in response.json()["detail"]
+
+        # Verify character unchanged
+        rows = storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id = ?",
+            ("char-1",),
+        )
+        assert rows[0]["voice_assignment_id"] is None
+
+    def test_seeded_voice_id_is_accepted(self, client, storage):
+        """PUT with a seed-script voice_config id ('ryan') succeeds — the id contract.
+
+        The frontend resolves dropdown voice NAMES to voice_config ids before
+        PUT (CONTRACTS.md "voice-id"), so the seeded id ('ryan') must be
+        accepted and stored.
+        """
+        response = client.put(
+            "/api/pipeline/characters/char-1/voice",
+            json={"voice_assignment_id": "ryan"},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["voice_assignment_id"] == "ryan"
+
+        # Verify DB state
+        rows = storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id = ?",
+            ("char-1",),
+        )
+        assert rows[0]["voice_assignment_id"] == "ryan"
+
+    def test_voice_name_is_rejected(self, client, storage):
+        """PUT with a voice NAME ('Ryan') is rejected with 400 — names are not ids.
+
+        Documents the contract that the backend validates voice_assignment_id
+        against voice_config.id only; the seed-script NAME of the 'ryan' row
+        must not be sent as an id (the pre-fix frontend bug).
+        """
+        response = client.put(
+            "/api/pipeline/characters/char-1/voice",
+            json={"voice_assignment_id": "Ryan"},
         )
         assert response.status_code == 400
         assert "not found" in response.json()["detail"]

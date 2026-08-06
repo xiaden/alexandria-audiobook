@@ -2,7 +2,7 @@
 
 > **Design Document:** `artifacts/designs/pending/DD-epub-audiobook-pipeline-rewrite-v3.md`
 > **Status:** ACTIVE — v3 design (SQLite-WAL two-graph model, 9-walk serial DAG)
-> **Feature cutover:** COMPLETE — pipeline-only mode. Plan Q (terminal) executed 11 phases / 70 steps: legacy dual-path surface removed, pipeline unconditional, negative-space guard suite green, frontend dead-poll gap resolved and vitest-enabled (142 tests). Superseded plans P archived; O pending archival (50 steps never marked complete by its executor — bookkeeping gap, see Plan Q P11-S13).
+> **Feature cutover:** COMPLETE — pipeline-only mode. Plan Q (terminal) executed 11 phases / 70 steps: legacy dual-path surface removed, pipeline unconditional, negative-space guard suite green, frontend dead-poll gap resolved and vitest-enabled (167 tests). Superseded plans P archived; O archived (artifacts/plans/completed/).
 > **Supersedes:** All prior v2 plans and contracts referencing file-based `pipeline_state/` JSON storage, 6-walk DAG, content_hash, Jaccard reconciliation.
 
 ## Plan Dependency Graph
@@ -79,7 +79,7 @@ Plans are sequentially ordered A→Q. Each plan depends on all prior plans. No p
 
 **Plan Q (terminal):** Depends on O and P. Deletes the legacy dual-path surface (ProjectManager/chunk editor, legacy voice/merge/batch/export endpoints, prompt files, the dual-mode toggle, audio tab, legacy tests/docs) and makes the pipeline unconditional. Introduces `app/engine.py` (see CONTRACTS.md). On completion, Plans O and P are archived as subsumed.
 
-**Plan Q status:** COMPLETE (all 11 phases executed; final counts 11 phases / 70 steps). Feature is cut over — pipeline-only. Guard suite `tests/pipeline/test_legacy_removed.py` stays 12/12; combined backend suite 758 passed / 40 environmental fails (MissingSchema + SKIP, no code failures). Frontend: tsc clean, `npm run build` regenerates dist without legacy markers, vitest 142/142 green. Known residuals: (1) `app/pipeline/adapter.py` SQLiteAdapter thread-affinity defect (sqlite3 connection created in threadpool by the sync `get_storage()` dependency, used on the event-loop thread) — blocks HTTP smoke-testing of DB-touching pipeline endpoints (characters/voices/review/preview/char-voice); NOT caused by Plan Q, pre-existing since Phase 1 (see Plan Q P11-S12 Blocked annotation); (2) Plan O archival blocked on 50 unmarked steps (P11-S13).
+**Plan Q status:** COMPLETE (all 11 phases executed; final counts 11 phases / 70 steps). Feature is cut over — pipeline-only. Guard suite `tests/pipeline/test_legacy_removed.py` stays 12/12; combined backend suite 768 passed (guard included; no environmental fails). Frontend: tsc clean, `npm run build` regenerates dist without legacy markers, vitest 167/167 green. Prior residuals resolved: (1) `app/pipeline/adapter.py` SQLiteAdapter thread-affinity defect — FIXED (adapter.py L82, committed), restoring HTTP smoke-testing of DB-touching pipeline endpoints (characters/voices/review/preview/char-voice); (2) Plan O archival — DONE (archived in artifacts/plans/completed/).
 
 ## Key Design Decisions (from DD v3)
 

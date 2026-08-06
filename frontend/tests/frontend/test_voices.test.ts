@@ -22,6 +22,7 @@ import {
   getCharacterVoiceAssignments,
   getCachedCharacters,
   loadVoices,
+  registerVoiceCatalog,
   initVoices,
   handleNarratorVoiceChange,
   getCurrentNarratorVoice,
@@ -261,6 +262,11 @@ describe('createCharacterCard', () => {
   });
 
   it('marks the assigned voice option as selected', () => {
+    registerVoiceCatalog([
+      { id: 'alice', name: 'Alice', voice: 'Alice' },
+      { id: 'bob', name: 'Bob', voice: 'Bob' },
+      { id: 'charlie', name: 'Charlie', voice: 'Charlie' },
+    ]);
     handleCharacterVoiceChange('char-001', 'Alice');
     const html = createCharacterCard(MOCK_CHARACTERS[0], 0);
     expect(html).toContain('<option value="Alice" selected>');
@@ -323,6 +329,12 @@ describe('handleCharacterVoiceChange', () => {
         </div>
       </div>
     `;
+    // Seed the name→id lookup (normally populated by loadVoices) so the
+    // handler can resolve dropdown names to voice_config ids before PUT.
+    registerVoiceCatalog([
+      { id: 'alice', name: 'Alice', voice: 'Alice' },
+      { id: 'bob', name: 'Bob', voice: 'Bob' },
+    ]);
   });
 
   it('should store voice assignment in local map', () => {
@@ -367,9 +379,28 @@ describe('handleCharacterVoiceChange', () => {
     // API.put's default mock implementation resolves (see vi.mock factory)
     handleCharacterVoiceChange('char-001', 'Alice');
 
+    // The selected NAME is resolved to the voice_config id before PUT
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/characters/char-001/voice', {
+      voice_assignment_id: 'alice',
+    });
+
     await vi.waitFor(() => {
       expect(showToast).toHaveBeenCalledWith('Voice assigned: Alice', 'success');
     });
+  });
+
+  it('shows an error toast and does NOT PUT when the voice name is not in the catalog', () => {
+    vi.clearAllMocks();
+    // Snapshot the map first — earlier tests may have left an assignment
+    const before = getCharacterVoiceAssignments();
+
+    // 'Zoe' is absent from the registered catalog — cannot be resolved to an id
+    handleCharacterVoiceChange('char-001', 'Zoe');
+
+    expect(API.put).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith("Voice 'Zoe' not found in voice catalog", 'error');
+    // The assignment map is left untouched — no optimistic update
+    expect(getCharacterVoiceAssignments()).toEqual(before);
   });
 
   it('shows an error toast when the assignment PUT rejects', async () => {
@@ -555,11 +586,13 @@ describe('initVoices', () => {
     // Bubbles must be true — the delegated listener lives on #character-ledger
     select.dispatchEvent(new Event('change', { bubbles: true }));
 
-    // Delegated handler (initVoices wiring) persists the assignment via PUT
+    // Delegated handler (initVoices wiring) resolves the selected name
+    // 'Alice' to the voice_config id 'alice' before persisting via PUT
     expect(API.put).toHaveBeenCalledWith('/api/pipeline/characters/char-001/voice', {
-      voice_assignment_id: 'Alice',
+      voice_assignment_id: 'alice',
     });
     // Local ledger state was updated through handleCharacterVoiceChange
+    // (kept by NAME for display; the backend round-trips by id)
     expect(getCharacterVoiceAssignments().get('char-001')).toBe('Alice');
   });
 });

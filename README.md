@@ -185,7 +185,7 @@ Configure your LLM connection and TTS engine. At minimum you need:
 - Click **Save Configuration** when done
 
 **Step 2 — Script**
-- Select your book file (.txt, .md, or .epub) using the file picker — it uploads and onboarded into the pipeline automatically
+- Select your book file (EPUB only) using the file picker — it uploads and is onboarded into the pipeline automatically (converted to plain text server-side)
 - Click **Run All Walks** — this runs the 9-walk LLM annotation pipeline (scene segmentation → character discovery → alias resolution → scene presence → span attribution → character description → voice audition → voice assignment → delivery) to build the annotated script
 - Watch walk progress in real time; each walk's status is shown as it completes
 - *(Optional)* Click **Re-onboard** if you need to reload the book from scratch
@@ -243,7 +243,7 @@ Configure connections to your LLM and TTS engine.
 - **Same Speaker Pause** - Silence in milliseconds when the same speaker continues during merge (default: 250)
 
 ### Script Tab
-Upload a text file (.txt, .md, or .epub) and run the annotation walks. EPUB files are automatically converted to plain text on upload. The pipeline runs 9 serial LLM walks that convert your book into a structured span graph with:
+Upload an EPUB file and run the annotation walks. Onboarding is EPUB-only — the file is converted to plain text server-side on upload. The pipeline runs 9 serial LLM walks that convert your book into a structured span graph with:
 - Speaker identification (NARRATOR vs character names)
 - Dialogue text with natural vocalizations (written as pronounceable text, not tags)
 - Style directions for TTS delivery
@@ -546,6 +546,16 @@ curl -X POST http://127.0.0.1:4200/api/lora/test \
 
 # Delete an adapter
 curl -X DELETE http://127.0.0.1:4200/api/lora/models/adapter_id_here
+
+# Check LoRA training status
+curl http://127.0.0.1:4200/api/lora/status
+```
+
+### Voice Dataset Preparer
+```bash
+# Check a preparer job's status (task_name: preparer | batch_preparer)
+curl http://127.0.0.1:4200/api/preparer/status/preparer
+curl http://127.0.0.1:4200/api/preparer/status/batch_preparer
 ```
 
 ### Dataset Builder

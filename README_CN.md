@@ -140,7 +140,7 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 配置 LLM 端点（Base URL、API Key、Model Name），TTS 模式设为 `local`，然后点击 **Save Configuration**。
 
 ### 第 2 步：脚本
-在脚本标签页中上传 `.txt`、`.md` 或 `.epub` 文件（EPUB 自动转换为纯文本）。点击 **Onboard Book** 导入书籍，然后点击 **Run All Walks** 运行完整的 9 步标注流水线（2a→2i）。行走进度显示在标签页中；任何行走均可取消或单独重新运行。如需重新导入（例如替换源文件），使用 **Re-onboard**。
+在脚本标签页中上传 `.epub` 文件（仅支持 EPUB，服务端自动转换为纯文本）。点击 **Onboard Book** 导入书籍，然后点击 **Run All Walks** 运行完整的 9 步标注流水线（2a→2i）。行走进度显示在标签页中；任何行走均可取消或单独重新运行。如需重新导入（例如替换源文件），使用 **Re-onboard**。
 
 ### 第 3 步：声音
 在声音标签页中，为每个检测到的角色从声音目录中选择声音。声音类型包括 Custom（9 个预置）、Clone（参考音频）、LoRA（训练适配器）和 Voice Design（文字描述）。使用**说话人别名**（Alias of 下拉菜单）将多个说话人名称映射到同一声音。更改通过流水线 API 自动保存。
@@ -180,7 +180,7 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 
 ### 脚本标签页
 
-1. 上传 `.txt`、`.md` 或 `.epub` 文件
+1. 上传 `.epub` 文件（仅支持 EPUB，服务端自动转换为纯文本）
 2. 点击 **Onboard Book** - 从 EPUB 提取文本并建立书籍结构
 3. 点击 **Run All Walks** - 运行完整标注流水线（2a→2i）
 4. 行走状态显示在标签页中；任何行走均可取消，可单独重新运行，全部完成后进入编辑器审校
@@ -367,7 +367,7 @@ curl -X POST http://127.0.0.1:4200/api/pipeline/voices \
 # 预览声音
 curl -X POST http://127.0.0.1:4200/api/pipeline/voices/<voice_id>/preview \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello world"}'
+  -d '{"sample_text": "Hello world"}'
 
 # 为角色分配声音
 curl -X PUT http://127.0.0.1:4200/api/pipeline/characters/<character_id>/voice \

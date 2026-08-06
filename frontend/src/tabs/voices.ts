@@ -52,6 +52,13 @@ let cachedCharacters: Character[] = [];
 /** Local voice assignments for characters (characterId → voiceName) */
 let characterVoiceAssignments: Map<string, string> = new Map();
 
+/**
+ * Lookup from voice NAME → voice_config id, populated by registerVoiceCatalog
+ * (called from loadVoices). The backend validates voice_assignment_id against
+ * voice_config.id, so the UI must translate dropdown names to ids before PUT.
+ */
+let voiceNameToId: Map<string, string> = new Map();
+
 /** Current narrator TTS voice (voice column of the NARRATOR row; defaults to Ryan). */
 let currentNarratorVoice: string = NARRATOR_DEFAULT_VOICE;
 
@@ -276,6 +283,21 @@ export function renderVoiceCatalog(voices: VoiceConfigRow[]): void {
 // ---------------------------------------------------------------------------
 
 /**
+ * Register the voice catalog for name→id resolution.
+ *
+ * Populates state.voicesNames (dropdown options) and the module-level
+ * name→id lookup used by handleCharacterVoiceChange when persisting
+ * assignments. The backend validates voice_assignment_id against
+ * voice_config.id, so names must be translated to ids before PUT.
+ * Exported for tests; loadVoices delegates to it.
+ * @param voices - Voice config rows from GET /api/pipeline/voices
+ */
+export function registerVoiceCatalog(voices: VoiceConfigRow[]): void {
+  state.voicesNames = voices.map(v => v.name);
+  voiceNameToId = new Map(voices.map(v => [v.name, v.id]));
+}
+
+/**
  * Load voices from the server and render the character ledger.
  * Always loads available TTS voices from /api/pipeline/voices (for dropdown
  * population), then loads pipeline characters and renders the ledger.
@@ -285,7 +307,7 @@ export async function loadVoices(): Promise<void> {
   let voices: VoiceConfigRow[] = [];
   try {
     voices = await API.get<VoiceConfigRow[]>('/api/pipeline/voices');
-    state.voicesNames = voices.map(v => v.name);
+    registerVoiceCatalog(voices);
 
     // Track the narrator's TTS voice (the NARRATOR row's `voice` column),
     // falling back to the default when the row is missing.
@@ -342,10 +364,28 @@ async function loadPipelineCharacters(): Promise<void> {
  * persists the assignment to the pipeline API
  * (PUT /api/pipeline/characters/{id}/voice).
  *
+ * The selected dropdown value is the voice NAME; it is resolved to the
+ * voice_config id before persisting, because the backend validates
+ * voice_assignment_id against voice_config.id and rejects names with 400
+ * (CONTRACTS.md "voice-id"). A name that cannot be resolved produces an
+ * error toast and is NOT persisted (null clears the assignment).
+ *
  * @param characterId - The character ID
  * @param voiceName - The selected voice name (empty string = unassigned)
  */
 export function handleCharacterVoiceChange(characterId: string, voiceName: string): void {
+  // Resolve the selected voice NAME to its voice_config id. An unresolvable
+  // name (not in the loaded catalog) is reported and left unpersisted — it
+  // must not be sent as-is, nor silently clear the assignment.
+  let voiceId: string | null = null;
+  if (voiceName) {
+    voiceId = voiceNameToId.get(voiceName) ?? null;
+    if (voiceId === null) {
+      showToast(`Voice '${voiceName}' not found in voice catalog`, 'error');
+      return;
+    }
+  }
+
   if (voiceName) {
     characterVoiceAssignments.set(characterId, voiceName);
   } else {
@@ -365,9 +405,10 @@ export function handleCharacterVoiceChange(characterId: string, voiceName: strin
     }
   }
 
-  // Persist to the pipeline character voice endpoint
+  // Persist to the pipeline character voice endpoint — send the resolved id
+  // (null clears the assignment).
   API.put(`/api/pipeline/characters/${characterId}/voice`, {
-    voice_assignment_id: voiceName || null,
+    voice_assignment_id: voiceId,
   }).then(() => {
     showToast(`Voice assigned: ${voiceName || '(cleared)'}`, 'success');
   }).catch((e: unknown) => {
