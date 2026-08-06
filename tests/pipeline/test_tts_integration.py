@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
@@ -40,7 +41,7 @@ class FakeTTSEngine:
         self.voice_calls: list[dict] = []
 
     def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
-        """Record the call and return all indices as completed."""
+        """Record the call, write placeholder wavs, and return all indices as completed."""
         self.batch_calls.append(
             {
                 "chunks": list(chunks),
@@ -49,11 +50,17 @@ class FakeTTSEngine:
                 "batch_seed": batch_seed,
             }
         )
+        # Mirror app/tts.py's batch file naming so the fsync/manifest
+        # discipline has real files to work with.
+        for chunk in chunks:
+            out_path = os.path.join(output_dir, f"temp_batch_{chunk['index']}.wav")
+            with open(out_path, "wb") as f:
+                f.write(b"fake wav data\n")
         completed = [c["index"] for c in chunks]
         return {"completed": completed, "failed": []}
 
     def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
-        """Record the call and return True (success)."""
+        """Record the call, write a placeholder wav, and return True (success)."""
         self.voice_calls.append(
             {
                 "text": text,
@@ -63,6 +70,8 @@ class FakeTTSEngine:
                 "output_path": output_path,
             }
         )
+        with open(output_path, "wb") as f:
+            f.write(b"fake wav data\n")
         return True
 
 
@@ -175,6 +184,21 @@ def storage():
 def fake_engine():
     """Return a FakeTTSEngine instance."""
     return FakeTTSEngine()
+
+
+@pytest.fixture(autouse=True)
+def _render_root(tmp_path, monkeypatch):
+    """Pin RENDER_ROOT to a fresh tmp dir for every test in this module.
+
+    ``render_audiobook`` resolves ``RENDER_ROOT`` from the environment at
+    call time; without this pin, ``output_dir=None`` renders would create
+    run dirs under the repo's ``data/render_root``.  All Plan C phase 1
+    tests rely on this deterministic file-backed root.
+    """
+    root = tmp_path / "render_root"
+    root.mkdir()
+    monkeypatch.setenv("RENDER_ROOT", str(root))
+    return str(root)
 
 
 # ---------------------------------------------------------------------------
@@ -410,16 +434,20 @@ class TestIndividualGeneration:
         assert "output_path" in call
 
     def test_generate_voice_output_path_format(self, storage, fake_engine):
-        """Output paths follow chunk_{index:04d}.wav pattern."""
+        """generate_voice writes to a tmp sibling; the final chunk_{index:04d}.wav
+        appears after the fsync+rename discipline (P1-S1)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             render_audiobook(
                 "b1", storage, fake_engine, use_batch=False, output_dir=tmpdir
             )
 
+            # The engine receives the tmp sibling path ...
             paths = [c["output_path"] for c in fake_engine.voice_calls]
-            assert paths[0] == os.path.join(tmpdir, "chunk_0000.wav")
-            assert paths[1] == os.path.join(tmpdir, "chunk_0001.wav")
-            assert paths[2] == os.path.join(tmpdir, "chunk_0002.wav")
+            assert paths[0] == os.path.join(tmpdir, "chunk_0000.wav.tmp")
+            assert paths[1] == os.path.join(tmpdir, "chunk_0001.wav.tmp")
+            assert paths[2] == os.path.join(tmpdir, "chunk_0002.wav.tmp")
+            # ... and the final chunk file exists after the rename.
+            assert os.path.isfile(os.path.join(tmpdir, "chunk_0000.wav"))
 
     def test_generate_voice_receives_voice_config(self, storage, fake_engine):
         """Each generate_voice call receives the full voice_config mapping."""
@@ -558,12 +586,12 @@ class TestOutputDir:
             )
             assert fake_engine.batch_calls[0]["output_dir"] == tmpdir
 
-    def test_auto_created_output_dir_when_none(self, storage, fake_engine):
-        """When output_dir is None, a temp directory is created."""
-        render_audiobook("b1", storage, fake_engine)
+    def test_auto_created_run_dir_when_none(self, storage, fake_engine, _render_root):
+        """When output_dir is None, the run dir is RENDER_ROOT/book-{id}/{job_id}/."""
+        job_id = render_audiobook("b1", storage, fake_engine)
         output_dir = fake_engine.batch_calls[0]["output_dir"]
+        assert output_dir == os.path.join(_render_root, "book-b1", job_id)
         assert os.path.isdir(output_dir)
-        assert "audiobook_b1_" in output_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1174,3 +1202,231 @@ class TestRenderJobPersistence:
             (job_id,),
         )
         assert rows[0]["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# P1-S1: RENDER_ROOT run directories + fsync discipline (Plan C phase 1)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderRootResolution:
+    """P1-S1: get_render_root() reads RENDER_ROOT from the env at call time."""
+
+    def test_env_override(self, monkeypatch, tmp_path):
+        """RENDER_ROOT env var wins when set."""
+        from app.pipeline.tts_integration import get_render_root
+
+        custom = str(tmp_path / "custom-root")
+        monkeypatch.setenv("RENDER_ROOT", custom)
+        assert get_render_root() == custom
+
+    def test_default_under_data(self, monkeypatch):
+        """Without RENDER_ROOT, the default lives under data/ (gitignored)."""
+        from app.pipeline.tts_integration import get_render_root
+
+        monkeypatch.delenv("RENDER_ROOT", raising=False)
+        assert get_render_root() == os.path.join(os.getcwd(), "data", "render_root")
+
+    def test_resolution_is_per_call(self, monkeypatch, tmp_path):
+        """get_render_root re-reads the env on every call."""
+        from app.pipeline.tts_integration import get_render_root
+
+        monkeypatch.setenv("RENDER_ROOT", str(tmp_path / "a"))
+        assert get_render_root() == str(tmp_path / "a")
+        monkeypatch.setenv("RENDER_ROOT", str(tmp_path / "b"))
+        assert get_render_root() == str(tmp_path / "b")
+
+
+class TestRenderRootRunDirs:
+    """P1-S1: output_dir=None renders land in RENDER_ROOT/book-{id}/{job_id}/."""
+
+    def test_batch_run_dir_under_render_root(self, storage, fake_engine, _render_root):
+        """Batch render with output_dir=None writes into the RENDER_ROOT run dir."""
+        render_audiobook("b1", storage, fake_engine, job_id="job-broot")
+        run_dir = os.path.join(_render_root, "book-b1", "job-broot")
+        assert fake_engine.batch_calls[0]["output_dir"] == run_dir
+        assert os.path.isdir(run_dir)
+        # the fake batch engine produces temp_batch_*.wav (app/tts.py naming)
+        assert os.path.isfile(os.path.join(run_dir, "temp_batch_0.wav"))
+
+    def test_individual_chunks_under_run_dir(self, storage, fake_engine, _render_root):
+        """Individual mode writes chunk_0000.wav.. under the RENDER_ROOT run dir."""
+        render_audiobook(
+            "b1", storage, fake_engine, use_batch=False, job_id="job-iroot"
+        )
+        run_dir = os.path.join(_render_root, "book-b1", "job-iroot")
+        for i in range(3):
+            assert os.path.isfile(os.path.join(run_dir, f"chunk_{i:04d}.wav"))
+            # the tmp write path is renamed away — no .tmp leftovers
+            assert not os.path.exists(os.path.join(run_dir, f"chunk_{i:04d}.wav.tmp"))
+
+
+class TestChunkFsyncDiscipline:
+    """P1-S1: per-chunk 2-fsync discipline — tmp write → fsync → rename → fsync parent."""
+
+    def test_tmp_then_rename_then_parent_fsync_order(
+        self, storage, fake_engine, monkeypatch
+    ):
+        """fsync(tmp file) precedes rename; rename precedes fsync(parent dir)."""
+        from app.pipeline import tts_integration as ti
+
+        events: list[str] = []
+        monkeypatch.setattr(
+            ti,
+            "_fsync_file",
+            lambda p: events.append(f"fsync_file:{os.path.basename(p)}"),
+        )
+        monkeypatch.setattr(
+            ti,
+            "_fsync_dir",
+            lambda p: events.append(f"fsync_dir:{os.path.basename(p)}"),
+        )
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            events.append(f"replace:{os.path.basename(src)}->{os.path.basename(dst)}")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", spy_replace)
+
+        render_audiobook(
+            "b1", storage, fake_engine, use_batch=False, job_id="job-fsseq"
+        )
+
+        # Per chunk: fsync(tmp) < rename < fsync(parent dir).  The fsync_dir
+        # events share one basename (the run dir), so compare by occurrence:
+        # the i-th dir fsync must follow the i-th chunk's rename.
+        dir_indices = [k for k, e in enumerate(events) if e.startswith("fsync_dir:")]
+        for i in range(3):
+            tmp = f"chunk_{i:04d}.wav.tmp"
+            final = f"chunk_{i:04d}.wav"
+            fi = events.index(f"fsync_file:{tmp}")
+            ri = events.index(f"replace:{tmp}->{final}")
+            assert fi < ri
+            assert dir_indices[i] > ri
+
+    def test_os_fsync_reached_for_tmp_and_parent(self, storage, fake_engine, monkeypatch):
+        """The discipline reaches the real os.fsync: file + parent dir per chunk."""
+        calls: list = []
+        real_fsync = os.fsync
+        monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd) or real_fsync(fd))
+
+        render_audiobook(
+            "b1", storage, fake_engine, use_batch=False, job_id="job-rawfs"
+        )
+
+        # 3 chunks × (fsync tmp file + fsync parent dir) + manifest file
+        # fsync + manifest rename's parent-dir fsync = 8
+        assert len(calls) == 8
+
+    def test_row_done_only_after_file_durable(
+        self, storage, fake_engine, _render_root, monkeypatch
+    ):
+        """Crash between rename and row-update: file exists, chunk row still pending.
+
+        Locks the invariant that done-marking happens strictly after the WAV
+        is durable — exactly the state Phase 2 reconciliation keys off.
+        """
+        from app.pipeline import tts_integration as ti
+
+        def crashing_mark_done(storage_, job_id_, idx_, wav_path_):
+            raise RuntimeError("simulated crash between rename and row update")
+
+        monkeypatch.setattr(ti, "_mark_chunk_done", crashing_mark_done)
+
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            render_audiobook(
+                "b1", storage, fake_engine, use_batch=False, job_id="job-crash"
+            )
+
+        # File is durable (renamed into its final place) ...
+        assert os.path.isfile(
+            os.path.join(_render_root, "book-b1", "job-crash", "chunk_0000.wav")
+        )
+        # ... but the row was never marked done — detectable by reconciliation.
+        rows = storage.execute_query(
+            "SELECT status FROM render_chunk WHERE job_id = ? AND idx = 0",
+            ("job-crash",),
+        )
+        assert rows[0]["status"] == "pending"
+
+
+class TestBatchFsyncDiscipline:
+    """P1-S1: batch mode applies fsync at file level (no per-chunk rows)."""
+
+    def test_batch_fsyncs_produced_files_then_parent(
+        self, storage, fake_engine, monkeypatch
+    ):
+        """Every produced temp_batch_*.wav is fsynced, then the parent dir once."""
+        from app.pipeline import tts_integration as ti
+
+        events: list[str] = []
+        monkeypatch.setattr(
+            ti,
+            "_fsync_file",
+            lambda p: events.append(f"fsync_file:{os.path.basename(p)}"),
+        )
+        monkeypatch.setattr(
+            ti,
+            "_fsync_dir",
+            lambda p: events.append(f"fsync_dir:{os.path.basename(p)}"),
+        )
+
+        render_audiobook("b1", storage, fake_engine, job_id="job-bfs")
+
+        for i in range(3):
+            assert f"fsync_file:temp_batch_{i}.wav" in events
+        first_dir_fsync = events.index("fsync_dir:job-bfs")
+        # every produced file is fsynced before the parent dir entry
+        assert first_dir_fsync > events.index("fsync_file:temp_batch_2.wav")
+
+
+class TestManifest:
+    """P1-S3: manifest.json is a derived cache written after completion."""
+
+    @staticmethod
+    def _load_manifest(root, book_id, job_id):
+        with open(os.path.join(root, f"book-{book_id}", job_id, "manifest.json")) as f:
+            return json.load(f)
+
+    def test_individual_manifest_content(self, storage, fake_engine, _render_root):
+        """Manifest carries job/book/mode/count/relative chunk paths/status."""
+        render_audiobook("b1", storage, fake_engine, use_batch=False, job_id="job-mf")
+        manifest = self._load_manifest(_render_root, "b1", "job-mf")
+        assert manifest["job_id"] == "job-mf"
+        assert manifest["book_id"] == "b1"
+        assert manifest["mode"] == "individual"
+        assert manifest["chunk_count"] == 3
+        assert manifest["status"] == "completed"
+        assert [c["idx"] for c in manifest["chunks"]] == [0, 1, 2]
+        # wav paths are relative to the run dir (documented choice)
+        assert manifest["chunks"][0]["wav_path"] == "chunk_0000.wav"
+        assert isinstance(manifest["created_ms"], int)
+
+    def test_batch_manifest_content(self, storage, fake_engine, _render_root):
+        """Batch manifest lists the produced temp_batch_*.wav files."""
+        render_audiobook("b1", storage, fake_engine, job_id="job-mfb")
+        manifest = self._load_manifest(_render_root, "b1", "job-mfb")
+        assert manifest["mode"] == "batch"
+        assert manifest["chunk_count"] == 3
+        assert [c["wav_path"] for c in manifest["chunks"]] == [
+            "temp_batch_0.wav",
+            "temp_batch_1.wav",
+            "temp_batch_2.wav",
+        ]
+
+    def test_manifest_write_is_atomic(self, storage, fake_engine, _render_root):
+        """No .tmp leftovers next to manifest.json after a completed render."""
+        render_audiobook("b1", storage, fake_engine, job_id="job-mfa")
+        assert not os.path.exists(
+            os.path.join(_render_root, "book-b1", "job-mfa", "manifest.json.tmp")
+        )
+
+    def test_no_manifest_on_failed_render(self, storage, _render_root):
+        """Failed renders leave no manifest (rows stay the authority)."""
+        engine = _FailingVoiceEngine()
+        with pytest.raises(RuntimeError, match="voice boom"):
+            render_audiobook("b1", storage, engine, use_batch=False, job_id="job-mff")
+        assert not os.path.exists(
+            os.path.join(_render_root, "book-b1", "job-mff", "manifest.json")
+        )

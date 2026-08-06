@@ -17,11 +17,62 @@ Covers:
 - FileResponse-404 subclass: completed job whose recorded artifact file is
   missing → 404 with a JSON detail body (NOT a broken 200)
 - not-completed job 404: 'Job not completed (status: X)' preserved
+
+Phase 4 of TASK-universal-upgrade-C-artifacts-gc-export-backend adds
+GET /api/pipeline/export/chunk/{job_id}/{idx} (bounded-range WAV serving):
+- full GET (no Range) -> 200 audio/wav full body (never capped)
+- valid byte Range -> 206 + Content-Range (capped per request to
+  PIPELINE_MAX_RANGE_BYTES, default 4 MiB)
+- unsatisfiable Range -> 416 + Content-Range: bytes */total
+- malformed Range -> 400 (starlette >= 0.49.1 native behavior)
+- unknown job / unknown idx / non-integer idx -> 404
+- pending / failed chunk rows -> 409 (row exists, not servable)
+- evicted chunk rows (GC tombstone) -> 410 Gone
+- wav_path resolved from the row against the run dir, containment-checked
+  (path traversal -> 404); missing file -> 404 JSON
+
+Phase 5 of TASK-universal-upgrade-C-artifacts-gc-export-backend adds
+GET /api/pipeline/export/audio/{job_id} (whole-book playback):
+- completed job with a file artifact (output_artifact_path names a file, e.g.
+  audiobook.m4b) -> 200 serving the artifact with Range support and the media
+  type for its extension (audio/mp4 for .m4b, audio/mpeg for .mp3, ...)
+- completed individual-mode job with no file artifact -> 200 audio/wav: a
+  synthesized whole-book WAV (chunk 0's RIFF header with sizes patched for the
+  summed payload + each chunk's PCM data) streamed chunk-by-chunk from disk
+  with Range support computed across chunk boundaries
+- batch-mode job (no chunk rows) -> synthesized whole-book WAV from the sorted
+  *.wav files in the run dir
+- unknown job -> 404; non-completed job -> 404 'Job not completed (status: X)';
+  expired job (GC tombstone) -> 410 Gone; evicted/non-done chunks -> 410/409
+- missing artifact/chunk file -> 404 JSON; path traversal -> 404;
+  chunk formats differing (sample rate/channels/bits) -> 409
+
+Phase 6 of TASK-universal-upgrade-C-artifacts-gc-export-backend adds
+POST /api/pipeline/export/m4b (3-phase FFMETADATA1 polished export):
+- request: multipart form (job_id + title/author/narrator/year/description +
+  optional cover UploadFile); rows = truth, dispatch mirrors export_audio
+  (unknown job -> 404, expired -> 410, non-completed -> 404, pending/evicted
+  chunks -> 409/410, path traversal -> 404, format mismatch -> 409)
+- phase 1 CONCAT: ffmpeg concat demuxer joins the chunk WAVs (rows for
+  individual mode, sorted *.wav for batch) into an intermediate WAV
+- phase 2 METADATA: audiobook.ffmetadata written atomically (tmp -> os.replace)
+  with global tags (title/artist/album_artist/date/comment) and one [CHAPTER]
+  per chunk, TIMEBASE=1/1000, integer-ms START/END, last END clamped to the
+  concatenated duration from a single ffprobe pass
+- phase 3 MUX: m4b (aac + ipod container + optional mjpeg attached_pic cover),
+  mp3 (libmp3lame, feature-detected; degrade to m4b-only with a message when
+  absent), audiobook-audacity.zip (ZIP_STORED, chunk wavs + mp3)
+- output_artifact_path updated to the m4b; m4b servable through the phase-5
+  GET /export/audio/{job_id} artifact path as audio/mp4
 """
 
 from __future__ import annotations
 
 import io
+import json
+import os
+import struct
+import subprocess
 import zipfile
 
 import pytest
@@ -197,3 +248,1321 @@ class TestDownloadRender:
         assert resp.headers["content-type"] == "audio/mp4"
         assert resp.headers["content-disposition"] == 'attachment; filename="audiobook.m4b"'
         assert resp.content == b"LATE-MERGE-M4B"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipeline/export/chunk/{job_id}/{idx}
+# ---------------------------------------------------------------------------
+
+
+class TestExportChunkBoundedRange:
+    """Bounded-range WAV serving for GET /api/pipeline/export/chunk/{job_id}/{idx}.
+
+    Rows = truth: the render_chunk row supplies status and wav_path; the
+    wav_path is resolved against the run dir (row's output_dir, or the
+    derived RENDER_ROOT/book-{id}/{job_id}/ when NULL) and containment is
+    enforced (path traversal -> 404).  A full GET without a Range header is
+    never capped; a Range request serves at most PIPELINE_MAX_RANGE_BYTES
+    bytes per request (default 4 MiB) by clamping the slice end.
+    """
+
+    _WAV = b"RIFF....WAVE...."  # 18 bytes
+
+    def _seed_job_and_chunk(
+        self,
+        storage,
+        job_id,
+        idx,
+        wav_path,
+        *,
+        status="done",
+        output_dir=None,
+        book_id="b1",
+    ):
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir) "
+            "VALUES (?, ?, 'individual', 'completed', ?)",
+            (job_id, book_id, output_dir),
+        )
+        storage.execute_insert(
+            "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
+            "VALUES (?, ?, ?, ?)",
+            (job_id, idx, status, wav_path),
+        )
+
+    def _write_chunk(self, tmp_path, data=_WAV):
+        chunk_file = tmp_path / "chunk_0000.wav"
+        chunk_file.write_bytes(data)
+        return str(chunk_file)
+
+    def test_full_get_without_range_returns_200_audio_wav(self, client, storage, tmp_path):
+        """A done chunk served without a Range header returns the full body as
+        audio/wav (200) — the whole-body path is never capped."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-full", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get("/api/pipeline/export/chunk/job-full/0")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/wav"
+        assert resp.headers["accept-ranges"] == "bytes"
+        assert resp.content == self._WAV
+
+    def test_partial_range_returns_206_with_content_range(self, client, storage, tmp_path):
+        """A valid byte range returns 206 with Content-Range and the slice only."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-range", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get(
+            "/api/pipeline/export/chunk/job-range/0", headers={"Range": "bytes=2-5"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == f"bytes 2-5/{len(self._WAV)}"
+        assert resp.headers["content-length"] == "4"
+        assert resp.content == self._WAV[2:6]
+
+    def test_open_ended_range_returns_206_rest_of_file(self, client, storage, tmp_path):
+        """bytes=<start>- (open-ended) serves from start to EOF as 206."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-open", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get(
+            "/api/pipeline/export/chunk/job-open/0", headers={"Range": "bytes=4-"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == f"bytes 4-{len(self._WAV) - 1}/{len(self._WAV)}"
+        assert resp.content == self._WAV[4:]
+
+    def test_unsatisfiable_range_returns_416_with_star(self, client, storage, tmp_path):
+        """A range starting beyond EOF returns 416 with Content-Range: bytes */N."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-416", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get(
+            "/api/pipeline/export/chunk/job-416/0", headers={"Range": "bytes=999999-"}
+        )
+        assert resp.status_code == 416
+        assert resp.headers["content-range"] == f"bytes */{len(self._WAV)}"
+
+    def test_range_end_beyond_eof_clamped_to_eof(self, client, storage, tmp_path):
+        """A range whose end exceeds the file size is clamped to EOF (206)."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-clamp-eof", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get(
+            "/api/pipeline/export/chunk/job-clamp-eof/0", headers={"Range": "bytes=2-99999"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == f"bytes 2-{len(self._WAV) - 1}/{len(self._WAV)}"
+        assert resp.content == self._WAV[2:]
+
+    def test_malformed_range_returns_400(self, client, storage, tmp_path):
+        """A malformed Range header returns 400 — starlette >= 0.49.1 native
+        behavior (the plan wording says 416 for malformed; the installed
+        starlette 1.3.1 sends 400 for malformed and 416 only for unsatisfiable,
+        which is the behavior locked by the >= 0.49.1 pin)."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-mal", 0, wav_path, output_dir=str(tmp_path))
+
+        for bad in ("bytes=abc", "bytes="):
+            resp = client.get(
+                "/api/pipeline/export/chunk/job-mal/0", headers={"Range": bad}
+            )
+            assert resp.status_code == 400, f"Range {bad!r} should be 400"
+
+    def test_unknown_job_returns_404(self, client):
+        """No render_job row -> 404 with the job_id in the detail."""
+        resp = client.get("/api/pipeline/export/chunk/does-not-exist/0")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Unknown job_id: does-not-exist"
+
+    def test_unknown_idx_returns_404(self, client, storage, tmp_path):
+        """A job with no chunk row for the idx -> 404."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-nochunk", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get("/api/pipeline/export/chunk/job-nochunk/7")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Unknown chunk idx: 7"
+
+    def test_non_integer_idx_returns_404(self, client, storage, tmp_path):
+        """A non-integer idx can name no chunk -> 404 (validation choice, plan
+        allows 404 or 400 for non-int / out-of-range idx)."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-alpha", 0, wav_path, output_dir=str(tmp_path))
+
+        for bad in ("abc", "1.5"):
+            resp = client.get(f"/api/pipeline/export/chunk/job-alpha/{bad}")
+            assert resp.status_code == 404
+
+    def test_negative_idx_returns_404(self, client, storage, tmp_path):
+        """A negative idx has no row -> 404."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-neg", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get("/api/pipeline/export/chunk/job-neg/-1")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Unknown chunk idx: -1"
+
+    def test_pending_chunk_returns_409(self, client, storage, tmp_path):
+        """A pending chunk row is not servable yet -> 409 Conflict."""
+        self._seed_job_and_chunk(
+            storage, "job-pending", 0, "ignored.wav", status="pending", output_dir=str(tmp_path)
+        )
+        resp = client.get("/api/pipeline/export/chunk/job-pending/0")
+        assert resp.status_code == 409
+        assert "pending" in resp.json()["detail"]
+
+    def test_failed_chunk_returns_409(self, client, storage, tmp_path):
+        """A failed chunk row is permanently unservable -> 409 Conflict."""
+        self._seed_job_and_chunk(
+            storage, "job-failed", 0, "ignored.wav", status="failed", output_dir=str(tmp_path)
+        )
+        resp = client.get("/api/pipeline/export/chunk/job-failed/0")
+        assert resp.status_code == 409
+        assert "failed" in resp.json()["detail"]
+
+    def test_evicted_chunk_returns_410(self, client, storage, tmp_path):
+        """An evicted chunk row is a GC tombstone -> 410 Gone (the row exists but
+        the artifact was intentionally removed and will not return)."""
+        self._seed_job_and_chunk(
+            storage, "job-evicted", 0, "evicted.wav", status="evicted", output_dir=str(tmp_path)
+        )
+        resp = client.get("/api/pipeline/export/chunk/job-evicted/0")
+        assert resp.status_code == 410
+        assert "evicted" in resp.json()["detail"].lower()
+
+    def test_range_slice_capped_to_env_limit(self, client, storage, tmp_path, monkeypatch):
+        """A Range request never streams more than PIPELINE_MAX_RANGE_BYTES per
+        request: oversized / open-ended ranges are clamped to a cap-sized prefix
+        (206 with the clamped Content-Range)."""
+        monkeypatch.setenv("PIPELINE_MAX_RANGE_BYTES", "4")
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-cap", 0, wav_path, output_dir=str(tmp_path))
+
+        # Open-ended bytes=0- would stream the whole 18-byte file: clamped to 4.
+        resp = client.get(
+            "/api/pipeline/export/chunk/job-cap/0", headers={"Range": "bytes=0-"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == f"bytes 0-3/{len(self._WAV)}"
+        assert resp.content == self._WAV[:4]
+
+        # Explicit end beyond the cap: clamped to start + cap - 1.
+        resp = client.get(
+            "/api/pipeline/export/chunk/job-cap/0", headers={"Range": "bytes=2-17"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == f"bytes 2-5/{len(self._WAV)}"
+        assert resp.content == self._WAV[2:6]
+
+    def test_full_get_not_capped_even_when_larger_than_limit(
+        self, client, storage, tmp_path, monkeypatch
+    ):
+        """The cap targets Range requests only: a full GET without Range still
+        returns the whole body even when the file exceeds the cap."""
+        monkeypatch.setenv("PIPELINE_MAX_RANGE_BYTES", "4")
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-big", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.get("/api/pipeline/export/chunk/job-big/0")
+        assert resp.status_code == 200
+        assert resp.content == self._WAV
+
+    def test_relative_wav_path_resolved_against_run_dir(self, client, storage, tmp_path):
+        """A relative wav_path (the manifest form) is resolved against the row's
+        output_dir before serving."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "chunk_0000.wav").write_bytes(self._WAV)
+        self._seed_job_and_chunk(storage, "job-rel", 0, "chunk_0000.wav", output_dir=str(run_dir))
+
+        resp = client.get("/api/pipeline/export/chunk/job-rel/0")
+        assert resp.status_code == 200
+        assert resp.content == self._WAV
+
+    def test_derived_run_dir_when_output_dir_null(self, client, storage, tmp_path, monkeypatch):
+        """With output_dir NULL the run dir is derived as
+        RENDER_ROOT/book-{id}/{job_id}/ (phase 1 layout) and the stored
+        wav_path is resolved against it."""
+        render_root = tmp_path / "render_root"
+        run_dir = render_root / "book-b1" / "job-derived"
+        run_dir.mkdir(parents=True)
+        (run_dir / "chunk_0000.wav").write_bytes(self._WAV)
+        monkeypatch.setenv("RENDER_ROOT", str(render_root))
+        self._seed_job_and_chunk(
+            storage, "job-derived", 0, str(run_dir / "chunk_0000.wav"), output_dir=None
+        )
+
+        resp = client.get("/api/pipeline/export/chunk/job-derived/0")
+        assert resp.status_code == 200
+        assert resp.content == self._WAV
+
+    def test_wav_path_escaping_run_dir_returns_404(self, client, storage, tmp_path):
+        """Path traversal: a wav_path that resolves outside the run dir (relative
+        '..' escape or absolute path elsewhere) is rejected with 404."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        outside = tmp_path / "outside.wav"
+        outside.write_bytes(self._WAV)
+        self._seed_job_and_chunk(storage, "job-trav", 0, "../../outside.wav", output_dir=str(run_dir))
+        self._seed_job_and_chunk(
+            storage, "job-trav-abs", 1, str(outside), output_dir=str(run_dir)
+        )
+
+        for job_id, idx in (("job-trav", "0"), ("job-trav-abs", "1")):
+            resp = client.get(f"/api/pipeline/export/chunk/{job_id}/{idx}")
+            assert resp.status_code == 404, (job_id, idx)
+            assert resp.headers.get("content-type", "").startswith("application/json")
+
+    def test_missing_wav_file_returns_404(self, client, storage, tmp_path):
+        """A done row whose WAV file has vanished -> 404 JSON (FileResponse404
+        pattern), not a broken 200 or a 500."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        wav_path = str(run_dir / "chunk_0000.wav")  # never created
+        self._seed_job_and_chunk(storage, "job-gone", 0, wav_path, output_dir=str(run_dir))
+
+        resp = client.get("/api/pipeline/export/chunk/job-gone/0")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Chunk WAV not found"
+
+    def test_head_returns_headers_without_body(self, client, storage, tmp_path):
+        """HEAD is served trivially (Starlette auto-adds HEAD to GET routes and
+        FileResponse sends headers only)."""
+        wav_path = self._write_chunk(tmp_path)
+        self._seed_job_and_chunk(storage, "job-head", 0, wav_path, output_dir=str(tmp_path))
+
+        resp = client.head("/api/pipeline/export/chunk/job-head/0")
+        assert resp.status_code == 200
+        assert resp.headers["content-length"] == str(len(self._WAV))
+        assert resp.headers["content-type"] == "audio/wav"
+        assert resp.content == b""
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipeline/export/audio/{job_id}
+# ---------------------------------------------------------------------------
+
+
+def _make_wav(data: bytes, sample_rate: int = 16000, channels: int = 1, bits: int = 16) -> bytes:
+    """Build a minimal 44-byte-header PCM WAV carrying *data* as its payload.
+
+    The synthesized whole-book body for concatenated chunks is byte-identical
+    to ``_make_wav(chunk0_data + chunk1_data + ...)`` — the endpoint patches
+    exactly the RIFF size + data-size fields a fresh header would carry.
+    """
+    byte_rate = sample_rate * channels * bits // 8
+    block_align = channels * bits // 8
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + len(data),
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits,
+        b"data",
+        len(data),
+    )
+    assert len(header) == 44
+    return header + data
+
+
+class TestExportAudioWholeBook:
+    """GET /api/pipeline/export/audio/{job_id} — whole-book playback.
+
+    Rows = truth: the render_job row decides what is served.  A completed job
+    whose output_artifact_path names a file serves that artifact (media type
+    from the extension) with Range support.  A completed job whose artifact is
+    the run dir (individual mode without an m4b) serves a synthesized
+    whole-book WAV streamed chunk-by-chunk from disk with Range computed
+    across chunk boundaries.  Batch-mode jobs (no chunk rows) synthesize from
+    the sorted *.wav files in the run dir.  Unknown jobs -> 404, non-completed
+    jobs -> 404 'Job not completed (status: X)', expired jobs (GC tombstone)
+    -> 410 Gone.  Playback is inline (no Content-Disposition).
+    """
+
+    def _seed_job(
+        self,
+        storage,
+        job_id,
+        *,
+        mode="individual",
+        status="completed",
+        output_dir=None,
+        artifact=None,
+        book_id="b1",
+    ):
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir, "
+            "output_artifact_path) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, book_id, mode, status, output_dir, artifact),
+        )
+
+    def _seed_chunk(self, storage, job_id, idx, wav_path, status="done"):
+        storage.execute_insert(
+            "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
+            "VALUES (?, ?, ?, ?)",
+            (job_id, idx, status, wav_path),
+        )
+
+    def _seed_individual_render(self, storage, job_id, run_dir, datas):
+        """Insert a completed individual-mode job + one done chunk per payload."""
+        paths = []
+        for i, data in enumerate(datas):
+            path = run_dir / f"chunk_{i:04d}.wav"
+            path.write_bytes(_make_wav(data))
+            paths.append(str(path))
+        self._seed_job(
+            storage,
+            job_id,
+            mode="individual",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
+        )
+        for i, path in enumerate(paths):
+            self._seed_chunk(storage, job_id, i, path)
+
+    # -- artifact serving ---------------------------------------------------
+
+    def test_artifact_m4b_full_get_200(self, client, storage, tmp_path):
+        """A completed job whose output_artifact_path is an m4b file serves it as
+        audio/mp4 with the exact bytes, accept-ranges, and inline playback (no
+        Content-Disposition)."""
+        out = tmp_path / "out"
+        out.mkdir()
+        m4b = out / "audiobook.m4b"
+        m4b.write_bytes(b"M4B-DATA-0123456789")
+        self._seed_job(
+            storage, "job-art", mode="batch", status="completed",
+            output_dir=str(out), artifact=str(m4b),
+        )
+
+        resp = client.get("/api/pipeline/export/audio/job-art")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/mp4"
+        assert resp.headers["accept-ranges"] == "bytes"
+        assert resp.content == b"M4B-DATA-0123456789"
+        assert "content-disposition" not in resp.headers
+
+    def test_artifact_m4b_range_206(self, client, storage, tmp_path):
+        """A byte range on the artifact returns 206 + Content-Range + the slice."""
+        out = tmp_path / "out"
+        out.mkdir()
+        m4b = out / "audiobook.m4b"
+        m4b.write_bytes(b"M4B-DATA-0123456789")
+        self._seed_job(
+            storage, "job-art-range", mode="batch", status="completed",
+            output_dir=str(out), artifact=str(m4b),
+        )
+
+        resp = client.get(
+            "/api/pipeline/export/audio/job-art-range", headers={"Range": "bytes=2-9"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == "bytes 2-9/19"
+        assert resp.content == b"B-DATA-0"
+
+    def test_artifact_media_type_from_extension(self, client, storage, tmp_path):
+        """The media type is picked from the artifact file's extension (.mp3)."""
+        out = tmp_path / "out"
+        out.mkdir()
+        mp3 = out / "audiobook.mp3"
+        mp3.write_bytes(b"MP3-FAKE")
+        self._seed_job(
+            storage, "job-mp3", mode="batch", status="completed",
+            output_dir=str(out), artifact=str(mp3),
+        )
+
+        resp = client.get("/api/pipeline/export/audio/job-mp3")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/mpeg"
+        assert resp.content == b"MP3-FAKE"
+
+    def test_artifact_head_headers_only(self, client, storage, tmp_path):
+        """HEAD on the artifact returns headers (Content-Length) without a body."""
+        out = tmp_path / "out"
+        out.mkdir()
+        m4b = out / "audiobook.m4b"
+        m4b.write_bytes(b"M4B-DATA-0123456789")
+        self._seed_job(
+            storage, "job-art-head", mode="batch", status="completed",
+            output_dir=str(out), artifact=str(m4b),
+        )
+
+        resp = client.head("/api/pipeline/export/audio/job-art-head")
+        assert resp.status_code == 200
+        assert resp.headers["content-length"] == "19"
+        assert resp.headers["content-type"] == "audio/mp4"
+        assert resp.content == b""
+
+    def test_artifact_missing_file_404_json(self, client, storage, tmp_path):
+        """A completed row whose recorded artifact FILE is missing -> 404 JSON
+        (FileResponse404 pattern), not a broken 200 or a 500."""
+        out = tmp_path / "out"
+        out.mkdir()
+        missing = out / "audiobook.m4b"  # never created
+        self._seed_job(
+            storage, "job-art-gone", mode="batch", status="completed",
+            output_dir=str(out), artifact=str(missing),
+        )
+
+        resp = client.get("/api/pipeline/export/audio/job-art-gone")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Audio file not found"
+
+    def test_late_merge_m4b_parity(self, client, storage, tmp_path):
+        """A row completed with artifact = run dir still serves an m4b that POST
+        /merge produced later (parity with download_render)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "audiobook.m4b").write_bytes(b"LATE-M4B")
+        self._seed_individual_render(storage, "job-parity", run_dir, [b"0123456789"])
+
+        resp = client.get("/api/pipeline/export/audio/job-parity")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/mp4"
+        assert resp.content == b"LATE-M4B"
+
+    # -- job state -----------------------------------------------------------
+
+    def test_unknown_job_404(self, client):
+        """No render_job row -> 404 with the job_id in the detail."""
+        resp = client.get("/api/pipeline/export/audio/does-not-exist")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Unknown job_id: does-not-exist"
+
+    def test_expired_job_410(self, client, storage):
+        """An expired job (GC tombstone — artifacts intentionally gone) -> 410."""
+        self._seed_job(storage, "job-expired", status="expired", output_dir="/gone")
+        resp = client.get("/api/pipeline/export/audio/job-expired")
+        assert resp.status_code == 410
+        assert "expired" in resp.json()["detail"].lower()
+
+    def test_running_job_404_not_completed(self, client, storage):
+        """A non-completed job -> 404 'Job not completed (status: X)' (the
+        download_render pattern)."""
+        self._seed_job(storage, "job-running", status="running", output_dir="/tmp/out")
+        resp = client.get("/api/pipeline/export/audio/job-running")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not completed (status: running)"
+
+    def test_failed_job_404_not_completed(self, client, storage):
+        """A failed job is not servable -> 404 like download_render."""
+        self._seed_job(storage, "job-failed", status="failed", output_dir="/tmp/out")
+        resp = client.get("/api/pipeline/export/audio/job-failed")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not completed (status: failed)"
+
+    # -- synthesized whole-book WAV ------------------------------------------
+
+    def test_synthesized_individual_full_get_200(self, client, storage, tmp_path):
+        """A completed individual-mode job with no m4b serves a whole-book WAV:
+        chunk 0's header with patched sizes + every chunk's PCM payload."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        data0, data1 = b"0123456789", b"abcdefghij"
+        self._seed_individual_render(storage, "job-synth", run_dir, [data0, data1])
+
+        resp = client.get("/api/pipeline/export/audio/job-synth")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/wav"
+        assert resp.headers["accept-ranges"] == "bytes"
+        expected = _make_wav(data0 + data1)
+        assert resp.headers["content-length"] == str(len(expected))
+        assert resp.content == expected
+
+    def test_synthesized_range_across_chunk_boundary(self, client, storage, tmp_path):
+        """A Range spanning the chunk boundary returns a 206 slice drawn from both
+        chunks (offsets computed across the virtual stream)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        data0, data1 = b"0123456789", b"abcdefghij"  # 44-byte header + 20 data = 64
+        self._seed_individual_render(storage, "job-cross", run_dir, [data0, data1])
+
+        resp = client.get(
+            "/api/pipeline/export/audio/job-cross", headers={"Range": "bytes=50-59"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == "bytes 50-59/64"
+        assert resp.content == b"6789abcdef"
+
+    def test_synthesized_range_inside_second_chunk(self, client, storage, tmp_path):
+        """A Range wholly inside the second chunk's data section."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        data0, data1 = b"0123456789", b"abcdefghij"
+        self._seed_individual_render(storage, "job-chunk1", run_dir, [data0, data1])
+
+        resp = client.get(
+            "/api/pipeline/export/audio/job-chunk1", headers={"Range": "bytes=54-59"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == "bytes 54-59/64"
+        assert resp.content == b"abcdef"
+
+    def test_synthesized_open_ended_range(self, client, storage, tmp_path):
+        """bytes=<start>- streams from start to EOF as 206."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        data0, data1 = b"0123456789", b"abcdefghij"
+        self._seed_individual_render(storage, "job-open", run_dir, [data0, data1])
+
+        resp = client.get(
+            "/api/pipeline/export/audio/job-open", headers={"Range": "bytes=44-"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == "bytes 44-63/64"
+        assert resp.content == data0 + data1
+
+    def test_synthesized_unsatisfiable_416(self, client, storage, tmp_path):
+        """A range starting beyond the virtual stream end -> 416 with
+        Content-Range: bytes */total (starlette >= 0.49.1 semantics)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        data0, data1 = b"0123456789", b"abcdefghij"
+        self._seed_individual_render(storage, "job-416", run_dir, [data0, data1])
+
+        resp = client.get(
+            "/api/pipeline/export/audio/job-416", headers={"Range": "bytes=999999-"}
+        )
+        assert resp.status_code == 416
+        assert resp.headers["content-range"] == "bytes */64"
+
+    def test_synthesized_malformed_range_400(self, client, storage, tmp_path):
+        """A malformed Range header -> 400 (starlette native semantics)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        self._seed_individual_render(storage, "job-mal", run_dir, [b"0123456789"])
+
+        for bad in ("bytes=abc", "bytes="):
+            resp = client.get(
+                "/api/pipeline/export/audio/job-mal", headers={"Range": bad}
+            )
+            assert resp.status_code == 400, f"Range {bad!r} should be 400"
+
+    def test_synthesized_range_capped(self, client, storage, tmp_path, monkeypatch):
+        """Synthesized Range requests are capped per request to
+        PIPELINE_MAX_RANGE_BYTES (default 4 MiB), like the phase-4 chunk cap."""
+        monkeypatch.setenv("PIPELINE_MAX_RANGE_BYTES", "4")
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        data0, data1 = b"0123456789", b"abcdefghij"
+        self._seed_individual_render(storage, "job-cap", run_dir, [data0, data1])
+        expected = _make_wav(data0 + data1)
+
+        resp = client.get(
+            "/api/pipeline/export/audio/job-cap", headers={"Range": "bytes=0-"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == "bytes 0-3/64"
+        assert resp.content == expected[:4]
+
+        resp = client.get(
+            "/api/pipeline/export/audio/job-cap", headers={"Range": "bytes=2-17"}
+        )
+        assert resp.status_code == 206
+        assert resp.headers["content-range"] == "bytes 2-5/64"
+        assert resp.content == expected[2:6]
+
+    def test_synthesized_head_headers_only(self, client, storage, tmp_path):
+        """HEAD on the synthesized form returns Content-Length (full virtual
+        size) without a body."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        data0, data1 = b"0123456789", b"abcdefghij"
+        self._seed_individual_render(storage, "job-head", run_dir, [data0, data1])
+
+        resp = client.head("/api/pipeline/export/audio/job-head")
+        assert resp.status_code == 200
+        assert resp.headers["content-length"] == "64"
+        assert resp.headers["content-type"] == "audio/wav"
+        assert resp.content == b""
+
+    def test_batch_mode_whole_book_from_dir_enumeration(self, client, storage, tmp_path):
+        """Batch mode has no chunk rows (by contract): the whole-book WAV is
+        synthesized from the sorted *.wav files in the run dir."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "temp_batch_0.wav").write_bytes(_make_wav(b"AAAA"))
+        (run_dir / "temp_batch_1.wav").write_bytes(_make_wav(b"BBBB"))
+        self._seed_job(
+            storage, "job-batch", mode="batch", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+
+        resp = client.get("/api/pipeline/export/audio/job-batch")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/wav"
+        assert resp.content == _make_wav(b"AAAA" + b"BBBB")
+
+    def test_batch_no_wavs_404(self, client, storage, tmp_path):
+        """A completed batch job whose run dir holds no WAVs -> 404."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        self._seed_job(
+            storage, "job-empty", mode="batch", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+
+        resp = client.get("/api/pipeline/export/audio/job-empty")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "No audio files found in output directory"
+
+    def test_individual_evicted_chunk_410(self, client, storage, tmp_path):
+        """A completed job with an evicted chunk row (GC tombstone) -> 410."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        chunk0 = run_dir / "chunk_0000.wav"
+        chunk0.write_bytes(_make_wav(b"0123456789"))
+        self._seed_job(
+            storage, "job-evict", mode="individual", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+        self._seed_chunk(storage, "job-evict", 0, str(chunk0))
+        self._seed_chunk(storage, "job-evict", 1, "gone.wav", status="evicted")
+
+        resp = client.get("/api/pipeline/export/audio/job-evict")
+        assert resp.status_code == 410
+        assert "evicted" in resp.json()["detail"].lower()
+
+    def test_individual_pending_chunk_409(self, client, storage, tmp_path):
+        """A completed job with a pending chunk row is inconsistent -> 409."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        chunk0 = run_dir / "chunk_0000.wav"
+        chunk0.write_bytes(_make_wav(b"0123456789"))
+        self._seed_job(
+            storage, "job-pend", mode="individual", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+        self._seed_chunk(storage, "job-pend", 0, str(chunk0))
+        self._seed_chunk(storage, "job-pend", 1, "ignored.wav", status="pending")
+
+        resp = client.get("/api/pipeline/export/audio/job-pend")
+        assert resp.status_code == 409
+        assert "pending" in resp.json()["detail"]
+
+    def test_individual_missing_chunk_file_404(self, client, storage, tmp_path):
+        """A done chunk row whose WAV file has vanished -> 404 JSON (incomplete
+        audio is never served)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        self._seed_job(
+            storage, "job-gone", mode="individual", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+        # Row says done; the file was never written.
+        self._seed_chunk(storage, "job-gone", 0, str(run_dir / "chunk_0000.wav"))
+
+        resp = client.get("/api/pipeline/export/audio/job-gone")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Audio file not found"
+
+    def test_individual_no_chunk_rows_404(self, client, storage, tmp_path):
+        """A completed individual job with no chunk rows -> 404."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        self._seed_job(
+            storage, "job-norows", mode="individual", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+
+        resp = client.get("/api/pipeline/export/audio/job-norows")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "No audio chunks found for job"
+
+    def test_derived_run_dir_when_output_dir_null(self, client, storage, tmp_path, monkeypatch):
+        """With output_dir NULL the run dir is derived as
+        RENDER_ROOT/book-{id}/{job_id}/ and chunk wav_paths resolve against it."""
+        render_root = tmp_path / "render_root"
+        run_dir = render_root / "book-b1" / "job-derived"
+        run_dir.mkdir(parents=True)
+        chunk = run_dir / "chunk_0000.wav"
+        chunk.write_bytes(_make_wav(b"0123456789"))
+        monkeypatch.setenv("RENDER_ROOT", str(render_root))
+        self._seed_job(storage, "job-derived", output_dir=None, artifact=None)
+        self._seed_chunk(storage, "job-derived", 0, str(chunk))
+
+        resp = client.get("/api/pipeline/export/audio/job-derived")
+        assert resp.status_code == 200
+        assert resp.content == _make_wav(b"0123456789")
+
+    def test_path_traversal_wav_path_404(self, client, storage, tmp_path):
+        """Path traversal: a chunk wav_path resolving outside the run dir
+        (relative '..' escape) is rejected with a JSON 404."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        outside = tmp_path / "outside.wav"
+        outside.write_bytes(_make_wav(b"0123456789"))
+        self._seed_job(
+            storage, "job-trav", mode="individual", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+        self._seed_chunk(storage, "job-trav", 0, "../../outside.wav")
+
+        resp = client.get("/api/pipeline/export/audio/job-trav")
+        assert resp.status_code == 404
+        assert resp.headers.get("content-type", "").startswith("application/json")
+
+    def test_format_mismatch_409(self, client, storage, tmp_path):
+        """Chunks whose formats disagree (different sample rates) cannot be
+        concatenated without a resampler (no ffmpeg in this phase) -> 409,
+        documented limitation."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        chunk0 = run_dir / "chunk_0000.wav"
+        chunk0.write_bytes(_make_wav(b"0123456789", sample_rate=16000))
+        chunk1 = run_dir / "chunk_0001.wav"
+        chunk1.write_bytes(_make_wav(b"abcdefghij", sample_rate=8000))
+        self._seed_job(
+            storage, "job-fmt", mode="individual", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+        self._seed_chunk(storage, "job-fmt", 0, str(chunk0))
+        self._seed_chunk(storage, "job-fmt", 1, str(chunk1))
+
+        resp = client.get("/api/pipeline/export/audio/job-fmt")
+        assert resp.status_code == 409
+        assert "differ" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/pipeline/export/m4b — 3-phase FFMETADATA1 polished export
+# ---------------------------------------------------------------------------
+
+# 0.5 s of silence at 16 kHz mono 16-bit: 8000 samples * 2 bytes.
+_CHUNK_PAYLOAD = b"\x00\x00" * 8000
+_CHUNK_DURATION_MS = 500
+
+
+def _seed_job_row(
+    storage,
+    job_id,
+    *,
+    book_id="b1",
+    mode="individual",
+    status="completed",
+    output_dir=None,
+    artifact=None,
+):
+    """Insert a render_job row with explicit fields (rows = truth)."""
+    storage.execute_insert(
+        "INSERT INTO render_job (job_id, book_id, mode, status, output_dir, "
+        "output_artifact_path) VALUES (?, ?, ?, ?, ?, ?)",
+        (job_id, book_id, mode, status, output_dir, artifact),
+    )
+
+
+def _seed_chunk_row(storage, job_id, idx, wav_path, status="done"):
+    """Insert a render_chunk row."""
+    storage.execute_insert(
+        "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
+        "VALUES (?, ?, ?, ?)",
+        (job_id, idx, status, wav_path),
+    )
+
+
+def _seed_two_chunk_job(
+    storage,
+    job_id,
+    run_dir,
+    *,
+    mode="individual",
+    status="completed",
+    output_dir=None,
+    artifact=None,
+    book_id="b1",
+    seed_rows=True,
+):
+    """Completed job with two real 0.5 s chunk WAVs on disk.
+
+    Individual mode seeds one done render_chunk row per WAV (rows = truth);
+    batch mode leaves the rows out and relies on run-dir *.wav enumeration.
+    Pass ``seed_rows=False`` to write the WAVs and job row only (caller seeds
+    chunk rows with custom statuses).  Returns the absolute wav paths.
+    """
+    paths = []
+    for i in range(2):
+        path = run_dir / f"chunk_{i:04d}.wav"
+        path.write_bytes(_make_wav(_CHUNK_PAYLOAD))
+        paths.append(str(path))
+    _seed_job_row(
+        storage,
+        job_id,
+        book_id=book_id,
+        mode=mode,
+        status=status,
+        output_dir=output_dir or str(run_dir),
+        artifact=artifact or str(run_dir),
+    )
+    if mode == "individual" and seed_rows:
+        for i, path in enumerate(paths):
+            _seed_chunk_row(storage, job_id, i, path)
+    return paths
+
+
+def _wav_duration_ms(path):
+    """Duration of a _make_wav PCM file in integer ms (header-derived, exactly
+    the math ffprobe reports for WAV: data bytes / byte_rate)."""
+    with open(path, "rb") as f:
+        header = f.read(44)
+    assert len(header) == 44
+    byte_rate = struct.unpack("<I", header[28:32])[0]
+    data_size = struct.unpack("<I", header[40:44])[0]
+    assert byte_rate > 0
+    return int(round(data_size / byte_rate * 1000))
+
+
+def _ffprobe_json(*args):
+    """Run ffprobe against the real binary (available in CI) and return JSON."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-of", "json", *args],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _parse_ffmetadata(path):
+    """Return (header_line, chapters, tags) from an FFMETADATA1 file.
+
+    chapters is a list of dicts with keys TIMEBASE/START/END/title;
+    tags is a dict of the global (non-chapter) key=value entries.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    header = lines[0] if lines else ""
+    chapters = []
+    tags = {}
+    current = None
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        if line == "[CHAPTER]":
+            chapters.append({})
+            current = chapters[-1]
+        elif current is not None:
+            key, _, value = line.partition("=")
+            current[key] = value
+        else:
+            key, _, value = line.partition("=")
+            tags[key] = value
+    return header, chapters, tags
+
+
+class TestExportM4B:
+    """POST /api/pipeline/export/m4b — 3-phase FFMETADATA1 polished export.
+
+    Concat (ffmpeg concat demuxer over the chunk WAVs in order) -> metadata
+    (audiobook.ffmetadata with global tags + one chapter per chunk, TIMEBASE
+    1/1000, integer-ms START/END, last END clamped to the single-ffprobe
+    duration) -> mux (m4b + optional attached_pic cover + optional libmp3lame
+    mp3 + always-producible ZIP_STORED audacity bundle).  The ffmetadata file
+    is CI-validated: TIMEBASE=1/1000, integer milliseconds, END clamp.
+    """
+
+    def _post(self, client, job_id, **fields):
+        return client.post(
+            "/api/pipeline/export/m4b", data={"job_id": job_id, **fields}
+        )
+
+    def _post_with_cover(self, client, job_id, cover_bytes, content_type="image/jpeg", **fields):
+        return client.post(
+            "/api/pipeline/export/m4b",
+            data={"job_id": job_id, **fields},
+            files={"cover": ("cover.jpg", cover_bytes, content_type)},
+        )
+
+    def _export(self, client, storage, job_id, run_dir, **fields):
+        """Seed a 2-chunk individual job and run a full export."""
+        _seed_two_chunk_job(storage, job_id, run_dir)
+        return self._post(client, job_id, **fields)
+
+    # -- happy path ---------------------------------------------------------
+
+    def test_m4b_export_full_success(self, client, storage, tmp_path):
+        """2-chunk job with full metadata -> 200 with m4b, mp3 and audacity
+        artifacts; response carries the artifact paths and flags."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        resp = self._export(
+            client, storage, "job-ok", run_dir,
+            title="The Title", author="The Author", narrator="The Narrator",
+            year="2024", description="The description.",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["output_path"].endswith("audiobook.m4b")
+        assert os.path.isfile(body["output_path"])
+        assert body["mp3"] is True
+        assert body["mp3_path"].endswith("audiobook.mp3")
+        assert os.path.isfile(body["mp3_path"])
+        assert body["audacity"] is True
+        assert body["audacity_path"].endswith("audiobook-audacity.zip")
+        assert os.path.isfile(body["audacity_path"])
+        # The m4b is a real mp4/aac container with exactly two chapters.
+        probe = _ffprobe_json("-show_chapters", body["output_path"])
+        assert len(probe["chapters"]) == 2
+
+    def test_output_artifact_path_updated_and_servable(self, client, storage, tmp_path):
+        """The render_job row's output_artifact_path is updated to the m4b and
+        the m4b becomes servable through the phase-5 whole-book artifact path
+        as audio/mp4 (rows = truth)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-serv", run_dir)
+        resp = self._post(client, "job-serv", title="T")
+        assert resp.status_code == 200, resp.text
+        rows = storage.execute_query(
+            "SELECT output_artifact_path FROM render_job WHERE job_id = ?",
+            ("job-serv",),
+        )
+        assert rows[0]["output_artifact_path"].endswith("audiobook.m4b")
+        assert os.path.isfile(rows[0]["output_artifact_path"])
+
+        audio = client.get("/api/pipeline/export/audio/job-serv")
+        assert audio.status_code == 200
+        assert audio.headers["content-type"] == "audio/mp4"
+        assert len(audio.content) > 1000
+
+    def test_ffmetadata_ci_validation(self, client, storage, tmp_path):
+        """CI-validated ffmetadata on the 2-chunk fixture: header, TIMEBASE
+        1/1000, integer-ms START/END, per-chunk chapter boundaries and the
+        last chapter's END clamped to the concatenated duration (never
+        exceeding the real stream duration)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        paths = _seed_two_chunk_job(storage, "job-ci", run_dir)
+        resp = self._post(client, "job-ci")
+        assert resp.status_code == 200, resp.text
+
+        header, chapters, _ = _parse_ffmetadata(run_dir / "audiobook.ffmetadata")
+        assert header == ";FFMETADATA1"
+        assert len(chapters) == 2  # one chapter per chunk
+        for chapter in chapters:
+            assert chapter["TIMEBASE"] == "1/1000"
+            # integer milliseconds: digits round-trip through int()
+            assert chapter["START"].isdigit()
+            assert chapter["END"].isdigit()
+            int(chapter["START"])
+            int(chapter["END"])
+        # Boundaries follow the chunk durations (2 x 0.5 s).
+        assert chapters[0]["START"] == "0"
+        assert chapters[0]["END"] == "500"
+        assert chapters[1]["START"] == "500"
+        # The last chapter's END is clamped to the concatenated duration
+        # (the same math the single ffprobe pass reports for WAV input).
+        expected_total = sum(_wav_duration_ms(p) for p in paths)
+        assert expected_total == 1000
+        assert chapters[1]["END"] == str(expected_total)
+        # Never exceeds the real muxed stream duration either.
+        m4b_probe = _ffprobe_json("-show_entries", "format=duration", str(run_dir / "audiobook.m4b"))
+        m4b_duration_ms = int(round(float(m4b_probe["format"]["duration"]) * 1000))
+        assert int(chapters[1]["END"]) <= m4b_duration_ms
+
+    def test_ffmetadata_global_tags(self, client, storage, tmp_path):
+        """title/author/narrator/year/description land in the ffmetadata global
+        section (title/artist/album_artist/date/comment) and round-trip into
+        the muxed m4b tags."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        resp = self._export(
+            client, storage, "job-tags", run_dir,
+            title="The Title", author="The Author", narrator="The Narrator",
+            year="2024", description="The description.",
+        )
+        assert resp.status_code == 200, resp.text
+        _, _, tags = _parse_ffmetadata(run_dir / "audiobook.ffmetadata")
+        assert tags["title"] == "The Title"
+        assert tags["artist"] == "The Author"
+        assert tags["album_artist"] == "The Narrator"
+        assert tags["date"] == "2024"
+        assert tags["comment"] == "The description."
+
+        probe = _ffprobe_json(
+            "-show_entries", "format_tags=title,artist,album_artist,date,comment",
+            str(run_dir / "audiobook.m4b"),
+        )
+        fmt_tags = probe["format"]["tags"]
+        assert fmt_tags["title"] == "The Title"
+        assert fmt_tags["artist"] == "The Author"
+        assert fmt_tags["album_artist"] == "The Narrator"
+        assert fmt_tags["date"] == "2024"
+        assert fmt_tags["comment"] == "The description."
+
+    def test_metadata_escaping_roundtrip(self, client, storage, tmp_path):
+        """Values containing ffmetadata-special characters (= ; # \\) are
+        escaped in the file and round-trip byte-exact through the mux; control
+        characters (newline injection) are stripped."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        nasty = "Semi=Colon;Hash#Back\\Slash"
+        newline = "Line1\nLine2"
+        resp = self._export(
+            client, storage, "job-esc", run_dir, title=nasty, description=newline,
+        )
+        assert resp.status_code == 200, resp.text
+        _, _, tags = _parse_ffmetadata(run_dir / "audiobook.ffmetadata")
+        # Same escape order as the generator: backslash first, then the
+        # line-structure specials (= ; #).
+        expected = nasty.replace("\\", "\\\\").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#")
+        assert tags["title"] == expected
+        assert "\n" not in tags["comment"]  # newline stripped, not written
+
+        probe = _ffprobe_json(
+            "-show_entries", "format_tags=title,comment",
+            str(run_dir / "audiobook.m4b"),
+        )
+        fmt_tags = probe["format"]["tags"]
+        assert fmt_tags["title"] == nasty
+        assert "\n" not in fmt_tags.get("comment", "")
+
+    def test_mp3_produced_with_libmp3lame(self, client, storage, tmp_path):
+        """libmp3lame is present in this ffmpeg build (7.1.5) -> a real mp3
+        (codec mp3) is produced alongside the m4b."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        resp = self._export(client, storage, "job-mp3", run_dir, title="T")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["mp3"] is True
+        mp3_path = run_dir / "audiobook.mp3"
+        assert mp3_path.is_file()
+        probe = _ffprobe_json("-show_entries", "stream=codec_name", str(mp3_path))
+        assert probe["streams"][0]["codec_name"] == "mp3"
+
+    def test_mp3_degraded_when_encoder_absent(self, client, storage, tmp_path, monkeypatch):
+        """When libmp3lame is not available the endpoint degrades to M4B-only:
+        mp3 flag False, no mp3 file, no mp3_path, and a clear message — while
+        the m4b export still succeeds (DD open item #8)."""
+        import app.pipeline.api_export as api_export_module
+
+        monkeypatch.setattr(api_export_module, "_libmp3lame_available", lambda: False)
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        resp = self._export(client, storage, "job-deg", run_dir, title="T")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["mp3"] is False
+        assert body["mp3_path"] is None
+        assert body["output_path"].endswith("audiobook.m4b")
+        assert os.path.isfile(body["output_path"])
+        assert not (run_dir / "audiobook.mp3").exists()
+        assert "message" in body and "mp3" in body["message"].lower()
+        # The audacity bundle is still produced.
+        assert body["audacity"] is True
+        assert (run_dir / "audiobook-audacity.zip").is_file()
+
+    def test_audacity_zip_stored_bundle(self, client, storage, tmp_path):
+        """audiobook-audacity.zip is ZIP_STORED and contains the per-chunk WAVs
+        (byte-exact) plus the mp3 when produced."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        paths = _seed_two_chunk_job(storage, "job-zip", run_dir)
+        resp = self._post(client, "job-zip", title="T")
+        assert resp.status_code == 200, resp.text
+        zip_path = run_dir / "audiobook-audacity.zip"
+        with zipfile.ZipFile(zip_path) as zf:
+            infos = zf.infolist()
+            assert infos, "empty bundle"
+            assert all(i.compress_type == zipfile.ZIP_STORED for i in infos)
+            names = set(zf.namelist())
+            for path in paths:
+                arcname = os.path.basename(path)
+                assert arcname in names
+                assert zf.read(arcname) == _make_wav(_CHUNK_PAYLOAD)
+            assert "audiobook.mp3" in names
+
+    def test_batch_mode_dir_enumeration(self, client, storage, tmp_path):
+        """Batch-mode job (no chunk rows by contract) exports from the sorted
+        *.wav files in the run dir; ffmetadata still has one chapter per file."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-batch", run_dir, mode="batch")
+        resp = self._post(client, "job-batch", title="T")
+        assert resp.status_code == 200, resp.text
+        _, chapters, _ = _parse_ffmetadata(run_dir / "audiobook.ffmetadata")
+        assert len(chapters) == 2
+        assert (run_dir / "audiobook.m4b").is_file()
+
+    def test_artifacts_in_derived_run_dir(self, client, storage, tmp_path, monkeypatch):
+        """A row with NULL output_dir resolves its run dir as
+        RENDER_ROOT/book-{id}/{job_id} and artifacts land there."""
+        root = tmp_path / "render_root"
+        monkeypatch.setenv("RENDER_ROOT", str(root))
+        run_dir = root / "book-b1" / "job-der"
+        run_dir.mkdir(parents=True)
+        _seed_two_chunk_job(storage, "job-der", run_dir, output_dir=None, artifact=None)
+        resp = self._post(client, "job-der", title="T")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["output_path"] == str(run_dir / "audiobook.m4b")
+        assert (run_dir / "audiobook.m4b").is_file()
+
+    # -- cover ---------------------------------------------------------------
+
+    @pytest.fixture()
+    def cover_jpg(self, tmp_path):
+        """A tiny real JPEG generated once per test via ffmpeg."""
+        path = tmp_path / "cover.jpg"
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+             "-i", "color=c=red:s=32x32", "-frames:v", "1", str(path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        return path.read_bytes()
+
+    def test_cover_embedded_attached_pic(self, client, storage, tmp_path, cover_jpg):
+        """An uploaded cover is embedded as an mjpeg attached_pic stream in the
+        m4b (disposition attached_pic = 1)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-cover", run_dir)
+        resp = self._post_with_cover(client, "job-cover", cover_jpg, title="T")
+        assert resp.status_code == 200, resp.text
+        probe = _ffprobe_json(
+            "-show_streams", "-select_streams", "v",
+            str(run_dir / "audiobook.m4b"),
+        )
+        assert len(probe["streams"]) == 1
+        stream = probe["streams"][0]
+        assert stream["codec_name"] == "mjpeg"
+        assert stream["disposition"]["attached_pic"] == 1
+
+    def test_cover_oversize_400(self, client, storage, tmp_path, monkeypatch):
+        """Cover uploads over the size cap are rejected (env-tunable cap)."""
+        monkeypatch.setenv("PIPELINE_MAX_COVER_BYTES", "8")
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-bigcover", run_dir)
+        resp = self._post_with_cover(client, "job-bigcover", b"x" * 16, title="T")
+        assert resp.status_code == 400
+
+    def test_cover_bad_content_type_400(self, client, storage, tmp_path):
+        """A non-image cover upload is rejected with 400."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-textcover", run_dir)
+        resp = self._post_with_cover(
+            client, "job-textcover", b"not an image", content_type="text/plain", title="T"
+        )
+        assert resp.status_code == 400
+
+    # -- dispatch / input validation ----------------------------------------
+
+    def test_unknown_job_404(self, client):
+        resp = self._post(client, "job-missing")
+        assert resp.status_code == 404
+        assert "Unknown job_id" in resp.json()["detail"]
+
+    def test_expired_job_410(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-exp", run_dir, status="expired")
+        resp = self._post(client, "job-exp")
+        assert resp.status_code == 410
+        assert "expired" in resp.json()["detail"].lower()
+
+    def test_non_completed_job_404(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-run", run_dir, status="running")
+        resp = self._post(client, "job-run")
+        assert resp.status_code == 404
+        assert "not completed" in resp.json()["detail"]
+
+    def test_missing_run_dir_404(self, client, storage, tmp_path):
+        """Completed row whose output dir does not exist -> 404 (download_render
+        precedent)."""
+        _seed_job_row(
+            storage, "job-nodir",
+            output_dir=str(tmp_path / "nowhere"), artifact=str(tmp_path / "nowhere"),
+        )
+        resp = self._post(client, "job-nodir")
+        assert resp.status_code == 404
+
+    def test_pending_chunk_409(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        paths = _seed_two_chunk_job(storage, "job-pend", run_dir, seed_rows=False)
+        _seed_chunk_row(storage, "job-pend", 0, paths[0], status="done")
+        _seed_chunk_row(storage, "job-pend", 1, paths[1], status="pending")
+        resp = self._post(client, "job-pend")
+        assert resp.status_code == 409
+        assert "not servable" in resp.json()["detail"]
+
+    def test_evicted_chunk_410(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        paths = _seed_two_chunk_job(storage, "job-evict", run_dir, seed_rows=False)
+        _seed_chunk_row(storage, "job-evict", 0, paths[0], status="done")
+        _seed_chunk_row(storage, "job-evict", 1, paths[1], status="evicted")
+        resp = self._post(client, "job-evict")
+        assert resp.status_code == 410
+        assert "evicted" in resp.json()["detail"].lower()
+
+    def test_no_chunks_400(self, client, storage, tmp_path):
+        """Completed individual job with zero chunk rows -> 400 (merge_audiobook
+        'No audio chunks' precedent)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_job_row(storage, "job-0chunk", output_dir=str(run_dir), artifact=str(run_dir))
+        resp = self._post(client, "job-0chunk")
+        assert resp.status_code == 400
+        assert "no audio chunks" in resp.json()["detail"].lower()
+
+    def test_format_mismatch_409(self, client, storage, tmp_path):
+        """Chunks with differing sample rates cannot share one concat pipeline
+        -> 409, mirroring the phase-5 synthesized-path limitation."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        chunk0 = run_dir / "chunk_0000.wav"
+        chunk0.write_bytes(_make_wav(b"0123456789", sample_rate=16000))
+        chunk1 = run_dir / "chunk_0001.wav"
+        chunk1.write_bytes(_make_wav(b"abcdefghij", sample_rate=8000))
+        _seed_job_row(storage, "job-fmt", output_dir=str(run_dir), artifact=str(run_dir))
+        _seed_chunk_row(storage, "job-fmt", 0, str(chunk0))
+        _seed_chunk_row(storage, "job-fmt", 1, str(chunk1))
+        resp = self._post(client, "job-fmt")
+        assert resp.status_code == 409
+        assert "differ" in resp.json()["detail"]
+
+    def test_path_traversal_wav_path_404(self, client, storage, tmp_path):
+        """A poisoned chunk wav_path escaping the run dir is never fed to
+        ffmpeg -> 404 (containment discipline from phases 4-5)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_job_row(storage, "job-escape", output_dir=str(run_dir), artifact=str(run_dir))
+        _seed_chunk_row(storage, "job-escape", 0, str(tmp_path / "evil.wav"))
+        resp = self._post(client, "job-escape")
+        assert resp.status_code == 404
+
+    def test_missing_chunk_file_404(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_job_row(storage, "job-gone", output_dir=str(run_dir), artifact=str(run_dir))
+        _seed_chunk_row(storage, "job-gone", 0, str(run_dir / "chunk_0000.wav"))
+        _seed_chunk_row(storage, "job-gone", 1, str(run_dir / "chunk_0001.wav"))
+        resp = self._post(client, "job-gone")
+        assert resp.status_code == 404
+
+    def test_ffmpeg_missing_500(self, client, storage, tmp_path, monkeypatch):
+        """No ffmpeg binary -> 500 (merge_audiobook precedent), not a crash."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-noffmpeg", run_dir)
+        monkeypatch.setattr(
+            "app.pipeline.api_export.subprocess.run",
+            lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()),
+        )
+        resp = self._post(client, "job-noffmpeg")
+        assert resp.status_code == 500
+        assert "not found" in resp.json()["detail"].lower()

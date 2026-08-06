@@ -3,6 +3,7 @@ import sys
 import json
 import shutil
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -23,6 +24,11 @@ from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapte
 # Pipeline API router (Phase 1 of pipeline rewrite)
 from app.pipeline.api import router as pipeline_router
 
+# Tombstoning GC scheduler (Plan C phase 3) — hourly, off the hot request path.
+# Started from the lifespan below; NEVER at module import time (importing
+# app.app must not spawn threads — the tests import it directly).
+from app.pipeline.adapter import start_gc_scheduler, stop_gc_scheduler
+
 # TTS engine factory (replaces legacy project engine access)
 from app.engine import get_tts_engine, reset_tts_engine
 
@@ -30,7 +36,25 @@ from app.engine import get_tts_engine, reset_tts_engine
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AlexandriaUI")
 
-app = FastAPI(title="Alexandria Audiobook")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """App lifecycle: start the hourly artifact-GC scheduler on startup.
+
+    The sweep never runs on the hot request path: it lives in a daemon
+    background thread started only when the ASGI server actually starts
+    (uvicorn, or a TestClient used as a context manager).  The existing test
+    suites construct ``TestClient(app)`` without entering the context
+    manager, so the lifespan — and therefore the thread — never runs under
+    ``pytest tests/pipeline``.  The scheduler defers its first sweep one full
+    interval and honors the ``PIPELINE_GC_SCHEDULER=0`` opt-out.
+    """
+    start_gc_scheduler()
+    yield
+    stop_gc_scheduler()
+
+
+app = FastAPI(title="Alexandria Audiobook", lifespan=lifespan)
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

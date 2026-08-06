@@ -156,7 +156,15 @@ def tts_engine():
     """Mock TTS engine."""
     engine = MagicMock()
     engine.generate_batch = MagicMock(return_value=None)
-    engine.generate_voice = MagicMock(return_value=None)
+
+    def fake_generate_voice(text, instruct_text, speaker, voice_config, output_path):
+        # Honest engine contract: the WAV file must exist when generate_voice
+        # returns (Plan C phase 1 fsync discipline depends on it).
+        with open(output_path, "wb") as f:
+            f.write(b"fake wav data\n")
+        return None
+
+    engine.generate_voice = MagicMock(side_effect=fake_generate_voice)
     return engine
 
 

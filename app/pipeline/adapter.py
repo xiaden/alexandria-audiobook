@@ -10,12 +10,25 @@ autocommit) and serialize writes through the owner-thread ``transaction()``
 context manager (``BEGIN IMMEDIATE`` + explicit COMMIT/ROLLBACK); writes from
 a non-owner thread — or a ``BEGIN IMMEDIATE`` that times out under contention —
 raise ``ConcurrentTransactionError``, mapped to HTTP 503 + ``Retry-After``.
+
+Garbage collection: expired artifacts are deleted by ``gc_expired_artifacts``
+(per-adapter entry point wrapping the module-level ``_gc_sweep``), which
+consults the snapshot-reference union built by ``_snapshot_referenced_run_dirs``
+so referenced runs are never collected, and re-derives manifests for surviving
+runs via ``_rebuild_manifests``.  The scheduler (``start_gc_scheduler`` /
+``stop_gc_scheduler``) runs ``_gc_sweep`` on an interval.  Retention and
+scheduler behavior are env-tunable: ``JOB_RETENTION_DAYS``,
+``CHUNK_RETENTION_DAYS``, ``GC_INTERVAL_HOURS``, and ``PIPELINE_GC_SCHEDULER``
+(``"0"`` disables the scheduler).
 """
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sqlite3
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -134,6 +147,447 @@ def _reconcile_stale_runs(conn: sqlite3.Connection) -> dict[str, int]:
     if not was_in_transaction:
         conn.commit()
     return {"render_job": render_count, "walk_run": walk_count}
+
+
+# ---------------------------------------------------------------------------
+# Startup manifest rebuild (contract rule #3 — rows = truth, manifest = derived)
+# ---------------------------------------------------------------------------
+
+# Terminal cause stamped on a completed row whose run dir is gone.  The row is
+# marked ``expired`` — the schema-valid GC terminal state for a job whose
+# artifacts no longer exist (DD decision #10: rows tombstoned as evicted/
+# expired when their artifacts are removed).
+_ARTIFACT_MISSING_ERROR = "artifact missing: run dir not found"
+
+
+def _manifest_is_stale(run_dir: str, row: sqlite3.Row, chunk_paths: list[str]) -> bool:
+    """True when ``manifest.json`` is missing or diverges from the rows.
+
+    Comparison mirrors the phase-1 manifest shape (job/book/mode/chunk_count/
+    relative chunk paths/status).  ``created_ms`` is intentionally excluded so
+    a cache that already matches the rows is never rewritten.
+    """
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return True
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            existing = json.load(f)
+    except (OSError, ValueError):
+        return True
+    if not isinstance(existing, dict):
+        return True
+    expected = {
+        "job_id": row["job_id"],
+        "book_id": row["book_id"],
+        "mode": row["mode"],
+        "chunk_count": len(chunk_paths),
+        "chunks": [
+            {"idx": i, "wav_path": os.path.relpath(path, run_dir)}
+            for i, path in enumerate(chunk_paths)
+        ],
+        "status": "completed",
+    }
+    return any(existing.get(key) != value for key, value in expected.items())
+
+
+def _rebuild_manifests(conn: sqlite3.Connection, render_root: str) -> dict[str, int]:
+    """Rebuild the derived ``manifest.json`` for completed renders (startup).
+
+    Contract rule #3 — rows are the truth, ``manifest.json`` is a derived
+    cache regenerated here at startup.  Regeneration is DRIVEN BY ROWS; the
+    filesystem is never scanned as authority.  For every ``completed`` row:
+
+    - the run dir is located from the row (``output_dir`` when set, else
+      derived as ``RENDER_ROOT/book-{book_id}/{job_id}/`` — the same rule the
+      renderer uses);
+    - a run dir that no longer exists flags the job artifact-missing: the
+      row is marked ``expired`` with ``_ARTIFACT_MISSING_ERROR``;
+    - otherwise ``manifest.json`` is (re)written when missing or stale, in
+      the exact phase-1 format and atomicity via
+      ``tts_integration._write_manifest`` (reused, not duplicated).
+      Individual mode takes the authoritative chunk list from the
+      ``render_chunk`` rows with status ``done``; batch mode enumerates the
+      ``*.wav`` files in the run dir (batch renders have no per-chunk rows).
+
+    Runs in the same transaction style as ``_reconcile_stale_runs``: UPDATEs
+    join an open transaction when one is owned by the caller (owner-thread
+    discipline enforced by the adapter method) and otherwise auto-commit.
+
+    Returns ``{"manifests_rebuilt": int, "jobs_marked_expired": int}``.
+    Safe to call on an empty database.
+    """
+    # Deferred import: tts_integration imports PipelineStorage from this
+    # module at load time, so a module-level import here would be circular.
+    from app.pipeline.tts_integration import _write_manifest
+
+    conn.row_factory = sqlite3.Row
+    now_ms = int(time.time() * 1000)
+    was_in_transaction = conn.in_transaction
+    rows = conn.execute(
+        "SELECT job_id, book_id, mode, output_dir FROM render_job "
+        "WHERE status = 'completed'"
+    ).fetchall()
+    rebuilt = 0
+    expired = 0
+    for row in rows:
+        run_dir = row["output_dir"] or os.path.join(
+            render_root, f"book-{row['book_id']}", row["job_id"]
+        )
+        if not os.path.isdir(run_dir):
+            conn.execute(
+                "UPDATE render_job SET status = 'expired', error = ?, "
+                "finished_ms = ? WHERE job_id = ?",
+                (_ARTIFACT_MISSING_ERROR, now_ms, row["job_id"]),
+            )
+            expired += 1
+            continue
+        if row["mode"] == "individual":
+            chunk_paths = [
+                chunk["wav_path"]
+                for chunk in conn.execute(
+                    "SELECT wav_path FROM render_chunk "
+                    "WHERE job_id = ? AND status = 'done' ORDER BY idx",
+                    (row["job_id"],),
+                ).fetchall()
+            ]
+        else:
+            chunk_paths = [
+                os.path.join(run_dir, name)
+                for name in sorted(os.listdir(run_dir))
+                if name.endswith(".wav")
+                and os.path.isfile(os.path.join(run_dir, name))
+            ]
+        if _manifest_is_stale(run_dir, row, chunk_paths):
+            _write_manifest(
+                run_dir,
+                job_id=row["job_id"],
+                book_id=row["book_id"],
+                mode=row["mode"],
+                chunk_paths=chunk_paths,
+                status="completed",
+            )
+            rebuilt += 1
+    if not was_in_transaction:
+        conn.commit()
+    return {"manifests_rebuilt": rebuilt, "jobs_marked_expired": expired}
+
+
+# ---------------------------------------------------------------------------
+# Tombstoning GC (contract rule #12) — retention >= 7d, hourly sweep, never
+# on the hot request path; snapshot references join the eligibility union.
+# ---------------------------------------------------------------------------
+
+# Retention defaults lock open item #1 of DD-universal-upgrade: both job and
+# chunk retention default to 7 days and are env-tunable at call time (float
+# days, so sub-day overrides work in tests).  The effective retention for a
+# job is the LONGER of the two — a job and its chunk rows are swept as one
+# unit and must never be split (files must not disappear while ``done`` chunk
+# rows still reference them).
+_GC_DEFAULT_RETENTION_DAYS = 7.0
+_MS_PER_DAY = 24 * 3600 * 1000
+
+# Terminal cause stamped on a swept job's row.  Chunks are tombstoned to
+# ``evicted``; the job row is tombstoned to ``expired`` — the schema-valid
+# GC terminal state (DD decision #10).
+_GC_EXPIRED_ERROR = "expired by GC: artifacts removed after retention"
+
+
+# ---------------------------------------------------------------------------
+# GC eligibility union (Plan C phase-3): project_snapshot artifact refs
+# ---------------------------------------------------------------------------
+
+
+def _walk_json_strings(value: object, out: set[str]) -> None:
+    """Collect every string value anywhere in a JSON document (recursive)."""
+    if isinstance(value, dict):
+        for v in value.values():
+            _walk_json_strings(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            _walk_json_strings(v, out)
+    elif isinstance(value, str):
+        out.add(value)
+
+
+def _snapshot_referenced_run_dirs(
+    conn: sqlite3.Connection, render_root: str
+) -> set[str]:
+    """Eligibility union: run dirs referenced by any ``project_snapshot`` row.
+
+    Plan I (snapshot projects) is not yet implemented, so the snapshot
+    manifest schema is UNKNOWN — parsing is deliberately defensive:
+    ``snapshot_json`` is parsed with ``json.loads`` (rows that fail to parse
+    are skipped — a broken snapshot must never pin artifacts forever), and
+    every string value anywhere in the document is checked for artifact-path
+    shape.  A string counts as a reference when it names a path at/under
+    ``render_root`` — matched by raw substring (relative and URI-embedded
+    forms such as ``file://…``), by absolute-path containment (snapshot
+    stores an absolute path while ``RENDER_ROOT`` is relative), or by
+    normalized path containment (a ``scheme://`` prefix is stripped before
+    resolution).  Returning normalized absolute paths.
+
+    With an empty ``project_snapshot`` table (the expected state while Plan I
+    is pending) the union is trivially empty and the sweep is unchanged.
+    """
+    render_root_abs = os.path.abspath(render_root)
+    root_prefix = render_root_abs + os.sep
+    references: set[str] = set()
+    for row in conn.execute("SELECT snapshot_json FROM project_snapshot").fetchall():
+        try:
+            document = json.loads(row["snapshot_json"])
+        except (TypeError, ValueError):
+            continue  # defensive: unparseable snapshot never pins artifacts
+        strings: set[str] = set()
+        _walk_json_strings(document, strings)
+        for value in strings:
+            normalized = value.split("://", 1)[1] if "://" in value else value
+            abs_value = os.path.abspath(normalized)
+            if (
+                render_root in value
+                or render_root_abs in value
+                or abs_value == render_root_abs
+                or abs_value.startswith(root_prefix)
+            ):
+                # Substring-level false positives (e.g. a ``render_root``
+                # prefix inside an unrelated token) are filtered later by
+                # ``_run_dir_is_referenced`` — the conservative direction
+                # (never delete a referenced dir) is safe.
+                references.add(abs_value)
+    return references
+
+
+def _run_dir_is_referenced(run_dir: str, references: set[str]) -> bool:
+    """True when a snapshot reference is the run dir itself or lies inside it."""
+    run_dir_abs = os.path.abspath(run_dir)
+    prefix = run_dir_abs + os.sep
+    return any(ref == run_dir_abs or ref.startswith(prefix) for ref in references)
+
+
+# ---------------------------------------------------------------------------
+# GC sweep
+# ---------------------------------------------------------------------------
+
+
+def _gc_retention_days(env_name: str, override: float | None) -> float:
+    """Resolve a retention in days: explicit override > env (float) > default.
+
+    Env values are parsed as float so tests can pin sub-day retentions (e.g.
+    ``JOB_RETENTION_DAYS=0.001``); an unset or malformed value falls back to
+    the 7-day default rather than crashing the sweep.
+    """
+    if override is not None:
+        return float(override)
+    raw = os.environ.get(env_name, "")
+    try:
+        return float(raw) if raw else _GC_DEFAULT_RETENTION_DAYS
+    except ValueError:
+        return _GC_DEFAULT_RETENTION_DAYS
+
+
+def _gc_sweep(
+    conn: sqlite3.Connection,
+    render_root: str,
+    *,
+    job_retention_days: float | None = None,
+    chunk_retention_days: float | None = None,
+) -> dict[str, int | list[str]]:
+    """Tombstoning GC sweep — expired run dirs + rows reclaimed in one pass.
+
+    Contract rule #12: retention defaults to 7 days for both jobs and chunks
+    (env-tunable at call time via ``JOB_RETENTION_DAYS``/``CHUNK_RETENTION_DAYS``,
+    float days); the sweep is scheduled hourly off the hot request path (see
+    ``start_gc_scheduler``); ``project_snapshot`` artifact references join the
+    eligibility union (see ``_snapshot_referenced_run_dirs``); rows are NEVER
+    time-deleted — tombstoned only (chunks ``evicted``, job ``expired``).
+
+    Candidates are ``completed`` render_job rows with ``finished_ms`` older
+    than the effective retention cutoff.  The effective retention is the
+    LONGER of the job/chunk retentions — the run dir contains the chunk
+    files, so the unit is swept as one and both retentions must have
+    elapsed.  Non-completed rows are never candidates; rows already
+    ``expired`` are skipped.
+
+    Crash-safety ordering (documented decision): run dirs are deleted FIRST,
+    then rows are tombstoned.  A crash between the two leaves a ``completed``
+    row with a missing run dir — exactly the state ``_rebuild_manifests()``
+    converts to ``expired`` at the next startup (the phase-2 safety net), so
+    the window self-heals.  The reverse order would orphan run dirs that no
+    row ever references again (rows are the truth; nothing would reclaim
+    them).  ``run_dirs_deleted`` counts swept run dirs, whether or not the
+    dir still existed at sweep time.
+
+    Trust boundary: GC deletes the row-recorded ``output_dir`` tree.  That
+    path originates from the RenderRequest body (Plan B contract), so any
+    client with render access can influence what is removed after retention
+    — the deletion path is not further validated.  The ``project_snapshot``
+    reference union protects snapshotted artifacts from collection.
+
+    Runs in the same transaction style as ``_reconcile_stale_runs``: UPDATEs
+    join an open transaction when one is owned by the caller (owner-thread
+    discipline enforced by the adapter method) and otherwise auto-commit.
+
+    Returns ``{"run_dirs_deleted": int, "chunks_evicted": int,
+    "jobs_expired": int, "skipped_snapshot_referenced": list[str]}``.
+    Safe to call on an empty database.
+    """
+    job_days = _gc_retention_days("JOB_RETENTION_DAYS", job_retention_days)
+    chunk_days = _gc_retention_days("CHUNK_RETENTION_DAYS", chunk_retention_days)
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = min(
+        now_ms - int(job_days * _MS_PER_DAY),
+        now_ms - int(chunk_days * _MS_PER_DAY),
+    )
+
+    conn.row_factory = sqlite3.Row
+    references = _snapshot_referenced_run_dirs(conn, render_root)
+
+    candidates: list[tuple[sqlite3.Row, str]] = []
+    skipped: list[str] = []
+    for row in conn.execute(
+        "SELECT job_id, book_id, mode, output_dir FROM render_job "
+        "WHERE status = 'completed' AND finished_ms IS NOT NULL AND finished_ms < ?",
+        (cutoff_ms,),
+    ).fetchall():
+        run_dir = row["output_dir"] or os.path.join(
+            render_root, f"book-{row['book_id']}", row["job_id"]
+        )
+        if _run_dir_is_referenced(run_dir, references):
+            skipped.append(row["job_id"])
+        else:
+            candidates.append((row, run_dir))
+
+    # Phase 1 — destructive step first (crash-safety rationale in docstring).
+    for _row, run_dir in candidates:
+        if os.path.isdir(run_dir):
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    # Phase 2 — row tombstones in one logical pass (files first, rows after).
+    was_in_transaction = conn.in_transaction
+    chunks_evicted = 0
+    jobs_expired = 0
+    for row, _run_dir in candidates:
+        cursor = conn.execute(
+            "UPDATE render_chunk SET status = 'evicted' "
+            "WHERE job_id = ? AND status != 'evicted'",
+            (row["job_id"],),
+        )
+        chunks_evicted += cursor.rowcount
+        cursor = conn.execute(
+            "UPDATE render_job SET status = 'expired', error = ?, finished_ms = ? "
+            "WHERE job_id = ? AND status = 'completed'",
+            (_GC_EXPIRED_ERROR, now_ms, row["job_id"]),
+        )
+        jobs_expired += cursor.rowcount
+    if not was_in_transaction:
+        conn.commit()
+
+    return {
+        "run_dirs_deleted": len(candidates),
+        "chunks_evicted": chunks_evicted,
+        "jobs_expired": jobs_expired,
+        "skipped_snapshot_referenced": skipped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GC scheduler — hourly daemon thread, never on the hot request path
+# ---------------------------------------------------------------------------
+
+# The scheduler is a singleton daemon thread.  It is started EXPLICITLY via
+# ``start_gc_scheduler()`` — never at module import time — so importing
+# app.pipeline.adapter (or app.app, which wires it into the FastAPI
+# lifespan) can never spawn threads under pytest.  The existing tests build
+# ``TestClient(app)`` without entering the context manager, so the lifespan
+# (and therefore this thread) never runs during ``pytest tests/pipeline``.
+_GC_THREAD_NAME = "alexandria-gc-scheduler"
+_gc_thread: threading.Thread | None = None
+_gc_stop_event: threading.Event | None = None
+_gc_start_lock = threading.Lock()
+
+
+def _gc_interval_seconds() -> float:
+    """Resolve the sweep interval from ``GC_INTERVAL_HOURS`` (default 1h)."""
+    try:
+        hours = float(os.environ.get("GC_INTERVAL_HOURS", "1"))
+    except ValueError:
+        hours = 1.0
+    return hours * 3600
+
+
+def _gc_scheduler_loop(stop_event: threading.Event, interval_seconds: float) -> None:
+    """Run the sweep every *interval_seconds* until *stop_event* is set.
+
+    Sleeps BEFORE the first sweep: starting the scheduler is never itself a
+    sweep moment, and the first pass happens one full interval later.  Each
+    sweep opens its own short-lived adapter over ``PIPELINE_DB_PATH`` (WAL
+    allows the concurrent API writer) and reads ``RENDER_ROOT`` at call time
+    via ``get_render_root()`` — the same single source of truth as
+    ``rebuild_manifests``.  Exceptions are swallowed per-iteration so one bad
+    sweep cannot kill the loop.
+    """
+    while not stop_event.wait(interval_seconds):
+        try:
+            # Deferred import: tts_integration imports PipelineStorage from
+            # this module at load time (same circular-import note as
+            # _rebuild_manifests).
+            from app.pipeline.tts_integration import get_render_root
+
+            adapter = SQLiteAdapter(
+                os.environ.get("PIPELINE_DB_PATH", "./data/pipeline.db")
+            )
+            try:
+                adapter.init_db()
+                adapter.gc_expired_artifacts(get_render_root())
+            finally:
+                adapter.close()
+        except Exception as exc:  # noqa: BLE001 — the loop must survive a bad sweep
+            print(f"warning: GC sweep failed: {exc}", file=sys.stderr)
+
+
+def start_gc_scheduler() -> None:
+    """Start the hourly GC daemon thread (idempotent, env-guarded).
+
+    Never runs on the hot request path: the sweep is invoked only from this
+    background thread, whose first pass is deferred one full interval (see
+    ``_gc_scheduler_loop``) and which is daemonized so it can never block
+    process exit.  No-op when ``PIPELINE_GC_SCHEDULER`` is set to ``"0"``
+    (explicit opt-out, e.g. tests) or when already running.
+    """
+    global _gc_thread, _gc_stop_event
+    if os.environ.get("PIPELINE_GC_SCHEDULER", "1") != "1":
+        return
+    with _gc_start_lock:
+        if _gc_thread is not None and _gc_thread.is_alive():
+            return
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_gc_scheduler_loop,
+            args=(stop_event, _gc_interval_seconds()),
+            name=_GC_THREAD_NAME,
+            daemon=True,
+        )
+        _gc_stop_event = stop_event
+        _gc_thread = thread
+        thread.start()
+
+
+def stop_gc_scheduler() -> None:
+    """Signal the GC thread to stop and join it (idempotent).
+
+    Safe to call when the scheduler was never started (e.g. under pytest) —
+    it simply returns.
+    """
+    global _gc_thread, _gc_stop_event
+    with _gc_start_lock:
+        thread = _gc_thread
+        stop_event = _gc_stop_event
+        _gc_thread = None
+        _gc_stop_event = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None:
+        thread.join(timeout=2)
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +739,42 @@ class SQLiteAdapter(PipelineStorage):
         self._ensure_owner_thread()
         return _reconcile_stale_runs(self._conn)
 
+    def rebuild_manifests(self, render_root: str) -> dict[str, int]:
+        """Startup-only: rebuild derived manifests for completed renders.
+
+        Contract rule #3 — rows stay the truth; ``manifest.json`` is a derived
+        cache regenerated here at startup (Plan C phase 2).  A completed row
+        whose run dir is gone is marked ``expired`` (artifact missing).
+        Returns ``{"manifests_rebuilt": int, "jobs_marked_expired": int}``.
+        """
+        self._ensure_owner_thread()
+        return _rebuild_manifests(self._conn, render_root)
+
+    def gc_expired_artifacts(
+        self,
+        render_root: str,
+        *,
+        job_retention_days: float | None = None,
+        chunk_retention_days: float | None = None,
+    ) -> dict[str, int | list[str]]:
+        """Tombstoning GC sweep — expired run dirs + rows reclaimed in one pass.
+
+        Contract rule #12 (Plan C phase 3): retention >= 7 days by default
+        (env-tunable ``JOB_RETENTION_DAYS``/``CHUNK_RETENTION_DAYS``, float
+        days, resolved at call time), scheduled hourly off the hot request
+        path, ``project_snapshot`` refs join the eligibility union, and rows
+        are never time-deleted (chunks ``evicted``, job ``expired``).
+        Returns ``{"run_dirs_deleted": int, "chunks_evicted": int,
+        "jobs_expired": int, "skipped_snapshot_referenced": list[str]}``.
+        """
+        self._ensure_owner_thread()
+        return _gc_sweep(
+            self._conn,
+            render_root,
+            job_retention_days=job_retention_days,
+            chunk_retention_days=chunk_retention_days,
+        )
+
 
 # ---------------------------------------------------------------------------
 # In-memory adapter (for testing)
@@ -420,3 +910,35 @@ class InMemorySQLiteAdapter(PipelineStorage):
         """
         self._ensure_owner_thread()
         return _reconcile_stale_runs(self._conn)
+
+    def rebuild_manifests(self, render_root: str) -> dict[str, int]:
+        """Startup-only: rebuild derived manifests for completed renders.
+
+        Mirror of ``SQLiteAdapter.rebuild_manifests`` (same schema and
+        interface).  Returns ``{"manifests_rebuilt": int,
+        "jobs_marked_expired": int}``.
+        """
+        self._ensure_owner_thread()
+        return _rebuild_manifests(self._conn, render_root)
+
+    def gc_expired_artifacts(
+        self,
+        render_root: str,
+        *,
+        job_retention_days: float | None = None,
+        chunk_retention_days: float | None = None,
+    ) -> dict[str, int | list[str]]:
+        """Tombstoning GC sweep — expired run dirs + rows reclaimed in one pass.
+
+        Mirror of ``SQLiteAdapter.gc_expired_artifacts`` (same schema and
+        interface).  Returns ``{"run_dirs_deleted": int, "chunks_evicted":
+        int, "jobs_expired": int, "skipped_snapshot_referenced":
+        list[str]}``.
+        """
+        self._ensure_owner_thread()
+        return _gc_sweep(
+            self._conn,
+            render_root,
+            job_retention_days=job_retention_days,
+            chunk_retention_days=chunk_retention_days,
+        )

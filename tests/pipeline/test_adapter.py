@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -30,6 +31,9 @@ from app.pipeline.adapter import (
     InMemorySQLiteAdapter,
     PipelineStorage,
     SQLiteAdapter,
+    _gc_scheduler_loop,
+    start_gc_scheduler,
+    stop_gc_scheduler,
 )
 
 
@@ -1238,3 +1242,1171 @@ class TestReconcileStartupWiring:
         second = api_onboard._get_production_storage()
         assert second is fake
         fake.reconcile_stale_runs.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# P2-S1: rebuild_manifests — startup manifest rebuild (manifest = derived)
+# ---------------------------------------------------------------------------
+
+
+def _insert_completed_render_job(
+    adapter,
+    job_id: str,
+    book_id: str = "b1",
+    mode: str = "batch",
+    output_dir=None,
+    finished_ms=None,
+):
+    """Insert a completed render_job row (Plan C phase-2 test helper).
+
+    ``finished_ms`` defaults to now; pass a value in the past (e.g.
+    ``int(time.time() * 1000) - 8 * _DAY_MS``) to make the job eligible for
+    the GC sweep under a 7-day retention.
+    """
+    now = int(time.time() * 1000)
+    if finished_ms is None:
+        finished_ms = now
+    adapter.execute_insert(
+        "INSERT INTO render_job "
+        "(job_id, book_id, mode, status, output_dir, created_ms, started_ms, "
+        " finished_ms) VALUES (?, ?, ?, 'completed', ?, ?, ?, ?)",
+        (job_id, book_id, mode, output_dir, now, now, finished_ms),
+    )
+
+
+def _insert_done_chunk_row(adapter, job_id: str, idx: int, wav_path: str):
+    """Insert a done render_chunk row (Plan C phase-2 test helper)."""
+    adapter.execute_insert(
+        "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
+        "VALUES (?, ?, 'done', ?)",
+        (job_id, idx, wav_path),
+    )
+
+
+class TestRebuildManifests:
+    """P2-S1/S3: startup manifest rebuild — a derived cache driven by rows.
+
+    Contract rule #3 (rows = truth, manifest = derived): regeneration is
+    driven by completed ``render_job`` rows, never by scanning the
+    filesystem as authority.  A completed row whose run dir still exists gets
+    ``manifest.json`` rebuilt when missing or stale; a completed row whose run
+    dir is gone is flagged ``expired`` (artifact missing — the schema-valid
+    terminal GC state, DD decision #10).
+
+    Crash-recovery scenario is FILE-BACKED: a simulated restart is a NEW
+    ``SQLiteAdapter`` instance over the same DB file + the same RENDER_ROOT
+    (per the DD test strategy — ``:memory:`` conceals crash recovery).
+    """
+
+    @staticmethod
+    def _reopen(db_path: str) -> SQLiteAdapter:
+        adapter = SQLiteAdapter(db_path=db_path)
+        adapter.init_db()
+        return adapter
+
+    @staticmethod
+    def _manifest(root: str, book_id: str, job_id: str) -> dict:
+        with open(
+            os.path.join(root, f"book-{book_id}", job_id, "manifest.json")
+        ) as f:
+            return json.load(f)
+
+    def test_rebuild_writes_missing_manifest_individual(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-i1")
+        os.makedirs(run_dir)
+        for i in range(3):
+            with open(os.path.join(run_dir, f"chunk_{i:04d}.wav"), "wb") as f:
+                f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer, "job-i1", mode="individual", output_dir=run_dir
+        )
+        for i in range(3):
+            _insert_done_chunk_row(
+                writer, "job-i1", i, os.path.join(run_dir, f"chunk_{i:04d}.wav")
+            )
+        writer.close()
+
+        adapter = self._reopen(db_path)  # simulated restart
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-i1")
+            assert manifest["job_id"] == "job-i1"
+            assert manifest["book_id"] == "b1"
+            assert manifest["mode"] == "individual"
+            assert manifest["status"] == "completed"
+            assert manifest["chunk_count"] == 3
+            assert [c["idx"] for c in manifest["chunks"]] == [0, 1, 2]
+            assert [c["wav_path"] for c in manifest["chunks"]] == [
+                "chunk_0000.wav",
+                "chunk_0001.wav",
+                "chunk_0002.wav",
+            ]
+        finally:
+            adapter.close()
+
+    def test_rebuild_individual_is_row_driven_not_filesystem(self, tmp_path):
+        # The run dir holds three wavs but only two chunk rows are 'done'.
+        # Rows are the authority: the manifest must list the two done rows,
+        # never the files on disk.
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-i2")
+        os.makedirs(run_dir)
+        for i in range(3):
+            with open(os.path.join(run_dir, f"chunk_{i:04d}.wav"), "wb") as f:
+                f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer, "job-i2", mode="individual", output_dir=run_dir
+        )
+        for i in range(2):  # only chunks 0 and 1 are done
+            _insert_done_chunk_row(
+                writer, "job-i2", i, os.path.join(run_dir, f"chunk_{i:04d}.wav")
+            )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-i2")
+            assert manifest["chunk_count"] == 2
+            assert [c["wav_path"] for c in manifest["chunks"]] == [
+                "chunk_0000.wav",
+                "chunk_0001.wav",
+            ]
+        finally:
+            adapter.close()
+
+    def test_rebuild_batch_enumerates_wav_files_sorted(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-b1")
+        os.makedirs(run_dir)
+        # Created out of order; the manifest must list them sorted by name.
+        for name in ("temp_batch_2.wav", "temp_batch_0.wav", "temp_batch_1.wav"):
+            with open(os.path.join(run_dir, name), "wb") as f:
+                f.write(b"fake wav")
+        with open(os.path.join(run_dir, "audiobook.m4b"), "wb") as f:
+            f.write(b"m4b")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer, "job-b1", mode="batch", output_dir=run_dir
+        )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-b1")
+            assert manifest["mode"] == "batch"
+            assert manifest["chunk_count"] == 3
+            assert [c["wav_path"] for c in manifest["chunks"]] == [
+                "temp_batch_0.wav",
+                "temp_batch_1.wav",
+                "temp_batch_2.wav",
+            ]
+        finally:
+            adapter.close()
+
+    def test_rebuild_derives_run_dir_from_render_root_when_output_dir_null(
+        self, tmp_path
+    ):
+        # Row without output_dir: the run dir is derived as
+        # RENDER_ROOT/book-{book_id}/{job_id}/ (same rule as the renderer).
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-null")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "temp_batch_0.wav"), "wb") as f:
+            f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(writer, "job-null", output_dir=None)
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-null")
+            assert manifest["chunk_count"] == 1
+        finally:
+            adapter.close()
+
+    def test_rebuild_marks_missing_run_dir_expired(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        gone_dir = str(tmp_path / "gone" / "run")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(writer, "job-gone", output_dir=gone_dir)
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 0, "jobs_marked_expired": 1}
+            row = adapter.execute_query(
+                "SELECT status, error, finished_ms FROM render_job "
+                "WHERE job_id = ?",
+                ("job-gone",),
+            )[0]
+            assert row["status"] == "expired"
+            assert row["error"] == "artifact missing: run dir not found"
+            assert row["finished_ms"] is not None
+        finally:
+            adapter.close()
+
+    def test_rebuild_leaves_fresh_manifest_untouched(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-fresh")
+        os.makedirs(run_dir)
+        for i in range(2):
+            with open(os.path.join(run_dir, f"chunk_{i:04d}.wav"), "wb") as f:
+                f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer, "job-fresh", mode="individual", output_dir=run_dir
+        )
+        for i in range(2):
+            _insert_done_chunk_row(
+                writer,
+                "job-fresh",
+                i,
+                os.path.join(run_dir, f"chunk_{i:04d}.wav"),
+            )
+        # A manifest that already matches the rows (created_ms must survive).
+        manifest_path = os.path.join(run_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(
+                {
+                    "job_id": "job-fresh",
+                    "book_id": "b1",
+                    "mode": "individual",
+                    "chunk_count": 2,
+                    "chunks": [
+                        {"idx": 0, "wav_path": "chunk_0000.wav"},
+                        {"idx": 1, "wav_path": "chunk_0001.wav"},
+                    ],
+                    "status": "completed",
+                    "created_ms": 12345,
+                },
+                f,
+            )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 0, "jobs_marked_expired": 0}
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            assert manifest["created_ms"] == 12345  # cache preserved
+        finally:
+            adapter.close()
+
+    def test_rebuild_rewrites_stale_manifest(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-stale")
+        os.makedirs(run_dir)
+        for i in range(3):
+            with open(os.path.join(run_dir, f"chunk_{i:04d}.wav"), "wb") as f:
+                f.write(b"fake wav")
+        # Stale manifest: claims one chunk while the rows say three.
+        with open(os.path.join(run_dir, "manifest.json"), "w") as f:
+            json.dump(
+                {
+                    "job_id": "job-stale",
+                    "book_id": "b1",
+                    "mode": "individual",
+                    "chunk_count": 1,
+                    "chunks": [{"idx": 0, "wav_path": "chunk_0000.wav"}],
+                    "status": "completed",
+                    "created_ms": 12345,
+                },
+                f,
+            )
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer, "job-stale", mode="individual", output_dir=run_dir
+        )
+        for i in range(3):
+            _insert_done_chunk_row(
+                writer,
+                "job-stale",
+                i,
+                os.path.join(run_dir, f"chunk_{i:04d}.wav"),
+            )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-stale")
+            assert manifest["chunk_count"] == 3
+            assert manifest["created_ms"] != 12345  # regenerated
+        finally:
+            adapter.close()
+
+    def test_rebuild_never_scans_filesystem_as_authority(self, tmp_path):
+        # A run dir full of wavs but NO completed render_job row: nothing is
+        # written.  The filesystem is never the authority.
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-orphan")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "temp_batch_0.wav"), "wb") as f:
+            f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 0, "jobs_marked_expired": 0}
+            assert not os.path.exists(os.path.join(run_dir, "manifest.json"))
+        finally:
+            adapter.close()
+
+    def test_rebuild_is_idempotent(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-idem")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "temp_batch_0.wav"), "wb") as f:
+            f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(writer, "job-idem", output_dir=run_dir)
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            assert adapter.rebuild_manifests(root) == {
+                "manifests_rebuilt": 1,
+                "jobs_marked_expired": 0,
+            }
+            assert adapter.rebuild_manifests(root) == {
+                "manifests_rebuilt": 0,
+                "jobs_marked_expired": 0,
+            }
+        finally:
+            adapter.close()
+
+    def test_rebuild_does_not_touch_non_completed_rows(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        now = int(time.time() * 1000)
+        for status in ("pending", "running", "failed", "cancelled",
+                       "interrupted", "expired"):
+            writer.execute_insert(
+                "INSERT INTO render_job (job_id, book_id, mode, status, "
+                " output_dir, created_ms) VALUES (?, 'b1', 'batch', ?, ?, ?)",
+                (f"job-{status}", status, None, now),
+            )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 0, "jobs_marked_expired": 0}
+            for status in ("pending", "running", "failed", "cancelled",
+                           "interrupted", "expired"):
+                row = adapter.execute_query(
+                    "SELECT status FROM render_job WHERE job_id = ?",
+                    (f"job-{status}",),
+                )[0]
+                assert row["status"] == status
+        finally:
+            adapter.close()
+
+    def test_rebuild_individual_with_no_done_chunks_writes_zero_manifest(
+        self, tmp_path
+    ):
+        # Completed individual job with an empty run dir: the rows-derived
+        # chunk list is empty, so the manifest mirrors the phase-1 empty
+        # render (chunk_count 0).
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-empty")
+        os.makedirs(run_dir)
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer, "job-empty", mode="individual", output_dir=run_dir
+        )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-empty")
+            assert manifest["chunk_count"] == 0
+            assert manifest["chunks"] == []
+        finally:
+            adapter.close()
+
+    def test_rebuild_reports_mixed_counts(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-ok")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "temp_batch_0.wav"), "wb") as f:
+            f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(writer, "job-ok", output_dir=run_dir)
+        _insert_completed_render_job(
+            writer, "job-gone", output_dir=str(tmp_path / "gone")
+        )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 1}
+        finally:
+            adapter.close()
+
+    def test_rebuild_parity_on_in_memory_adapter(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-mem")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "temp_batch_0.wav"), "wb") as f:
+            f.write(b"fake wav")
+        adapter = InMemorySQLiteAdapter()
+        adapter.init_db()
+        try:
+            _insert_completed_render_job(adapter, "job-mem", output_dir=run_dir)
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-mem")
+            assert manifest["chunk_count"] == 1
+        finally:
+            adapter.close()
+
+
+class TestRebuildStartupWiring:
+    """The production bootstrap rebuilds manifests AFTER reconciliation."""
+
+    def test_production_storage_bootstrap_rebuilds_manifests_after_reconcile(
+        self, monkeypatch, tmp_path
+    ):
+        import app.pipeline.api_onboard as api_onboard
+
+        fake = MagicMock()
+        monkeypatch.setattr(api_onboard, "_storage", None)
+        monkeypatch.setattr(api_onboard, "SQLiteAdapter", lambda db_path: fake)
+        root = str(tmp_path / "render_root")
+        os.makedirs(root)
+        monkeypatch.setenv("RENDER_ROOT", root)
+
+        first = api_onboard._get_production_storage()
+        assert first is fake
+        fake.init_db.assert_called_once_with()
+        fake.reconcile_stale_runs.assert_called_once_with()
+        # Manifest rebuild uses the same RENDER_ROOT the renderer would read.
+        fake.rebuild_manifests.assert_called_once_with(root)
+        # Reconcile first, then rebuild: freshly-interrupted rows must not be
+        # rebuilt as if they had completed.
+        calls = [call[0] for call in fake.method_calls]
+        assert calls.index("reconcile_stale_runs") < calls.index(
+            "rebuild_manifests"
+        )
+
+
+# ---------------------------------------------------------------------------
+# P3-S1/S4: gc_expired_artifacts — tombstoning GC sweep (rows + files, one pass)
+# ---------------------------------------------------------------------------
+
+_DAY_MS = 24 * 3600 * 1000
+
+
+def _insert_done_chunk_at(adapter, job_id: str, idx: int, wav_path: str, status: str = "done"):
+    """Insert a render_chunk row with an explicit status (GC test helper)."""
+    adapter.execute_insert(
+        "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
+        "VALUES (?, ?, ?, ?)",
+        (job_id, idx, status, wav_path),
+    )
+
+
+def _insert_snapshot(adapter, name: str, snapshot_json: str, book_id: str = "b1"):
+    """Insert a project_snapshot row (Plan C phase-3 test helper)."""
+    adapter.execute_insert(
+        "INSERT INTO project_snapshot (name, book_id, snapshot_json, created_ms) "
+        "VALUES (?, ?, ?, ?)",
+        (name, book_id, snapshot_json, int(time.time() * 1000)),
+    )
+
+
+def _make_run_dir(root: str, book_id: str, job_id: str, n_chunks: int = 0) -> str:
+    """Create a real run dir with real chunk files under ``root``."""
+    run_dir = os.path.join(root, f"book-{book_id}", job_id)
+    os.makedirs(run_dir)
+    for i in range(n_chunks):
+        with open(os.path.join(run_dir, f"chunk_{i:04d}.wav"), "wb") as f:
+            f.write(b"fake wav")
+    return run_dir
+
+
+class TestGCSweep:
+    """P3-S1/S4: tombstoning GC sweep — files and rows reclaimed in one pass.
+
+    Contract rule #12: retention >= 7 days (env-tunable ``JOB_RETENTION_DAYS``
+    / ``CHUNK_RETENTION_DAYS``, float days, defaults 7.0), sweep runs hourly
+    off the hot request path, ``project_snapshot`` artifact refs join the
+    eligibility union, and rows are NEVER time-deleted — tombstoned only
+    (chunks ``evicted``, job ``expired``).
+
+    FILE-BACKED fixture: tmp_path DB + real run dirs + real files under a
+    tmp RENDER_ROOT (an :memory: adapter would conceal file deletion).
+    """
+
+    @staticmethod
+    def _open(db_path):
+        adapter = SQLiteAdapter(db_path=db_path)
+        adapter.init_db()
+        return adapter
+
+    def test_sweep_deletes_run_dir_and_tombstones_rows(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-old", n_chunks=3)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-old",
+                mode="individual",
+                output_dir=run_dir,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+            for i in range(3):
+                _insert_done_chunk_at(
+                    adapter, "job-old", i, os.path.join(run_dir, f"chunk_{i:04d}.wav")
+                )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["chunks_evicted"] == 3
+            assert summary["jobs_expired"] == 1
+            assert summary["skipped_snapshot_referenced"] == []
+            assert not os.path.isdir(run_dir)
+            job = adapter.execute_query(
+                "SELECT status, error FROM render_job WHERE job_id = 'job-old'"
+            )[0]
+            assert job["status"] == "expired"
+            assert "GC" in job["error"] or "retention" in job["error"]
+            chunks = adapter.execute_query(
+                "SELECT status FROM render_chunk WHERE job_id = 'job-old' ORDER BY idx"
+            )
+            assert [c["status"] for c in chunks] == ["evicted", "evicted", "evicted"]
+        finally:
+            adapter.close()
+
+    def test_sweep_leaves_young_jobs_untouched(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-young", n_chunks=2)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter, "job-young", mode="individual", output_dir=run_dir
+            )
+            for i in range(2):
+                _insert_done_chunk_at(
+                    adapter, "job-young", i, os.path.join(run_dir, f"chunk_{i:04d}.wav")
+                )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary == {
+                "run_dirs_deleted": 0,
+                "chunks_evicted": 0,
+                "jobs_expired": 0,
+                "skipped_snapshot_referenced": [],
+            }
+            assert os.path.isdir(run_dir)
+            assert (
+                adapter.execute_query(
+                    "SELECT status FROM render_job WHERE job_id = 'job-young'"
+                )[0]["status"]
+                == "completed"
+            )
+            statuses = [
+                c["status"]
+                for c in adapter.execute_query(
+                    "SELECT status FROM render_chunk WHERE job_id = 'job-young' ORDER BY idx"
+                )
+            ]
+            assert statuses == ["done", "done"]
+        finally:
+            adapter.close()
+
+    def test_sweep_never_time_deletes_rows(self, tmp_path):
+        """Rows are tombstoned only — a swept job keeps its row (and chunk rows)."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-old", n_chunks=2)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-old",
+                mode="individual",
+                output_dir=run_dir,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+            for i in range(2):
+                _insert_done_chunk_at(
+                    adapter, "job-old", i, os.path.join(run_dir, f"chunk_{i:04d}.wav")
+                )
+            before_jobs = adapter.execute_query("SELECT COUNT(*) AS n FROM render_job")[0]["n"]
+            before_chunks = adapter.execute_query(
+                "SELECT COUNT(*) AS n FROM render_chunk"
+            )[0]["n"]
+
+            adapter.gc_expired_artifacts(root)
+
+            assert (
+                adapter.execute_query("SELECT COUNT(*) AS n FROM render_job")[0]["n"]
+                == before_jobs
+            )
+            assert (
+                adapter.execute_query("SELECT COUNT(*) AS n FROM render_chunk")[0]["n"]
+                == before_chunks
+            )
+        finally:
+            adapter.close()
+
+    def test_sweep_skips_non_completed_rows(self, tmp_path):
+        """Only 'completed' rows are candidates — every other status is skipped."""
+        root = str(tmp_path / "render_root")
+        old = int(time.time() * 1000) - 8 * _DAY_MS
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            statuses = {
+                "job-run": "running",
+                "job-fail": "failed",
+                "job-cancel": "cancelled",
+                "job-exp": "expired",
+            }
+            for job_id, status in statuses.items():
+                run_dir = _make_run_dir(root, "b1", job_id, n_chunks=1)
+                adapter.execute_insert(
+                    "INSERT INTO render_job "
+                    "(job_id, book_id, mode, status, output_dir, created_ms, "
+                    " started_ms, finished_ms) VALUES (?, ?, 'batch', ?, ?, ?, ?, ?)",
+                    (job_id, "b1", status, run_dir, old, old, old),
+                )
+                _insert_done_chunk_at(adapter, job_id, 0, os.path.join(run_dir, "chunk_0000.wav"))
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 0
+            assert summary["chunks_evicted"] == 0
+            assert summary["jobs_expired"] == 0
+            for job_id, status in statuses.items():
+                assert os.path.isdir(os.path.join(root, "book-b1", job_id))
+                assert (
+                    adapter.execute_query(
+                        "SELECT status FROM render_job WHERE job_id = ?", (job_id,)
+                    )[0]["status"]
+                    == status
+                )
+        finally:
+            adapter.close()
+
+    def test_sweep_skips_already_expired_jobs(self, tmp_path):
+        """Jobs already 'expired' are never re-candidates — their dir is left alone."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-exp", n_chunks=1)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            old = int(time.time() * 1000) - 8 * _DAY_MS
+            adapter.execute_insert(
+                "INSERT INTO render_job "
+                "(job_id, book_id, mode, status, output_dir, created_ms, "
+                " started_ms, finished_ms, error) VALUES (?, ?, 'batch', "
+                "'expired', ?, ?, ?, ?, ?)",
+                ("job-exp", "b1", run_dir, old, old, old, "previously expired"),
+            )
+            _insert_done_chunk_at(adapter, "job-exp", 0, os.path.join(run_dir, "chunk_0000.wav"))
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary == {
+                "run_dirs_deleted": 0,
+                "chunks_evicted": 0,
+                "jobs_expired": 0,
+                "skipped_snapshot_referenced": [],
+            }
+            assert os.path.isdir(run_dir)
+            assert (
+                adapter.execute_query(
+                    "SELECT error FROM render_job WHERE job_id = 'job-exp'"
+                )[0]["error"]
+                == "previously expired"
+            )
+        finally:
+            adapter.close()
+
+    def test_sweep_missing_run_dir_still_tombstones_row(self, tmp_path):
+        """A completed row whose run dir is already gone is swept without error."""
+        root = str(tmp_path / "render_root")
+        missing = os.path.join(root, "book-b1", "job-ghost")
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-ghost",
+                mode="individual",
+                output_dir=missing,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+            _insert_done_chunk_at(adapter, "job-ghost", 0, os.path.join(missing, "chunk_0000.wav"))
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["jobs_expired"] == 1
+            assert (
+                adapter.execute_query(
+                    "SELECT status FROM render_job WHERE job_id = 'job-ghost'"
+                )[0]["status"]
+                == "expired"
+            )
+        finally:
+            adapter.close()
+
+    def test_sweep_batch_mode_evicts_no_chunks(self, tmp_path):
+        """Batch jobs have no render_chunk rows — only the job row is tombstoned."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-batch", n_chunks=2)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-batch",
+                mode="batch",
+                output_dir=run_dir,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["chunks_evicted"] == 0
+            assert summary["jobs_expired"] == 1
+            assert not os.path.isdir(run_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_snapshot_referenced_run_dir_survives(self, tmp_path):
+        """A project_snapshot referencing a run dir keeps the WHOLE run dir alive."""
+        root = str(tmp_path / "render_root")
+        ref_dir = _make_run_dir(root, "b1", "job-ref", n_chunks=1)
+        free_dir = _make_run_dir(root, "b1", "job-free", n_chunks=1)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            old = int(time.time() * 1000) - 8 * _DAY_MS
+            for job_id, run_dir in (("job-ref", ref_dir), ("job-free", free_dir)):
+                _insert_completed_render_job(
+                    adapter, job_id, mode="individual", output_dir=run_dir, finished_ms=old
+                )
+                _insert_done_chunk_at(adapter, job_id, 0, os.path.join(run_dir, "chunk_0000.wav"))
+            # Snapshot referencing an artifact path INSIDE the run dir and a
+            # second, URI-embedded form (Plan I's snapshot schema is not yet
+            # implemented, so refs are matched defensively by shape).
+            _insert_snapshot(
+                adapter,
+                "snap-1",
+                json.dumps(
+                    {
+                        "title": "book",
+                        "tracks": [
+                            {"path": os.path.join(ref_dir, "chunk_0000.wav")},
+                            {"uri": f"file://{ref_dir}/audiobook.m4b"},
+                        ],
+                    }
+                ),
+            )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["chunks_evicted"] == 1
+            assert summary["jobs_expired"] == 1
+            assert summary["skipped_snapshot_referenced"] == ["job-ref"]
+            # Referenced job untouched...
+            assert os.path.isdir(ref_dir)
+            assert (
+                adapter.execute_query(
+                    "SELECT status FROM render_job WHERE job_id = 'job-ref'"
+                )[0]["status"]
+                == "completed"
+            )
+            assert (
+                adapter.execute_query(
+                    "SELECT status FROM render_chunk WHERE job_id = 'job-ref'"
+                )[0]["status"]
+                == "done"
+            )
+            # ...while the unreferenced sibling was swept.
+            assert not os.path.isdir(free_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_unparseable_snapshot_does_not_pin(self, tmp_path):
+        """A snapshot row with garbage JSON must not keep artifacts alive forever."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-old", n_chunks=1)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-old",
+                mode="individual",
+                output_dir=run_dir,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav"))
+            _insert_snapshot(adapter, "snap-broken", "{not valid json!!")
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["jobs_expired"] == 1
+            assert not os.path.isdir(run_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_empty_db_noop(self, tmp_path):
+        root = str(tmp_path / "render_root")
+        os.makedirs(root)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            summary = adapter.gc_expired_artifacts(root)
+            assert summary == {
+                "run_dirs_deleted": 0,
+                "chunks_evicted": 0,
+                "jobs_expired": 0,
+                "skipped_snapshot_referenced": [],
+            }
+        finally:
+            adapter.close()
+
+    def test_sweep_retention_env_float_override(self, tmp_path, monkeypatch):
+        """Sub-day retention via float env override (locks float-days support)."""
+        root = str(tmp_path / "render_root")
+        now = int(time.time() * 1000)
+        old_dir = _make_run_dir(root, "b1", "job-old", n_chunks=1)
+        young_dir = _make_run_dir(root, "b1", "job-young", n_chunks=1)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter, "job-old", mode="individual", output_dir=old_dir,
+                finished_ms=now - 300_000,
+            )
+            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(old_dir, "chunk_0000.wav"))
+            _insert_completed_render_job(
+                adapter, "job-young", mode="individual", output_dir=young_dir,
+                finished_ms=now - 30_000,
+            )
+            _insert_done_chunk_at(
+                adapter, "job-young", 0, os.path.join(young_dir, "chunk_0000.wav")
+            )
+
+            monkeypatch.setenv("JOB_RETENTION_DAYS", "0.001")
+            monkeypatch.setenv("CHUNK_RETENTION_DAYS", "0.001")
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["jobs_expired"] == 1
+            assert not os.path.isdir(old_dir)
+            assert os.path.isdir(young_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_chunk_retention_extends_retention(self, tmp_path, monkeypatch):
+        """Job+chunk retention are per-job gates: the LONGER one wins (both
+        must elapse — the run dir contains the chunk files, so the unit is
+        never split)."""
+        root = str(tmp_path / "render_root")
+        now = int(time.time() * 1000)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            # 8 days old: past the 7d job retention but far short of the
+            # (test-pinned) 1000d chunk retention -> NOT swept (chunk rows
+            # would be evicted while 'done' files were just deleted).
+            mid_dir = _make_run_dir(root, "b1", "job-mid", n_chunks=1)
+            _insert_completed_render_job(
+                adapter, "job-mid", mode="individual", output_dir=mid_dir,
+                finished_ms=now - 8 * _DAY_MS,
+            )
+            _insert_done_chunk_at(adapter, "job-mid", 0, os.path.join(mid_dir, "chunk_0000.wav"))
+            # 1001 days old: past both cutoffs -> swept.
+            old_dir = _make_run_dir(root, "b1", "job-old", n_chunks=1)
+            _insert_completed_render_job(
+                adapter, "job-old", mode="individual", output_dir=old_dir,
+                finished_ms=now - 1001 * _DAY_MS,
+            )
+            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(old_dir, "chunk_0000.wav"))
+
+            monkeypatch.setenv("CHUNK_RETENTION_DAYS", "1000")
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["jobs_expired"] == 1
+            assert os.path.isdir(mid_dir)
+            assert not os.path.isdir(old_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_derives_run_dir_when_output_dir_null(self, tmp_path):
+        """A NULL output_dir resolves to RENDER_ROOT/book-{id}/{job_id}/ (the
+        renderer's run-dir rule) — single source of truth for the GC path."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-null", n_chunks=1)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-null",
+                mode="individual",
+                output_dir=None,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+            _insert_done_chunk_at(adapter, "job-null", 0, os.path.join(run_dir, "chunk_0000.wav"))
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert not os.path.isdir(run_dir)
+            assert (
+                adapter.execute_query(
+                    "SELECT status FROM render_job WHERE job_id = 'job-null'"
+                )[0]["status"]
+                == "expired"
+            )
+        finally:
+            adapter.close()
+
+    def test_sweep_mixed_scenario_counts(self, tmp_path):
+        """Old individual + old batch swept, young + snapshot-referenced kept."""
+        root = str(tmp_path / "render_root")
+        now = int(time.time() * 1000)
+        old_ind_dir = _make_run_dir(root, "b1", "job-old-ind", n_chunks=2)
+        old_batch_dir = _make_run_dir(root, "b1", "job-old-batch", n_chunks=0)
+        young_dir = _make_run_dir(root, "b1", "job-young", n_chunks=1)
+        ref_dir = _make_run_dir(root, "b1", "job-ref", n_chunks=1)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            for job_id, run_dir, finished_ms in (
+                ("job-old-ind", old_ind_dir, now - 8 * _DAY_MS),
+                ("job-old-batch", old_batch_dir, now - 8 * _DAY_MS),
+                ("job-young", young_dir, now),
+                ("job-ref", ref_dir, now - 8 * _DAY_MS),
+            ):
+                _insert_completed_render_job(
+                    adapter, job_id, mode="batch", output_dir=run_dir,
+                    finished_ms=finished_ms,
+                )
+            for i in range(2):
+                _insert_done_chunk_at(
+                    adapter, "job-old-ind", i,
+                    os.path.join(old_ind_dir, f"chunk_{i:04d}.wav"),
+                )
+            _insert_done_chunk_at(adapter, "job-young", 0, os.path.join(young_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(adapter, "job-ref", 0, os.path.join(ref_dir, "chunk_0000.wav"))
+            _insert_snapshot(
+                adapter,
+                "snap-1",
+                json.dumps({"tracks": [{"path": os.path.join(ref_dir, "chunk_0000.wav")}]}),
+            )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 2
+            assert summary["chunks_evicted"] == 2
+            assert summary["jobs_expired"] == 2
+            assert summary["skipped_snapshot_referenced"] == ["job-ref"]
+            assert not os.path.isdir(old_ind_dir)
+            assert not os.path.isdir(old_batch_dir)
+            assert os.path.isdir(young_dir)
+            assert os.path.isdir(ref_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_explicit_args_beat_env(self, tmp_path, monkeypatch):
+        """Explicit kwargs override env vars (testability without env surgery)."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-old", n_chunks=1)
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-old",
+                mode="individual",
+                output_dir=run_dir,
+                finished_ms=int(time.time() * 1000) - 300_000,
+            )
+            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav"))
+            monkeypatch.setenv("JOB_RETENTION_DAYS", "1000")
+            monkeypatch.setenv("CHUNK_RETENTION_DAYS", "1000")
+
+            summary = adapter.gc_expired_artifacts(root, job_retention_days=0.001, chunk_retention_days=0.001)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert not os.path.isdir(run_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_parity_in_memory(self, tmp_path):
+        """InMemorySQLiteAdapter exposes the same GC sweep with identical semantics."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-old", n_chunks=2)
+        adapter = InMemorySQLiteAdapter()
+        adapter.init_db()
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-old",
+                mode="individual",
+                output_dir=run_dir,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+            for i in range(2):
+                _insert_done_chunk_at(
+                    adapter, "job-old", i, os.path.join(run_dir, f"chunk_{i:04d}.wav")
+                )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 1
+            assert summary["chunks_evicted"] == 2
+            assert summary["jobs_expired"] == 1
+            assert not os.path.isdir(run_dir)
+        finally:
+            adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# P3-S2: hourly GC scheduler — daemon thread, never on the hot request path
+# ---------------------------------------------------------------------------
+
+
+def _gc_threads():
+    return [t for t in threading.enumerate() if t.name == "alexandria-gc-scheduler"]
+
+
+class TestGCScheduler:
+    """P3-S2: the hourly sweep lives in a daemon background thread.
+
+    Contract rule #12: the sweep never runs on the hot request path — it is
+    invoked only from this thread, which is started explicitly (never at
+    module import time) and defers its first sweep one full interval.
+    """
+
+    def test_start_spawns_single_daemon_thread(self):
+        assert _gc_threads() == []
+        start_gc_scheduler()
+        try:
+            threads = _gc_threads()
+            assert len(threads) == 1
+            assert threads[0].daemon is True
+            start_gc_scheduler()  # idempotent: must not spawn a second thread
+            assert len(_gc_threads()) == 1
+        finally:
+            stop_gc_scheduler()
+
+    def test_stop_joins_and_terminates(self):
+        start_gc_scheduler()
+        stop_gc_scheduler()
+        assert _gc_threads() == []
+
+    def test_stop_without_start_is_noop(self):
+        stop_gc_scheduler()  # must not raise
+        assert _gc_threads() == []
+
+    def test_env_disable_prevents_start(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_GC_SCHEDULER", "0")
+        start_gc_scheduler()
+        assert _gc_threads() == []
+
+    def test_scheduler_loop_sweeps_expired_artifacts(self, tmp_path, monkeypatch):
+        """End-to-end: the loop actually calls the sweep (short interval)."""
+        root = str(tmp_path / "render_root")
+        run_dir = _make_run_dir(root, "b1", "job-old", n_chunks=1)
+        db_path = str(tmp_path / "gc-loop.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer,
+            "job-old",
+            mode="individual",
+            output_dir=run_dir,
+            finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+        )
+        _insert_done_chunk_at(writer, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav"))
+        writer.close()
+        monkeypatch.setenv("PIPELINE_DB_PATH", db_path)
+        monkeypatch.setenv("RENDER_ROOT", root)
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_gc_scheduler_loop,
+            args=(stop, 0.05),
+            name="gc-scheduler-test",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            deadline = time.time() + 5
+            swept = False
+            while time.time() < deadline:
+                reader = SQLiteAdapter(db_path=db_path)
+                reader.init_db()
+                try:
+                    rows = reader.execute_query(
+                        "SELECT status FROM render_job WHERE job_id = 'job-old'"
+                    )
+                    if rows and rows[0]["status"] == "expired":
+                        swept = True
+                        break
+                finally:
+                    reader.close()
+                time.sleep(0.02)
+            assert swept, "GC loop never swept the expired job"
+            assert not os.path.isdir(run_dir)
+        finally:
+            stop.set()
+            thread.join(timeout=2)

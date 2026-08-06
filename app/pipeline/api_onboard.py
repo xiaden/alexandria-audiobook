@@ -22,6 +22,7 @@ from app.pipeline.adapter import PipelineStorage, SQLiteAdapter
 from app.pipeline.assembly import reonboard_book
 from app.pipeline.extract import extract_epub_text
 from app.pipeline.populate import populate_spine
+from app.pipeline.tts_integration import get_render_root
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +45,14 @@ _storage: PipelineStorage | None = None
 
 
 def _get_production_storage() -> PipelineStorage:
-    """Lazily create and return the production SQLiteAdapter singleton."""
+    """Lazily create and return the production SQLiteAdapter singleton.
+
+    Startup-only side effects on first acquisition: stale running
+    render_job/walk_run rows are flipped to ``interrupted``
+    (``reconcile_stale_runs``), then manifests are rebuilt for completed
+    render_job rows whose run dir exists and artifact-missing jobs are
+    flagged (``rebuild_manifests``).
+    """
     global _storage
     if _storage is None:
         db_path = os.environ.get("PIPELINE_DB_PATH", "./data/pipeline.db")
@@ -56,6 +64,12 @@ def _get_production_storage() -> PipelineStorage:
         # deployment is race-free by construction.  Runs once, on first
         # acquisition, before any request can be handled.
         adapter.reconcile_stale_runs()
+        # Startup-only manifest rebuild (contract rule #3 — rows = truth,
+        # manifest = derived): regenerate manifest.json for completed jobs
+        # whose run dir exists and flag artifact-missing jobs.  Runs AFTER
+        # reconciliation so freshly-interrupted rows are never rebuilt.
+        # RENDER_ROOT is read from the environment at call time.
+        adapter.rebuild_manifests(get_render_root())
         _storage = adapter
     return _storage
 
