@@ -3,14 +3,15 @@
  * Tests cover: pipeline operations (split/merge/move/delete), span display,
  * confidence review UI, TTS rendering.
  *
- * NOTE: No test framework is installed in frontend/package.json.
- * These tests are written with vitest-compatible syntax.
- * To run: install vitest (`npm install -D vitest jsdom`) and add to package.json:
- *   "scripts": { "test": "vitest" },
- *   "vitest": { "environment": "jsdom" }
+ * NOTE: Run `npm test` from frontend/ to execute this suite with vitest
+ * (^4.1.10) + jsdom (^30.0.1) — both are devDependencies in
+ * frontend/package.json; the "test" script is `vitest` with jsdom.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   PipelineSpan,
   ReviewItem,
@@ -39,9 +40,14 @@ import {
   getCachedSpans,
   getCachedReviewItems,
   getSelectedIndices,
+  handlePreviewSpan,
+  setPreviewPlayer,
+  playPipelineAudiobook,
+  playSpanSequence,
   initEditor,
 } from '../../src/tabs/editor';
 import { state } from '../../src/state';
+import { getPreviewPlayer } from '../../src/player';
 import * as API from '../../src/api';
 
 // Mock the API module
@@ -108,6 +114,24 @@ const MOCK_REVIEW_ITEMS: ReviewItem[] = [
     walk_name: 'attribution',
   },
 ];
+
+// ---------------------------------------------------------------------------
+// index.html fixture resolution
+// ---------------------------------------------------------------------------
+// Read frontend/index.html robustly regardless of the vitest cwd: prefer a
+// path derived from this file's own location (import.meta.url → fileURLToPath)
+// and fall back to process.cwd() when the runner does not expose a file:// URL
+// (jsdom transforms import.meta.url to an http URL in this setup).
+
+function readIndexHtml(): string {
+  try {
+    const viaMeta = fileURLToPath(new URL('../../index.html', import.meta.url));
+    if (existsSync(viaMeta)) return readFileSync(viaMeta, 'utf8');
+  } catch {
+    // import.meta.url is not a file:// URL under this runner — fall back.
+  }
+  return readFileSync(resolve(process.cwd(), 'index.html'), 'utf8');
+}
 
 // ---------------------------------------------------------------------------
 // Test suites
@@ -959,5 +983,610 @@ describe('Editor Tab — Testability Exports', () => {
     selected.add(99);
     const selectedAgain = getSelectedIndices();
     expect(selectedAgain.has(99)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-span audio preview (audio surface — Plan E, Phase 4)
+//
+// Backend conventions verified from source (see plan annotations):
+//   • Individual-mode render writes ONE render_chunk per span in annotated-script
+//     presentation order, idx 0-BASED (tts_integration.py render_audiobook:
+//     enumerate(script) → _insert_chunk_row(job_id, i, ...); script is the same
+//     array GET /api/pipeline/export/{book_id} serves). So chunk idx =
+//     span.global_index − 1.
+//   • GET /api/pipeline/export/jobs/{job_id}/chunks → ChunkRow[] ordered by idx
+//     ({job_id, idx, status, wav_path, error}); empty for batch jobs.
+//   • GET /api/pipeline/render_status/{job_id} → {job_id, status, mode, ...}
+//     where mode ∈ {'individual', 'batch'}.
+//   • Batch jobs have no per-chunk rows → per-span preview is blocked with the
+//     contract tooltip "preview differs from final — whole-book playback only".
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Per-Span Audio Preview (Audio Surface)', () => {
+  /** Injectable mock player — setPreviewPlayer swaps it for the real singleton. */
+  let mockPlayer: {
+    play: ReturnType<typeof vi.fn>;
+    pause: ReturnType<typeof vi.fn>;
+    seek: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+  };
+
+  const MOCK_CHUNK_ROWS = [
+    { job_id: 'job-preview-1', idx: 0, status: 'done', wav_path: 'chunk_0000.wav', error: null },
+    { job_id: 'job-preview-1', idx: 1, status: 'done', wav_path: 'chunk_0001.wav', error: null },
+    { job_id: 'job-preview-1', idx: 2, status: 'done', wav_path: 'chunk_0002.wav', error: null },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Clear any leftover mockResolvedValueOnce queue from prior tests in this file.
+    vi.mocked(API.get).mockReset();
+    state.pipelineBookId = 'book-123';
+    state.pipelineRenderJobId = 'job-preview-1';
+    mockPlayer = {
+      play: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn(),
+      seek: vi.fn(),
+      stop: vi.fn().mockResolvedValue(undefined),
+    };
+    setPreviewPlayer(mockPlayer);
+  });
+
+  afterEach(() => {
+    state.pipelineRenderJobId = null;
+    // Restore the real singleton player so any later tests use the default binding.
+    setPreviewPlayer(getPreviewPlayer());
+  });
+
+  describe('renderSpanRow preview affordance', () => {
+    it('emits a ▶ preview button with job/idx data attributes', () => {
+      const span: PipelineSpan = {
+        global_index: 3,
+        speaker: 'Darcy',
+        text: 'Forgive me, I was wrong.',
+        instruct: 'sincere',
+      };
+
+      const html = renderSpanRow(span);
+
+      expect(html).toContain('btn-span-preview');
+      expect(html).toContain('data-job-id="job-preview-1"');
+      // chunk idx is 0-based: global_index − 1
+      expect(html).toContain('data-chunk-idx="2"');
+      expect(html).toContain('fa-play');
+    });
+
+    it('emits the preview button disabled when no render job is known', () => {
+      state.pipelineRenderJobId = null;
+      const span: PipelineSpan = {
+        global_index: 1,
+        speaker: 'Narrator',
+        text: 'Once upon a time',
+        instruct: '',
+      };
+
+      const html = renderSpanRow(span);
+
+      expect(html).toContain('btn-span-preview');
+      expect(html).toContain('disabled');
+    });
+  });
+
+  describe('handlePreviewSpan', () => {
+    it('resolves the correct chunk URL and plays it via the player (individual mode)', async () => {
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-preview-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockResolvedValueOnce(MOCK_CHUNK_ROWS);
+
+      await handlePreviewSpan(2);
+
+      expect(API.get).toHaveBeenCalledWith('/api/pipeline/render_status/job-preview-1');
+      expect(API.get).toHaveBeenCalledWith('/api/pipeline/export/jobs/job-preview-1/chunks');
+      expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/chunk/job-preview-1/1');
+    });
+
+    it('falls back to the presentation-order chunk idx when the chunk list is unavailable', async () => {
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-preview-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockRejectedValueOnce(new Error('network'));
+
+      await handlePreviewSpan(3);
+
+      expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/chunk/job-preview-1/2');
+    });
+
+    it('uses the render_chunk row list when available to resolve the idx', async () => {
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-preview-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockResolvedValueOnce(MOCK_CHUNK_ROWS);
+
+      await handlePreviewSpan(2);
+
+      expect(API.get).toHaveBeenCalledWith('/api/pipeline/export/jobs/job-preview-1/chunks');
+      expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/chunk/job-preview-1/1');
+    });
+
+    it('shows the "preview differs from final" tooltip and does not play for batch jobs', async () => {
+      const { showToast } = await import('../../src/utils');
+      vi.mocked(API.get).mockResolvedValue({
+        job_id: 'job-preview-1',
+        status: 'completed',
+        mode: 'batch',
+        output_dir: null,
+        error: null,
+      });
+
+      await handlePreviewSpan(2);
+
+      expect(showToast).toHaveBeenCalledWith('preview differs from final — whole-book playback only', 'warning');
+      expect(mockPlayer.play).not.toHaveBeenCalled();
+      // Batch jobs have no chunk rows — the chunk list must not even be fetched.
+      expect(API.get).not.toHaveBeenCalledWith('/api/pipeline/export/jobs/job-preview-1/chunks');
+    });
+
+    it('shows a warning and does not play when no render job exists', async () => {
+      const { showToast } = await import('../../src/utils');
+      state.pipelineRenderJobId = null;
+
+      await handlePreviewSpan(1);
+
+      expect(showToast).toHaveBeenCalledWith('No render job to preview', 'warning');
+      expect(mockPlayer.play).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('delegated click wiring', () => {
+    it('clicking a row preview button plays the span chunk', async () => {
+      document.body.innerHTML = `<table><tbody id="spans-table-body"></tbody></table>`;
+      const tbody = document.getElementById('spans-table-body') as HTMLElement;
+      tbody.innerHTML = renderSpanRow({
+        global_index: 2,
+        speaker: 'Elizabeth',
+        text: 'I cannot believe it!',
+        instruct: 'surprised',
+      });
+
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-preview-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockResolvedValueOnce(MOCK_CHUNK_ROWS);
+
+      const btn = tbody.querySelector('.btn-span-preview') as HTMLButtonElement;
+      expect(btn).not.toBeNull();
+      btn.click();
+
+      // Exactly-once: the initEditor duplicate-wiring guard means only one
+      // delegated listener is ever registered for the spans table.
+      await vi.waitFor(() => {
+        expect(mockPlayer.play).toHaveBeenCalledTimes(1);
+        expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/chunk/job-preview-1/1');
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Whole-book playback (audio surface — Plan E, Phase 5)
+//
+// Backend contract (Plan C, CONTRACTS.md): GET /api/pipeline/export/audio/{job_id}
+// serves whole-book playback — the artifact WAV when present, otherwise a
+// synthesized streaming concat of the job's chunks (Range supported across
+// chunk boundaries, HEAD supported). Available for BOTH individual and batch
+// render modes: batch jobs have NO per-chunk rows, so whole-book playback is
+// their only audio surface (see BATCH_PREVIEW_TOOLTIP).
+//
+// The affordance is a "Play book" button (#btn-pipeline-play-book) in the
+// editor tab card header next to the #pipeline-render-job badge. It resolves
+// the job id exactly like downloadPipelineRender / mergePipelineAudiobook:
+//   state.pipelineRenderJobId ?? _currentRenderJobId
+// and plays GET /api/pipeline/export/audio/{job_id} via the injected player
+// (setPreviewPlayer — same injectable-singleton pattern as handlePreviewSpan).
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Whole-Book Playback (Audio Surface)', () => {
+  /** Injectable mock player — setPreviewPlayer swaps it for the real singleton. */
+  let mockPlayer: {
+    play: ReturnType<typeof vi.fn>;
+    pause: ReturnType<typeof vi.fn>;
+    seek: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Clear any leftover mockResolvedValueOnce queue from prior tests in this file.
+    vi.mocked(API.get).mockReset();
+    state.pipelineBookId = 'book-123';
+    state.pipelineRenderJobId = 'job-play-1';
+    mockPlayer = {
+      play: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn(),
+      seek: vi.fn(),
+      stop: vi.fn().mockResolvedValue(undefined),
+    };
+    setPreviewPlayer(mockPlayer);
+  });
+
+  afterEach(() => {
+    state.pipelineRenderJobId = null;
+    // Restore the real singleton player so any later tests use the default binding.
+    setPreviewPlayer(getPreviewPlayer());
+  });
+
+  describe('play book affordance in the editor tab UI', () => {
+    it('index.html declares the #btn-pipeline-play-book button near the render job badge', () => {
+      const html = readIndexHtml();
+
+      expect(html).toContain('id="btn-pipeline-play-book"');
+      // Spec from Plan E P5-S2: btn-outline-info, play icon, title "Play whole book".
+      expect(html).toContain('btn-outline-info');
+      expect(html).toContain('fa-play');
+      expect(html).toContain('Play whole book');
+
+      // The affordance must live in the editor tab card header, next to the
+      // #pipeline-render-job badge (not somewhere unreachable in another tab).
+      // Positional ordering is less brittle than slicing the HTML between
+      // landmark ids: the button must sit inside the editor tab and the badge
+      // must come after it.
+      const editorTabStart = html.indexOf('id="editor-tab"');
+      const playBookIdx = html.indexOf('id="btn-pipeline-play-book"');
+      const renderJobIdx = html.indexOf('id="pipeline-render-job"');
+      expect(editorTabStart).toBeGreaterThan(-1);
+      expect(playBookIdx).toBeGreaterThan(editorTabStart);
+      expect(renderJobIdx).toBeGreaterThan(playBookIdx);
+    });
+  });
+
+  describe('playPipelineAudiobook', () => {
+    it('plays the whole book via GET /api/pipeline/export/audio/{job_id}', async () => {
+      await playPipelineAudiobook();
+
+      expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/audio/job-play-1');
+    });
+
+    it('accepts an explicit job id (takes precedence over state)', async () => {
+      await playPipelineAudiobook('job-explicit');
+
+      expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/audio/job-explicit');
+    });
+
+    it('supports seeking on the singleton player after playback starts', async () => {
+      await playPipelineAudiobook();
+      expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/audio/job-play-1');
+
+      // seek(seconds) on the real player just delegates to the audio element's
+      // currentTime; with the injected spy we assert the call itself.
+      mockPlayer.seek(120);
+      expect(mockPlayer.seek).toHaveBeenCalledWith(120);
+      // Same singleton instance serves both play and seek (whole-book surface).
+      expect(mockPlayer.play.mock.instances[0]).toBe(mockPlayer.seek.mock.instances[0]);
+    });
+
+    it('shows a warning toast and does not play when no render job exists', async () => {
+      const { showToast } = await import('../../src/utils');
+      state.pipelineRenderJobId = null;
+
+      await playPipelineAudiobook();
+
+      expect(showToast).toHaveBeenCalledWith('No render job to play. Render the audiobook first.', 'warning');
+      expect(mockPlayer.play).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('click wiring', () => {
+    it('clicking the Play book button resolves the job id and plays the export/audio URL', async () => {
+      document.body.innerHTML = `
+        <button id="btn-pipeline-play-book"><i class="fas fa-play"></i></button>
+      `;
+
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      const btn = document.getElementById('btn-pipeline-play-book') as HTMLButtonElement;
+      expect(btn).not.toBeNull();
+      btn.click();
+
+      // Exactly-once: the initEditor duplicate-wiring guard prevents stacked
+      // click handlers from firing play multiple times.
+      await vi.waitFor(() => {
+        expect(mockPlayer.play).toHaveBeenCalledTimes(1);
+        expect(mockPlayer.play).toHaveBeenCalledWith('/api/pipeline/export/audio/job-play-1');
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sequence playback (audio surface — Plan E, Phase 6)
+//
+// playSpanSequence() resolves the chunk URLs for a set of spans and plays them
+// in sequence through the injected player's playSequence() queue (auto-advance
+// on the element's 'ended' event). v1 semantics (DD open item #5): the
+// sequence is the presentation order of the LOADED spans (_cachedSpans sorted
+// by global_index); when a non-empty selection exists (_selectedIndices) the
+// sequence is the selected spans sorted by global_index. Review-filtered spans
+// are NOT excluded — _cachedSpans is the full export; review items never
+// remove spans from the table.
+//
+// Chunk idx mapping is the Phase 4 convention (0-based presentation order =
+// global_index − 1, verified from tts_integration.py render_audiobook
+// enumerate(script) → _insert_chunk_row(job_id, i, ...)), confirmed by
+// GET /api/pipeline/export/jobs/{job_id}/chunks when available.
+//
+// Batch jobs have no per-chunk rows, so sequence playback requires individual
+// mode: a batch job shows the same contract tooltip as per-span preview
+// (BATCH_PREVIEW_TOOLTIP) and nothing is queued.
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Sequence Playback (Audio Surface)', () => {
+  /** Injectable mock player — setPreviewPlayer swaps it for the real singleton. */
+  let mockPlayer: {
+    play: ReturnType<typeof vi.fn>;
+    playSequence: ReturnType<typeof vi.fn>;
+    pause: ReturnType<typeof vi.fn>;
+    seek: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+  };
+
+  const MOCK_CHUNK_ROWS = [
+    { job_id: 'job-seq-1', idx: 0, status: 'done', wav_path: 'chunk_0000.wav', error: null },
+    { job_id: 'job-seq-1', idx: 1, status: 'done', wav_path: 'chunk_0001.wav', error: null },
+    { job_id: 'job-seq-1', idx: 2, status: 'done', wav_path: 'chunk_0002.wav', error: null },
+  ];
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Clear any leftover mockResolvedValueOnce queue from prior tests in this file.
+    vi.mocked(API.get).mockReset();
+    // Clear any selection leaked by earlier describes in this file.
+    for (const idx of getSelectedIndices()) toggleSpanSelection(idx);
+
+    state.pipelineBookId = 'book-123';
+    state.pipelineRenderJobId = 'job-seq-1';
+    mockPlayer = {
+      play: vi.fn().mockResolvedValue(undefined),
+      playSequence: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn(),
+      seek: vi.fn(),
+      stop: vi.fn().mockResolvedValue(undefined),
+    };
+    setPreviewPlayer(mockPlayer);
+
+    // Seed the span cache in presentation order (loadSpans reads the export
+    // endpoint into _cachedSpans).
+    document.body.innerHTML = `<table><tbody id="spans-table-body"></tbody></table>`;
+    vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
+    await loadSpans();
+  });
+
+  afterEach(() => {
+    state.pipelineRenderJobId = null;
+    // Restore the real singleton player so any later tests use the default binding.
+    setPreviewPlayer(getPreviewPlayer());
+  });
+
+  describe('playSpanSequence', () => {
+    it('queues all loaded spans in presentation order (no selection)', async () => {
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-seq-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockResolvedValueOnce(MOCK_CHUNK_ROWS);
+
+      await playSpanSequence();
+
+      expect(API.get).toHaveBeenCalledWith('/api/pipeline/render_status/job-seq-1');
+      expect(API.get).toHaveBeenCalledWith('/api/pipeline/export/jobs/job-seq-1/chunks');
+      expect(mockPlayer.playSequence).toHaveBeenCalledWith([
+        '/api/pipeline/export/chunk/job-seq-1/0',
+        '/api/pipeline/export/chunk/job-seq-1/1',
+        '/api/pipeline/export/chunk/job-seq-1/2',
+      ]);
+    });
+
+    it('queues only the selected spans, sorted by presentation order', async () => {
+      toggleSpanSelection(3);
+      toggleSpanSelection(1);
+
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-seq-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockResolvedValueOnce(MOCK_CHUNK_ROWS);
+
+      await playSpanSequence();
+
+      // Selected spans {3, 1} sorted by global_index → 1 then 3 → idx 0 then 2.
+      expect(mockPlayer.playSequence).toHaveBeenCalledWith([
+        '/api/pipeline/export/chunk/job-seq-1/0',
+        '/api/pipeline/export/chunk/job-seq-1/2',
+      ]);
+
+      // Cleanup: clear the leaked selection.
+      toggleSpanSelection(3);
+      toggleSpanSelection(1);
+    });
+
+    it('falls back to presentation-order chunk idx when the chunk list is unavailable', async () => {
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-seq-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockRejectedValueOnce(new Error('network'));
+
+      await playSpanSequence();
+
+      expect(mockPlayer.playSequence).toHaveBeenCalledWith([
+        '/api/pipeline/export/chunk/job-seq-1/0',
+        '/api/pipeline/export/chunk/job-seq-1/1',
+        '/api/pipeline/export/chunk/job-seq-1/2',
+      ]);
+    });
+
+    it('shows the "preview differs from final" tooltip and does not queue for batch jobs', async () => {
+      const { showToast } = await import('../../src/utils');
+      vi.mocked(API.get).mockResolvedValue({
+        job_id: 'job-seq-1',
+        status: 'completed',
+        mode: 'batch',
+        output_dir: null,
+        error: null,
+      });
+
+      await playSpanSequence();
+
+      expect(showToast).toHaveBeenCalledWith('preview differs from final — whole-book playback only', 'warning');
+      expect(mockPlayer.playSequence).not.toHaveBeenCalled();
+      // Batch jobs have no chunk rows — the chunk list must not even be fetched.
+      expect(API.get).not.toHaveBeenCalledWith('/api/pipeline/export/jobs/job-seq-1/chunks');
+    });
+
+    it('shows a warning and does not queue when no render job exists', async () => {
+      const { showToast } = await import('../../src/utils');
+      state.pipelineRenderJobId = null;
+
+      await playSpanSequence();
+
+      expect(showToast).toHaveBeenCalledWith('No render job to play. Render the audiobook first.', 'warning');
+      expect(mockPlayer.playSequence).not.toHaveBeenCalled();
+    });
+
+    it('shows a "No spans to play" toast and does not queue when the span cache is empty', async () => {
+      const { showToast } = await import('../../src/utils');
+      // Empty the span cache: re-run loadSpans against an empty export so the
+      // ordered span set is empty (individual mode — no batch guard applies).
+      vi.mocked(API.get).mockResolvedValue([]);
+      await loadSpans();
+
+      vi.mocked(API.get).mockResolvedValueOnce({
+        job_id: 'job-seq-1',
+        status: 'completed',
+        mode: 'individual',
+        output_dir: null,
+        error: null,
+      });
+
+      await playSpanSequence();
+
+      expect(showToast).toHaveBeenCalledWith('No spans to play', 'warning');
+      expect(mockPlayer.playSequence).not.toHaveBeenCalled();
+      // The chunk list must not be fetched for an empty span set.
+      expect(API.get).not.toHaveBeenCalledWith('/api/pipeline/export/jobs/job-seq-1/chunks');
+    });
+
+    it('accepts an explicit job id (takes precedence over state)', async () => {
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-seq-explicit',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockResolvedValueOnce(MOCK_CHUNK_ROWS);
+
+      await playSpanSequence('job-seq-explicit');
+
+      expect(API.get).toHaveBeenCalledWith('/api/pipeline/render_status/job-seq-explicit');
+      expect(API.get).toHaveBeenCalledWith('/api/pipeline/export/jobs/job-seq-explicit/chunks');
+      expect(mockPlayer.playSequence).toHaveBeenCalledWith([
+        '/api/pipeline/export/chunk/job-seq-explicit/0',
+        '/api/pipeline/export/chunk/job-seq-explicit/1',
+        '/api/pipeline/export/chunk/job-seq-explicit/2',
+      ]);
+    });
+  });
+
+  describe('sequence affordance in the editor tab UI', () => {
+    it('index.html declares the #btn-pipeline-play-sequence button near the render job badge', () => {
+      const html = readIndexHtml();
+
+      expect(html).toContain('id="btn-pipeline-play-sequence"');
+
+      // The affordance must live in the editor tab card header, next to the
+      // #pipeline-render-job badge (like the Play Book button) — positional
+      // ordering, less brittle than slicing the HTML between landmark ids.
+      const editorTabStart = html.indexOf('id="editor-tab"');
+      const playSeqIdx = html.indexOf('id="btn-pipeline-play-sequence"');
+      const renderJobIdx = html.indexOf('id="pipeline-render-job"');
+      expect(editorTabStart).toBeGreaterThan(-1);
+      expect(playSeqIdx).toBeGreaterThan(editorTabStart);
+      expect(renderJobIdx).toBeGreaterThan(playSeqIdx);
+    });
+  });
+
+  describe('click wiring', () => {
+    it('clicking the Play Sequence button queues the spans in order', async () => {
+      document.body.innerHTML = `
+        <button id="btn-pipeline-play-sequence"><i class="fas fa-list-ul"></i></button>
+      `;
+
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-seq-1',
+          status: 'completed',
+          mode: 'individual',
+          output_dir: null,
+          error: null,
+        })
+        .mockResolvedValueOnce(MOCK_CHUNK_ROWS);
+
+      const btn = document.getElementById('btn-pipeline-play-sequence') as HTMLButtonElement;
+      expect(btn).not.toBeNull();
+      btn.click();
+
+      // Exactly-once: the initEditor duplicate-wiring guard prevents stacked
+      // click handlers from queueing the sequence multiple times.
+      await vi.waitFor(() => {
+        expect(mockPlayer.playSequence).toHaveBeenCalledTimes(1);
+        expect(mockPlayer.playSequence).toHaveBeenCalledWith([
+          '/api/pipeline/export/chunk/job-seq-1/0',
+          '/api/pipeline/export/chunk/job-seq-1/1',
+          '/api/pipeline/export/chunk/job-seq-1/2',
+        ]);
+      });
+    });
   });
 });

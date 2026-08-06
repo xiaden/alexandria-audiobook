@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-44F8ZaNx.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-Dx_qAJuB.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -102,14 +102,14 @@
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto">
-                    <li class="nav-item"><a class="nav-link nav-pipeline active" data-tab="setup">1. Setup</a></li>
-                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="script">2. Script</a></li>
-                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="voices">3. Voices</a></li>
-                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="editor">4. Editor</a></li>
-                    <li class="nav-item ms-3 border-start border-secondary ps-3"><a class="nav-link nav-advanced" data-tab="designer">Designer</a></li>
-                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="preparer">Preparer</a></li>
-                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="dataset-builder">Dataset</a></li>
-                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="training">Training</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline active" href="#" role="button" data-tab="setup">1. Setup</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="script">2. Script</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="voices">3. Voices</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="editor">4. Editor</a></li>
+                    <li class="nav-item ms-3 border-start border-secondary ps-3"><a class="nav-link nav-advanced" href="#" role="button" data-tab="designer">Designer</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" href="#" role="button" data-tab="preparer">Preparer</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" href="#" role="button" data-tab="dataset-builder">Dataset</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" href="#" role="button" data-tab="training">Training</a></li>
                 </ul>
                 <ul class="navbar-nav ms-auto align-items-center">
                     <li class="nav-item small d-flex align-items-center" title="System Status">
@@ -986,6 +986,8 @@
                             <button class="btn btn-outline-success btn-sm" id="btn-pipeline-regen"><i class="fas fa-redo me-1"></i>Re-render All</button>
                             <button class="btn btn-danger btn-sm" id="btn-pipeline-cancel" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
                             <button class="btn btn-warning btn-sm" id="btn-pipeline-merge-audiobook"><i class="fas fa-file-audio me-1"></i>Merge Audiobook</button>
+                            <button class="btn btn-outline-info btn-sm" id="btn-pipeline-play-book" title="Play whole book" aria-label="Play whole book"><i class="fas fa-play me-1"></i>Play Book</button>
+                            <button class="btn btn-outline-primary btn-sm" id="btn-pipeline-play-sequence" title="Play spans in sequence (selected, or all)" aria-label="Play spans in sequence"><i class="fas fa-list-ul me-1"></i>Play Sequence</button>
                             <span id="pipeline-render-job" class="badge bg-info d-none"></span>
                         </div>
                     </div>

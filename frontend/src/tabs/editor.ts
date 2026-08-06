@@ -40,6 +40,9 @@ import {
   handleMove,
   handleDelete,
   toggleSpanSelection,
+  // Per-span preview (audio surface)
+  handlePreviewSpan,
+  setPreviewPlayer,
   // Review UI
   loadReviewItems,
   renderReviewItem,
@@ -51,6 +54,10 @@ import {
   cancelPipelineRender,
   downloadPipelineRender,
   mergePipelineAudiobook,
+  // Whole-book playback (audio surface)
+  playPipelineAudiobook,
+  // Sequence playback (audio surface)
+  playSpanSequence,
   // Getters
   getCachedSpans,
   getCachedReviewItems,
@@ -106,6 +113,17 @@ export {
   pipelineRenderAll,
   cancelPipelineRender,
   downloadPipelineRender,
+  mergePipelineAudiobook,
+};
+
+// Re-export whole-book playback (audio surface)
+export {
+  playPipelineAudiobook,
+};
+
+// Re-export sequence playback (audio surface)
+export {
+  playSpanSequence,
 };
 
 // Re-export pipeline getters
@@ -115,15 +133,29 @@ export {
   getSelectedIndices,
 };
 
+// Re-export per-span preview (audio surface)
+export {
+  handlePreviewSpan,
+  setPreviewPlayer,
+};
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 
+let _editorInitialized = false;
+
 /**
  * Initialize the Editor tab
- * Attaches event listeners to buttons and sets up tab-switch handler
+ * Attaches event listeners to buttons and sets up tab-switch handler.
+ *
+ * Idempotent: a module flag ensures the DOMContentLoaded handler is registered
+ * at most once, so calling initEditor() again (tests, accidental double-init)
+ * cannot stack duplicate document listeners or duplicate click wiring.
  */
 export function initEditor(): void {
+  if (_editorInitialized) return;
+  _editorInitialized = true;
   document.addEventListener('DOMContentLoaded', () => {
     // Pipeline Render button
     const btnPipelineRender = document.getElementById('btn-pipeline-render');
@@ -153,6 +185,18 @@ export function initEditor(): void {
     const btnPipelineMergeAudiobook = document.getElementById('btn-pipeline-merge-audiobook');
     if (btnPipelineMergeAudiobook) {
       btnPipelineMergeAudiobook.addEventListener('click', () => mergePipelineAudiobook());
+    }
+
+    // Pipeline Play Book button (whole-book playback via /export/audio/{job_id})
+    const btnPipelinePlayBook = document.getElementById('btn-pipeline-play-book');
+    if (btnPipelinePlayBook) {
+      btnPipelinePlayBook.addEventListener('click', () => playPipelineAudiobook());
+    }
+
+    // Pipeline Play Sequence button (sequence playback via player queue)
+    const btnPipelinePlaySequence = document.getElementById('btn-pipeline-play-sequence');
+    if (btnPipelinePlaySequence) {
+      btnPipelinePlaySequence.addEventListener('click', () => playSpanSequence());
     }
 
     // Pipeline merge button (for merging selected spans)
@@ -199,6 +243,10 @@ export function initEditor(): void {
           }
         } else if (btn.classList.contains('btn-span-delete')) {
           handleDelete(index);
+        } else if (btn.classList.contains('btn-span-preview')) {
+          // Per-span audio preview (individual render mode; batch jobs are
+          // blocked inside handlePreviewSpan with the contract tooltip).
+          handlePreviewSpan(index);
         }
       });
 
