@@ -14,7 +14,7 @@
 5. **Startup-only reconciliation.** One pass at startup flips stale `running` → `interrupted` for render_job/walk_run before the API accepts requests. No on-read sweeper, no periodic reaper.
 6. **LLM never inside a transaction.** Per-unit pattern: SELECT (outside txn) → LLM call (no txn) → `with storage.transaction():` UPSERT + walk_review_item + heartbeat + COMMIT. `ConcurrentTransactionError` → 50-100ms backoff retry of idempotent write ×3, then fail unit.
 7. **Cancel:** single dispatcher `is_cancel_requested(run_id)` reads DB row (`cancel_requested=1`) + stop-file + event. Persisted cancel survives process restart. Batch renders: job-level cancel only; individual mode: per-chunk.
-8. **Review:** single 0.5–0.7 band v1; ≥0.7 accept, <0.5 reject, 0.5–0.7 review. No ×0.8 degraded auto-accept. `walkitem:`-prefixed IDs for walk-derived review items; `junction:` for junction items.
+8. **Review:** single 0.5–0.7 band v1; ≥0.7 accept, <0.5 reject, 0.5–0.7 review. No ×0.8 degraded auto-accept. `walkitem:`-prefixed IDs for walk-derived review items; junction items use `{junction_table}:{character_id}:{entity_id}` ids (unprefixed); dispatch on the `walkitem:` prefix, else junction.
 9. **Supersede:** completion-time per-target only (in walk's FINAL transaction). Nothing superseded on failure/cancel.
 10. **Snapshots:** restore blocked while any active walk_run/render_job row exists; snapshot load merges (characters never deleted); audio missing → explicit "re-render" notice.
 11. **Config:** raw-JSON merge, validation-only AppConfig (`extra='ignore'`, output never serialized), `schema_version` stamp, byte-stable round-trip guaranteed.
@@ -62,7 +62,7 @@
 |--------|-------|
 | `get_review_items(book_id, walk_name=None)` (extended) | Honest union: junction live query (existing) + `walk_review_item` rows where status='pending'. Walk items carry ids `walkitem:{id}`. |
 | `resolve_review_action(action, item_id, new_value)` (extended) | Prefix dispatch: `junction:` → existing behavior; `walkitem:` → walk-side value-restore: restore `prior_value` into `target_table.target_id` transactionally + mark row `resolved`. |
-| supersede helper | `supersede_targets(book_id, run_id, kind, target_ids)` — used by walk final transaction. |
+| supersede helper | `supersede_targets(storage, *, book_id, run_id, kind, target_ids)` — module-level helper (NOT a ReviewManager method), used by the walk's final transaction. |
 
 ### WalkRunner (Plan B)
 | Method | Signature | Notes |
@@ -121,7 +121,7 @@
 | WalkRunRow (frontend type) | B | run_id, walk_name, status, heartbeat_ms, created_ms, finished_ms, error |
 | ExportJobDetail | B | job_id, book_id, mode, status, error, output_dir, output_artifact_path, created_ms, started_ms, finished_ms |
 | ChunkRow | B/C | job_id, idx, status, wav_path, error |
-| ReviewItem (extended) | D | id (junction:/walkitem: prefixed), kind, target_table, target_id, prior_value, confidence, human_override, created_ms |
+| ReviewItem (extended) | D | item_id (junction:/walkitem: prefixed), kind, target_table, target_id, prior_value, created_ms; confidence/human_override are junction-only fields — walk items carry exactly {item_id, kind, target_table, target_id, prior_value, created_ms} |
 | ProjectSnapshot (frontend type) | I | name, book_id, created_ms, size_bytes |
 | SnapshotLoadRequest | I | name, book_id |
 | RenameProjectRequest | I | new_name |

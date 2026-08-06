@@ -1,8 +1,13 @@
-"""ReviewManager — confidence review queue for the audiobook pipeline.
+"""Unified review queue for the audiobook pipeline.
 
-Manages the human review workflow for low-confidence junction records
-(confidence in the [0.5, 0.7) band).  Supports accept, reject, and
-override actions across all four character junction tables.
+Owns the honest-union review queue: the junction live query
+(low-confidence character junction records in the [0.5, 0.7) band) plus
+pending ``walk_review_item`` rows recorded by walks 2g/2h/2i (ids prefixed
+``walkitem:``), with an optional ``walk_name`` filter.  Accept/reject/
+override dispatch on the ``walkitem:`` prefix; walk-side actions
+transactionally restore ``prior_value`` (undo) and mark the row resolved.
+Also exposes ``supersede_targets``, the completion-time per-target
+supersede runs in a walk's FINAL transaction.
 
 Usage::
 
@@ -13,6 +18,7 @@ Usage::
     manager = ReviewManager(storage)
     items = manager.get_review_items("book-001")
     manager.accept_review_item("character_book:c1:b1")
+    manager.resolve_review_action("reject", "walkitem:run-1:voice_profile:c1")
 """
 
 from __future__ import annotations
@@ -92,8 +98,78 @@ def _make_item_id(junction_table: str, character_id: str, related_entity_id: str
     return f"{junction_table}:{character_id}:{related_entity_id}"
 
 
+def supersede_targets(
+    storage: PipelineStorage,
+    *,
+    book_id: str,
+    run_id: str,
+    kind: str,
+    target_ids: list[str],
+) -> int:
+    """Mark prior pending walk_review_item rows as superseded (completion-time).
+
+    Runs in ONE transaction (the walk's FINAL transaction per contract rule
+    #9): ``UPDATE walk_review_item SET status = 'superseded'`` for rows of the
+    same *kind* whose ``target_id`` is in *target_ids*, scoped to *book_id*,
+    still ``pending``, and belonging to a different run (``run_id <> ?``).
+    An empty *target_ids* is a no-op — nothing was regenerated this run, so
+    nothing is superseded.  On failure or cancel the walk never reaches this
+    helper, so nothing is superseded there either.
+
+    Returns the number of rows updated.
+    """
+    if not target_ids:
+        return 0
+
+    placeholders = ", ".join("?" for _ in target_ids)
+    sql = (
+        "UPDATE walk_review_item SET status = 'superseded' "
+        "WHERE book_id = ? AND run_id <> ? AND status = 'pending' AND kind = ? "
+        f"AND target_id IN ({placeholders})"
+    )
+    params = (book_id, run_id, kind, *target_ids)
+
+    with storage.transaction():
+        return storage.execute_update(sql, params)
+
+
+class ReviewItemNotFoundError(LookupError):
+    """Raised when an action targets a well-formed but unknown review item.
+
+    The API layer maps this to HTTP 404.  ``ValueError`` continues to map to
+    400 — this distinct type exists so "the id is malformed" (400) and "the
+    id is fine but no such item exists" (404) stay distinguishable.
+    """
+
+
+# Maps walk item kind → the target-row write used by reject/override.
+# Walk items have NO ``new_value`` column, so the value goes into the target
+# row; the mapping is keyed by *kind* (CHECK-constrained, never interpolated
+# from ``target_table``) — the validated allowlist for value writes.
+_WALK_TARGET_WRITES: dict[str, str] = {
+    "voice_profile": (
+        "UPDATE character_metadata SET value = ? "
+        "WHERE character_id = ? AND key = 'voice_profile'"
+    ),
+    "voice_assignment": (
+        "UPDATE character SET voice_assignment_id = ? WHERE id = ?"
+    ),
+    "instruction": (
+        "UPDATE span SET instruct = ? WHERE id = ?"
+    ),
+}
+
+
 class ReviewManager:
-    """Manage the confidence review queue for character junction records.
+    """Manage the unified review queue for a book.
+
+    Two halves: junction records (low-confidence ``character_book`` /
+    ``character_scene`` / ``character_span`` / ``character_series`` rows in
+    the [0.5, 0.7) band) and pending ``walk_review_item`` rows
+    (``walkitem:``-prefixed ids).  ``get_review_items`` returns the union
+    (junction items first, then walk items); actions dispatch on the prefix
+    and walk-side accept/reject/override run transactionally with
+    value-restore.
 
     Parameters
     ----------
@@ -114,20 +190,33 @@ class ReviewManager:
         book_id: str,
         walk_name: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return all junction records with confidence in [0.5, 0.7).
+        """Return the HONEST UNION of the review queue for *book_id*.
 
-        Queries three junction tables: ``character_book``,
-        ``character_scene``, and ``character_span``.  Each returned dict
-        includes an ``item_id`` key that encodes the junction table and
-        primary key for use with accept/reject/override.
+        Two halves, junction items first then walk items (no other sort):
+
+        1. Junction live query — the existing low-confidence
+           ``character_book`` / ``character_scene`` / ``character_span``
+           records with confidence in [0.5, 0.7).  Each dict includes an
+           ``item_id`` key encoding the junction table and primary key
+           (``{junction_table}:{character_id}:{entity_id}`` — byte-identical
+           to the pre-union format) for use with accept/reject/override.
+        2. Walk items — pending ``walk_review_item`` rows recorded by walks
+           2g/2h/2i in their per-unit transaction.  These carry the raw
+           table columns (``kind``, ``target_table``, ``target_id``,
+           ``prior_value``, ``created_ms`` — there is no confidence /
+           human_override on walk items) and ``item_id`` of the form
+           ``walkitem:{id}`` so actions can dispatch on the prefix.
 
         Parameters
         ----------
         book_id:
             The book whose review queue to retrieve.
         walk_name:
-            Optional filter — restrict results to entries whose ``source``
-            column contains *walk_name* (LIKE ``%walk_name%`` heuristic).
+            Optional filter — restrict junction entries to those whose
+            ``source`` column contains *walk_name* (LIKE ``%walk_name%``
+            heuristic) and walk entries to those whose run's ``walk_name``
+            (via ``walk_run``) contains *walk_name*.  Without the filter
+            every pending walk item for the book is included.
         """
         items: list[dict[str, Any]] = []
 
@@ -145,6 +234,9 @@ class ReviewManager:
 
         # 3) character_span — spans belonging to this book
         items.extend(self._get_span_review_items(book_id, walk_name))
+
+        # 4) walk_review_item — pending walk items (union tail)
+        items.extend(self._get_walk_review_items(book_id, walk_name))
 
         return items
 
@@ -164,11 +256,13 @@ class ReviewManager:
         meta = _JUNCTION_META[junction_table]
         related_col = meta["related_col"]
 
-        self._storage.execute_update(
+        updated = self._storage.execute_update(
             f"UPDATE {junction_table} SET confidence = {CONFIDENCE_ACCEPTED} "
             f"WHERE character_id = ? AND {related_col} = ?",
             (character_id, related_entity_id),
         )
+        if updated == 0:
+            raise ReviewItemNotFoundError(item_id)
 
     def reject_review_item(self, item_id: str) -> None:
         """Reject a review item — set confidence to 0.0 and mark
@@ -183,11 +277,13 @@ class ReviewManager:
         meta = _JUNCTION_META[junction_table]
         related_col = meta["related_col"]
 
-        self._storage.execute_update(
+        updated = self._storage.execute_update(
             f"UPDATE {junction_table} SET confidence = {CONFIDENCE_REJECTED}, human_override = 1 "
             f"WHERE character_id = ? AND {related_col} = ?",
             (character_id, related_entity_id),
         )
+        if updated == 0:
+            raise ReviewItemNotFoundError(item_id)
 
     def override_review_item(
         self,
@@ -225,11 +321,95 @@ class ReviewManager:
 
         params.extend([character_id, related_entity_id])
 
-        self._storage.execute_update(
+        updated = self._storage.execute_update(
             f"UPDATE {junction_table} SET {', '.join(set_parts)} "
             f"WHERE character_id = ? AND {related_col} = ?",
             tuple(params),
         )
+        if updated == 0:
+            raise ReviewItemNotFoundError(item_id)
+
+    def resolve_review_action(
+        self,
+        action: str,
+        item_id: str,
+        new_value: Any = None,
+    ) -> None:
+        """Resolve a review *action* on *item_id*, dispatching on the id prefix.
+
+        ``walkitem:`` ids take the walk-side branch (``_resolve_walk_item``);
+        everything else takes the existing junction branch (accept/reject/
+        override as before — junction ids carry NO literal ``junction:``
+        prefix).  Malformed ids raise ``ValueError`` (400); well-formed ids
+        with no matching row raise ``ReviewItemNotFoundError`` (404).
+        """
+        if item_id.startswith("walkitem:"):
+            self._resolve_walk_item(action, item_id[len("walkitem:"):], new_value)
+            return
+
+        if action == "accept":
+            self.accept_review_item(item_id)
+        elif action == "reject":
+            self.reject_review_item(item_id)
+        elif action == "override":
+            self.override_review_item(item_id, new_value)
+        else:
+            raise ValueError(f"Unknown review action: {action!r}")
+
+    def _resolve_walk_item(
+        self,
+        action: str,
+        item_id: str,
+        new_value: Any,
+    ) -> None:
+        """Resolve a walk-side review item (``walkitem:`` id, prefix stripped).
+
+        Accept keeps the walk's generated value (no target write); reject
+        restores ``prior_value`` into the target row; override writes
+        *new_value* into the target row.  All three mark the item row
+        ``resolved``.  The target write + status update run inside ONE
+        ``storage.transaction()`` so the pair commits atomically and rolls
+        back together on failure.
+        """
+        row = self._storage.execute_query(
+            "SELECT kind, target_id, prior_value "
+            "FROM walk_review_item WHERE id = ? AND status = 'pending'",
+            (item_id,),
+        )
+        if not row:
+            raise ReviewItemNotFoundError(item_id)
+
+        kind = row[0]["kind"]
+        target_id = row[0]["target_id"]
+        prior_value = row[0]["prior_value"]
+
+        if action == "override" and new_value is None:
+            raise ValueError(
+                "override on a walkitem: requires a new_value to write "
+                "into the target row"
+            )
+
+        write_sql = _WALK_TARGET_WRITES.get(kind)
+        if write_sql is None:
+            raise ValueError(f"Unsupported walk item kind: {kind!r}")
+
+        if action == "accept":
+            # keep the walk's generated value — no target write
+            writes: list[tuple[str, tuple[Any, ...]]] = []
+        elif action == "reject":
+            writes = [(write_sql, (prior_value, target_id))]
+        elif action == "override":
+            writes = [(write_sql, (new_value, target_id))]
+        else:
+            raise ValueError(f"Unknown review action: {action!r}")
+
+        with self._storage.transaction():
+            for sql, params in writes:
+                self._storage.execute_update(sql, params)
+            self._storage.execute_update(
+                "UPDATE walk_review_item SET status = 'resolved' WHERE id = ?",
+                (item_id,),
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -309,4 +489,48 @@ class ReviewManager:
             row["item_id"] = _make_item_id(
                 "character_span", row["character_id"], row["related_entity_id"]
             )
+        return rows
+
+    def _get_walk_review_items(
+        self,
+        book_id: str,
+        walk_name: str | None,
+    ) -> list[dict[str, Any]]:
+        """Query pending ``walk_review_item`` rows for *book_id* (union tail).
+
+        Walk items are the low-confidence artifacts recorded by walks 2g
+        (kind ``voice_profile``), 2h (``voice_assignment``) and 2i
+        (``instruction``) inside their per-unit transaction.  Each returned
+        dict carries exactly the raw table columns — ``kind``,
+        ``target_table``, ``target_id``, ``prior_value``, ``created_ms`` —
+        with ``item_id`` of the form ``walkitem:{id}`` (there is no
+        confidence/human_override on walk items).
+
+        With *walk_name* the walk items are filtered through the honest
+        data-model link ``run_id → walk_run.walk_name`` (set by
+        ``run_walk``): ``JOIN walk_run ON wri.run_id = walk_run.run_id AND
+        walk_run.walk_name LIKE ?``.  Without the filter every pending walk
+        item for the book is included, regardless of walk_name.
+        """
+        walk_filter = ""
+        if walk_name is not None:
+            walk_filter = (
+                " JOIN walk_run ON wri.run_id = walk_run.run_id"
+                " AND walk_run.walk_name LIKE ?"
+            )
+            params: list[Any] = [f"%{walk_name}%", book_id]
+        else:
+            params = [book_id]
+
+        rows = self._storage.execute_query(
+            f"""SELECT wri.id AS item_id, wri.kind, wri.target_table,
+                       wri.target_id, wri.prior_value, wri.created_ms
+                  FROM walk_review_item wri
+                 {walk_filter}
+                 WHERE wri.book_id = ? AND wri.status = 'pending'""",
+            tuple(params),
+        )
+
+        for row in rows:
+            row["item_id"] = f"walkitem:{row['item_id']}"
         return rows

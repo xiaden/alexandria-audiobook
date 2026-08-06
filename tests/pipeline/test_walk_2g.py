@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2g_voice_audition import (
     execute,
     _build_voice_audition_prompt,
@@ -152,6 +153,26 @@ def _make_voice_profile_response(voice_profile=None, confidence=0.9):
     return json.dumps({"voice_profile": voice_profile, "confidence": confidence})
 
 
+def _get_review_items(storage):
+    """Return all walk_review_item rows written for the test book."""
+    return storage.execute_query(
+        "SELECT * FROM walk_review_item WHERE book_id = 'book-1' ORDER BY target_id"
+    )
+
+
+class _FailingItemInsert(HeartbeatStorage):
+    """HeartbeatStorage wrapper whose walk_review_item INSERT always fails.
+
+    Used to simulate a mid-savepoint unit failure so tests can assert the
+    ROLLBACK TO SAVEPOINT removes both the target write and the item row.
+    """
+
+    def execute_insert(self, sql, params=()):
+        if "walk_review_item" in sql:
+            raise RuntimeError("simulated failure writing walk_review_item")
+        return super().execute_insert(sql, params)
+
+
 # ---------------------------------------------------------------------------
 # Tests: execute()
 # ---------------------------------------------------------------------------
@@ -245,7 +266,7 @@ class TestExecute:
         response = _make_voice_profile_response(confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        result = execute("book-1", populated_storage, {})
+        result = execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
 
         # Profile IS stored but flagged for review
         assert result["profiles_generated"] == 1
@@ -343,6 +364,250 @@ class TestExecute:
 
         assert len(result["errors"]) > 0
         assert result["profiles_generated"] == 0
+
+
+class TestWalkReviewItem:
+    """walk_review_item rows written in-walk for review-band voice profiles."""
+
+    def test_review_band_writes_item_row_with_prior_value(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Review-band profile writes an item row capturing the prior profile value."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        # Seed a prior voice_profile so prior_value can be verified
+        old_profile = {"age": "young", "gender": "female"}
+        populated_storage.execute_insert(
+            "INSERT INTO character_metadata (character_id, key, value) VALUES (?, ?, ?)",
+            ("char-1", "voice_profile", json.dumps(old_profile)),
+        )
+
+        new_profile = {"age": "middle-aged", "gender": "male", "tone": "authoritative but warm"}
+        response = _make_voice_profile_response(new_profile, confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["kind"] == "voice_profile"
+        assert row["target_table"] == "character_metadata"
+        assert row["target_id"] == "char-1"
+        assert row["prior_value"] == json.dumps(old_profile)
+        assert row["status"] == "pending"
+        assert isinstance(row["created_ms"], int)
+        assert row["created_ms"] > 0
+        assert row["book_id"] == "book-1"
+        assert row["run_id"] == "run-1"
+        assert row["id"] == "run-1:voice_profile:char-1"
+
+    def test_review_band_without_prior_value_records_none(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Review-band profile with no prior value records prior_value=None."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 1
+        assert rows[0]["prior_value"] is None
+
+    def test_auto_accept_writes_no_item_row(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Auto-accepted profile (>= 0.7) does not write a walk_review_item row."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.9)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        assert _get_review_items(populated_storage) == []
+
+    def test_auto_reject_writes_no_item_row(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Auto-rejected profile (< 0.5) does not write a walk_review_item row."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.3)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        assert _get_review_items(populated_storage) == []
+
+    def test_rollback_removes_item_row_and_target_write(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """A mid-savepoint failure rolls back BOTH the item row and the profile write."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        failing = _FailingItemInsert(populated_storage, "run-1")
+        result = execute("book-1", failing, {})
+
+        # Unit failure recorded; walk continues; nothing committed
+        assert len(result["errors"]) == 1
+        assert result["profiles_generated"] == 0
+        assert _get_review_items(populated_storage) == []
+        rows = populated_storage.execute_query(
+            "SELECT COUNT(*) AS cnt FROM character_metadata WHERE character_id = ? AND key = 'voice_profile'",
+            ("char-1",),
+        )
+        assert rows[0]["cnt"] == 0
+
+
+class TestSupersede:
+    """Completion-time supersede: a successful run supersedes prior pending
+    items of the same kind for the targets it regenerated (contract rule #9)."""
+
+    def test_rerun_supersedes_prior_pending_item(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Re-running with a NEW run_id supersedes the old pending item and
+        writes a fresh pending item for the regenerated target."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 1
+        assert rows[0]["run_id"] == "run-1"
+        assert rows[0]["status"] == "pending"
+
+        # Second run with a new run_id regenerates char-1's profile
+        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 2
+        by_run = {r["run_id"]: r for r in rows}
+        assert by_run["run-1"]["status"] == "superseded"
+        assert by_run["run-2"]["status"] == "pending"
+        assert by_run["run-2"]["id"] == "run-2:voice_profile:char-1"
+
+    def test_target_not_regenerated_keeps_prior_pending_item(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """A target NOT regenerated this run keeps its prior pending item."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+        _insert_character(populated_storage, "char-2", "Mary")
+        _insert_character_span(populated_storage, "char-2", "span-3a", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        assert len(_get_review_items(populated_storage)) == 2
+
+        # char-1 loses its dialogue junction → skipped in run-2 → not committed
+        populated_storage.execute_delete(
+            "DELETE FROM character_span WHERE character_id = 'char-1'", ()
+        )
+        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 3
+        by_run_target = {(r["run_id"], r["target_id"]): r for r in rows}
+        # char-2 regenerated → old item superseded, new pending item
+        assert by_run_target[("run-1", "char-2")]["status"] == "superseded"
+        assert by_run_target[("run-2", "char-2")]["status"] == "pending"
+        # char-1 not regenerated → its run-1 item stays pending
+        assert by_run_target[("run-1", "char-1")]["status"] == "pending"
+
+    def test_supersede_touches_same_kind_only(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Items of a different kind are untouched by the supersede."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        # Seed a voice_assignment item for the same target from another run
+        populated_storage.execute_insert(
+            "INSERT INTO walk_review_item "
+            "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+            "VALUES ('run-other:voice_assignment:char-1', 'book-1', 'run-other', "
+            "'voice_assignment', 'character', 'char-1', NULL, 'pending', 1)"
+        )
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        by_id = {r["id"]: r for r in rows}
+        assert by_id["run-1:voice_profile:char-1"]["status"] == "superseded"
+        assert by_id["run-2:voice_profile:char-1"]["status"] == "pending"
+        # Different kind → untouched
+        assert by_id["run-other:voice_assignment:char-1"]["status"] == "pending"
+
+    def test_top_level_failure_supersedes_nothing(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """If execute() raises, no supersede runs — prior items stay pending."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        response = _make_voice_profile_response(confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        assert _get_review_items(populated_storage)[0]["status"] == "pending"
+
+        # run-2 fails before the loop: client creation raises
+        def boom(config_path=None):
+            raise RuntimeError("simulated top-level failure")
+
+        monkeypatch.setattr("app.utils.create_llm_client", boom)
+
+        with pytest.raises(RuntimeError):
+            execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 1
+        assert rows[0]["run_id"] == "run-1"
+        assert rows[0]["status"] == "pending"
+
+    def test_empty_committed_set_supersedes_nothing(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """No committed targets → nothing superseded (prior item stays pending)."""
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+
+        _patch_llm(
+            monkeypatch, mock_llm_client, _make_voice_profile_response(confidence=0.6)
+        )
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        assert len(_get_review_items(populated_storage)) == 1
+
+        # run-2 auto-rejects char-1 → nothing committed → no supersede
+        _patch_llm(
+            monkeypatch, mock_llm_client, _make_voice_profile_response(confidence=0.3)
+        )
+        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 1
+        assert rows[0]["run_id"] == "run-1"
+        assert rows[0]["status"] == "pending"
 
 
 # ---------------------------------------------------------------------------

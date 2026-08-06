@@ -13,10 +13,14 @@ Covers:
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
-from app.pipeline.adapter import InMemorySQLiteAdapter
-from app.pipeline.review import ReviewManager
+import app.pipeline.review as review_module
+
+from app.pipeline.adapter import ConcurrentTransactionError, InMemorySQLiteAdapter
+from app.pipeline.review import ReviewManager, supersede_targets
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +110,13 @@ def _populate_storage(storage: InMemorySQLiteAdapter) -> None:
     )
 
 
-@pytest.fixture
-def manager():
-    """Return a ReviewManager connected to a populated in-memory store."""
-    storage = InMemorySQLiteAdapter()
-    storage.init_db()
-    _populate_storage(storage)
+def _populate_junction_review_items(storage: InMemorySQLiteAdapter) -> None:
+    """Insert the review-band junction records used by the queue tests.
 
+    Extracted from the ``manager`` fixture so the union fixture can reuse the
+    exact same junction data.  Produces 5 review-band items (book/scene/span)
+    plus out-of-band rows that must NOT surface.
+    """
     # -- character_book junctions -------------------------------------------
     # c1/Alice: confidence 0.9 (high — not review)
     storage.execute_insert(
@@ -170,6 +174,85 @@ def manager():
            VALUES ('c4', 'sp3', 'speaker', 'walk', 0.52)"""
     )
 
+
+def _insert_walk_review_rows(storage: InMemorySQLiteAdapter) -> None:
+    """Insert walk_run + walk_review_item rows for the union queue tests.
+
+    Pending rows (w1/w2/w3, one per kind) MUST surface; resolved/superseded/
+    stale rows (w4/w5/w6) MUST NOT; w7 belongs to another book and MUST NOT
+    surface.  walk_run rows model the honest run_id → walk_name link that
+    run_walk() sets (runner.py), used by the walk_name filter.
+    """
+    for run_id, book_id, walk_name in (
+        ("run-1", "b1", "walk_2g_voice_audition"),
+        ("run-2", "b1", "walk_2h_voice_assignment"),
+        ("run-3", "b1", "walk_2i_delivery"),
+        ("run-9", "b2", "walk_2g_voice_audition"),
+    ):
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, ?, 'completed', 1)",
+            (run_id, book_id, walk_name),
+        )
+
+    def _item(
+        item_id,
+        book_id,
+        run_id,
+        kind,
+        target_table,
+        target_id,
+        prior_value,
+        status,
+        created_ms,
+    ):
+        storage.execute_insert(
+            "INSERT INTO walk_review_item "
+            "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item_id,
+                book_id,
+                run_id,
+                kind,
+                target_table,
+                target_id,
+                prior_value,
+                status,
+                created_ms,
+            ),
+        )
+
+    # pending — must appear in the union
+    _item("w1", "b1", "run-1", "voice_profile", "character_metadata", "c1", '{"voice":"old"}', "pending", 1000)
+    _item("w2", "b1", "run-2", "voice_assignment", "character", "c2", None, "pending", 2000)
+    _item("w3", "b1", "run-3", "instruction", "span", "sp1", "slow", "pending", 3000)
+    # non-pending — must NOT appear
+    _item("w4", "b1", "run-1", "voice_profile", "character_metadata", "c1", '{"voice":"old"}', "resolved", 4000)
+    _item("w5", "b1", "run-2", "voice_assignment", "character", "c2", None, "superseded", 5000)
+    _item("w6", "b1", "run-3", "instruction", "span", "sp1", "slow", "stale", 6000)
+    # other book — must NOT appear
+    _item("w7", "b2", "run-9", "voice_assignment", "character", "c2", None, "pending", 7000)
+
+
+@pytest.fixture
+def manager():
+    """Return a ReviewManager connected to a populated in-memory store."""
+    storage = InMemorySQLiteAdapter()
+    storage.init_db()
+    _populate_storage(storage)
+    _populate_junction_review_items(storage)
+    return ReviewManager(storage)
+
+
+@pytest.fixture
+def union_manager():
+    """Return a ReviewManager over junction items PLUS walk_review_item rows."""
+    storage = InMemorySQLiteAdapter()
+    storage.init_db()
+    _populate_storage(storage)
+    _populate_junction_review_items(storage)
+    _insert_walk_review_rows(storage)
     return ReviewManager(storage)
 
 
@@ -183,6 +266,166 @@ def empty_manager():
         "INSERT INTO book (id, series_id) VALUES ('b-empty', 's-empty')"
     )
     return ReviewManager(storage)
+
+
+# ---------------------------------------------------------------------------
+# supersede_targets() — completion-time per-target supersede
+# ---------------------------------------------------------------------------
+
+
+class TestSupersedeTargets:
+    """supersede_targets() marks prior pending items of the same kind as
+    superseded when a walk run regenerates their targets (contract rule #9)."""
+
+    def _make_storage(self):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        return storage
+
+    def _insert_item(
+        self,
+        storage,
+        item_id,
+        book_id,
+        run_id,
+        kind,
+        target_id,
+        status="pending",
+    ):
+        """Insert a walk_review_item row directly."""
+        storage.execute_insert(
+            "INSERT INTO walk_review_item "
+            "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+            "VALUES (?, ?, ?, ?, 'character', ?, NULL, ?, 1)",
+            (item_id, book_id, run_id, kind, target_id, status),
+        )
+
+    def test_empty_target_ids_is_noop(self):
+        """Empty committed set → no-op: nothing is changed."""
+        storage = self._make_storage()
+        self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
+
+        result = supersede_targets(
+            storage, book_id="b1", run_id="run-2", kind="voice_profile", target_ids=[]
+        )
+
+        assert result == 0
+        rows = storage.execute_query(
+            "SELECT status FROM walk_review_item WHERE id = 'i1'"
+        )
+        assert rows[0]["status"] == "pending"
+
+    def test_supersedes_matching_pending_items(self):
+        """Committing targets supersedes prior pending same-kind items for them."""
+        storage = self._make_storage()
+        self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
+        self._insert_item(storage, "i2", "b1", "run-1", "voice_profile", "c2")
+        self._insert_item(storage, "i3", "b1", "run-1", "voice_profile", "c3")
+
+        result = supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1", "c2"],
+        )
+
+        assert result == 2
+        statuses = {
+            row["id"]: row["status"]
+            for row in storage.execute_query("SELECT id, status FROM walk_review_item")
+        }
+        assert statuses["i1"] == "superseded"
+        assert statuses["i2"] == "superseded"
+        assert statuses["i3"] == "pending"  # target not regenerated → untouched
+
+    def test_excludes_same_run_items(self):
+        """Rows belonging to the current run are never superseded."""
+        storage = self._make_storage()
+        self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
+        self._insert_item(storage, "i2", "b1", "run-2", "voice_profile", "c1")
+
+        result = supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1"],
+        )
+
+        assert result == 1
+        statuses = {
+            row["id"]: row["status"]
+            for row in storage.execute_query("SELECT id, status FROM walk_review_item")
+        }
+        assert statuses["i1"] == "superseded"
+        assert statuses["i2"] == "pending"
+
+    def test_excludes_other_kinds(self):
+        """Supersede is kind-scoped — items of other kinds are untouched."""
+        storage = self._make_storage()
+        self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
+        self._insert_item(storage, "i2", "b1", "run-1", "voice_assignment", "c1")
+
+        result = supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1"],
+        )
+
+        assert result == 1
+        statuses = {
+            row["id"]: row["status"]
+            for row in storage.execute_query("SELECT id, status FROM walk_review_item")
+        }
+        assert statuses["i1"] == "superseded"
+        assert statuses["i2"] == "pending"
+
+    def test_excludes_resolved_and_superseded_rows(self):
+        """Only pending rows are touched; resolved/superseded/stale stay as-is."""
+        storage = self._make_storage()
+        self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1", status="resolved")
+        self._insert_item(storage, "i2", "b1", "run-1", "voice_profile", "c1", status="superseded")
+        self._insert_item(storage, "i3", "b1", "run-1", "voice_profile", "c1", status="stale")
+
+        result = supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1"],
+        )
+
+        assert result == 0
+        statuses = {
+            row["id"]: row["status"]
+            for row in storage.execute_query("SELECT id, status FROM walk_review_item")
+        }
+        assert statuses == {"i1": "resolved", "i2": "superseded", "i3": "stale"}
+
+    def test_excludes_other_books(self):
+        """Supersede is scoped to the walk's book."""
+        storage = self._make_storage()
+        self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
+        self._insert_item(storage, "i2", "b2", "run-1", "voice_profile", "c1")
+
+        result = supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1"],
+        )
+
+        assert result == 1
+        statuses = {
+            row["id"]: row["status"]
+            for row in storage.execute_query("SELECT id, status FROM walk_review_item")
+        }
+        assert statuses["i1"] == "superseded"
+        assert statuses["i2"] == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +898,170 @@ class TestGetReviewItemsMultipleJunctionTypes:
 
 
 # ---------------------------------------------------------------------------
+# Union queue — walk items (honest union of junction + walk_review_item)
+# ---------------------------------------------------------------------------
+
+
+class TestWalkItemsInQueue:
+    """get_review_items returns the HONEST UNION: junction live query
+    (unchanged, byte-identical ids) PLUS pending walk_review_item rows with
+    ``walkitem:``-prefixed ids and their own shape (kind, target_table,
+    target_id, prior_value, created_ms — there is no confidence /
+    human_override on walk items).  Junction items come first, walk items
+    after (plan P3-S3).
+    """
+
+    _JUNCTION_IDS = {
+        "character_book:c2:b1",
+        "character_scene:c1:sc1",
+        "character_scene:c3:sc2",
+        "character_span:c1:sp1",
+        "character_span:c4:sp3",
+    }
+
+    @staticmethod
+    def _walk_items(items):
+        return [i for i in items if i["item_id"].startswith("walkitem:")]
+
+    def test_union_contains_junction_and_walk_items(self, union_manager):
+        """Both junction items and pending walk items are returned."""
+        items = union_manager.get_review_items("b1")
+        junction = [i for i in items if "junction_table" in i]
+        walk = self._walk_items(items)
+        assert len(junction) == 5
+        assert len(walk) == 3
+        assert len(items) == 8
+
+    def test_walk_items_carry_prefixed_ids_and_fields(self, union_manager):
+        """Walk items expose walkitem:{id} ids and the table columns."""
+        walk = self._walk_items(union_manager.get_review_items("b1"))
+        by_id = {i["item_id"]: i for i in walk}
+        assert set(by_id) == {"walkitem:w1", "walkitem:w2", "walkitem:w3"}
+
+        w1 = by_id["walkitem:w1"]
+        assert w1["kind"] == "voice_profile"
+        assert w1["target_table"] == "character_metadata"
+        assert w1["target_id"] == "c1"
+        assert w1["prior_value"] == '{"voice":"old"}'
+        assert w1["created_ms"] == 1000
+
+        w2 = by_id["walkitem:w2"]
+        assert w2["kind"] == "voice_assignment"
+        assert w2["target_table"] == "character"
+        assert w2["target_id"] == "c2"
+        assert w2["prior_value"] is None
+        assert w2["created_ms"] == 2000
+
+        w3 = by_id["walkitem:w3"]
+        assert w3["kind"] == "instruction"
+        assert w3["target_table"] == "span"
+        assert w3["target_id"] == "sp1"
+        assert w3["prior_value"] == "slow"
+        assert w3["created_ms"] == 3000
+
+    def test_walk_item_shape_is_table_columns_only(self, union_manager):
+        """Walk items carry exactly the walk_review_item columns — no
+        confidence/human_override (those do not exist on walk items)."""
+        walk = self._walk_items(union_manager.get_review_items("b1"))
+        assert len(walk) == 3
+        expected = {
+            "item_id",
+            "kind",
+            "target_table",
+            "target_id",
+            "prior_value",
+            "created_ms",
+        }
+        for item in walk:
+            assert set(item) == expected
+
+    def test_non_pending_walk_items_excluded(self, union_manager):
+        """resolved/superseded/stale rows never surface in the queue."""
+        walk_ids = {
+            i["item_id"] for i in self._walk_items(union_manager.get_review_items("b1"))
+        }
+        assert "walkitem:w4" not in walk_ids  # resolved
+        assert "walkitem:w5" not in walk_ids  # superseded
+        assert "walkitem:w6" not in walk_ids  # stale
+
+    def test_walk_items_scoped_to_book(self, union_manager):
+        """Pending walk items of OTHER books never surface."""
+        walk_ids = {
+            i["item_id"] for i in self._walk_items(union_manager.get_review_items("b1"))
+        }
+        assert "walkitem:w7" not in walk_ids
+
+    def test_union_order_junction_first(self, union_manager):
+        """Junction items come first, then walk items (no other sort)."""
+        items = union_manager.get_review_items("b1")
+        assert len(items) == 8
+        assert all("junction_table" in i for i in items[:5])
+        assert all(i["item_id"].startswith("walkitem:") for i in items[5:])
+
+    def test_junction_item_ids_byte_identical(self, union_manager):
+        """Junction ids stay byte-identical {table}:{char}:{entity} in the
+        union — backward compatible with the existing frontend."""
+        items = union_manager.get_review_items("b1")
+        junction_ids = {i["item_id"] for i in items if "junction_table" in i}
+        assert junction_ids == self._JUNCTION_IDS
+
+    def test_junction_items_keep_full_shape(self, union_manager):
+        """Junction item shape is unchanged when walk items are present."""
+        items = union_manager.get_review_items("b1")
+        required = {
+            "item_id",
+            "character_id",
+            "character_name",
+            "junction_table",
+            "confidence",
+            "walk_name",
+            "related_entity_id",
+            "reason",
+        }
+        for item in items:
+            if "junction_table" in item:
+                assert required.issubset(set(item)), (
+                    f"Missing keys: {required - set(item)}"
+                )
+
+    def test_walk_name_filter_narrows_junction_and_walk_items(self, union_manager):
+        """walk_name narrows junction items (source LIKE) AND walk items
+        (join walk_run on run_id → walk_name LIKE).
+
+        'walk_2g' matches no junction source (all sources are 'walk') and
+        exactly one walk run (run-1 → walk_2g_voice_audition), so the union
+        collapses to the single walk item w1.
+        """
+        items = union_manager.get_review_items("b1", walk_name="walk_2g")
+        assert len(items) == 1
+        assert items[0]["item_id"] == "walkitem:w1"
+
+    def test_walk_name_filter_matches_all_walk_sources(self, union_manager):
+        """'walk' matches every junction source and every walk_run walk_name
+        — the full union (5 junction + 3 walk items) comes back."""
+        items = union_manager.get_review_items("b1", walk_name="walk")
+        junction = [i for i in items if "junction_table" in i]
+        walk = self._walk_items(items)
+        assert len(junction) == 5
+        assert len(walk) == 3
+        # ordering preserved under the filter too
+        assert all("junction_table" in i for i in items[:5])
+
+    def test_walk_name_filter_no_match_returns_empty(self, union_manager):
+        """A walk_name matching nothing yields an empty union."""
+        items = union_manager.get_review_items("b1", walk_name="nonexistent-walk")
+        assert items == []
+
+    def test_union_without_walk_items_is_pure_junction(self, manager):
+        """Backward compat: a book with no walk rows returns the exact same
+        junction-only list as before the union."""
+        items = manager.get_review_items("b1")
+        assert all("junction_table" in i for i in items)
+        assert all(not i["item_id"].startswith("walkitem:") for i in items)
+        assert len(items) == 5
+
+
+# ---------------------------------------------------------------------------
 # Empty book
 # ---------------------------------------------------------------------------
 
@@ -691,3 +1098,318 @@ class TestItemIdParsing:
         """Item ID with too many parts raises ValueError."""
         with pytest.raises(ValueError, match="Invalid item_id format"):
             manager.reject_review_item("character_book:c1:b1:extra")
+
+
+# ---------------------------------------------------------------------------
+# resolve_review_action — prefix dispatch guards (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveReviewActionDispatch:
+    """ReviewManager.resolve_review_action — defensive-branch unit tests.
+
+    The happy paths are covered via the API (TestReviewActionDispatch in
+    test_api.py); these cover the guard branches that are unreachable through
+    the endpoint layer (unknown action names) or through constrained data
+    (an item kind absent from the target-write allowlist).
+    """
+
+    def test_unknown_action_on_junction_raises_value_error(self, manager):
+        """An action outside accept/reject/override is rejected on junction ids."""
+        with pytest.raises(ValueError, match="Unknown review action"):
+            manager.resolve_review_action("explode", "character_book:c2:b1")
+
+    def test_unknown_action_on_walk_item_raises_value_error(self, union_manager):
+        """An action outside accept/reject/override is rejected on walkitem ids."""
+        with pytest.raises(ValueError, match="Unknown review action"):
+            union_manager.resolve_review_action("explode", "walkitem:w1")
+
+    def test_unsupported_kind_raises_value_error(self, union_manager, monkeypatch):
+        """A kind missing from the target-write allowlist is rejected (400 path).
+
+        Patches the module-level allowlist to a subset so the walk branch of
+        reject hits the unsupported-kind guard (the real map covers all three
+        CHECK-constrained kinds, making this branch defensive).
+        """
+        monkeypatch.setattr(
+            review_module,
+            "_WALK_TARGET_WRITES",
+            {"voice_profile": "UPDATE character_metadata SET value = ? WHERE character_id = ? AND key = 'voice_profile'"},
+        )
+        # w2 is kind voice_assignment — not in the patched allowlist
+        with pytest.raises(ValueError, match="Unsupported walk item kind"):
+            union_manager.resolve_review_action("reject", "walkitem:w2")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — transactional value-restore (undo backend): atomicity + rollback
+# ---------------------------------------------------------------------------
+
+
+def _seed_value_restore_rows(storage: InMemorySQLiteAdapter) -> None:
+    """Seed walk_run + one pending walk_review_item per kind, with the walk's
+    generated (current) values already written into the target rows.
+
+    Mirrors the walk write order (2g voice_profile, 2h voice_assignment,
+    2i instruction): ``prior_value`` is what the walk overwrote.
+    """
+    storage.execute_insert(
+        "INSERT INTO voice_config (id, name, description) "
+        "VALUES ('vc1', 'Warm Female', 'A warm female voice')"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+        "VALUES ('run-p5', 'b1', 'walk_2g_voice_audition', 'completed', 1)"
+    )
+    # voice_profile -> character_metadata c1 (current '{"voice":"new"}', prior '{"voice":"old"}')
+    storage.execute_insert(
+        "INSERT INTO character_metadata (character_id, key, value) "
+        "VALUES ('c1', 'voice_profile', '{\"voice\":\"new\"}')"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('wp1', 'b1', 'run-p5', 'voice_profile', 'character_metadata', 'c1', "
+        "'{\"voice\":\"old\"}', 'pending', 100)"
+    )
+    # voice_assignment -> character c2 (current 'vc1', prior NULL)
+    storage.execute_update(
+        "UPDATE character SET voice_assignment_id = 'vc1' WHERE id = 'c2'"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('wa1', 'b1', 'run-p5', 'voice_assignment', 'character', 'c2', NULL, 'pending', 200)"
+    )
+    # instruction -> span sp1 (current 'slowly', prior 'cheerfully')
+    storage.execute_update("UPDATE span SET instruct = 'slowly' WHERE id = 'sp1'")
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('wi1', 'b1', 'run-p5', 'instruction', 'span', 'sp1', 'cheerfully', 'pending', 300)"
+    )
+
+
+def _item_status(storage: InMemorySQLiteAdapter, item_id: str) -> str:
+    """Return the current status of a walk_review_item row by id."""
+    rows = storage.execute_query(
+        "SELECT status FROM walk_review_item WHERE id = ?", (item_id,)
+    )
+    assert rows, f"no walk_review_item row {item_id!r}"
+    return rows[0]["status"]
+
+
+class TestWalkItemValueRestore:
+    """Reject/override on a walkitem: value-restore is ATOMIC (contract L64).
+
+    The restore (or override write) and the ``status = 'resolved'`` UPDATE
+    commit in ONE transaction — either both are visible or neither.  A failure
+    inside the transaction (bogus target SQL, or the adapter raising) rolls
+    BOTH back: the item row stays ``pending`` and the target row keeps the
+    walk's value.
+    """
+
+    @pytest.fixture
+    def storage(self):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        _populate_storage(storage)
+        _seed_value_restore_rows(storage)
+        return storage
+
+    @pytest.fixture
+    def manager(self, storage):
+        return ReviewManager(storage)
+
+    # -- happy path: restore/write + resolved, one commit -------------------
+
+    def test_reject_restores_prior_value_and_resolves(self, manager, storage):
+        """Reject restores prior_value into the target and marks the item resolved."""
+        manager.resolve_review_action("reject", "walkitem:wp1")
+
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"old"}'
+        assert _item_status(storage, "wp1") == "resolved"
+
+    def test_reject_restores_null_prior_and_resolves(self, manager, storage):
+        """A NULL prior_value is restored as NULL (voice_assignment unset)."""
+        manager.resolve_review_action("reject", "walkitem:wa1")
+
+        rows = storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id = 'c2'"
+        )
+        assert rows[0]["voice_assignment_id"] is None
+        assert _item_status(storage, "wa1") == "resolved"
+
+    def test_reject_restores_instruct_and_resolves(self, manager, storage):
+        """Reject on an instruction item restores span.instruct."""
+        manager.resolve_review_action("reject", "walkitem:wi1")
+
+        rows = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp1'")
+        assert rows[0]["instruct"] == "cheerfully"
+        assert _item_status(storage, "wi1") == "resolved"
+
+    def test_override_writes_new_value_and_resolves(self, manager, storage):
+        """Override writes new_value into the target and marks the item resolved."""
+        manager.resolve_review_action("override", "walkitem:wp1", '{"voice":"human"}')
+
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"human"}'
+        assert _item_status(storage, "wp1") == "resolved"
+
+    def test_accept_resolves_without_target_write(self, manager, storage):
+        """Accept writes NO target row — only the status flips to resolved."""
+        manager.resolve_review_action("accept", "walkitem:wp1")
+
+        assert _item_status(storage, "wp1") == "resolved"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"new"}'  # the walk's value is kept
+
+    def test_item_select_happens_outside_transaction(self, manager, storage, monkeypatch):
+        """Rule #6: the walkitem SELECT runs BEFORE the transaction opens."""
+        calls: list[tuple[str, str | None]] = []
+        real_transaction = storage.transaction
+        real_query = storage.execute_query
+
+        def tracking_query(sql, params=()):
+            calls.append(("query", sql))
+            return real_query(sql, params)
+
+        def tracking_transaction():
+            calls.append(("txn", None))
+            return real_transaction()
+
+        monkeypatch.setattr(storage, "execute_query", tracking_query)
+        monkeypatch.setattr(storage, "transaction", tracking_transaction)
+
+        manager.resolve_review_action("reject", "walkitem:wp1")
+
+        txn_index = next(i for i, (kind, _) in enumerate(calls) if kind == "txn")
+        select_calls = [sql for kind, sql in calls[:txn_index] if kind == "query"]
+        assert any("walk_review_item" in sql for sql in select_calls)
+
+    # -- rollback: a failure inside the txn undoes BOTH ---------------------
+
+    def test_restore_write_failure_rolls_back_both(self, manager, storage, monkeypatch):
+        """A failing restore (bogus target SQL) never commits: the item stays
+        pending and the target keeps the walk value."""
+        monkeypatch.setattr(
+            review_module,
+            "_WALK_TARGET_WRITES",
+            {
+                **review_module._WALK_TARGET_WRITES,
+                "voice_profile": "UPDATE nonexistent SET value = ? WHERE character_id = ?",
+            },
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            manager.resolve_review_action("reject", "walkitem:wp1")
+
+        assert _item_status(storage, "wp1") == "pending"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"new"}'  # unchanged
+
+    def test_status_update_failure_rolls_back_restore(self, manager, storage, monkeypatch):
+        """The DISCRIMINATING rollback case: the restore write SUCCEEDS inside
+        the txn, then the status UPDATE fails — both roll back (target
+        unchanged, item still pending).  Without the transaction wrap the
+        restore would have autocommitted and stayed visible."""
+        real_update = storage.execute_update
+
+        def failing_status_update(sql, params=()):
+            if "status = 'resolved'" in sql:
+                raise ConcurrentTransactionError("simulated status-write failure")
+            return real_update(sql, params)
+
+        monkeypatch.setattr(storage, "execute_update", failing_status_update)
+        with pytest.raises(ConcurrentTransactionError):
+            manager.resolve_review_action("reject", "walkitem:wp1")
+
+        assert _item_status(storage, "wp1") == "pending"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"new"}'  # the restore was rolled back
+
+    def test_override_write_failure_rolls_back_both(self, manager, storage, monkeypatch):
+        """A failing override write (bogus target SQL) never commits: the item
+        stays pending and the target keeps the walk value."""
+        monkeypatch.setattr(
+            review_module,
+            "_WALK_TARGET_WRITES",
+            {
+                **review_module._WALK_TARGET_WRITES,
+                "instruction": "UPDATE nonexistent SET instruct = ? WHERE id = ?",
+            },
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            manager.resolve_review_action("override", "walkitem:wi1", "quickly")
+
+        assert _item_status(storage, "wi1") == "pending"
+        rows = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp1'")
+        assert rows[0]["instruct"] == "slowly"  # unchanged
+
+    def test_override_status_update_failure_rolls_back_write(self, manager, storage, monkeypatch):
+        """Same discriminating rollback for override: the new_value write
+        succeeds inside the txn, the status UPDATE fails, both roll back."""
+        real_update = storage.execute_update
+
+        def failing_status_update(sql, params=()):
+            if "status = 'resolved'" in sql:
+                raise ConcurrentTransactionError("simulated status-write failure")
+            return real_update(sql, params)
+
+        monkeypatch.setattr(storage, "execute_update", failing_status_update)
+        with pytest.raises(ConcurrentTransactionError):
+            manager.resolve_review_action(
+                "override", "walkitem:wp1", '{"voice":"human"}'
+            )
+
+        assert _item_status(storage, "wp1") == "pending"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"new"}'  # the override was rolled back
+
+    def test_failed_restore_leaves_item_actionable(self, manager, storage, monkeypatch):
+        """After a rolled-back failure the item is still pending and retryable."""
+        real_sql = review_module._WALK_TARGET_WRITES["voice_profile"]
+        monkeypatch.setattr(
+            review_module,
+            "_WALK_TARGET_WRITES",
+            {
+                **review_module._WALK_TARGET_WRITES,
+                "voice_profile": "UPDATE nonexistent SET value = ? WHERE character_id = ?",
+            },
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            manager.resolve_review_action("reject", "walkitem:wp1")
+        assert _item_status(storage, "wp1") == "pending"
+
+        # restore the allowlist and retry — the item is still actionable
+        monkeypatch.setattr(
+            review_module,
+            "_WALK_TARGET_WRITES",
+            {**review_module._WALK_TARGET_WRITES, "voice_profile": real_sql},
+        )
+        manager.resolve_review_action("reject", "walkitem:wp1")
+
+        assert _item_status(storage, "wp1") == "resolved"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"old"}'

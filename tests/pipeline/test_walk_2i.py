@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2i_delivery import (
     execute,
     _build_delivery_prompt,
@@ -150,6 +151,26 @@ def _make_delivery_response(instruct="neutral and narrative", confidence=0.9):
     return json.dumps({"instruct": instruct, "confidence": confidence})
 
 
+def _get_review_items(storage):
+    """Return all walk_review_item rows written for the test book."""
+    return storage.execute_query(
+        "SELECT * FROM walk_review_item WHERE book_id = 'book-1' ORDER BY target_id"
+    )
+
+
+class _FailingItemInsert(HeartbeatStorage):
+    """HeartbeatStorage wrapper whose walk_review_item INSERT always fails.
+
+    Used to simulate a mid-savepoint unit failure so tests can assert the
+    ROLLBACK TO SAVEPOINT removes both the target write and the item row.
+    """
+
+    def execute_insert(self, sql, params=()):
+        if "walk_review_item" in sql:
+            raise RuntimeError("simulated failure writing walk_review_item")
+        return super().execute_insert(sql, params)
+
+
 # ---------------------------------------------------------------------------
 # Tests: execute()
 # ---------------------------------------------------------------------------
@@ -221,7 +242,7 @@ class TestExecute:
         response = _make_delivery_response("measured pace", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        result = execute("book-1", populated_storage, {})
+        result = execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
 
         # Instruct IS stored but flagged for review
         assert result["instructs_generated"] > 0
@@ -411,6 +432,208 @@ class TestExecute:
         assert len(result["errors"]) > 0
         assert result["spans_processed"] == 0
         assert result["instructs_generated"] == 0
+
+
+class TestWalkReviewItem:
+    """walk_review_item rows written in-walk for review-band delivery instructs."""
+
+    def test_review_band_writes_item_row_with_prior_value(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Review-band instruct writes an item row capturing the prior instruct."""
+        # Seed a prior instruct on span-1b so prior_value can be verified
+        populated_storage.execute_update(
+            "UPDATE span SET instruct = ? WHERE id = ?",
+            ("slow and deliberate", "span-1b"),
+        )
+
+        response = _make_delivery_response("measured pace", confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        rows = _get_review_items(populated_storage)
+        # Every span in the book is review-band → one item row per span
+        assert len(rows) == 6
+        by_id = {r["target_id"]: r for r in rows}
+        row = by_id["span-1b"]
+        assert row["kind"] == "instruction"
+        assert row["target_table"] == "span"
+        assert row["target_id"] == "span-1b"
+        assert row["prior_value"] == "slow and deliberate"
+        assert row["status"] == "pending"
+        assert isinstance(row["created_ms"], int)
+        assert row["created_ms"] > 0
+        assert row["book_id"] == "book-1"
+        assert row["run_id"] == "run-1"
+        assert row["id"] == "run-1:instruction:span-1b"
+        # Unseeded spans capture prior_value=None
+        assert by_id["span-1a"]["prior_value"] is None
+
+        # The instruct itself was still written
+        rows = populated_storage.execute_query(
+            "SELECT instruct FROM span WHERE id = ?",
+            ("span-1b",),
+        )
+        assert rows[0]["instruct"] == "measured pace"
+
+    def test_auto_accept_writes_no_item_row(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Auto-accepted instruct (>= 0.7) does not write a walk_review_item row."""
+        response = _make_delivery_response(confidence=0.9)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        assert _get_review_items(populated_storage) == []
+
+    def test_auto_reject_writes_no_item_row(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Auto-rejected instruct (< 0.5) does not write a walk_review_item row."""
+        response = _make_delivery_response(confidence=0.3)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+
+        assert _get_review_items(populated_storage) == []
+
+    def test_rollback_removes_item_row_and_target_write(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """A mid-savepoint failure rolls back BOTH the item row and the instruct write."""
+        # Seed a prior instruct; it must survive the rollback unchanged
+        populated_storage.execute_update(
+            "UPDATE span SET instruct = ? WHERE id = ?",
+            ("prior instruct", "span-1b"),
+        )
+
+        response = _make_delivery_response("measured pace", confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        failing = _FailingItemInsert(populated_storage, "run-1")
+        result = execute("book-1", failing, {})
+
+        # Every span unit fails at the item insert → errors for all, nothing committed
+        assert result["spans_processed"] == 6
+        assert len(result["errors"]) == 6
+        assert result["instructs_generated"] == 0
+        assert _get_review_items(populated_storage) == []
+        # The seeded prior instruct survives; no new instructs were committed
+        rows = populated_storage.execute_query(
+            "SELECT instruct FROM span WHERE id = ?",
+            ("span-1b",),
+        )
+        assert rows[0]["instruct"] == "prior instruct"
+        rows = populated_storage.execute_query(
+            "SELECT COUNT(*) AS cnt FROM span WHERE instruct = 'measured pace'"
+        )
+        assert rows[0]["cnt"] == 0
+
+
+class TestSupersede:
+    """Completion-time supersede: a successful run supersedes prior pending
+    items of the same kind for the targets it regenerated (contract rule #9)."""
+
+    def _patch_llm_side_effect(self, monkeypatch, mock_llm_client, responses):
+        """Patch LLM plumbing with per-call responses (in presentation order)."""
+        call_count = [0]
+
+        def side_effect(**kwargs):
+            idx = call_count[0]
+            call_count[0] += 1
+            return _make_mock_response(responses[idx])
+
+        mock_llm_client.chat.completions.create.side_effect = side_effect
+        monkeypatch.setattr(
+            "app.utils.create_llm_client",
+            lambda config_path=None: (mock_llm_client, "test-model"),
+        )
+        monkeypatch.setattr(
+            "app.utils.resolve_task_llm",
+            lambda task_name, config_path=None: {
+                "model_name": "test-model",
+                "reasoning_effort": None,
+                "temperature": 0.3,
+            },
+        )
+
+    def test_rerun_supersedes_regenerated_and_keeps_unregenerated(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Re-running supersedes prior pending items for regenerated spans;
+        a span NOT regenerated (auto-rejected this run) keeps its item."""
+        response = _make_delivery_response("measured pace", confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        assert len(_get_review_items(populated_storage)) == 6
+
+        # run-2: every span regenerated EXCEPT span-1b (auto-rejected, conf 0.3).
+        # Presentation order: 1a, 1b, 2a, 3a, 4a, 5a.
+        responses = [
+            _make_delivery_response("a", confidence=0.6),
+            _make_delivery_response("b", confidence=0.3),
+            _make_delivery_response("c", confidence=0.6),
+            _make_delivery_response("d", confidence=0.6),
+            _make_delivery_response("e", confidence=0.6),
+            _make_delivery_response("f", confidence=0.6),
+        ]
+        self._patch_llm_side_effect(monkeypatch, mock_llm_client, responses)
+
+        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 11  # 6 from run-1 + 5 regenerated in run-2
+        by_run_target = {(r["run_id"], r["target_id"]): r for r in rows}
+        # Regenerated spans: old item superseded, new pending item
+        assert by_run_target[("run-1", "span-1a")]["status"] == "superseded"
+        assert by_run_target[("run-2", "span-1a")]["status"] == "pending"
+        # span-1b not regenerated → its run-1 item stays pending, no new item
+        assert by_run_target[("run-1", "span-1b")]["status"] == "pending"
+        assert ("run-2", "span-1b") not in by_run_target
+
+    def test_top_level_failure_supersedes_nothing(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """If execute() raises, no supersede runs — prior items stay pending."""
+        response = _make_delivery_response("measured pace", confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        assert len(_get_review_items(populated_storage)) == 6
+
+        # run-2 fails before the loop: client creation raises
+        def boom(config_path=None):
+            raise RuntimeError("simulated top-level failure")
+
+        monkeypatch.setattr("app.utils.create_llm_client", boom)
+
+        with pytest.raises(RuntimeError):
+            execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 6
+        assert all(r["status"] == "pending" for r in rows)
+
+    def test_empty_committed_set_supersedes_nothing(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """No committed targets → nothing superseded (prior items stay pending)."""
+        response = _make_delivery_response("measured pace", confidence=0.6)
+        _patch_llm(monkeypatch, mock_llm_client, response)
+        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        assert len(_get_review_items(populated_storage)) == 6
+
+        # run-2 auto-rejects every span → nothing committed → no supersede
+        _patch_llm(
+            monkeypatch, mock_llm_client, _make_delivery_response(confidence=0.3)
+        )
+        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+
+        rows = _get_review_items(populated_storage)
+        assert len(rows) == 6
+        assert all(r["run_id"] == "run-1" for r in rows)
+        assert all(r["status"] == "pending" for r in rows)
 
 
 # ---------------------------------------------------------------------------

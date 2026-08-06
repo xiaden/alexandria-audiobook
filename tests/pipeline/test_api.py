@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.pipeline.adapter import InMemorySQLiteAdapter
+from app.pipeline.adapter import ConcurrentTransactionError, InMemorySQLiteAdapter
 from app.pipeline.api import (
     get_character_ledger,
     get_operation_executor,
@@ -577,6 +577,296 @@ class TestReviewOverrideEndpoint:
         # Error can be either format error or unknown junction table
         detail = response.json()["detail"]
         assert "Invalid item_id format" in detail or "Unknown junction table" in detail
+
+
+# ---------------------------------------------------------------------------
+# P4-S1: Prefix dispatch on accept/reject/override
+# ---------------------------------------------------------------------------
+
+
+def _seed_walk_review_items(storage):
+    """Seed walk_run + walk_review_item rows (one per kind) for dispatch tests.
+
+    The walk's generated (current) values are written into the target rows so
+    reject/override can be asserted against prior_value:
+    - voice_profile on c1: current '{"voice":"new"}', prior '{"voice":"old"}'
+    - voice_assignment on c2: current 'vc1', prior NULL
+    - instruction on sp1: current 'slowly', prior 'cheerfully'
+    """
+    storage.execute_insert(
+        "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+        "VALUES ('run-p4', 'b1', 'walk_2g_voice_audition', 'completed', 1)"
+    )
+
+    # voice_profile -> character_metadata c1 / key='voice_profile'
+    storage.execute_insert(
+        "INSERT INTO character_metadata (character_id, key, value) "
+        "VALUES ('c1', 'voice_profile', '{\"voice\":\"new\"}')"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('wp1', 'b1', 'run-p4', 'voice_profile', 'character_metadata', 'c1', "
+        "'{\"voice\":\"old\"}', 'pending', 100)"
+    )
+
+    # voice_assignment -> character c2.voice_assignment_id
+    storage.execute_update(
+        "UPDATE character SET voice_assignment_id = 'vc1' WHERE id = 'c2'"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('wa1', 'b1', 'run-p4', 'voice_assignment', 'character', 'c2', NULL, 'pending', 200)"
+    )
+
+    # instruction -> span sp1.instruct
+    storage.execute_update("UPDATE span SET instruct = 'slowly' WHERE id = 'sp1'")
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('wi1', 'b1', 'run-p4', 'instruction', 'span', 'sp1', 'cheerfully', 'pending', 300)"
+    )
+
+
+def _walk_status(storage, item_id):
+    """Return the current status of a walk_review_item row by id."""
+    rows = storage.execute_query(
+        "SELECT status FROM walk_review_item WHERE id = ?", (item_id,)
+    )
+    assert rows, f"no walk_review_item row {item_id!r}"
+    return rows[0]["status"]
+
+
+class TestReviewActionDispatch:
+    """POST /review/accept|reject|override dispatch by id prefix (P4).
+
+    ``walkitem:`` ids -> walk-side action (status resolved, target write only
+    for reject/override); everything else -> existing junction behavior.
+    Malformed ids -> 400; well-formed but unknown ids -> 404 (NEW contract);
+    walk-side override without a value -> 400.  Junction ids stay byte-identical
+    ``{table}:{char}:{entity}`` — there is no literal ``junction:`` prefix.
+    """
+
+    # -- walkitem: accept --------------------------------------------------
+
+    def test_accept_walk_item_resolves_row_and_leaves_target(self, client, storage):
+        """Accept on a walkitem: marks the row resolved and writes NO target row."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/accept", json={"item_id": "walkitem:wp1"}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "accepted", "item_id": "walkitem:wp1"}
+        assert _walk_status(storage, "wp1") == "resolved"
+        # the walk's generated value stays in the target — accept writes nothing
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"new"}'
+
+    # -- walkitem: reject --------------------------------------------------
+
+    def test_reject_walk_item_restores_prior_value(self, client, storage):
+        """Reject on a walkitem: restores prior_value into the target row."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/reject", json={"item_id": "walkitem:wp1"}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "rejected", "item_id": "walkitem:wp1"}
+        assert _walk_status(storage, "wp1") == "resolved"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"old"}'  # prior_value restored
+
+    def test_reject_walk_item_restores_null_prior(self, client, storage):
+        """A NULL prior_value is restored as NULL (voice_assignment unset)."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/reject", json={"item_id": "walkitem:wa1"}
+        )
+        assert response.status_code == 200
+        rows = storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id = 'c2'"
+        )
+        assert rows[0]["voice_assignment_id"] is None
+        assert _walk_status(storage, "wa1") == "resolved"
+
+    def test_reject_walk_item_restores_instruct(self, client, storage):
+        """Reject on an instruction walkitem: restores span.instruct."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/reject", json={"item_id": "walkitem:wi1"}
+        )
+        assert response.status_code == 200
+        rows = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp1'")
+        assert rows[0]["instruct"] == "cheerfully"
+        assert _walk_status(storage, "wi1") == "resolved"
+
+    # -- walkitem: override ------------------------------------------------
+
+    def test_override_walk_item_writes_new_value_to_target(self, client, storage):
+        """Override on a walkitem: writes new_value into the target row."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/override",
+            json={"item_id": "walkitem:wp1", "new_value": '{"voice":"human"}'},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "overridden", "item_id": "walkitem:wp1"}
+        assert _walk_status(storage, "wp1") == "resolved"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"human"}'  # the human's value
+
+    def test_override_walk_item_voice_assignment(self, client, storage):
+        """Override writes the new voice_assignment_id into the character row."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/override",
+            json={"item_id": "walkitem:wa1", "new_value": "vc1"},
+        )
+        assert response.status_code == 200
+        rows = storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id = 'c2'"
+        )
+        assert rows[0]["voice_assignment_id"] == "vc1"
+        assert _walk_status(storage, "wa1") == "resolved"
+
+    def test_override_walk_item_instruct(self, client, storage):
+        """Override writes the new instruct into the span row."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/override",
+            json={"item_id": "walkitem:wi1", "new_value": "quickly"},
+        )
+        assert response.status_code == 200
+        rows = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp1'")
+        assert rows[0]["instruct"] == "quickly"
+        assert _walk_status(storage, "wi1") == "resolved"
+
+    # -- error codes -------------------------------------------------------
+
+    def test_walk_item_unknown_id_returns_404(self, client):
+        """A well-formed walkitem: id with no matching row returns 404."""
+        response = client.post(
+            "/api/pipeline/review/accept", json={"item_id": "walkitem:nope"}
+        )
+        assert response.status_code == 404
+
+    def test_junction_item_unknown_id_returns_404(self, client):
+        """A well-formed junction id with no matching row returns 404 (NEW)."""
+        response = client.post(
+            "/api/pipeline/review/accept",
+            json={"item_id": "character_book:c1:nonexistent-book"},
+        )
+        assert response.status_code == 404
+
+    def test_junction_reject_unknown_id_returns_404(self, client):
+        """Reject on a well-formed but unknown junction id returns 404 (NEW)."""
+        response = client.post(
+            "/api/pipeline/review/reject",
+            json={"item_id": "character_scene:c1:nonexistent-scene"},
+        )
+        assert response.status_code == 404
+
+    def test_junction_override_unknown_id_returns_404(self, client):
+        """Override on a well-formed but unknown junction id returns 404 (NEW)."""
+        response = client.post(
+            "/api/pipeline/review/override",
+            json={
+                "item_id": "character_span:c1:nonexistent-span",
+                "new_value": {"relation_type": "speaker"},
+            },
+        )
+        assert response.status_code == 404
+
+    def test_malformed_item_id_returns_400(self, client):
+        """Malformed ids still return 400 via the existing ValueError path."""
+        response = client.post(
+            "/api/pipeline/review/accept", json={"item_id": "invalid:item:id"}
+        )
+        assert response.status_code == 400
+
+    def test_override_walk_item_without_value_returns_400(self, client, storage):
+        """Override on a walkitem: without a value is a 400 and resolves nothing."""
+        _seed_walk_review_items(storage)
+        response = client.post(
+            "/api/pipeline/review/override", json={"item_id": "walkitem:wp1"}
+        )
+        assert response.status_code == 400
+        assert _walk_status(storage, "wp1") == "pending"
+
+    def test_override_junction_item_without_value_keeps_junction_behavior(
+        self, client, storage
+    ):
+        """Junction override with no value keeps existing behavior (flags only)."""
+        response = client.post(
+            "/api/pipeline/review/override", json={"item_id": "character_book:c2:b1"}
+        )
+        assert response.status_code == 200
+        rows = storage.execute_query(
+            "SELECT confidence, human_override FROM character_book "
+            "WHERE character_id = 'c2' AND book_id = 'b1'"
+        )
+        assert rows[0]["confidence"] == 1.0
+        assert rows[0]["human_override"] == 1
+
+    def test_junction_items_still_dispatch_to_existing_behavior(self, client, storage):
+        """Junction ids keep dispatching to the existing junction actions."""
+        _seed_walk_review_items(storage)  # walk rows present; junction still works
+        response = client.post(
+            "/api/pipeline/review/accept", json={"item_id": "character_book:c2:b1"}
+        )
+        assert response.status_code == 200
+        rows = storage.execute_query(
+            "SELECT confidence FROM character_book "
+            "WHERE character_id = 'c2' AND book_id = 'b1'"
+        )
+        assert rows[0]["confidence"] == 1.0
+        # the walk items are untouched by a junction action
+        assert _walk_status(storage, "wp1") == "pending"
+
+
+class TestReviewActionRollback:
+    """P5: a failing value-restore through the API is ATOMIC — nothing commits.
+
+    The storage error propagates out of the endpoint (TestClient re-raises it);
+    the item row stays ``pending`` and the target row keeps the walk's value.
+    """
+
+    def test_restore_failure_rolls_back_via_api(self, client, storage, monkeypatch):
+        """The restore write SUCCEEDS inside the txn, then the status UPDATE
+        fails — the endpoint surfaces the error and BOTH writes are rolled
+        back (target unchanged, item still pending).  Without the transaction
+        the restore would have autocommitted and stayed visible."""
+        _seed_walk_review_items(storage)
+
+        real_update = storage.execute_update
+
+        def failing_status_update(sql, params=()):
+            if "status = 'resolved'" in sql:
+                raise ConcurrentTransactionError("simulated status-write failure")
+            return real_update(sql, params)
+
+        monkeypatch.setattr(storage, "execute_update", failing_status_update)
+        with pytest.raises(ConcurrentTransactionError):
+            client.post(
+                "/api/pipeline/review/reject", json={"item_id": "walkitem:wp1"}
+            )
+
+        assert _walk_status(storage, "wp1") == "pending"
+        rows = storage.execute_query(
+            "SELECT value FROM character_metadata "
+            "WHERE character_id = 'c1' AND key = 'voice_profile'"
+        )
+        assert rows[0]["value"] == '{"voice":"new"}'  # unchanged
 
 
 # ---------------------------------------------------------------------------

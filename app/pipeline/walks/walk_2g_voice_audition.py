@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
+from app.pipeline.review import supersede_targets
 from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 if TYPE_CHECKING:
@@ -73,6 +75,10 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
         "errors": [],
     }
 
+    # Targets whose write committed this run; the FINAL transaction supersedes
+    # prior pending items of the same kind for exactly these targets.
+    committed_target_ids: list[str] = []
+
     # Resolve LLM config for voice audition
     llm_config = resolve_task_llm("voice_audition", config_path=None)
     client, _ = create_llm_client(config_path=None)
@@ -104,16 +110,34 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 character_id=character_id,
                 character_name=character_name,
                 character_aliases=character_aliases,
+                book_id=book_id,
                 storage=storage,
                 client=client,
                 model_name=model_name,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 result=result,
+                committed_target_ids=committed_target_ids,
             )
         except Exception as e:
             logger.error(f"Error processing character {character_id}: {e}")
             result["errors"].append({"character_id": character_id, "error": str(e)})
+
+    # Completion-time per-target supersede (contract rule #9): the walk's
+    # FINAL transaction marks prior pending items of the same kind for the
+    # targets THIS run regenerated as superseded.  Nothing is superseded when
+    # a unit raised (a top-level exception never reaches this point) or when
+    # the run was cancelled (run_walk never invokes execute).  A raw adapter
+    # without a run context (direct-call tests) has no run to supersede from.
+    run_id = getattr(storage, "run_id", None)
+    if run_id is not None:
+        supersede_targets(
+            storage,
+            book_id=book_id,
+            run_id=run_id,
+            kind="voice_profile",
+            target_ids=committed_target_ids,
+        )
 
     return result
 
@@ -211,12 +235,14 @@ def _process_character(
     character_id: str,
     character_name: str,
     character_aliases: str,
+    book_id: str,
     storage: PipelineStorage,
     client: Any,
     model_name: str,
     temperature: float,
     reasoning_effort: str | None,
     result: dict,
+    committed_target_ids: list[str],
 ) -> None:
     """Process a single character: collect description + dialogue, call LLM, store profile."""
     # Collect dialogue spans for this character
@@ -275,12 +301,24 @@ def _process_character(
 
     is_review = 0.5 <= confidence < 0.7
 
+    # Capture the prior voice_profile value OUTSIDE the savepoint so the
+    # review item records the pre-write state (None if absent).
+    prior_profile = _get_prior_voice_profile(character_id, storage)
+
     # Store voice profile in character_metadata
     conn = storage.get_connection()
     conn.execute("SAVEPOINT walk_2g_voice")
     try:
         _store_voice_profile(character_id, voice_profile, storage)
+        if is_review:
+            _insert_review_item(
+                storage=storage,
+                book_id=book_id,
+                character_id=character_id,
+                prior_value=prior_profile,
+            )
         conn.execute("RELEASE SAVEPOINT walk_2g_voice")
+        committed_target_ids.append(character_id)
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2g_voice")
         raise
@@ -306,6 +344,54 @@ def _store_voice_profile(
         ON CONFLICT(character_id, key) DO UPDATE SET value = excluded.value
         """,
         (character_id, "voice_profile", json.dumps(voice_profile)),
+    )
+
+
+def _get_prior_voice_profile(
+    character_id: str, storage: PipelineStorage
+) -> str | None:
+    """Return the stored voice_profile JSON for a character, or None if absent.
+
+    Read OUTSIDE the savepoint so ``prior_value`` reflects the pre-write
+    state of the target row (contract: prior_value from pre-write state).
+    """
+    rows = storage.execute_query(
+        "SELECT value FROM character_metadata WHERE character_id = ? AND key = 'voice_profile'",
+        (character_id,),
+    )
+    if rows:
+        return rows[0]["value"]
+    return None
+
+
+def _insert_review_item(
+    storage: PipelineStorage,
+    book_id: str,
+    character_id: str,
+    prior_value: str | None,
+) -> None:
+    """Write a walk_review_item row for a review-band voice profile.
+
+    Called inside the per-unit savepoint so the item row commits (or rolls
+    back) atomically with the voice-profile UPSERT.  Auto-accept (>=0.7)
+    and auto-reject (<0.5) paths never reach this helper.
+    """
+    run_id = storage.run_id
+    storage.execute_insert(
+        """
+        INSERT INTO walk_review_item
+            (id, book_id, run_id, kind, target_table, target_id,
+             prior_value, status, created_ms)
+        VALUES (?, ?, ?, 'voice_profile', 'character_metadata', ?, ?, 'pending', ?)
+        """,
+        (
+            f"{run_id}:voice_profile:{character_id}",
+            book_id,
+            run_id,
+            character_id,
+            prior_value,
+            int(time.time() * 1000),
+        ),
     )
 
 

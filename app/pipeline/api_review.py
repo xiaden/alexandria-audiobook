@@ -1,7 +1,9 @@
 """Pipeline API — Review endpoints.
 
-Provides HTTP endpoints for the confidence review workflow:
-- GET /api/pipeline/review/{book_id} — get review items (confidence 0.5-0.7)
+Provides HTTP endpoints for the unified review workflow:
+- GET /api/pipeline/review/{book_id} — get review items (junction items
+  with confidence 0.5-0.7, plus ``walkitem:``-prefixed walk items, which
+  carry no confidence)
 - POST /api/pipeline/review/accept — accept a review item
 - POST /api/pipeline/review/reject — reject a review item
 - POST /api/pipeline/review/override — override a review item
@@ -16,7 +18,7 @@ from pydantic import BaseModel
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
-from app.pipeline.review import ReviewManager
+from app.pipeline.review import ReviewItemNotFoundError, ReviewManager
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +60,8 @@ async def get_review_items(
     book_id: str,
     manager: ReviewManager = Depends(get_review_manager),
 ) -> list[dict]:
-    """Return review items (confidence 0.5-0.7) for a book."""
+    """Return review items for a book — junction items (confidence 0.5-0.7)
+    plus ``walkitem:``-prefixed walk items, which carry no confidence."""
     items = manager.get_review_items(book_id)
     return items
 
@@ -73,9 +76,11 @@ async def accept_review_item(
     request: ReviewActionRequest,
     manager: ReviewManager = Depends(get_review_manager),
 ) -> dict:
-    """Accept a review item — set confidence to 1.0."""
+    """Accept a review item — dispatch by id prefix (junction | walkitem)."""
     try:
-        manager.accept_review_item(request.item_id)
+        manager.resolve_review_action("accept", request.item_id)
+    except ReviewItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "accepted", "item_id": request.item_id}
@@ -91,9 +96,11 @@ async def reject_review_item(
     request: ReviewActionRequest,
     manager: ReviewManager = Depends(get_review_manager),
 ) -> dict:
-    """Reject a review item — set confidence to 0.0."""
+    """Reject a review item — dispatch by id prefix (junction | walkitem)."""
     try:
-        manager.reject_review_item(request.item_id)
+        manager.resolve_review_action("reject", request.item_id)
+    except ReviewItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "rejected", "item_id": request.item_id}
@@ -109,9 +116,11 @@ async def override_review_item(
     request: ReviewActionRequest,
     manager: ReviewManager = Depends(get_review_manager),
 ) -> dict:
-    """Override a review item — set confidence to 1.0, human_override=1."""
+    """Override a review item — dispatch by id prefix (junction | walkitem)."""
     try:
-        manager.override_review_item(request.item_id, request.new_value)
+        manager.resolve_review_action("override", request.item_id, request.new_value)
+    except ReviewItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "overridden", "item_id": request.item_id}

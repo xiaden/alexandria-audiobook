@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
+from app.pipeline.review import supersede_targets
 from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 if TYPE_CHECKING:
@@ -76,6 +78,10 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
         "errors": [],
     }
 
+    # Targets whose write committed this run; the FINAL transaction supersedes
+    # prior pending items of the same kind for exactly these targets.
+    committed_target_ids: list[str] = []
+
     # Resolve LLM config for voice assignment
     llm_config = resolve_task_llm("voice_assignment", config_path=None)
     client, _ = create_llm_client(config_path=None)
@@ -112,16 +118,34 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 character_id=character_id,
                 character_name=character_name,
                 available_voices=available_voices,
+                book_id=book_id,
                 storage=storage,
                 client=client,
                 model_name=model_name,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 result=result,
+                committed_target_ids=committed_target_ids,
             )
         except Exception as e:
             logger.error(f"Error processing character {character_id}: {e}")
             result["errors"].append({"character_id": character_id, "error": str(e)})
+
+    # Completion-time per-target supersede (contract rule #9): the walk's
+    # FINAL transaction marks prior pending items of the same kind for the
+    # targets THIS run regenerated as superseded.  Nothing is superseded when
+    # a unit raised (a top-level exception never reaches this point) or when
+    # the run was cancelled (run_walk never invokes execute).  A raw adapter
+    # without a run context (direct-call tests) has no run to supersede from.
+    run_id = getattr(storage, "run_id", None)
+    if run_id is not None:
+        supersede_targets(
+            storage,
+            book_id=book_id,
+            run_id=run_id,
+            kind="voice_assignment",
+            target_ids=committed_target_ids,
+        )
 
     return result
 
@@ -204,12 +228,14 @@ def _process_character(
     character_id: str,
     character_name: str,
     available_voices: list[dict[str, str]],
+    book_id: str,
     storage: PipelineStorage,
     client: Any,
     model_name: str,
     temperature: float,
     reasoning_effort: str | None,
     result: dict,
+    committed_target_ids: list[str],
 ) -> None:
     """Process a single character: read voice profile, match to available voice, assign."""
     # Read voice profile from character_metadata
@@ -281,6 +307,10 @@ def _process_character(
             result["voices_unmatched"] += 1
             return
 
+        # Capture the prior voice_assignment_id OUTSIDE the savepoint so the
+        # review item records the pre-write state (None if unassigned).
+        prior_assignment = _get_prior_voice_assignment(character_id, storage)
+
         # Update character.voice_assignment_id
         conn = storage.get_connection()
         conn.execute("SAVEPOINT walk_2h_voice_assignment")
@@ -289,7 +319,15 @@ def _process_character(
                 "UPDATE character SET voice_assignment_id = ? WHERE id = ?",
                 (voice_config_id, character_id),
             )
+            if is_review:
+                _insert_review_item(
+                    storage=storage,
+                    book_id=book_id,
+                    character_id=character_id,
+                    prior_value=prior_assignment,
+                )
             conn.execute("RELEASE SAVEPOINT walk_2h_voice_assignment")
+            committed_target_ids.append(character_id)
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT walk_2h_voice_assignment")
             raise
@@ -301,6 +339,54 @@ def _process_character(
     else:
         # LLM returned null voice_config_id — no match
         result["voices_unmatched"] += 1
+
+
+def _get_prior_voice_assignment(
+    character_id: str, storage: PipelineStorage
+) -> str | None:
+    """Return the character's current voice_assignment_id, or None if unassigned.
+
+    Read OUTSIDE the savepoint so ``prior_value`` reflects the pre-write
+    state of the target row (contract: prior_value from pre-write state).
+    """
+    rows = storage.execute_query(
+        "SELECT voice_assignment_id FROM character WHERE id = ?",
+        (character_id,),
+    )
+    if rows:
+        return rows[0]["voice_assignment_id"]
+    return None
+
+
+def _insert_review_item(
+    storage: PipelineStorage,
+    book_id: str,
+    character_id: str,
+    prior_value: str | None,
+) -> None:
+    """Write a walk_review_item row for a review-band voice assignment.
+
+    Called inside the per-unit savepoint so the item row commits (or rolls
+    back) atomically with the voice_assignment_id update.  Auto-accept
+    (>=0.7) and auto-reject (<0.5) paths never reach this helper.
+    """
+    run_id = storage.run_id
+    storage.execute_insert(
+        """
+        INSERT INTO walk_review_item
+            (id, book_id, run_id, kind, target_table, target_id,
+             prior_value, status, created_ms)
+        VALUES (?, ?, ?, 'voice_assignment', 'character', ?, ?, 'pending', ?)
+        """,
+        (
+            f"{run_id}:voice_assignment:{character_id}",
+            book_id,
+            run_id,
+            character_id,
+            prior_value,
+            int(time.time() * 1000),
+        ),
+    )
 
 
 def _build_voice_assignment_prompt(
