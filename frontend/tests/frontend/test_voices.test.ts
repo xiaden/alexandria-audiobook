@@ -1,13 +1,12 @@
 /**
  * Spec-first tests for Voices tab (frontend/src/tabs/voices.ts).
- * Tests cover: pipeline character loading, character ledger display,
- * voice assignment dropdown, pipeline toggle integration.
  *
- * NOTE: No test framework is installed in frontend/package.json.
- * These tests are written with vitest-compatible syntax.
- * To run: install vitest (`npm install -D vitest jsdom`) and add to package.json:
- *   "scripts": { "test": "vitest" },
- *   "vitest": { "environment": "jsdom" }
+ * Tests cover: pipeline character loading, character ledger display,
+ * voice assignment dropdown persistence, narrator voice selector (Phase 19),
+ * voice catalog rendering & preview (Phase 23), and the voices-GET failure path.
+ *
+ * Run with `npm test` (vitest run) from frontend/ — vitest ^4.1.10 and
+ * jsdom ^30.0.1 are installed (see frontend/package.json and vitest.config.ts).
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -23,17 +22,24 @@ import {
   getCharacterVoiceAssignments,
   getCachedCharacters,
   loadVoices,
-  debouncedSaveVoices,
   initVoices,
+  handleNarratorVoiceChange,
+  getCurrentNarratorVoice,
+  NARRATOR_DEFAULT_VOICE,
+  createVoiceCard,
+  renderVoiceCatalog,
+  previewVoice,
+  VoiceConfigRow,
 } from '../../src/tabs/voices';
 import { state } from '../../src/state';
 import * as API from '../../src/api';
+import { showToast } from '../../src/utils';
 
 // Mock the API module
 vi.mock('../../src/api', () => ({
   get: vi.fn(),
   post: vi.fn(),
-  upload: vi.fn(),
+  put: vi.fn(() => Promise.resolve({ status: 'ok' })),
 }));
 
 // Mock utils to avoid DOM side effects
@@ -43,11 +49,6 @@ vi.mock('../../src/utils', () => ({
   escapeHtml: (s: string) => s,
 }));
 
-// Mock templates module
-vi.mock('../../src/templates', () => ({
-  createVoiceCard: vi.fn((v: any, i: number) => `<div class="voice-card" data-voice="${v.name}"></div>`),
-  buildSpeakerSelect: vi.fn(() => '<select></select>'),
-}));
 
 // ---------------------------------------------------------------------------
 // Test data fixtures
@@ -330,83 +331,46 @@ describe('handleCharacterVoiceChange', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Pipeline toggle integration
+// loadVoices — pipeline character loading
 // ---------------------------------------------------------------------------
 
-describe('loadVoices — pipeline toggle integration', () => {
+describe('loadVoices — pipeline character loading', () => {
   beforeEach(() => {
     document.body.innerHTML = `
-      <div id="pipeline-voices-disabled-notice" style="display:none;"></div>
       <div id="pipeline-voices-section" style="display:none;">
         <div id="character-ledger"></div>
-      </div>
-      <div id="legacy-voices-section" style="display:none;">
-        <div id="voices-list"></div>
       </div>
       <span id="voice-save-status"></span>
     `;
     vi.clearAllMocks();
     vi.mocked(API.get).mockImplementation((url: string) => {
-      if (url === '/api/voices') return Promise.resolve(MOCK_VOICES);
+      if (url === '/api/pipeline/voices') return Promise.resolve(MOCK_VOICES);
       if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
-      if (url === '/api/voice_design/list') return Promise.resolve([]);
-      if (url === '/api/clone_voices/list') return Promise.resolve([]);
-      if (url === '/api/lora/models') return Promise.resolve([]);
       return Promise.resolve([]);
     });
   });
 
-  it('should load pipeline characters when pipelineEnabled is true', async () => {
-    state.pipelineEnabled = true;
+  it('should load voices list and pipeline characters', async () => {
     state.pipelineBookId = 'book-abc';
 
     await loadVoices();
 
-    expect(API.get).toHaveBeenCalledWith('/api/voices');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/voices');
     expect(API.get).toHaveBeenCalledWith('/api/pipeline/characters/book-abc');
     expect(state.voicesNames).toEqual(['Alice', 'Bob', 'Charlie']);
   });
 
-  it('should show pipeline section and hide legacy when pipelineEnabled is true', async () => {
-    state.pipelineEnabled = true;
+  it('should show the pipeline section', async () => {
     state.pipelineBookId = 'book-abc';
 
     await loadVoices();
 
-    const pipelineNotice = document.getElementById('pipeline-voices-disabled-notice');
     const pipelineSection = document.getElementById('pipeline-voices-section');
-    const legacySection = document.getElementById('legacy-voices-section');
-
-    expect(pipelineNotice!.style.display).toBe('none');
     expect(pipelineSection!.style.display).toBe('');
-    expect(legacySection!.style.display).toBe('none');
   });
 
-  it('should load legacy voices when pipelineEnabled is false', async () => {
-    state.pipelineEnabled = false;
 
-    await loadVoices();
-
-    expect(API.get).toHaveBeenCalledWith('/api/voices');
-    expect(API.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/pipeline/characters/'));
-  });
-
-  it('should show legacy section and hide pipeline when pipelineEnabled is false', async () => {
-    state.pipelineEnabled = false;
-
-    await loadVoices();
-
-    const pipelineNotice = document.getElementById('pipeline-voices-disabled-notice');
-    const pipelineSection = document.getElementById('pipeline-voices-section');
-    const legacySection = document.getElementById('legacy-voices-section');
-
-    expect(pipelineNotice!.style.display).toBe('');
-    expect(pipelineSection!.style.display).toBe('none');
-    expect(legacySection!.style.display).toBe('');
-  });
-
-  it('should show warning when pipelineEnabled but no book onboarded', async () => {
-    state.pipelineEnabled = true;
+  it('should show warning when no book onboarded', async () => {
     state.pipelineBookId = null;
 
     await loadVoices();
@@ -417,11 +381,10 @@ describe('loadVoices — pipeline toggle integration', () => {
   });
 
   it('should show error in character ledger when API fails', async () => {
-    state.pipelineEnabled = true;
     state.pipelineBookId = 'book-fail';
 
     vi.mocked(API.get).mockImplementation((url: string) => {
-      if (url === '/api/voices') return Promise.resolve(MOCK_VOICES);
+      if (url === '/api/pipeline/voices') return Promise.resolve(MOCK_VOICES);
       if (url.startsWith('/api/pipeline/characters/')) return Promise.reject(new Error('Server error'));
       return Promise.resolve([]);
     });
@@ -433,18 +396,25 @@ describe('loadVoices — pipeline toggle integration', () => {
     expect(container!.innerHTML).toContain('Failed to load characters');
   });
 
-  it('should always load /api/voices regardless of pipeline mode', async () => {
-    state.pipelineEnabled = false;
+  it('should always load /api/pipeline/voices', async () => {
     await loadVoices();
-    expect(API.get).toHaveBeenCalledWith('/api/voices');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/voices');
+  });
 
-    vi.clearAllMocks();
-    vi.mocked(API.get).mockResolvedValue(MOCK_VOICES);
-
-    state.pipelineEnabled = true;
+  it('shows an error toast and still loads characters when the voices GET fails', async () => {
     state.pipelineBookId = 'book-abc';
+
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.reject(new Error('Voices service down'));
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+
     await loadVoices();
-    expect(API.get).toHaveBeenCalledWith('/api/voices');
+
+    expect(showToast).toHaveBeenCalledWith('Failed to load voices: Voices service down', 'error');
+    // Tab init continues: characters are still loaded despite the voices failure
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/characters/book-abc');
   });
 });
 
@@ -456,6 +426,8 @@ describe('getCachedCharacters', () => {
   beforeEach(() => {
     document.body.innerHTML = `<div id="character-ledger"></div>`;
     state.voicesNames = ['Alice'];
+    // Reset the module-level character cache (populated by earlier describes)
+    renderCharacterLedger([]);
   });
 
   it('should return empty array before any characters are loaded', () => {
@@ -476,54 +448,6 @@ describe('getCachedCharacters', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// debouncedSaveVoices (preserved functionality)
-// ---------------------------------------------------------------------------
-
-describe('debouncedSaveVoices', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    document.body.innerHTML = `
-      <span id="voice-save-status"></span>
-      <div id="voices-list"></div>
-    `;
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it('should show "unsaved" status immediately', () => {
-    debouncedSaveVoices();
-    const statusEl = document.getElementById('voice-save-status');
-    expect(statusEl!.innerHTML).toContain('unsaved');
-    expect(statusEl!.innerHTML).toContain('text-warning');
-  });
-
-  it('should not save immediately (debounced 800ms)', () => {
-    debouncedSaveVoices();
-    expect(API.post).not.toHaveBeenCalled();
-  });
-
-  it('should save after 800ms debounce delay', () => {
-    debouncedSaveVoices();
-    vi.advanceTimersByTime(800);
-    // Note: collectVoiceConfig returns empty when no voice-cards exist,
-    // so API.post may not be called. This tests the timer mechanism.
-  });
-
-  it('should reset timer on subsequent calls', () => {
-    debouncedSaveVoices();
-    vi.advanceTimersByTime(400);
-    debouncedSaveVoices(); // reset
-    vi.advanceTimersByTime(400);
-    // Should not have saved yet (only 400ms since last call)
-    expect(API.post).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(400);
-    // Now 800ms since last call
-  });
-});
 
 // ---------------------------------------------------------------------------
 // initVoices (event listener attachment)
@@ -533,7 +457,6 @@ describe('initVoices', () => {
   beforeEach(() => {
     document.body.innerHTML = `
       <div id="character-ledger"></div>
-      <div id="voices-list"></div>
       <span id="voice-save-status"></span>
     `;
     vi.clearAllMocks();
@@ -552,5 +475,342 @@ describe('initVoices', () => {
     const ledger = document.getElementById('character-ledger');
     // Verify the event listener was attached by checking the element exists
     expect(ledger).not.toBeNull();
+  });
+
+  it('delegated change on a character voice select persists via PUT', async () => {
+    state.pipelineBookId = 'book-abc';
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve(CATALOG_VOICES);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+
+    initVoices();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    // Wait for the ledger to render character voice selects
+    await vi.waitFor(() => {
+      expect(document.querySelector('.character-voice-select[data-character-id="char-001"]')).not.toBeNull();
+    });
+
+    const select = document.querySelector('.character-voice-select[data-character-id="char-001"]') as HTMLSelectElement;
+    select.value = 'Alice';
+    // Bubbles must be true — the delegated listener lives on #character-ledger
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // Delegated handler (initVoices wiring) persists the assignment via PUT
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/characters/char-001/voice', {
+      voice_assignment_id: 'Alice',
+    });
+    // Local ledger state was updated through handleCharacterVoiceChange
+    expect(getCharacterVoiceAssignments().get('char-001')).toBe('Alice');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Narrator voice selector (Phase 19)
+// ---------------------------------------------------------------------------
+
+describe('narrator voice selector', () => {
+  // Voice catalog rows (all 12 columns are returned by the API; tests only
+  // exercise the id/name/voice fields). Includes the NARRATOR pseudo-row.
+  const NARRATOR_MOCK_VOICES = [
+    { id: 'NARRATOR', name: 'NARRATOR', voice: 'Ryan' },
+    { id: 'ryan', name: 'Ryan', voice: 'Ryan' },
+    { id: 'alice', name: 'Alice', voice: 'Alice' },
+    { id: 'bob', name: 'Bob', voice: 'Bob' },
+    { id: 'charlie', name: 'Charlie', voice: 'Charlie' },
+  ];
+
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div id="pipeline-voices-section" style="display:none;">
+        <select id="narrator-voice-select"></select>
+        <div id="character-ledger"></div>
+      </div>
+    `;
+    vi.clearAllMocks();
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve(NARRATOR_MOCK_VOICES);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+  });
+
+  it('renders all available voices as options with the NARRATOR voice selected', async () => {
+    state.pipelineBookId = 'book-abc';
+
+    await loadVoices();
+
+    const select = document.getElementById('narrator-voice-select') as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    const options = Array.from(select.options).map(o => o.value);
+    expect(options).toContain('Ryan');
+    expect(options).toContain('Alice');
+    expect(options).toContain('Bob');
+    expect(options).toContain('Charlie');
+    // The NARRATOR pseudo-row is not offered as a narrator voice choice
+    expect(options).not.toContain('NARRATOR');
+    // The NARRATOR row's `voice` column is the selected value
+    expect(select.value).toBe('Ryan');
+    expect(getCurrentNarratorVoice()).toBe('Ryan');
+  });
+
+  it('calls PUT /api/pipeline/voices/NARRATOR with the selected voice on change', async () => {
+    state.pipelineBookId = 'book-abc';
+
+    initVoices();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    // Wait for loadVoices (fired by DOMContentLoaded) to populate the options
+    await vi.waitFor(() => {
+      const select = document.getElementById('narrator-voice-select') as HTMLSelectElement;
+      expect(select.options.length).toBeGreaterThan(0);
+    });
+
+    const select = document.getElementById('narrator-voice-select') as HTMLSelectElement;
+    select.value = 'Bob';
+    select.dispatchEvent(new Event('change'));
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/voices/NARRATOR', { voice: 'Bob' });
+  });
+
+  it('persists the narrator voice via handleNarratorVoiceChange', () => {
+    handleNarratorVoiceChange('Charlie');
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/voices/NARRATOR', { voice: 'Charlie' });
+    expect(getCurrentNarratorVoice()).toBe('Charlie');
+  });
+
+  it('shows a success toast after persisting', async () => {
+    vi.mocked(API.put).mockResolvedValueOnce({ id: 'NARRATOR', voice: 'Bob' });
+
+    handleNarratorVoiceChange('Bob');
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith('Narrator voice set to Bob', 'success');
+    });
+  });
+
+  it('shows an error toast when persisting fails', async () => {
+    vi.mocked(API.put).mockRejectedValueOnce(new Error('Server error'));
+
+    handleNarratorVoiceChange('Bob');
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith('Failed to update narrator voice: Server error', 'error');
+    });
+    // Local selection is preserved even when the persist fails
+    expect(getCurrentNarratorVoice()).toBe('Bob');
+  });
+
+  it('falls back to the default narrator voice when no NARRATOR row exists', async () => {
+    state.pipelineBookId = 'book-abc';
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve([
+        { id: 'ryan', name: 'Ryan', voice: 'Ryan' },
+        { id: 'alice', name: 'Alice', voice: 'Alice' },
+      ]);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+
+    await loadVoices();
+
+    const select = document.getElementById('narrator-voice-select') as HTMLSelectElement;
+    expect(select.value).toBe(NARRATOR_DEFAULT_VOICE);
+    expect(getCurrentNarratorVoice()).toBe(NARRATOR_DEFAULT_VOICE);
+    const options = Array.from(select.options).map(o => o.value);
+    expect(options).toContain('Ryan');
+    expect(options).toContain('Alice');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice catalog & preview (Phase 23)
+// ---------------------------------------------------------------------------
+
+/** Voice config rows for the catalog (includes the NARRATOR pseudo-row). */
+const CATALOG_VOICES: VoiceConfigRow[] = [
+  { id: 'ryan', name: 'Ryan', voice: 'Ryan', type: 'custom' },
+  { id: 'alice', name: 'Alice', voice: 'Alice', type: 'custom' },
+  { id: 'bob-clone', name: 'Bob', voice: 'Bob', type: 'clone' },
+  { id: 'NARRATOR', name: 'NARRATOR', voice: 'Ryan', type: 'custom' },
+];
+
+/** Instances created by the stubbed Audio constructor (reset per test). */
+let audioInstances: MockAudio[] = [];
+
+/**
+ * jsdom does not implement HTMLMediaElement.play(), so the real Audio global
+ * would throw on .play(). This stub records each constructed instance (src)
+ * and resolves play() so previewVoice's .catch() chain works.
+ */
+class MockAudio {
+  src: string;
+  play = vi.fn().mockResolvedValue(undefined);
+  constructor(src?: string) {
+    this.src = src ?? '';
+    audioInstances.push(this);
+  }
+}
+
+describe('voice catalog (Phase 23)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders a card with name, type badge, and preview button for each voice', () => {
+    const html = createVoiceCard(CATALOG_VOICES[1]);
+    expect(html).toContain('Alice');
+    expect(html).toContain('voice-type-badge');
+    expect(html).toContain('>custom<');
+    expect(html).toContain('data-action="preview-voice"');
+    expect(html).toContain('data-voice-id="alice"');
+    expect(html).toContain('btn btn-sm btn-outline-success');
+    expect(html).toContain('fas fa-play');
+  });
+
+  it('renders one voice card per voice, excluding the NARRATOR pseudo-row', () => {
+    document.body.innerHTML = '<div id="voice-catalog"></div>';
+    renderVoiceCatalog(CATALOG_VOICES);
+
+    const cards = document.querySelectorAll('.voice-card');
+    expect(cards.length).toBe(3);
+    expect(document.querySelector('.voice-card[data-voice-id="NARRATOR"]')).toBeNull();
+    expect(document.querySelector('.voice-card[data-voice-id="alice"]')).not.toBeNull();
+    expect(document.querySelector('.voice-card[data-voice-id="bob-clone"]')).not.toBeNull();
+  });
+
+  it('shows a muted message when no real voices exist', () => {
+    document.body.innerHTML = '<div id="voice-catalog"></div>';
+    renderVoiceCatalog([{ id: 'NARRATOR', name: 'NARRATOR', voice: 'Ryan' }]);
+
+    const container = document.getElementById('voice-catalog');
+    expect(container!.innerHTML).toContain('No voices available yet');
+  });
+
+  it('does nothing when #voice-catalog is absent', () => {
+    document.body.innerHTML = '';
+    expect(() => renderVoiceCatalog(CATALOG_VOICES)).not.toThrow();
+  });
+});
+
+describe('voice preview (Phase 23)', () => {
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div id="pipeline-voices-section" style="display:none;">
+        <select id="narrator-voice-select"></select>
+        <div id="voice-catalog"></div>
+        <div id="character-ledger"></div>
+      </div>
+    `;
+    vi.clearAllMocks();
+    audioInstances = [];
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve(CATALOG_VOICES);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+    vi.stubGlobal('Audio', MockAudio);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('clicking Preview calls POST /api/pipeline/voices/{id}/preview with default sample text and plays the audio', async () => {
+    state.pipelineBookId = 'book-abc';
+    vi.mocked(API.post).mockResolvedValueOnce({ audio_url: '/designed_voices/previews/alice.wav', voice_id: 'alice' });
+
+    initVoices();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    // Wait for the catalog to render (3 cards — NARRATOR excluded)
+    await vi.waitFor(() => {
+      expect(document.querySelectorAll('.voice-card').length).toBe(3);
+    });
+
+    const button = document.querySelector('[data-action="preview-voice"][data-voice-id="alice"]') as HTMLButtonElement;
+    expect(button).not.toBeNull();
+    button.click();
+
+    await vi.waitFor(() => {
+      expect(API.post).toHaveBeenCalledWith('/api/pipeline/voices/alice/preview', {
+        sample_text: 'This is a preview of the voice.',
+      });
+    });
+
+    // Audio is constructed with the returned URL and play() is invoked
+    await vi.waitFor(() => {
+      expect(audioInstances.length).toBe(1);
+      expect(audioInstances[0].src).toBe('/designed_voices/previews/alice.wav');
+      expect(audioInstances[0].play).toHaveBeenCalled();
+    });
+
+    expect(showToast).toHaveBeenCalledWith('Preview generated successfully', 'success');
+    // Button is restored (re-enabled) after preview completes
+    expect(button.disabled).toBe(false);
+  });
+
+  it('previewVoice plays the returned audio URL on success', async () => {
+    vi.mocked(API.post).mockResolvedValueOnce({ audio_url: '/designed_voices/previews/bob-clone.wav', voice_id: 'bob-clone' });
+
+    const button = document.createElement('button');
+    button.innerHTML = '<i class="fas fa-play me-1"></i>Preview';
+    document.body.appendChild(button);
+
+    await previewVoice('bob-clone', button);
+
+    expect(API.post).toHaveBeenCalledWith('/api/pipeline/voices/bob-clone/preview', {
+      sample_text: 'This is a preview of the voice.',
+    });
+    expect(audioInstances.length).toBe(1);
+    expect(audioInstances[0].src).toBe('/designed_voices/previews/bob-clone.wav');
+    expect(audioInstances[0].play).toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith('Preview generated successfully', 'success');
+    expect(button.disabled).toBe(false);
+    expect(button.innerHTML).toContain('fas fa-play');
+  });
+
+  it('shows an error toast and restores the button when the preview API rejects', async () => {
+    vi.mocked(API.post).mockRejectedValueOnce(new Error('TTS engine not available'));
+
+    const button = document.createElement('button');
+    button.innerHTML = '<i class="fas fa-play me-1"></i>Preview';
+    document.body.appendChild(button);
+
+    await previewVoice('alice', button);
+
+    expect(API.post).toHaveBeenCalledWith('/api/pipeline/voices/alice/preview', {
+      sample_text: 'This is a preview of the voice.',
+    });
+    expect(showToast).toHaveBeenCalledWith('Failed to generate preview: TTS engine not available', 'error');
+    expect(button.disabled).toBe(false);
+    expect(button.innerHTML).toContain('fas fa-play');
+  });
+
+  it('shows an error toast when audio.play() rejects and restores the button', async () => {
+    vi.mocked(API.post).mockResolvedValueOnce({ audio_url: '/designed_voices/previews/alice.wav', voice_id: 'alice' });
+
+    // Reuse MockAudio's recording constructor but make play() reject
+    class FailingAudio extends MockAudio {
+      play = vi.fn().mockRejectedValue(new Error('audio decode failed'));
+    }
+    vi.stubGlobal('Audio', FailingAudio);
+
+    const button = document.createElement('button');
+    button.innerHTML = '<i class="fas fa-play me-1"></i>Preview';
+    document.body.appendChild(button);
+
+    await previewVoice('alice', button);
+
+    // The play() rejection surfaces as an error toast (handled asynchronously)
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith('Failed to play preview: audio decode failed', 'error');
+    });
+    // Button is restored after the play failure
+    expect(button.disabled).toBe(false);
+    expect(button.innerHTML).toContain('fas fa-play');
   });
 });

@@ -1,23 +1,17 @@
 /**
- * Voices tab module — Voice configuration, character ledger display, and auto-save.
+ * Voices tab module — Pipeline character ledger, narrator voice, and voice assignment.
  *
- * When state.pipelineEnabled is true:
- *   - Loads characters from GET /api/pipeline/characters/{book_id}
- *   - Displays character ledger with name, aliases, voice assignment, confidence
- *   - Provides voice assignment dropdown per character
- *
- * When state.pipelineEnabled is false:
- *   - Shows a notice to enable pipeline mode (old persona endpoints removed)
- *   - Still loads available TTS voices from /api/voices for cache population
- *
- * Ported from app/static/index.html lines 1604-1961 (JS logic).
- * Phase 5: Connected to pipeline character ledger.
+ * - Loads available TTS voices from GET /api/pipeline/voices (for dropdown population)
+ * - Loads characters from GET /api/pipeline/characters/{book_id}
+ * - Displays character ledger with name, aliases, voice assignment, confidence
+ * - Persists voice assignments via PUT /api/pipeline/characters/{id}/voice
+ * - Narrator voice selector persists via PUT /api/pipeline/voices/NARRATOR
+ * - Voice catalog cards with Preview buttons (POST /api/pipeline/voices/{id}/preview)
  */
 
 import * as API from '../api';
 import { showToast, escapeHtml } from '../utils';
-import { state, type Voice, type VoiceConfig } from '../state';
-import { createVoiceCard } from '../templates';
+import { state } from '../state';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,27 +27,36 @@ export interface Character {
   confidence: number;
 }
 
-/** Voice config shape for save endpoint */
-type VoiceConfigMap = Record<string, VoiceConfig & { alias_of?: string; seed?: string }>;
-
-/** Character voice assignment stored in local state */
-export interface CharacterVoiceAssignment {
-  characterId: string;
-  voiceName: string;
+/** Voice config row from GET /api/pipeline/voices (all 12 columns returned). */
+export interface VoiceConfigRow {
+  id: string;
+  name: string;
+  /** TTS engine voice name used by this config (the NARRATOR row's `voice` column). */
+  voice: string | null;
+  /** Voice type: custom | clone | lora | builtin_lora | design. */
+  type?: string | null;
+  /** Optional human-readable description of the voice. */
+  description?: string | null;
 }
+
+/** Default narrator TTS voice when no NARRATOR row exists (matches backend NARRATOR_VOICE). */
+export const NARRATOR_DEFAULT_VOICE = 'Ryan';
 
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
-
-/** Debounce timer for voice config save */
-let voiceSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Cached characters loaded from the pipeline */
 let cachedCharacters: Character[] = [];
 
 /** Local voice assignments for characters (characterId → voiceName) */
 let characterVoiceAssignments: Map<string, string> = new Map();
+
+/** Current narrator TTS voice (voice column of the NARRATOR row; defaults to Ryan). */
+let currentNarratorVoice: string = NARRATOR_DEFAULT_VOICE;
+
+/** Name of the NARRATOR pseudo-row, excluded from the narrator dropdown options. */
+let narratorRowName: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Pipeline API functions
@@ -115,10 +118,10 @@ export function getConfidenceBadgeClass(confidence: number): string {
  * Create HTML for a character card in the ledger display.
  * Shows character name, aliases, voice assignment dropdown, and confidence.
  * @param character - Character object from the pipeline
- * @param index - Index for unique element naming
+ * @param _index - Reserved for unique element naming (unused)
  * @returns HTML string for the character card
  */
-export function createCharacterCard(character: Character, index: number): string {
+export function createCharacterCard(character: Character, _index: number): string {
   const aliases = parseAliases(character.aliases);
   const confidence = character.confidence ?? 0;
   const confidenceBadgeClass = getConfidenceBadgeClass(confidence);
@@ -128,10 +131,14 @@ export function createCharacterCard(character: Character, index: number): string
     ? aliases.map(a => `<span class="badge bg-light text-dark border me-1">${escapeHtml(a)}</span>`).join('')
     : '<span class="text-muted small">No aliases</span>';
 
-  // Build voice options from available voices
-  const voiceOptions = state.voicesNames.map(v =>
-    `<option value="${escapeHtml(v)}" ${v === assignedVoice ? 'selected' : ''}>${escapeHtml(v)}</option>`
-  ).join('');
+  // Build voice options from available voices, excluding the NARRATOR
+  // pseudo-row — assigning it would deliver voice='NARRATOR' to the TTS
+  // engine instead of the real TTS voice (see _build_voice_config).
+  const voiceOptions = state.voicesNames
+    .filter(v => v !== narratorRowName)
+    .map(v =>
+      `<option value="${escapeHtml(v)}" ${v === assignedVoice ? 'selected' : ''}>${escapeHtml(v)}</option>`
+    ).join('');
 
   return `
     <div class="card character-card mb-3" data-character-id="${escapeHtml(character.id)}">
@@ -186,49 +193,122 @@ export function renderCharacterLedger(characters: Character[]): void {
 }
 
 // ---------------------------------------------------------------------------
-// Voice loading (branches on pipelineEnabled)
+// Narrator voice selector
 // ---------------------------------------------------------------------------
 
 /**
- * Load voices from the server and render voice cards or character ledger.
- *
- * When pipelineEnabled is true:
- *   - Loads available TTS voices from /api/voices (for dropdown population)
- *   - Loads characters from /api/pipeline/characters/{book_id}
- *   - Renders character ledger with voice assignment dropdowns
- *
- * When pipelineEnabled is false:
- *   - Loads voice caches (designed voices, clone voices, LoRA models)
- *   - Loads voices from /api/voices
- *   - Renders voice cards using createVoiceCard template
+ * Render the narrator voice selector dropdown.
+ * Lists every available TTS voice (state.voicesNames), excluding the NARRATOR
+ * pseudo-row itself, and selects the current narrator voice. The current voice
+ * is always present as an option (added if missing) so the dropdown never shows
+ * an empty selection. No-op when the #narrator-voice-select element is absent.
+ */
+export function renderNarratorSelector(): void {
+  const select = document.getElementById('narrator-voice-select') as HTMLSelectElement | null;
+  if (!select) return;
+
+  const voices = state.voicesNames.filter(v => v !== narratorRowName);
+  if (currentNarratorVoice !== '' && !voices.includes(currentNarratorVoice)) {
+    voices.push(currentNarratorVoice);
+  }
+
+  const options = voices.map(v =>
+    `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
+  ).join('');
+  select.innerHTML = options;
+  select.value = currentNarratorVoice;
+}
+
+// ---------------------------------------------------------------------------
+// Voice catalog display
+// ---------------------------------------------------------------------------
+
+/**
+ * Create HTML for a voice catalog card.
+ * Shows the voice name, a type badge, and a Preview button that triggers
+ * POST /api/pipeline/voices/{id}/preview via the delegated click handler.
+ * @param voice - Voice config row from GET /api/pipeline/voices
+ * @returns HTML string for the voice card
+ */
+export function createVoiceCard(voice: VoiceConfigRow): string {
+  const type = voice.type || 'unknown';
+  return `
+    <div class="card voice-card mb-2" data-voice-id="${escapeHtml(voice.id)}">
+      <div class="card-body d-flex justify-content-between align-items-center">
+        <div>
+          <h6 class="card-title mb-1">${escapeHtml(voice.name)}</h6>
+          <span class="badge bg-secondary voice-type-badge">${escapeHtml(type)}</span>
+        </div>
+        <button type="button" class="btn btn-sm btn-outline-success"
+                data-action="preview-voice"
+                data-voice-id="${escapeHtml(voice.id)}"
+                title="Preview this voice">
+          <i class="fas fa-play me-1"></i>Preview
+        </button>
+      </div>
+    </div>`;
+}
+
+/**
+ * Render the voice catalog into the #voice-catalog container — one card per
+ * available TTS voice. The NARRATOR pseudo-row (id='NARRATOR') is excluded:
+ * it is not a real TTS voice (its `voice` column holds the narrator's chosen
+ * engine voice, which is already listed as its own row) and previewing it
+ * would synthesize with speaker 'NARRATOR'. No-op when the container is absent.
+ * @param voices - Voice config rows from GET /api/pipeline/voices
+ */
+export function renderVoiceCatalog(voices: VoiceConfigRow[]): void {
+  const container = document.getElementById('voice-catalog');
+  if (!container) return;
+
+  const catalogVoices = voices.filter(v => v.id !== 'NARRATOR');
+
+  if (catalogVoices.length === 0) {
+    container.innerHTML = '<div class="text-muted small">No voices available yet.</div>';
+    return;
+  }
+
+  container.innerHTML = catalogVoices.map(createVoiceCard).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Voice loading
+// ---------------------------------------------------------------------------
+
+/**
+ * Load voices from the server and render the character ledger.
+ * Always loads available TTS voices from /api/pipeline/voices (for dropdown
+ * population), then loads pipeline characters and renders the ledger.
  */
 export async function loadVoices(): Promise<void> {
   // Always load available TTS voices for dropdown population
-  const voices = await API.get<Voice[]>('/api/voices');
-  state.voicesNames = voices.map(v => v.name);
+  let voices: VoiceConfigRow[] = [];
+  try {
+    voices = await API.get<VoiceConfigRow[]>('/api/pipeline/voices');
+    state.voicesNames = voices.map(v => v.name);
 
-  if (state.pipelineEnabled) {
-    // Pipeline mode: load characters from the ledger
-    await loadPipelineCharacters();
-  } else {
-    // Legacy mode: load voice caches and render voice cards
-    await loadLegacyVoices(voices);
+    // Track the narrator's TTS voice (the NARRATOR row's `voice` column),
+    // falling back to the default when the row is missing.
+    const narratorRow = voices.find(v => v.id === 'NARRATOR');
+    currentNarratorVoice = narratorRow?.voice || NARRATOR_DEFAULT_VOICE;
+    narratorRowName = narratorRow?.name ?? null;
+
+    renderNarratorSelector();
+    renderVoiceCatalog(voices);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast('Failed to load voices: ' + msg, 'error');
   }
+
+  await loadPipelineCharacters();
 }
 
 /**
  * Load characters from the pipeline and render the character ledger.
- * Called when state.pipelineEnabled is true.
  */
 async function loadPipelineCharacters(): Promise<void> {
-  const pipelineNotice = document.getElementById('pipeline-voices-disabled-notice');
   const pipelineSection = document.getElementById('pipeline-voices-section');
-  const legacySection = document.getElementById('legacy-voices-section');
-
-  // Show pipeline section, hide legacy
-  if (pipelineNotice) pipelineNotice.style.display = 'none';
   if (pipelineSection) pipelineSection.style.display = '';
-  if (legacySection) legacySection.style.display = 'none';
 
   const bookId = state.pipelineBookId;
   if (!bookId) {
@@ -252,176 +332,16 @@ async function loadPipelineCharacters(): Promise<void> {
   }
 }
 
-/**
- * Load legacy voice caches and render voice cards.
- * Called when state.pipelineEnabled is false.
- * @param voices - Pre-loaded voices from /api/voices
- */
-async function loadLegacyVoices(voices: Voice[]): Promise<void> {
-  // Load voice caches for dropdowns
-  try {
-    state.designedVoices = await API.get('/api/voice_design/list');
-  } catch (e) { /* ignore if designer not available */ }
-  try {
-    state.cloneVoices = await API.get('/api/clone_voices/list');
-  } catch (e) { /* ignore if no uploads */ }
-  try {
-    state.loraModels = await API.get('/api/lora/models');
-  } catch (e) { /* ignore if no adapters */ }
-
-  const pipelineNotice = document.getElementById('pipeline-voices-disabled-notice');
-  const pipelineSection = document.getElementById('pipeline-voices-section');
-  const legacySection = document.getElementById('legacy-voices-section');
-
-  // Show legacy section, hide pipeline
-  if (pipelineNotice) pipelineNotice.style.display = '';
-  if (pipelineSection) pipelineSection.style.display = 'none';
-  if (legacySection) legacySection.style.display = '';
-
-  const container = document.getElementById('voices-list');
-  if (!container) return;
-
-  if (voices.length === 0) {
-    container.innerHTML = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
-    return;
-  }
-
-  container.innerHTML = voices.map((v, i) => createVoiceCard(v, i)).join('');
-
-  // If any voice has no saved config, save defaults immediately
-  if (voices.some(v => !v.config || Object.keys(v.config).length === 0)) {
-    debouncedSaveVoices();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Voice config collection and saving (preserved from previous version)
-// ---------------------------------------------------------------------------
-
-/**
- * Collect voice configuration from all voice cards in the DOM.
- * Reads voice card DOM elements and builds a config object keyed by voice name.
- * Each voice config includes type-specific fields and optional alias_of.
- * @returns Voice configuration map ready for saving
- */
-function collectVoiceConfig(): VoiceConfigMap {
-  const cards = document.querySelectorAll<HTMLElement>('.voice-card');
-  const config: VoiceConfigMap = {};
-
-  cards.forEach(card => {
-    const name = card.dataset.voice;
-    if (!name) return;
-
-    const aliasSelect = card.querySelector<HTMLSelectElement>('.alias-select');
-    const alias = aliasSelect ? aliasSelect.value : '';
-    const typeRadio = card.querySelector<HTMLInputElement>('.voice-type:checked');
-    if (!typeRadio) return;
-    const type = typeRadio.value;
-
-    if (type === 'custom') {
-      const voiceSelect = card.querySelector<HTMLSelectElement>('.voice-select');
-      const characterStyle = card.querySelector<HTMLInputElement>('.character-style');
-      config[name] = {
-        type: 'custom',
-        voice: voiceSelect?.value || '',
-        character_style: characterStyle?.value || '',
-        seed: '-1',
-      };
-    } else if (type === 'clone') {
-      const refText = card.querySelector<HTMLInputElement>('.ref-text');
-      const refAudio = card.querySelector<HTMLInputElement>('.ref-audio');
-      config[name] = {
-        type: 'clone',
-        ref_text: refText?.value || '',
-        ref_audio: refAudio?.value || '',
-        seed: '-1',
-      };
-    } else if (type === 'builtin_lora') {
-      const builtinLoraSelect = card.querySelector<HTMLSelectElement>('.builtin-lora-select');
-      const builtinLoraStyle = card.querySelector<HTMLInputElement>('.builtin-lora-style');
-      const adapterId = builtinLoraSelect?.value || '';
-      const adapterEntry = state.loraModels.find(m => m.id === adapterId);
-      config[name] = {
-        type: 'builtin_lora',
-        adapter_id: adapterId,
-        adapter_path: adapterEntry?.adapter_path || '',
-        character_style: builtinLoraStyle?.value || '',
-        seed: '-1',
-      };
-    } else if (type === 'lora') {
-      const loraAdapterSelect = card.querySelector<HTMLSelectElement>('.lora-adapter-select');
-      const loraCharacterStyle = card.querySelector<HTMLInputElement>('.lora-character-style');
-      const adapterId = loraAdapterSelect?.value || '';
-      const adapterEntry = state.loraModels.find(m => m.id === adapterId);
-      config[name] = {
-        type: 'lora',
-        adapter_id: adapterId,
-        adapter_path: adapterEntry?.adapter_path || (adapterId ? `lora_models/${adapterId}` : ''),
-        character_style: loraCharacterStyle?.value || '',
-        seed: '-1',
-      };
-    } else if (type === 'design') {
-      const designDescription = card.querySelector<HTMLInputElement>('.design-description');
-      config[name] = {
-        type: 'design',
-        description: designDescription?.value || '',
-        seed: '-1',
-      };
-    }
-
-    // Include alias_of if set
-    if (alias && config[name]) {
-      config[name].alias_of = alias;
-    }
-  });
-
-  return config;
-}
-
-/**
- * Debounced save of voice configuration to the server.
- * Shows "unsaved" status immediately, then waits 800ms before saving.
- * POSTs collected voice config to /api/save_voice_config.
- * Shows "saved" status on success, "save failed" on error.
- */
-export function debouncedSaveVoices(): void {
-  const statusEl = document.getElementById('voice-save-status');
-  if (statusEl) {
-    statusEl.innerHTML = '<i class="fas fa-circle text-warning" style="font-size:0.5em;"></i> unsaved';
-  }
-
-  if (voiceSaveTimer) {
-    clearTimeout(voiceSaveTimer);
-  }
-
-  voiceSaveTimer = setTimeout(async () => {
-    const cards = document.querySelectorAll('.voice-card');
-    if (cards.length === 0) return;
-
-    try {
-      const config = collectVoiceConfig();
-      await API.post('/api/save_voice_config', config);
-      if (statusEl) {
-        statusEl.innerHTML = '<i class="fas fa-check text-success me-1"></i>saved';
-        setTimeout(() => {
-          if (statusEl) statusEl.innerHTML = '';
-        }, 2000);
-      }
-    } catch (e) {
-      if (statusEl) {
-        statusEl.innerHTML = '<i class="fas fa-times text-danger me-1"></i>save failed';
-      }
-    }
-  }, 800);
-}
-
 // ---------------------------------------------------------------------------
 // Character voice assignment handlers
 // ---------------------------------------------------------------------------
 
 /**
  * Handle a character voice assignment change.
- * Updates the local assignment map and re-renders the character card.
+ * Updates the local assignment map, re-renders the character card, and
+ * persists the assignment to the pipeline API
+ * (PUT /api/pipeline/characters/{id}/voice).
+ *
  * @param characterId - The character ID
  * @param voiceName - The selected voice name (empty string = unassigned)
  */
@@ -432,7 +352,7 @@ export function handleCharacterVoiceChange(characterId: string, voiceName: strin
     characterVoiceAssignments.delete(characterId);
   }
 
-  // Update the card's assigned voice display
+  // Update the card's assigned voice display (immediate UX feedback)
   const card = document.querySelector(`.character-card[data-character-id="${characterId}"]`);
   if (card) {
     const voiceBadge = card.querySelector('.col-md-2');
@@ -445,8 +365,15 @@ export function handleCharacterVoiceChange(characterId: string, voiceName: strin
     }
   }
 
-  // Trigger debounced save
-  debouncedSaveVoices();
+  // Persist to the pipeline character voice endpoint
+  API.put(`/api/pipeline/characters/${characterId}/voice`, {
+    voice_assignment_id: voiceName || null,
+  }).then(() => {
+    showToast(`Voice assigned: ${voiceName || '(cleared)'}`, 'success');
+  }).catch((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to save voice assignment: ${msg}`, 'error');
+  });
 }
 
 /**
@@ -458,6 +385,36 @@ export function getCharacterVoiceAssignments(): Map<string, string> {
 }
 
 /**
+ * Get the current narrator TTS voice name.
+ * @returns The narrator voice from the last voices load (default 'Ryan').
+ */
+export function getCurrentNarratorVoice(): string {
+  return currentNarratorVoice;
+}
+
+/**
+ * Handle a narrator voice selection change.
+ * Keeps the local value in sync so the UI reflects the chosen voice
+ * immediately, then persists to the pipeline API
+ * (PUT /api/pipeline/voices/NARRATOR). Only the `voice` field is sent — the
+ * backend's exclude_unset handling preserves the rest of the NARRATOR row.
+ *
+ * @param voiceName - The selected TTS voice name
+ */
+export function handleNarratorVoiceChange(voiceName: string): void {
+  if (!voiceName) return;
+
+  currentNarratorVoice = voiceName;
+
+  API.put('/api/pipeline/voices/NARRATOR', { voice: voiceName }).then(() => {
+    showToast(`Narrator voice set to ${voiceName}`, 'success');
+  }).catch((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to update narrator voice: ${msg}`, 'error');
+  });
+}
+
+/**
  * Get the cached characters.
  * @returns Array of characters from the last pipeline load
  */
@@ -465,33 +422,45 @@ export function getCachedCharacters(): Character[] {
   return [...cachedCharacters];
 }
 
-// ---------------------------------------------------------------------------
-// Voice type toggle (preserved for legacy voice cards)
-// ---------------------------------------------------------------------------
-
 /**
- * Toggle voice type options visibility within a voice card.
- * Shows/hides the appropriate options section based on the selected voice type.
- * Triggers auto-save after toggling.
- * @param radio - The selected radio button element
+ * Preview a voice by generating audio and playing it.
+ * Calls POST /api/pipeline/voices/{voice_id}/preview with sample text.
+ * @param voiceId - The voice ID to preview
+ * @param button - The button element (for loading state)
  */
-function toggleVoiceType(radio: HTMLInputElement): void {
-  const cardBody = radio.closest('.card-body');
-  if (!cardBody) return;
+export async function previewVoice(voiceId: string, button: HTMLButtonElement): Promise<void> {
+  const originalHtml = button.innerHTML;
+  const icon = button.querySelector('i');
 
-  const customOpts = cardBody.querySelector<HTMLElement>('.custom-opts');
-  const builtinLoraOpts = cardBody.querySelector<HTMLElement>('.builtin-lora-opts');
-  const cloneOpts = cardBody.querySelector<HTMLElement>('.clone-opts');
-  const loraOpts = cardBody.querySelector<HTMLElement>('.lora-opts');
-  const designOpts = cardBody.querySelector<HTMLElement>('.design-opts');
+  // Show loading state
+  button.disabled = true;
+  button.classList.add('disabled');
+  if (icon) {
+    icon.className = 'fas fa-spinner fa-spin me-1';
+  }
 
-  if (customOpts) customOpts.style.display = radio.value === 'custom' ? 'block' : 'none';
-  if (builtinLoraOpts) builtinLoraOpts.style.display = radio.value === 'builtin_lora' ? 'block' : 'none';
-  if (cloneOpts) cloneOpts.style.display = radio.value === 'clone' ? 'block' : 'none';
-  if (loraOpts) loraOpts.style.display = radio.value === 'lora' ? 'block' : 'none';
-  if (designOpts) designOpts.style.display = radio.value === 'design' ? 'block' : 'none';
+  try {
+    const response = await API.post<{ audio_url: string; voice_id: string }>(
+      `/api/pipeline/voices/${encodeURIComponent(voiceId)}/preview`,
+      { sample_text: 'This is a preview of the voice.' }
+    );
 
-  debouncedSaveVoices();
+    // Play the audio
+    const audio = new Audio(response.audio_url);
+    audio.play().catch((err) => {
+      showToast(`Failed to play preview: ${err.message}`, 'error');
+    });
+
+    showToast('Preview generated successfully', 'success');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    showToast(`Failed to generate preview: ${msg}`, 'error');
+  } finally {
+    // Restore button state
+    button.disabled = false;
+    button.classList.remove('disabled');
+    button.innerHTML = originalHtml;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -501,16 +470,24 @@ function toggleVoiceType(radio: HTMLInputElement): void {
 /**
  * Initialize the Voices tab.
  * Attaches event listeners for:
- *   - Character voice assignment dropdowns (pipeline mode)
- *   - Voice type radio buttons (legacy mode)
- *   - Auto-save on voice card changes (legacy mode)
+ *   - Narrator voice selection dropdown (#narrator-voice-select change)
+ *   - Character voice assignment dropdowns (#character-ledger, delegated change)
+ *   - Voice catalog preview buttons (#voice-catalog, delegated click on
+ *     [data-action="preview-voice"])
  *
- * Shows character ledger when state.pipelineEnabled is true;
- * otherwise shows legacy voice cards with a notice about pipeline mode.
+ * Loads available TTS voices and the character ledger on init.
  */
 export function initVoices(): void {
   document.addEventListener('DOMContentLoaded', () => {
-    // ----- Pipeline mode: character voice assignment -----
+    // ----- Narrator voice selection -----
+    const narratorSelect = document.getElementById('narrator-voice-select') as HTMLSelectElement | null;
+    if (narratorSelect) {
+      narratorSelect.addEventListener('change', () => {
+        handleNarratorVoiceChange(narratorSelect.value);
+      });
+    }
+
+    // ----- Character voice assignment -----
     const characterLedger = document.getElementById('character-ledger');
     if (characterLedger) {
       characterLedger.addEventListener('change', (e) => {
@@ -525,74 +502,19 @@ export function initVoices(): void {
       });
     }
 
-    // ----- Legacy mode: voice type radio buttons and clone/design actions -----
-    const voicesList = document.getElementById('voices-list');
-    if (voicesList) {
-      voicesList.addEventListener('change', (e) => {
+    // ----- Voice preview -----
+    // Event delegation: any [data-action="preview-voice"] button inside the
+    // voice catalog triggers a preview of its data-voice-id voice.
+    const voiceCatalog = document.getElementById('voice-catalog');
+    if (voiceCatalog) {
+      voiceCatalog.addEventListener('click', (e) => {
         const target = e.target as HTMLElement;
-        const actionEl = target.closest('[data-action]') as HTMLElement;
-        
-        if (actionEl) {
-          const action = actionEl.dataset.action;
-          
-          // Handle voice type radio button changes
-          if (action === 'toggle-voice-type' && (target as HTMLInputElement).type === 'radio') {
-            toggleVoiceType(target as HTMLInputElement);
-            return;
+        const button = target.closest('[data-action="preview-voice"]') as HTMLButtonElement | null;
+        if (button) {
+          const voiceId = button.dataset.voiceId;
+          if (voiceId) {
+            previewVoice(voiceId, button);
           }
-          
-          // Handle designed voice select
-          if (action === 'designed-voice-select') {
-            // TODO: Implement onDesignedVoiceSelect functionality
-            console.warn('designed-voice-select action not yet implemented');
-            return;
-          }
-        }
-        
-        // Any other change in voices-list triggers auto-save
-        debouncedSaveVoices();
-      });
-
-      // Input events also trigger auto-save
-      voicesList.addEventListener('input', () => {
-        debouncedSaveVoices();
-      });
-
-      // Click events for clone/design buttons
-      voicesList.addEventListener('click', (e) => {
-        const target = e.target as HTMLElement;
-        const actionEl = target.closest('[data-action]') as HTMLElement;
-        if (!actionEl) return;
-
-        const action = actionEl.dataset.action;
-        
-        switch (action) {
-          case 'upload-clone-voice':
-            // TODO: Implement uploadCloneVoice functionality
-            console.warn('upload-clone-voice action not yet implemented');
-            break;
-          case 'play-clone-voice':
-            // TODO: Implement playCloneVoice functionality
-            console.warn('play-clone-voice action not yet implemented');
-            break;
-          case 'delete-clone-voice':
-            // TODO: Implement deleteCloneVoice functionality
-            console.warn('delete-clone-voice action not yet implemented');
-            break;
-          case 'open-voice-design-editor':
-            // TODO: Implement openVoiceDesignEditor functionality
-            console.warn('open-voice-design-editor action not yet implemented');
-            break;
-        }
-      });
-
-      // Change events for file inputs
-      voicesList.addEventListener('change', (e) => {
-        const target = e.target as HTMLElement;
-        const actionEl = target.closest('[data-action="handle-clone-voice-upload"]') as HTMLElement;
-        if (actionEl) {
-          // TODO: Implement handleCloneVoiceUpload functionality
-          console.warn('handle-clone-voice-upload action not yet implemented');
         }
       });
     }

@@ -79,7 +79,7 @@ JOIN book ON book_chapter.parent_id = book.id;
 - `character_scene(character_id FK, scene_id FK, relation_type CHECK(present|speaker), source, confidence, human_override)`
 - `character_span(character_id FK, span_id FK, relation_type CHECK(speaker|mentioned|present), source, confidence, human_override)`
 - `voice_config(id TEXT PK, name TEXT, description TEXT, type TEXT DEFAULT 'custom', voice TEXT, character_style TEXT, seed TEXT DEFAULT '-1', ref_audio TEXT, ref_text TEXT, adapter_id TEXT, adapter_path TEXT, alias_of TEXT)`
-  **Notes:** Schema extended in Plan O (Voice Workflow Parity) to include all 11 fields from `VoiceConfigItem` model. Supports 5 voice types: custom, clone, builtin_lora, lora, design.
+  **Notes:** Schema extended in Plan O (Voice Workflow Parity) from 3 columns (id, name, description) to 12 columns. The 12 DB columns map to the `VoiceConfigItem` Pydantic model (11 fields) plus `id` and `name` which are DB-only. `default_style` is a backward-compat Pydantic alias for `character_style` and is NOT stored in the DB. Supports 5 voice types: custom, clone, builtin_lora, lora, design. Migration: `scripts/migrate_voice_config_schema.py` (idempotent ALTER TABLE).
 
 ## Extraction
 
@@ -254,6 +254,10 @@ def render_audiobook(book_id: str, storage: PipelineStorage, tts_engine: object,
 # Returns job_id
 ```
 
+**_build_voice_config behavior (Plan D, Phase 1):** Queries all 12 columns from `voice_config` table (id, name, description, type, voice, character_style, seed, ref_audio, ref_text, adapter_id, adapter_path, alias_of) and returns complete voice config dicts. Voice type is no longer hardcoded to "custom" — it comes from the DB `type` column, enabling TTSEngine to route to clone/design/LoRA/builtin_lora/custom methods based on actual voice configuration.
+
+**Narrator voice configurability (Plan F, Phase 2):** The NARRATOR voice is configurable via the `voice_config` table. `_build_voice_config` queries for `id='NARRATOR'` and uses the DB row if present (all 10 voice config fields). Falls back to the hardcoded `NARRATOR_VOICE` constant (type=custom, voice=Ryan) if no DB row exists. The seed script `scripts/seed_voice_catalog.py` inserts a NARRATOR row by default (configurable via `--narrator-voice` flag).
+
 ## Review Manager
 
 ### ReviewManager
@@ -288,17 +292,67 @@ def get_book_version(book_id: str, storage: PipelineStorage) -> int
 POST /api/pipeline/onboard
 POST /api/pipeline/run_walk
 POST /api/pipeline/run_all_walks
+POST /api/pipeline/cancel_walks          ← Plan P (background walk cancellation)
 GET  /api/pipeline/walk_status/{book_id}
 GET  /api/pipeline/characters/{book_id}
+PUT  /api/pipeline/characters/{id}/voice ← Plan E (character voice assignment)
 GET  /api/pipeline/review/{book_id}
 POST /api/pipeline/review/accept
 POST /api/pipeline/review/reject
 POST /api/pipeline/review/override
 POST /api/pipeline/operation
+PUT  /api/pipeline/span/{span_id}/text   ← Plan P (span text editing)
 GET  /api/pipeline/export/{book_id}
 POST /api/pipeline/render
+GET  /api/pipeline/render_status/{job_id} ← Plan P (render status polling)
+POST /api/pipeline/cancel_render         ← Plan P (render cancellation)
+GET  /api/pipeline/download/{job_id}     ← Plan P (audiobook download)
+POST /api/pipeline/merge                 ← Plan P (chunk merge to M4B)
 POST /api/pipeline/reonboard
+GET  /api/pipeline/voices                ← Plan O (voice catalog CRUD)
+POST /api/pipeline/voices                ← Plan O (voice catalog CRUD)
+PUT  /api/pipeline/voices/{id}           ← Plan O (voice catalog CRUD)
+DELETE /api/pipeline/voices/{id}         ← Plan O (voice catalog CRUD)
+POST /api/pipeline/voices/{id}/preview   ← Plan O (voice preview generation)
 ```
+
+### Character Voice Assignment (Plan E)
+
+#### PUT /api/pipeline/characters/{id}/voice
+
+Set or clear a character's voice assignment.
+
+**Request body:**
+```json
+{
+  "voice_assignment_id": "voice-id"  // optional, null to clear
+}
+```
+
+**Response (200):**
+```json
+{
+  "id": "character-uuid",
+  "name": "Alice",
+  "aliases": "[\"Ally\",\"Aly\"]",
+  "voice_assignment_id": "ryan",
+  "description": "..."
+}
+```
+
+**Error codes:**
+- `404` — Character not found
+- `400` — Invalid voice_assignment_id (voice config does not exist in voice_config table)
+
+**Implementation:** `app/pipeline/api_characters.py`
+- `CharacterVoiceUpdateRequest` Pydantic model with `voice_assignment_id: Optional[str] = None`
+- Endpoint flow: (1) query character by id → 404 if not found, (2) if voice_assignment_id provided, verify voice_config row exists → 400 if invalid, (3) UPDATE character SET voice_assignment_id, (4) return updated character
+- Registered in `app/pipeline/api.py` via `include_router`
+
+**Frontend integration:** `frontend/src/tabs/voices.ts` `handleCharacterVoiceChange`
+- Always calls `API.put('/api/pipeline/characters/{characterId}/voice', { voice_assignment_id: voiceName || null })`
+- Shows success toast on success, error toast on failure
+- Local assignment Map update and character-card badge update preserved for immediate UX feedback
 
 ## Config
 
@@ -512,15 +566,135 @@ POST /api/pipeline/render           — render an audiobook from the pipeline's 
 Dependency injection:
 ```python
 def get_tts_engine() -> object | None
-# Returns the TTS engine from project_manager.get_engine().
-# Uses a lazy import of app.app.project_manager at call time to avoid
-# circular imports (app.app imports app.pipeline.api at module level).
+# Returns the TTS engine from app.engine.get_tts_engine().
+# Uses a lazy import of app.engine at call time to avoid circular imports
+# (app.app imports app.pipeline.api at module level).
 # Tests override this via FastAPI dependency_overrides.
+```
+
+**Engine factory — `app/engine.py`** (introduced in Plan Q; `app/project.py` is deleted):
+```python
+def get_tts_engine() -> object | None
+# Module-level _tts_engine cache. Config path: ALEXANDRIA_CONFIG_PATH env or
+# app/config.json (identical resolution to the legacy engine factory).
+# Returns TTSEngine(config) from app.tts on success, None on failure.
+
+def reset_tts_engine() -> None
+# Sets the module cache to None (tears down the cached engine).
+```
+All non-pipeline engine consumers in app/app.py (voice_design preview, lora generate_dataset/train/test/preview, dataset_builder generate_sample/generate_batch) call `app.engine.get_tts_engine()` / `reset_tts_engine()` directly; behavior unchanged.
+
+#### Module: `app/pipeline/api_voices.py`
+Voice catalog CRUD endpoints (Plan O).
+
+Endpoints:
+```
+GET    /api/pipeline/voices          — list all voice configs (optional type filter)
+POST   /api/pipeline/voices          — create a new voice config
+PUT    /api/pipeline/voices/{id}     — partial update of an existing voice config
+DELETE /api/pipeline/voices/{id}     — delete a voice config
+```
+
+Request/Response shapes:
+```python
+# GET /api/pipeline/voices
+# Query params: type (optional) — filter by voice type
+# Response: list[dict] — each dict contains all 12 voice_config columns
+# Example: [{"id": "ryan", "name": "Ryan", "type": "custom", ...}]
+
+# POST /api/pipeline/voices
+# Request body: VoiceCreateRequest
+{
+    "id": "optional-explicit-id",  # Optional, derived from name if omitted
+    "name": "Voice Name",          # Required
+    "description": "Description",  # Optional
+    "type": "custom",              # Optional, default "custom"
+                                   # Valid: custom, clone, builtin_lora, lora, design
+    "voice": "BaseVoice",          # Optional
+    "character_style": "cheerful", # Optional
+    "seed": "42",                  # Optional, default "-1"
+    "ref_audio": "/path/to/ref.wav", # Optional
+    "ref_text": "Reference text",  # Optional
+    "adapter_id": "adapter-1",     # Optional
+    "adapter_path": "/path/to/adapter", # Optional
+    "alias_of": "canonical-id"     # Optional
+}
+# Response: 201 Created — returns created voice config dict (all 12 columns)
+# Error: 409 Conflict — if voice with same id already exists
+# Error: 422 Unprocessable Entity — if type is invalid or name is missing
+
+# PUT /api/pipeline/voices/{voice_id}
+# Request body: VoiceUpdateRequest — all fields Optional
+{
+    "name": "New Name",            # Optional
+    "description": "New desc",     # Optional
+    "type": "clone",               # Optional (must be valid type if provided)
+    "voice": "NewBase",            # Optional
+    "character_style": "warm",     # Optional
+    "seed": "99",                  # Optional
+    "ref_audio": "/new/ref.wav",   # Optional
+    "ref_text": "New text",        # Optional
+    "adapter_id": "adapter-2",     # Optional
+    "adapter_path": "/new/path",   # Optional
+    "alias_of": "other-id"         # Optional
+}
+# Only fields explicitly present in the request body are updated.
+# Setting a field to null clears it.
+# Response: 200 OK — returns updated voice config dict (all 12 columns)
+# Error: 404 Not Found — if voice_id does not exist
+# Error: 422 Unprocessable Entity — if type is invalid
+
+# DELETE /api/pipeline/voices/{voice_id}
+# Response: 204 No Content — no response body
+# Error: 404 Not Found — if voice_id does not exist
+
+# POST /api/pipeline/voices/{voice_id}/preview
+# Request body: VoicePreviewRequest
+{
+    "sample_text": "This is a preview of the voice."  # Required
+}
+# Response: 200 OK
+{
+    "audio_url": "/designed_voices/previews/{voice_id}.wav",
+    "voice_id": "voice-id"
+}
+# Error: 404 Not Found — if voice_id does not exist
+# Error: 503 Service Unavailable — if TTS engine is not available
+# Error: 500 Internal Server Error — if TTS generation fails
+
+# Audio Serving:
+# Preview audio files are saved to designed_voices/previews/{voice_id}.wav
+# and served via the existing /designed_voices static mount in app/app.py.
+# The voice_id is sanitized to prevent path traversal (slashes, backslashes,
+# and ".." are replaced with underscores).
+```
+
+Frontend integration:
+```typescript
+// Preview button appears on each voice card in frontend/src/tabs/voices.ts
+// Button has data-action="preview-voice" and data-voice-id attributes
+// Click handler in frontend/src/tabs/voices.ts:
+// 1. Shows loading state (disabled button, spinner icon)
+// 2. Calls POST /api/pipeline/voices/{voiceId}/preview with sample text
+// 3. Plays returned audio_url via HTML5 Audio element: new Audio(audio_url).play()
+// 4. Shows success/error toasts
+// 5. Restores button state in finally block
+```
+
+Error codes summary:
+- **404 Not Found**: PUT/DELETE on non-existent voice_id
+- **409 Conflict**: POST with duplicate voice id
+- **422 Unprocessable Entity**: Invalid voice type or missing required fields (Pydantic validation)
+
+Dependency injection:
+```python
+# Uses get_storage from api_onboard (same as other pipeline modules)
+# Tests override via FastAPI dependency_overrides with InMemorySQLiteAdapter
 ```
 
 #### Thin entry point: `app/pipeline/api.py`
 
-`api.py` is the thin entry point that combines all 5 sub-routers into a
+`api.py` is the thin entry point that combines all sub-routers into a
 single `router` export. It has NO prefix of its own — each sub-router
 already declares `prefix="/api/pipeline"` and `tags=["pipeline"]`, so
 including them directly preserves their routes as-is.
@@ -532,6 +706,8 @@ from app.pipeline.api_walks import router as _walks_router
 from app.pipeline.api_operations import router as _operations_router
 from app.pipeline.api_review import router as _review_router
 from app.pipeline.api_export import router as _export_router
+from app.pipeline.api_characters import router as _characters_router
+from app.pipeline.api_voices import router as _voices_router
 
 # Re-export dependencies for backward compatibility with tests
 from app.pipeline.api_onboard import get_storage, extract_epub_text, populate_spine
@@ -546,6 +722,8 @@ router.include_router(_walks_router)
 router.include_router(_operations_router)
 router.include_router(_review_router)
 router.include_router(_export_router)
+router.include_router(_characters_router)
+router.include_router(_voices_router)
 ```
 
 `app/app.py` imports `router` from `api.py` unchanged:
@@ -555,6 +733,122 @@ from app.pipeline.api import router as pipeline_router
 
 This preserves backward compatibility — no changes needed in the app
 entry point or in test imports that reference `app.pipeline.api.*`.
+
+## Regression Tests (Plan O — Voice Workflow Parity)
+
+All regression tests added by Plan O (Voice Workflow Parity). Coverage proves
+voice type routing, manual character voice assignment, voice catalog CRUD,
+preview generation, and narrator configurability end-to-end (backend API/DB →
+TTS engine → frontend persistence). Plan H named some tests generically (e.g.
+`test_voice_catalog_crud`, `test_voice_preview_generation`); the real class and
+method names below are authoritative.
+
+### Backend: `tests/pipeline/test_tts_integration.py`
+
+- `TestVoiceTypeRouting::test_voice_type_routing` — seeds one voice per type
+  (custom, clone, builtin_lora, lora, design), calls `render_audiobook`, and
+  asserts the `voice_config` delivered to the engine carries the correct `type`
+  plus type-specific fields per speaker (clone → `ref_audio`/`ref_text`;
+  lora/builtin_lora → `adapter_path`; lora also `character_style`; design →
+  `description`). Proves the TTSEngine dispatch contract: clone →
+  `generate_clone_voice`, lora/builtin_lora → `generate_lora_voice`, design →
+  `generate_design_voice`, custom → `generate_custom_voice`.
+- `TestNarratorFromDatabase::test_narrator_voice_from_db_overrides_constant` —
+  a `NARRATOR` row in `voice_config` wins over the hardcoded `NARRATOR_VOICE`
+  constant (all DB values used, including type-specific fields).
+- `TestNarratorFromDatabase::test_narrator_fallback_to_constant_when_not_in_db` —
+  with no `NARRATOR` row, `_build_voice_config` falls back to the `NARRATOR_VOICE`
+  constant (type `custom`, voice `Ryan`).
+- `TestCloneVoiceIntegration::test_clone_voice_type_flows_to_tts_engine` —
+  `render_audiobook` resolves a character's assigned voice via
+  `voice_assignment_id` and passes clone type-specific fields to the engine.
+- `TestCloneVoiceIntegration::test_clone_voice_individual_mode` — the assigned
+  voice also flows through individual (non-batch) `generate_voice` calls.
+
+### Backend: `tests/pipeline/test_characters.py`
+
+- `TestUpdateCharacterVoice::test_set_voice_assignment` — `PUT
+  /api/pipeline/characters/{id}/voice` persists `voice_assignment_id` in the DB
+  and returns the updated character. (Plan H named this
+  `test_manual_character_voice_assignment`; the persistence half lives here, the
+  render half in `TestCloneVoiceIntegration` above.)
+- `TestUpdateCharacterVoice::test_clear_voice_assignment` — empty assignment
+  clears the DB column; `test_invalid_voice_id_returns_400` — unknown voice id →
+  400; `test_returns_all_character_fields` — response contains the full
+  character shape.
+- `TestUpdateCharacterVoiceNotFound` — 404 for a nonexistent character, checked
+  before voice validation.
+
+### Backend: `tests/pipeline/test_voices.py`
+
+- `TestVoiceCRUDIntegration::test_full_crud_flow` / `test_crud_with_filter` —
+  full GET/POST/PUT/DELETE lifecycle with DB-state assertions after each
+  operation. (Plan H named this `test_voice_catalog_crud`; the real class is
+  `TestVoiceCRUDIntegration`.)
+- `TestListVoicesEndpoint` — lists all voices with all 12 `voice_config`
+  columns; empty table → empty list. `TestListVoicesFilterByType` — `?type=`
+  filter for each of the 5 voice types; unknown type → empty list.
+- `TestCreateVoiceEndpoint` — create with all fields, explicit id, and minimal
+  fields; duplicate id → 409. `TestCreateVoiceInvalidType` — invalid/empty type
+  or missing name → 422.
+- `TestUpdateVoiceEndpoint` — partial update preserves other fields; null
+  clears a field; invalid type → 422; empty body leaves the row unchanged.
+  `TestUpdateVoiceNotFound` — 404 and no row created.
+- `TestDeleteVoiceEndpoint` — row removed and count reduced; 204 no body.
+  `TestDeleteVoiceNotFound` — 404 for nonexistent/already-deleted id.
+- `TestPreviewVoiceEndpoint::test_preview_returns_audio_url` — `POST
+  /api/pipeline/voices/{id}/preview` writes a wav via the TTS engine and returns
+  the audio URL; `test_preview_audio_file_is_accessible` — the file is served
+  via the `/designed_voices` static mount;
+  `test_preview_tts_engine_none_returns_503` — no engine → 503.
+  `TestPreviewVoiceNotFound` — 404 before the TTS check.
+
+### Backend: seed & migration (`tests/pipeline/`)
+
+- `test_seed_voice_catalog.py::TestSeedDefaultVoices` — seeding inserts the
+  narrator and Ryan default voices. `TestSeedWithSamples` — sample catalog
+  inserts 6 voices covering all types. `TestSeedIdempotency` — re-seeding does
+  not duplicate rows. `TestCustomNarratorVoice` — a custom narrator voice is
+  seeded.
+- `test_voice_config_json_migration.py::TestReadVoiceConfigJson` — legacy
+  `voice_config.json` parsing (valid / empty / invalid / missing / non-dict).
+  `TestMigrationWithSampleData` — JSON → DB migration inserts rows and is
+  idempotent. `TestMigrationEdgeCases` — empty / missing / invalid JSON handled
+  without error.
+- `test_schema_migration.py::TestMigrationOldSchema` — schema migration adds
+  missing `voice_config` columns, preserves existing data, and applies correct
+  defaults. `TestMigrationIdempotency` — migration runs twice without error and
+  is a no-op on the new schema. `TestMigrationEdgeCases` — nonexistent table.
+  `TestIntegrationWithInMemoryAdapter` — migration pattern verified against the
+  in-memory adapter.
+
+### Frontend: `frontend/tests/frontend/test_voices.test.ts`
+
+- Character voice assignment persistence — `handleCharacterVoiceChange` updates
+  the local assignments map, refreshes the character-card voice badge, shows
+  "Unassigned" when cleared, and returns a defensive copy via
+  `getCharacterVoiceAssignments`. The handler issues `PUT
+  /api/pipeline/characters/{id}/voice` (`frontend/src/tabs/voices.ts`), whose DB
+  persistence is proven by `TestUpdateCharacterVoice` above. `initVoices`
+  attaches the change listener to `#character-ledger`; `createCharacterCard`
+  renders the per-character voice dropdown with all available voices.
+- Narrator voice selector (Phase 19) — dropdown renders all available voices
+  (excluding the `NARRATOR` pseudo-row) with the `NARRATOR` row's `voice`
+  selected; change → `PUT /api/pipeline/voices/NARRATOR` with `{voice}`;
+  success/error toasts; falls back to the default narrator voice when no
+  `NARRATOR` row exists.
+- Voice catalog + preview (Phase 23) — `createVoiceCard` renders a card with
+  name, type badge, and preview button per voice (excluding `NARRATOR`); click
+  → `POST /api/pipeline/voices/{id}/preview` with default sample text → returned
+  `audio_url` plays via `new Audio(url).play()`; error path shows a toast and
+  restores the button.
+
+## Legacy API removed in Plan Q
+
+Plan Q deleted the legacy dual-path surface. These endpoints are removed (all now return 404) and the orphan files are deleted; the **Pipeline Router** section above is the only script/voice/render API surface:
+
+- **Deleted endpoints (29):** `GET /api/default_prompts`, `POST /api/upload`, `GET /api/annotated_script`, `POST /api/status/{task_name}`, `GET /api/voices`, `POST /api/cancel_persona`, `POST /api/save_voice_config`, `GET /api/audiobook`, `GET /api/chunks`, `POST /api/chunks/restore`, `POST /api/chunks/{index}`, `POST /api/chunks/{index}/insert`, `DELETE /api/chunks/{index}`, `POST /api/chunks/{index}/generate`, `POST /api/merge`, `POST /api/unload`, `POST /api/export_audacity`, `GET /api/export_audacity`, `POST /api/merge_m4b`, `GET /api/audiobook_m4b`, `POST /api/m4b_cover`, `DELETE /api/m4b_cover`, `POST /api/generate_batch`, `POST /api/generate_batch_fast`, `POST /api/cancel_audio`, `GET /api/scripts`, `POST /api/scripts/save`, `POST /api/scripts/load`, `DELETE /api/scripts/{name}`.
+- **Orphan files deleted:** `app/project.py`, `app/default_prompts.py`, `app/review_prompts.py`, `app/persona_prompts.py`, `default_prompts.txt`, `review_prompts.txt`, `persona_prompts.txt`, `frontend/src/tabs/editor-legacy.ts`, `frontend/src/tabs/audio.ts`.
 
 ## Superseded Contracts (v2 — DO NOT USE)
 - File-based `pipeline_state/` JSON storage

@@ -10,6 +10,12 @@
 
 **Target loss: 4.1-4.2** — this is the sweet spot for voice identity + instruct following + clean audio. Loss 4.1 is the floor; below this, garbling becomes increasingly likely. Note that identical settings can produce slightly different losses between runs, so aim for 4.15-4.2 for a reliable margin.
 
+## Voice Configs & the Engine Factory
+
+- Trained LoRA adapters are referenced from the pipeline's **`voice_config` DB table** (SQLite, `data/pipeline.db`) via `adapter_id` / `adapter_path` — there is no `voice_config.json` file. A voice entry of `type=lora` (or `builtin_lora`) resolves the adapter path for the TTS engine.
+- The TTS engine used for preview/generation is created by the `app/engine.py` factory: `get_tts_engine()` (module-level cache, `ALEXANDRIA_CONFIG_PATH` env or `app/config.json`, lazy `app.tts` import) and `reset_tts_engine()` to tear it down. LoRA training endpoints (`/api/lora/*`) and dataset-builder sample generation call this factory directly.
+- To use a trained adapter, create a voice in the Voices tab with type `LoRA` and select the adapter.
+
 ## Key Principles
 
 - **More data = fewer epochs.** Each epoch teaches more with a larger dataset, so fewer passes are needed before overfitting.

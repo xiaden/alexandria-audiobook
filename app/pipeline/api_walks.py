@@ -9,7 +9,7 @@ Provides HTTP endpoints for running walks and querying walk/character status:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.pipeline.adapter import PipelineStorage
@@ -37,6 +37,12 @@ class RunAllWalksRequest(BaseModel):
 
     book_id: str
     config: dict = {}
+
+
+class CancelWalksRequest(BaseModel):
+    """Request body for POST /api/pipeline/cancel_walks."""
+
+    book_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -76,17 +82,27 @@ router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 @router.post("/run_walk")
 async def run_walk(
     request: RunWalkRequest,
+    background_tasks: BackgroundTasks,
     runner: WalkRunner = Depends(get_walk_runner),
 ) -> dict:
-    """Run a single walk for a book."""
+    """Run a single walk for a book in the background.
+
+    Returns immediately with ``{status: 'started', walk_name: ...}``.
+    The walk runs asynchronously; poll ``GET /walk_status/{book_id}``
+    for progress.
+    """
     if request.walk_name not in WALK_ORDER:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown walk: {request.walk_name}. "
             f"Must be one of {WALK_ORDER}",
         )
-    result = runner.run_walk(request.walk_name, request.book_id, request.config)
-    return result
+    # Clear any previous cancellation flag
+    runner.clear_cancel(request.book_id)
+    background_tasks.add_task(
+        runner.run_walk, request.walk_name, request.book_id, request.config
+    )
+    return {"status": "started", "walk_name": request.walk_name}
 
 
 # ---------------------------------------------------------------------------
@@ -97,11 +113,39 @@ async def run_walk(
 @router.post("/run_all_walks")
 async def run_all_walks(
     request: RunAllWalksRequest,
+    background_tasks: BackgroundTasks,
     runner: WalkRunner = Depends(get_walk_runner),
 ) -> dict:
-    """Run all 9 walks serially for a book."""
-    results = runner.run_all_walks(request.book_id, request.config)
-    return results
+    """Run all 9 walks serially for a book in the background.
+
+    Returns immediately with ``{status: 'started'}``.
+    Poll ``GET /walk_status/{book_id}`` for progress.
+    """
+    # Clear any previous cancellation flag
+    runner.clear_cancel(request.book_id)
+    background_tasks.add_task(
+        runner.run_all_walks, request.book_id, request.config
+    )
+    return {"status": "started"}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/pipeline/cancel_walks
+# ---------------------------------------------------------------------------
+
+
+@router.post("/cancel_walks")
+async def cancel_walks(
+    request: CancelWalksRequest,
+    runner: WalkRunner = Depends(get_walk_runner),
+) -> dict:
+    """Cancel any running walks for a book.
+
+    Sets a cancellation flag that the runner checks before each walk.
+    Returns ``{status: 'cancelled'}``.
+    """
+    runner.cancel_walks(request.book_id)
+    return {"status": "cancelled"}
 
 
 # ---------------------------------------------------------------------------

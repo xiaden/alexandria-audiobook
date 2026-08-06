@@ -11,7 +11,6 @@ import argparse
 import io
 import json
 import sys
-import time
 import requests
 
 # ── Global state ─────────────────────────────────────────────
@@ -77,17 +76,6 @@ def assert_key(data, key):
         raise TestFailure(f"Missing key '{key}' in: {json.dumps(data)[:300]}")
 
 
-def wait_for_task(task, timeout=120, poll_interval=2):
-    """Poll /api/status/{task} until it stops running or timeout is reached."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        r = requests.get(f"{BASE_URL}/api/status/{task}", timeout=10)
-        if r.status_code == 200 and not r.json().get("running"):
-            return True
-        time.sleep(poll_interval)
-    return False
-
-
 def get(path, **kwargs):
     return requests.get(f"{BASE_URL}{path}", timeout=30, **kwargs)
 
@@ -117,8 +105,13 @@ def test_get_config():
     data = r.json()
     assert_key(data, "llm")
     assert_key(data, "tts")
-    # current_file should always be present (may be null)
-    assert_key(data, "current_file")
+    # Legacy prompts/generation/current_file surface removed — must be absent
+    if "prompts" in data:
+        raise TestFailure("Legacy prompts key still present in config response")
+    if "generation" in data:
+        raise TestFailure("Legacy generation key still present in config response")
+    if "current_file" in data:
+        raise TestFailure("Legacy current_file key still present in config response")
 
 
 def test_save_config_roundtrip():
@@ -132,8 +125,6 @@ def test_save_config_roundtrip():
     test_config = {
         "llm": original["llm"],
         "tts": {**original.get("tts", {}), "language": "_test_roundtrip_lang"},
-        "prompts": original.get("prompts"),
-        "generation": original.get("generation"),
     }
     test_config["tts"].setdefault("mode", "external")
     test_config["tts"].setdefault("url", "http://127.0.0.1:7860")
@@ -150,27 +141,16 @@ def test_save_config_roundtrip():
     if readback.get("tts", {}).get("language") != "_test_roundtrip_lang":
         raise TestFailure("Config round-trip failed: language not persisted")
 
-    # Verify generation section persists
-    if original.get("generation") and not readback.get("generation"):
-        raise TestFailure("Config round-trip failed: generation section dropped")
-
-    # Verify review prompts persist through config save
-    readback_prompts = readback.get("prompts", {})
-    if original.get("prompts", {}).get("review_system_prompt"):
-        if not readback_prompts.get("review_system_prompt"):
-            raise TestFailure("Config round-trip failed: review_system_prompt dropped")
-
-    # Verify persona prompts persist through config save
-    if original.get("prompts", {}).get("persona_system_prompt"):
-        if not readback_prompts.get("persona_system_prompt"):
-            raise TestFailure("Config round-trip failed: persona_system_prompt dropped")
+    # Legacy prompts/generation sections must not reappear in the saved config
+    if "prompts" in readback:
+        raise TestFailure("Config round-trip failed: prompts section still present")
+    if "generation" in readback:
+        raise TestFailure("Config round-trip failed: generation section still present")
 
     # Restore original
     restore = {
         "llm": original["llm"],
         "tts": original.get("tts", {"mode": "external", "url": "http://127.0.0.1:7860", "device": "auto"}),
-        "prompts": original.get("prompts"),
-        "generation": original.get("generation"),
     }
     post("/api/config", json=restore)
 
@@ -189,8 +169,6 @@ def test_save_pause_config_roundtrip():
             "pause_between_speakers_ms": 1000,
             "pause_same_speaker_ms": 400,
         },
-        "prompts": original.get("prompts"),
-        "generation": original.get("generation"),
     }
     test_config["tts"].setdefault("mode", "external")
     test_config["tts"].setdefault("url", "http://127.0.0.1:7860")
@@ -213,8 +191,6 @@ def test_save_pause_config_roundtrip():
     restore = {
         "llm": original["llm"],
         "tts": original.get("tts", {"mode": "external", "url": "http://127.0.0.1:7860", "device": "auto"}),
-        "prompts": original.get("prompts"),
-        "generation": original.get("generation"),
     }
     post("/api/config", json=restore)
 
@@ -236,114 +212,6 @@ def test_pause_config_defaults():
         raise TestFailure(f"Invalid pause_same_speaker_ms: {pause_same}")
 
 
-def test_save_review_prompts_roundtrip():
-    # Read current config
-    r = get("/api/config")
-    assert_status(r, 200)
-    original = r.json()
-
-    # Save config with custom review prompts
-    test_config = {
-        "llm": original["llm"],
-        "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
-        "prompts": {
-            **(original.get("prompts") or {}),
-            "review_system_prompt": f"{TEST_PREFIX}review_sys",
-            "review_user_prompt": f"{TEST_PREFIX}review_usr",
-        },
-        "generation": original.get("generation"),
-    }
-    r = post("/api/config", json=test_config)
-    assert_status(r, 200)
-
-    # Read back and verify
-    r = get("/api/config")
-    assert_status(r, 200)
-    readback = r.json()
-    prompts = readback.get("prompts", {})
-    if prompts.get("review_system_prompt") != f"{TEST_PREFIX}review_sys":
-        raise TestFailure(f"review_system_prompt not persisted: {prompts.get('review_system_prompt')}")
-    if prompts.get("review_user_prompt") != f"{TEST_PREFIX}review_usr":
-        raise TestFailure(f"review_user_prompt not persisted: {prompts.get('review_user_prompt')}")
-
-    # Restore original
-    restore = {
-        "llm": original["llm"],
-        "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
-        "prompts": original.get("prompts"),
-        "generation": original.get("generation"),
-    }
-    post("/api/config", json=restore)
-
-
-def test_save_persona_prompts_roundtrip():
-    # Read current config
-    r = get("/api/config")
-    assert_status(r, 200)
-    original = r.json()
-
-    # Save config with custom persona prompts
-    test_config = {
-        "llm": original["llm"],
-        "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
-        "prompts": {
-            **(original.get("prompts") or {}),
-            "persona_system_prompt": f"{TEST_PREFIX}persona_sys",
-            "persona_user_prompt": f"{TEST_PREFIX}persona_usr",
-            "persona_advanced_prompt": f"{TEST_PREFIX}persona_adv",
-        },
-        "generation": original.get("generation"),
-    }
-    r = post("/api/config", json=test_config)
-    assert_status(r, 200)
-
-    # Read back and verify
-    r = get("/api/config")
-    assert_status(r, 200)
-    readback = r.json()
-    prompts = readback.get("prompts", {})
-    if prompts.get("persona_system_prompt") != f"{TEST_PREFIX}persona_sys":
-        raise TestFailure(f"persona_system_prompt not persisted: {prompts.get('persona_system_prompt')}")
-    if prompts.get("persona_user_prompt") != f"{TEST_PREFIX}persona_usr":
-        raise TestFailure(f"persona_user_prompt not persisted: {prompts.get('persona_user_prompt')}")
-    if prompts.get("persona_advanced_prompt") != f"{TEST_PREFIX}persona_adv":
-        raise TestFailure(f"persona_advanced_prompt not persisted: {prompts.get('persona_advanced_prompt')}")
-
-    # Restore original
-    restore = {
-        "llm": original["llm"],
-        "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
-        "prompts": original.get("prompts"),
-        "generation": original.get("generation"),
-    }
-    post("/api/config", json=restore)
-
-
-def test_get_default_prompts():
-    r = get("/api/default_prompts")
-    assert_status(r, 200)
-    data = r.json()
-    assert_key(data, "system_prompt")
-    assert_key(data, "user_prompt")
-    if not data["system_prompt"]:
-        raise TestFailure("system_prompt is empty")
-    assert_key(data, "review_system_prompt")
-    assert_key(data, "review_user_prompt")
-    if not data["review_system_prompt"]:
-        raise TestFailure("review_system_prompt is empty")
-    if not data["review_user_prompt"]:
-        raise TestFailure("review_user_prompt is empty")
-    assert_key(data, "persona_system_prompt")
-    assert_key(data, "persona_user_prompt")
-    assert_key(data, "persona_advanced_prompt")
-    if not data["persona_system_prompt"]:
-        raise TestFailure("persona_system_prompt is empty")
-    if not data["persona_user_prompt"]:
-        raise TestFailure("persona_user_prompt is empty")
-    if not data["persona_advanced_prompt"]:
-        raise TestFailure("persona_advanced_prompt is empty")
-
-
 # ── Section 2b: System Stats ───────────────────────────────
 
 def test_system_stats():
@@ -361,357 +229,16 @@ def test_system_stats():
         raise TestFailure(f"disk.low_space should be bool, got {type(disk['low_space']).__name__}")
 
 
-# ── Section 3: Upload ───────────────────────────────────────
 
-def test_upload_file():
-    content = b"Chapter One\nIt was a dark and stormy night.\nThe end."
-    files = {"file": (f"{TEST_PREFIX}upload.txt", io.BytesIO(content), "text/plain")}
-    r = post("/api/upload", files=files)
-    assert_status(r, 200)
-    data = r.json()
-    assert_key(data, "filename")
-    assert_key(data, "path")
-    if data["filename"] != f"{TEST_PREFIX}upload.txt":
-        raise TestFailure(f"Unexpected filename: {data['filename']}")
 
 
-# ── Section 4: Annotated Script ─────────────────────────────
 
-def test_get_annotated_script():
-    r = get("/api/annotated_script")
-    if r.status_code == 404:
-        shared["has_script"] = False
-        return  # acceptable — no script loaded
-    assert_status(r, 200)
-    data = r.json()
-    if not isinstance(data, list):
-        raise TestFailure(f"Expected list, got {type(data).__name__}")
-    shared["has_script"] = True
-
-
-# ── Section 5: Scripts CRUD ─────────────────────────────────
-
-def test_save_script():
-    if not shared.get("has_script"):
-        raise TestFailure("SKIP: no annotated script loaded")
-    r = post("/api/scripts/save", json={"name": f"{TEST_PREFIX}script"})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "saved":
-        raise TestFailure(f"Expected status=saved, got {data}")
-
-
-def test_list_scripts():
-    r = get("/api/scripts")
-    assert_status(r, 200)
-    data = r.json()
-    if not isinstance(data, list):
-        raise TestFailure(f"Expected list, got {type(data).__name__}")
-    if shared.get("has_script"):
-        names = [s["name"] for s in data]
-        if f"{TEST_PREFIX}script" not in names:
-            raise TestFailure(f"Saved script not in list: {names}")
-
-
-def test_load_script():
-    if not shared.get("has_script"):
-        raise TestFailure("SKIP: no annotated script loaded")
-    r = post("/api/scripts/load", json={"name": f"{TEST_PREFIX}script"})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "loaded":
-        raise TestFailure(f"Expected status=loaded, got {data}")
-
-
-def test_delete_script():
-    if not shared.get("has_script"):
-        raise TestFailure("SKIP: no annotated script loaded")
-    r = delete(f"/api/scripts/{TEST_PREFIX}script")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "deleted":
-        raise TestFailure(f"Expected status=deleted, got {data}")
-
-
-def test_delete_script_404():
-    r = delete(f"/api/scripts/{TEST_PREFIX}nonexistent_xyz")
-    assert_status(r, 404)
-
-
-# ── Section 6: Voices ───────────────────────────────────────
-
-def test_get_voices():
-    r = get("/api/voices")
-    assert_status(r, 200)
-    data = r.json()
-    if not isinstance(data, list):
-        raise TestFailure(f"Expected list, got {type(data).__name__}")
-
-
-def test_save_voice_config():
-    r = post("/api/save_voice_config", json={
-        f"{TEST_PREFIX}voice": {
-            "type": "custom",
-            "voice": "Ryan",
-            "character_style": "",
-            "seed": "-1"
-        }
-    })
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "saved":
-        raise TestFailure(f"Expected status=saved, got {data}")
-
-
-# ── Section 7: Chunks ───────────────────────────────────────
-
-def test_get_chunks():
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    data = r.json()
-    if not isinstance(data, list):
-        raise TestFailure(f"Expected list, got {type(data).__name__}")
-    shared["has_chunks"] = len(data) > 0
-    if data:
-        shared["chunk0_original"] = {
-            "text": data[0].get("text", ""),
-            "instruct": data[0].get("instruct", ""),
-            "speaker": data[0].get("speaker", ""),
-        }
-
-
-def test_update_chunk():
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-
-    r = post("/api/chunks/0", json={
-        "text": f"{TEST_PREFIX}updated_text",
-        "instruct": f"{TEST_PREFIX}instruct"
-    })
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("text") != f"{TEST_PREFIX}updated_text":
-        raise TestFailure(f"Chunk text not updated: {data.get('text')}")
-
-    # Restore original
-    orig = shared.get("chunk0_original", {})
-    post("/api/chunks/0", json=orig)
-
-
-def test_update_chunk_pause_after():
-    """Setting pause_after on a chunk persists and does not reset status."""
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-
-    # Read current chunk 0 status
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    original_status = r.json()[0].get("status")
-
-    # Set pause_after
-    r = post("/api/chunks/0", json={"pause_after": 3000})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("pause_after") != 3000:
-        raise TestFailure(f"pause_after not set: {data.get('pause_after')}")
-
-    # Verify status was NOT reset (pause_after is merge-time only)
-    if data.get("status") != original_status:
-        raise TestFailure(
-            f"Status changed from '{original_status}' to '{data.get('status')}' "
-            f"— pause_after should not reset status"
-        )
-
-    # Read back via GET to confirm persistence
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    chunk0 = r.json()[0]
-    if chunk0.get("pause_after") != 3000:
-        raise TestFailure(f"pause_after not persisted on read-back: {chunk0.get('pause_after')}")
-
-    # Clear pause_after by sending null
-    r = post("/api/chunks/0", json={"pause_after": None})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("pause_after") is not None:
-        raise TestFailure(f"pause_after not cleared: {data.get('pause_after')}")
-
-    # Verify key is removed from JSON (not just set to null)
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    chunk0 = r.json()[0]
-    if "pause_after" in chunk0:
-        raise TestFailure(f"pause_after key should be removed after clearing, got: {chunk0.get('pause_after')}")
-
-
-def test_update_chunk_pause_after_zero():
-    """pause_after=0 is a valid override (no silence)."""
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-
-    r = post("/api/chunks/0", json={"pause_after": 0})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("pause_after") != 0:
-        raise TestFailure(f"pause_after=0 not set correctly: {data.get('pause_after')}")
-
-    # Clean up
-    post("/api/chunks/0", json={"pause_after": None})
-
-
-def test_update_chunk_pause_after_negative():
-    """Negative pause_after should be clamped to 0."""
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-
-    r = post("/api/chunks/0", json={"pause_after": -500})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("pause_after") != 0:
-        raise TestFailure(f"Negative pause_after should clamp to 0, got: {data.get('pause_after')}")
-
-    # Clean up
-    post("/api/chunks/0", json={"pause_after": None})
-
-
-def test_update_chunk_404():
-    r = post("/api/chunks/99999", json={"text": "nope"})
-    assert_status(r, 404)
-
-
-def test_insert_chunk():
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-
-    # Get initial count
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    initial_chunks = r.json()
-    initial_count = len(initial_chunks)
-
-    # Insert after index 0
-    r = post("/api/chunks/0/insert")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "ok":
-        raise TestFailure(f"Expected status=ok, got {data}")
-    if data.get("total") != initial_count + 1:
-        raise TestFailure(f"Expected total={initial_count + 1}, got {data.get('total')}")
-
-    # Verify the new chunk exists at index 1 with empty text
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    chunks = r.json()
-    if len(chunks) != initial_count + 1:
-        raise TestFailure(f"Chunk count mismatch: expected {initial_count + 1}, got {len(chunks)}")
-    if chunks[1].get("text") != "":
-        raise TestFailure(f"Inserted chunk should have empty text, got: {chunks[1].get('text')}")
-
-    # Store index for cleanup in delete test
-    shared["inserted_chunk_index"] = 1
-
-
-def test_insert_chunk_404():
-    r = post("/api/chunks/99999/insert")
-    assert_status(r, 404)
-
-
-def test_delete_chunk():
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-
-    idx = shared.get("inserted_chunk_index")
-    if idx is None:
-        raise TestFailure("SKIP: no inserted chunk to delete")
-
-    # Get count before delete
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    before_count = len(r.json())
-
-    r = delete(f"/api/chunks/{idx}")
-    assert_status(r, 200)
-    data = r.json()
-    assert_key(data, "deleted")
-    assert_key(data, "total")
-    if data["total"] != before_count - 1:
-        raise TestFailure(f"Expected total={before_count - 1}, got {data['total']}")
-
-    # Save deleted chunk for restore test
-    shared["deleted_chunk"] = data["deleted"]
-    shared["deleted_chunk_index"] = idx
-
-
-def test_delete_chunk_invalid():
-    r = delete("/api/chunks/99999")
-    assert_status(r, 400)
-
-
-def test_restore_chunk():
-    if not shared.get("deleted_chunk"):
-        raise TestFailure("SKIP: no deleted chunk to restore")
-
-    r = get("/api/chunks")
-    assert_status(r, 200)
-    before_count = len(r.json())
-
-    r = post("/api/chunks/restore", json={
-        "chunk": shared["deleted_chunk"],
-        "at_index": shared["deleted_chunk_index"]
-    })
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "ok":
-        raise TestFailure(f"Expected status=ok, got {data}")
-    if data.get("total") != before_count + 1:
-        raise TestFailure(f"Expected total={before_count + 1}, got {data.get('total')}")
-
-    # Clean up: delete the restored chunk so we leave chunks as we found them
-    delete(f"/api/chunks/{shared['deleted_chunk_index']}")
-
-
-# ── Section 8: Status Polling ────────────────────────────────
-
-def test_status_known_tasks():
-    task_names = [
-        "script", "audio", "audacity_export",
-        "review", "lora_training", "dataset_gen", "dataset_builder",
-        "persona",
-        "preparer", "batch_preparer"
-    ]
-    for name in task_names:
-        r = get(f"/api/status/{name}")
-        assert_status(r, 200, msg=f"task={name}")
-        data = r.json()
-        if "running" not in data:
-            raise TestFailure(f"Missing 'running' key for task '{name}'")
-        if "logs" not in data:
-            raise TestFailure(f"Missing 'logs' key for task '{name}'")
-
-
-def test_status_unknown_task():
-    r = get(f"/api/status/{TEST_PREFIX}fake_task")
-    assert_status(r, 404)
 
 
 # ── Section: Preparer ─────────────────────────────────────────
 
-def test_preparer_status():
-    r = get("/api/status/preparer")
-    assert_status(r, 200)
-    data = r.json()
-    assert_key(data, "running")
-    assert_key(data, "logs")
-    assert_key(data, "status")
 
 
-def test_batch_preparer_status():
-    r = get("/api/status/batch_preparer")
-    assert_status(r, 200)
-    data = r.json()
-    assert_key(data, "running")
-    assert_key(data, "logs")
-    assert_key(data, "tasks")
 
 
 def test_preparer_cancel_when_idle():
@@ -1014,97 +541,6 @@ def test_dataset_builder_delete_404():
     assert_status(r, 404)
 
 
-# ── Section 13: Persona Generation ──────────────────────────
-
-def test_cancel_persona_not_running():
-    """Cancel endpoint returns idle when not running."""
-    r = post("/api/cancel_persona", json={})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") not in ("idle", "cancelling"):
-        raise TestFailure(f"Expected status idle or cancelling, got {data}")
-
-
-# ── Section 14: Merge / Export ──────────────────────────────
-
-def test_get_audiobook():
-    r = get("/api/audiobook")
-    if r.status_code == 404:
-        return  # acceptable — no audiobook generated yet
-    assert_status(r, 200)
-
-
-def test_get_audiobook_m4b():
-    r = get("/api/audiobook_m4b")
-    if r.status_code == 404:
-        return  # acceptable — no M4B generated yet
-    assert_status(r, 200)
-
-
-def test_get_audacity_export():
-    r = get("/api/export_audacity")
-    if r.status_code == 404:
-        return  # acceptable — no export generated yet
-    assert_status(r, 200)
-
-
-
-def test_generate_chunk():
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-    r = post("/api/chunks/0/generate")
-    assert_status(r, 200)
-
-
-def test_generate_batch():
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-    r = post("/api/generate_batch", json={"indices": [0]})
-    if r.status_code == 400:
-        raise TestFailure("SKIP: audio generation already running")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
-    # Wait for batch to finish so subsequent tests don't conflict
-    if not wait_for_task("audio", timeout=120):
-        raise TestFailure("generate_batch did not complete within 120s")
-
-
-def test_generate_batch_fast():
-    if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
-    # Wait for any prior generation to finish
-    if not wait_for_task("audio", timeout=120):
-        raise TestFailure("SKIP: prior audio generation did not finish in time")
-    r = post("/api/generate_batch_fast", json={"indices": [0]})
-    if r.status_code == 400:
-        raise TestFailure("SKIP: audio generation already running")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
-
-
-def test_cancel_audio():
-    """Cancel endpoint works when nothing is running (resets stuck chunks)."""
-    r = post("/api/cancel_audio", json={})
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") not in ("not_running", "cancelling"):
-        raise TestFailure(f"Expected status not_running or cancelling, got {data}")
-
-
-def test_export_audacity():
-    r = post("/api/export_audacity")
-    if r.status_code == 400:
-        raise TestFailure("SKIP: already running")
-    assert_status(r, 200)
-    data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
-
-
 def test_lora_test_model():
     models = shared.get("lora_models", [])
     if not models:
@@ -1171,50 +607,11 @@ def run_all_tests():
     run_test("save_config_roundtrip", test_save_config_roundtrip)
     run_test("save_pause_config_roundtrip", test_save_pause_config_roundtrip)
     run_test("pause_config_defaults", test_pause_config_defaults)
-    run_test("save_review_prompts_roundtrip", test_save_review_prompts_roundtrip)
-    run_test("save_persona_prompts_roundtrip", test_save_persona_prompts_roundtrip)
-    run_test("get_default_prompts", test_get_default_prompts)
 
     section("System Stats")
     run_test("system_stats", test_system_stats)
 
-    section("Upload")
-    run_test("upload_file", test_upload_file)
-
-    section("Annotated Script")
-    run_test("get_annotated_script", test_get_annotated_script)
-
-    section("Scripts CRUD")
-    run_test("save_script", test_save_script)
-    run_test("list_scripts", test_list_scripts)
-    run_test("load_script", test_load_script)
-    run_test("delete_script", test_delete_script)
-    run_test("delete_script_404", test_delete_script_404)
-
-    section("Voices")
-    run_test("get_voices", test_get_voices)
-    run_test("save_voice_config", test_save_voice_config)
-
-    section("Chunks")
-    run_test("get_chunks", test_get_chunks)
-    run_test("update_chunk", test_update_chunk)
-    run_test("update_chunk_pause_after", test_update_chunk_pause_after)
-    run_test("update_chunk_pause_after_zero", test_update_chunk_pause_after_zero)
-    run_test("update_chunk_pause_after_negative", test_update_chunk_pause_after_negative)
-    run_test("update_chunk_404", test_update_chunk_404)
-    run_test("insert_chunk", test_insert_chunk)
-    run_test("insert_chunk_404", test_insert_chunk_404)
-    run_test("delete_chunk", test_delete_chunk)
-    run_test("delete_chunk_invalid", test_delete_chunk_invalid)
-    run_test("restore_chunk", test_restore_chunk)
-
-    section("Status Polling")
-    run_test("status_known_tasks", test_status_known_tasks)
-    run_test("status_unknown_task", test_status_unknown_task)
-
     section("Preparer")
-    run_test("preparer_status", test_preparer_status)
-    run_test("batch_preparer_status", test_batch_preparer_status)
     run_test("preparer_cancel_when_idle", test_preparer_cancel_when_idle)
     run_test("preparer_list_outputs", test_preparer_list_outputs)
     run_test("preparer_download_404", test_preparer_download_404)
@@ -1257,20 +654,6 @@ def run_all_tests():
     run_test("dataset_builder_delete", test_dataset_builder_delete)
     run_test("dataset_builder_delete_404", test_dataset_builder_delete_404)
 
-    section("Persona Generation")
-    run_test("cancel_persona_not_running", test_cancel_persona_not_running)
-
-    section("Merge / Export")
-    run_test("get_audiobook", test_get_audiobook)
-    run_test("get_audiobook_m4b", test_get_audiobook_m4b)
-    run_test("get_audacity_export", test_get_audacity_export)
-
-    run_test("generate_chunk", test_generate_chunk, requires_full=True)
-    run_test("generate_batch", test_generate_batch, requires_full=True)
-    run_test("generate_batch_fast", test_generate_batch_fast, requires_full=True)
-    run_test("cancel_audio", test_cancel_audio)
-    run_test("export_audacity", test_export_audacity, requires_full=True)
-
     section("LoRA (TTS)")
     run_test("lora_test_model", test_lora_test_model, requires_full=True)
     run_test("lora_generate_dataset", test_lora_generate_dataset, requires_full=True)
@@ -1282,14 +665,9 @@ def run_all_tests():
 # ── Cleanup ──────────────────────────────────────────────────
 
 def cleanup():
-    print(f"\n--- Cleanup ---")
+    print("\n--- Cleanup ---")
     items = []
 
-    try:
-        delete(f"/api/scripts/{TEST_PREFIX}script")
-        items.append("test script")
-    except Exception:
-        pass
 
     try:
         delete(f"/api/dataset_builder/{TEST_PREFIX}builder_proj")
@@ -1322,7 +700,7 @@ def cleanup():
     if items:
         print(f"  Cleaned: {', '.join(items)}")
     else:
-        print(f"  Nothing to clean")
+        print("  Nothing to clean")
 
 
 # ── Main ─────────────────────────────────────────────────────
@@ -1340,7 +718,7 @@ def main():
     BASE_URL = args.url.rstrip("/")
     FULL_MODE = args.full
 
-    print(f"Alexandria API Tests")
+    print("Alexandria API Tests")
     print(f"Server: {BASE_URL}")
     print(f"Mode:   {'FULL (includes TTS/LLM tests)' if FULL_MODE else 'QUICK (no TTS/LLM)'}")
 
@@ -1357,7 +735,7 @@ def main():
     print(f"{'=' * 60}")
 
     if failures:
-        print(f"\nFailed tests:")
+        print("\nFailed tests:")
         for name, err in failures:
             # Truncate long error messages
             short = err.split("\n")[0][:200]

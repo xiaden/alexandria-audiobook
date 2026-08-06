@@ -93,7 +93,16 @@ _GRAPH2_CHARACTER_DDL = """
 CREATE TABLE IF NOT EXISTS voice_config (
     id TEXT PRIMARY KEY,
     name TEXT,
-    description TEXT
+    description TEXT,
+    type TEXT DEFAULT 'custom',
+    voice TEXT,
+    character_style TEXT,
+    seed TEXT DEFAULT '-1',
+    ref_audio TEXT,
+    ref_text TEXT,
+    adapter_id TEXT,
+    adapter_path TEXT,
+    alias_of TEXT
 );
 
 CREATE TABLE IF NOT EXISTS character (

@@ -1,5 +1,13 @@
 # Walk Definitions
 
+> **Status:** SUPERSEDED — stale v2 design. Do NOT use.
+>
+> **Superseded by:** the v3 9-walk serial DAG (2a→2i) defined in [CONTRACTS.md](./CONTRACTS.md).
+> This file documents the v2 6-walk DAG (2a-2f), file-based `pipeline_state/` JSON storage,
+> and content-overlap (Jaccard) re-attribution — all replaced by the SQLite-WAL two-graph
+> model and the canonical walk order in `app/pipeline/walks/order.py`.
+> Retained for historical reference only.
+
 ## Walk Table
 
 | Walk | Input | Output | LLM Task Name | Temp | Confidence |

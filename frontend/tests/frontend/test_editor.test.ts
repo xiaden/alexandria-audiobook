@@ -1,7 +1,7 @@
 /**
  * Spec-first tests for Editor tab (frontend/src/tabs/editor.ts).
  * Tests cover: pipeline operations (split/merge/move/delete), span display,
- * confidence review UI, TTS rendering, pipeline toggle integration.
+ * confidence review UI, TTS rendering.
  *
  * NOTE: No test framework is installed in frontend/package.json.
  * These tests are written with vitest-compatible syntax.
@@ -48,7 +48,6 @@ import * as API from '../../src/api';
 vi.mock('../../src/api', () => ({
   get: vi.fn(),
   post: vi.fn(),
-  upload: vi.fn(),
   handleError: vi.fn(),
 }));
 
@@ -56,14 +55,14 @@ vi.mock('../../src/api', () => ({
 vi.mock('../../src/utils', () => ({
   showToast: vi.fn(),
   showConfirm: vi.fn(),
-  escapeHtml: (s: string) => s.replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+  // Match the real utils.escapeHtml contract: null/undefined -> ''
+  escapeHtml: (s: unknown) => (s == null ? '' : String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;')),
 }));
 
 // Mock templates module
 vi.mock('../../src/templates', () => ({
   buildSpeakerSelect: vi.fn(() => '<select></select>'),
   updateChunkRow: vi.fn(),
-  createVoiceCard: vi.fn(),
 }));
 
 // Mock script module
@@ -82,9 +81,9 @@ const MOCK_SPANS_RAW = [
 ];
 
 const MOCK_SPANS: PipelineSpan[] = [
-  { global_index: 0, speaker: 'Narrator', text: 'It was a dark and stormy night.', instruct: 'dramatic' },
-  { global_index: 1, speaker: 'Elizabeth', text: 'I cannot believe it!', instruct: 'surprised' },
-  { global_index: 2, speaker: 'Darcy', text: 'Forgive me, I was wrong.', instruct: 'sincere' },
+  { global_index: 1, speaker: 'Narrator', text: 'It was a dark and stormy night.', instruct: 'dramatic' },
+  { global_index: 2, speaker: 'Elizabeth', text: 'I cannot believe it!', instruct: 'surprised' },
+  { global_index: 3, speaker: 'Darcy', text: 'Forgive me, I was wrong.', instruct: 'sincere' },
 ];
 
 const MOCK_REVIEW_ITEMS: ReviewItem[] = [
@@ -118,12 +117,10 @@ describe('Editor Tab — Pipeline API Functions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.pipelineBookId = 'book-123';
-    state.pipelineEnabled = true;
   });
 
   afterEach(() => {
     state.pipelineBookId = null;
-    state.pipelineEnabled = false;
   });
 
   describe('pipelineOperation', () => {
@@ -307,7 +304,6 @@ describe('Editor Tab — Span Display', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.pipelineBookId = 'book-123';
-    state.pipelineEnabled = true;
   });
 
   describe('toPipelineSpans', () => {
@@ -316,13 +312,14 @@ describe('Editor Tab — Span Display', () => {
 
       expect(result).toHaveLength(3);
       expect(result[0]).toEqual({
-        global_index: 0,
+        id: '',
+        global_index: 1,
         speaker: 'Narrator',
         text: 'It was a dark and stormy night.',
         instruct: 'dramatic',
       });
-      expect(result[1].global_index).toBe(1);
-      expect(result[2].global_index).toBe(2);
+      expect(result[1].global_index).toBe(2);
+      expect(result[2].global_index).toBe(3);
     });
 
     it('should handle null instruct values', () => {
@@ -451,7 +448,6 @@ describe('Editor Tab — Pipeline Operations', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.pipelineBookId = 'book-123';
-    state.pipelineEnabled = true;
     document.body.innerHTML = `
       <div id="spans-table-body"></div>
       <button id="btn-pipeline-merge" disabled></button>
@@ -468,12 +464,12 @@ describe('Editor Tab — Pipeline Operations', () => {
       global.prompt = vi.fn().mockReturnValue('10');
       vi.mocked(API.post).mockResolvedValue({ status: 'ok', operation: 'split' });
 
-      await handleSplit(0);
+      await handleSplit(1);
 
       expect(API.post).toHaveBeenCalledWith('/api/pipeline/operation', {
         operation: 'split',
         book_id: 'book-123',
-        presentation_index: 0,
+        presentation_index: 1,
         split_point: 10,
       });
     });
@@ -482,7 +478,7 @@ describe('Editor Tab — Pipeline Operations', () => {
       state.pipelineBookId = null;
       const { showToast } = await import('../../src/utils');
 
-      await handleSplit(0);
+      await handleSplit(1);
 
       expect(showToast).toHaveBeenCalledWith('No book onboarded', 'warning');
       expect(API.post).not.toHaveBeenCalled();
@@ -495,7 +491,7 @@ describe('Editor Tab — Pipeline Operations', () => {
       global.prompt = vi.fn().mockReturnValue('999');
       const { showToast } = await import('../../src/utils');
 
-      await handleSplit(0);
+      await handleSplit(1);
 
       expect(showToast).toHaveBeenCalledWith('Invalid split point', 'error');
       expect(API.post).not.toHaveBeenCalled();
@@ -507,7 +503,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
       global.prompt = vi.fn().mockReturnValue(null);
 
-      await handleSplit(0);
+      await handleSplit(1);
 
       expect(API.post).not.toHaveBeenCalled();
     });
@@ -518,8 +514,8 @@ describe('Editor Tab — Pipeline Operations', () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
       await loadSpans();
 
-      toggleSpanSelection(0);
       toggleSpanSelection(1);
+      toggleSpanSelection(2);
       vi.mocked(API.post).mockResolvedValue({ status: 'ok', operation: 'merge' });
 
       await handleMerge();
@@ -527,8 +523,8 @@ describe('Editor Tab — Pipeline Operations', () => {
       expect(API.post).toHaveBeenCalledWith('/api/pipeline/operation', {
         operation: 'merge',
         book_id: 'book-123',
-        presentation_index_left: 0,
-        presentation_index_right: 1,
+        presentation_index_left: 1,
+        presentation_index_right: 2,
       });
     });
 
@@ -536,27 +532,30 @@ describe('Editor Tab — Pipeline Operations', () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
       await loadSpans();
 
-      toggleSpanSelection(0);
+      toggleSpanSelection(1);
       const { showToast } = await import('../../src/utils');
 
       await handleMerge();
 
       expect(showToast).toHaveBeenCalledWith('Select exactly 2 adjacent spans to merge', 'warning');
       expect(API.post).not.toHaveBeenCalled();
+      toggleSpanSelection(1); // cleanup: clear leaked selection
     });
 
     it('should show warning if spans are not adjacent', async () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
       await loadSpans();
 
-      toggleSpanSelection(0);
-      toggleSpanSelection(2);
+      toggleSpanSelection(1);
+      toggleSpanSelection(3);
       const { showToast } = await import('../../src/utils');
 
       await handleMerge();
 
       expect(showToast).toHaveBeenCalledWith('Can only merge adjacent spans', 'warning');
       expect(API.post).not.toHaveBeenCalled();
+      toggleSpanSelection(1);
+      toggleSpanSelection(3); // cleanup: clear leaked selection
     });
   });
 
@@ -565,16 +564,16 @@ describe('Editor Tab — Pipeline Operations', () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
       await loadSpans();
 
-      toggleSpanSelection(0);
+      toggleSpanSelection(1);
       vi.mocked(API.post).mockResolvedValue({ status: 'ok', operation: 'move' });
 
-      await handleMove(2);
+      await handleMove(3);
 
       expect(API.post).toHaveBeenCalledWith('/api/pipeline/operation', {
         operation: 'move',
         book_id: 'book-123',
-        presentation_index_from: 0,
-        presentation_index_to: 2,
+        presentation_index_from: 1,
+        presentation_index_to: 3,
       });
     });
 
@@ -584,7 +583,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
       const { showToast } = await import('../../src/utils');
 
-      await handleMove(2);
+      await handleMove(3);
 
       expect(showToast).toHaveBeenCalledWith('Select exactly 1 span to move', 'warning');
       expect(API.post).not.toHaveBeenCalled();
@@ -594,13 +593,14 @@ describe('Editor Tab — Pipeline Operations', () => {
       vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
       await loadSpans();
 
-      toggleSpanSelection(2);
+      toggleSpanSelection(3);
       const { showToast } = await import('../../src/utils');
 
-      await handleMove(2);
+      await handleMove(3);
 
       expect(showToast).toHaveBeenCalledWith('Span is already at that position', 'info');
       expect(API.post).not.toHaveBeenCalled();
+      toggleSpanSelection(3); // cleanup: clear leaked selection
     });
   });
 
@@ -642,6 +642,7 @@ describe('Editor Tab — Pipeline Operations', () => {
 
       const selected = getSelectedIndices();
       expect(selected.has(5)).toBe(true);
+      toggleSpanSelection(5); // cleanup: clear leaked selection
     });
 
     it('should remove index if already selected', () => {
@@ -673,7 +674,6 @@ describe('Editor Tab — Confidence Review UI', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.pipelineBookId = 'book-123';
-    state.pipelineEnabled = true;
     document.body.innerHTML = `
       <div id="review-items-container"></div>
     `;
@@ -842,7 +842,6 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.pipelineBookId = 'book-123';
-    state.pipelineEnabled = true;
     document.body.innerHTML = `
       <button id="btn-pipeline-render"></button>
       <button id="btn-pipeline-regen"></button>
@@ -856,20 +855,24 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
       await cancelPipelineRender(true);
     });
 
-    it('should call pipelineRenderAudiobook and display job_id', async () => {
+    it('should call pipelineRenderAudiobook and store job id on completion', async () => {
+      vi.useFakeTimers();
       vi.mocked(API.post).mockResolvedValue({ job_id: 'job-abc-123' });
+      vi.mocked(API.get).mockResolvedValue({ job_id: 'job-abc-123', status: 'completed', output_dir: null, error: null });
 
-      await pipelineRenderAll();
+      const promise = pipelineRenderAll();
+      // Fire the 2s render-status poll so the job completes
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
 
       expect(API.post).toHaveBeenCalledWith('/api/pipeline/render', {
         book_id: 'book-123',
         use_batch: true,
         batch_seed: null,
       });
+      expect(state.pipelineRenderJobId).toBe('job-abc-123');
 
-      const jobDisplay = document.getElementById('pipeline-render-job');
-      expect(jobDisplay?.textContent).toContain('job-abc-123');
-      expect(jobDisplay?.classList.contains('d-none')).toBe(false);
+      vi.useRealTimers();
     });
 
     it('should show warning if no book onboarded', async () => {
@@ -883,10 +886,13 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
     });
 
     it('should hide render buttons and show cancel button during render', async () => {
+      vi.useFakeTimers();
       vi.mocked(API.post).mockResolvedValue({ job_id: 'job-test' });
+      vi.mocked(API.get).mockResolvedValue({ job_id: 'job-test', status: 'completed', output_dir: null, error: null });
 
-      await pipelineRenderAll();
+      const promise = pipelineRenderAll();
 
+      // Buttons are swapped synchronously before the first await
       const btnRender = document.getElementById('btn-pipeline-render');
       const btnRegen = document.getElementById('btn-pipeline-regen');
       const btnCancel = document.getElementById('btn-pipeline-cancel');
@@ -894,6 +900,11 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
       expect(btnRender?.style.display).toBe('none');
       expect(btnRegen?.style.display).toBe('none');
       expect(btnCancel?.style.display).toBe('inline-block');
+
+      // Let the render finish (poll resolves -> finally restores buttons)
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+      vi.useRealTimers();
     });
 
     it('should handle render failure gracefully', async () => {
@@ -904,54 +915,6 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
 
       expect(showToast).toHaveBeenCalledWith('Render failed: Render failed', 'error');
     });
-  });
-});
-
-describe('Editor Tab — Pipeline Toggle Integration', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    document.body.innerHTML = `
-      <div id="editor-pipeline-disabled-notice" style="display:none;"></div>
-      <div id="pipeline-editor-section" style="display:none;"></div>
-      <div id="legacy-editor-section"></div>
-      <div id="spans-table-body"></div>
-      <div id="chunks-table-body"></div>
-      <div id="review-items-container"></div>
-    `;
-  });
-
-  it('should show pipeline section when pipelineEnabled is true', () => {
-    state.pipelineEnabled = true;
-    state.pipelineBookId = 'book-123';
-
-    // Simulate tab switch behavior
-    const pipelineSection = document.getElementById('pipeline-editor-section');
-    const legacySection = document.getElementById('legacy-editor-section');
-    const notice = document.getElementById('editor-pipeline-disabled-notice');
-
-    if (pipelineSection) pipelineSection.style.display = 'block';
-    if (legacySection) legacySection.style.display = 'none';
-    if (notice) notice.style.display = 'none';
-
-    expect(pipelineSection?.style.display).toBe('block');
-    expect(legacySection?.style.display).toBe('none');
-    expect(notice?.style.display).toBe('none');
-  });
-
-  it('should show legacy section and notice when pipelineEnabled is false', () => {
-    state.pipelineEnabled = false;
-
-    const pipelineSection = document.getElementById('pipeline-editor-section');
-    const legacySection = document.getElementById('legacy-editor-section');
-    const notice = document.getElementById('editor-pipeline-disabled-notice');
-
-    if (pipelineSection) pipelineSection.style.display = 'none';
-    if (legacySection) legacySection.style.display = 'block';
-    if (notice) notice.style.display = 'block';
-
-    expect(pipelineSection?.style.display).toBe('none');
-    expect(legacySection?.style.display).toBe('block');
-    expect(notice?.style.display).toBe('block');
   });
 });
 

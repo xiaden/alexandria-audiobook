@@ -288,6 +288,8 @@ class WalkRunner:
         self._storage = storage
         # {book_id: OrderedDict(walk_name -> status)}
         self._status: dict[str, OrderedDict[str, str]] = {}
+        # {book_id: bool} — cancellation flag per book
+        self._cancelled: dict[str, bool] = {}
 
     def run_walk(
         self, walk_name: str, book_id: str, config: dict
@@ -311,6 +313,15 @@ class WalkRunner:
             error dict with ``status='failed'`` on failure.
         """
         self._ensure_book(book_id)
+        # Check cancellation flag before starting
+        if self._cancelled.get(book_id, False):
+            self._set_status(book_id, walk_name, "cancelled")
+            logger.info(
+                "Walk '%s' cancelled before start for book '%s'",
+                walk_name,
+                book_id,
+            )
+            return {"status": "cancelled", "error": "Walk cancelled by user"}
         if self._get_status(book_id, walk_name) == "running":
             return {
                 "status": "failed",
@@ -369,6 +380,19 @@ class WalkRunner:
         self._ensure_book(book_id)
         results: dict[str, dict] = {}
         for walk_name in WALK_ORDER:
+            # Check cancellation flag before each walk
+            if self._cancelled.get(book_id, False):
+                logger.info(
+                    "Walks cancelled before '%s' for book '%s'",
+                    walk_name,
+                    book_id,
+                )
+                self._set_status(book_id, walk_name, "cancelled")
+                results[walk_name] = {
+                    "status": "cancelled",
+                    "error": "Walk cancelled by user",
+                }
+                continue
             result = self.run_walk(walk_name, book_id, config)
             results[walk_name] = result
             if result.get("status") == "failed":
@@ -387,6 +411,18 @@ class WalkRunner:
         this book.
         """
         return self._get_status(book_id, walk_name)
+
+    def cancel_walks(self, book_id: str) -> None:
+        """Set the cancellation flag for a book.
+
+        The runner checks this flag before each walk and aborts if set.
+        """
+        self._cancelled[book_id] = True
+        logger.info("Walks cancelled for book '%s'", book_id)
+
+    def clear_cancel(self, book_id: str) -> None:
+        """Clear the cancellation flag for a book (e.g. before a new run)."""
+        self._cancelled.pop(book_id, None)
 
     # -- Internal helpers ---------------------------------------------------
 

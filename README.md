@@ -19,12 +19,10 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ### AI-Powered Pipeline
 - **Local & Cloud LLM Support** - Use any OpenAI-compatible API (LM Studio, Ollama, OpenAI, etc.)
-- **Automatic Script Annotation** - LLM parses text into JSON with speakers, dialogue, and TTS instruct directions
-- **LLM Script Review** - Optional second LLM pass that fixes common annotation errors: strips attribution tags from dialogue, splits misattributed narration/dialogue, merges over-split narrator entries, and validates instruct fields
-- **Persona Generation** - LLM analyzes the script to create voice descriptions for each character, then generates reference audio via VoiceDesign and assigns clone voices automatically — one click to go from script to fully-voiced cast
+- **Automatic Script Annotation** - A serial 9-walk LLM pipeline (2a→2i) converts your book into structured spans with speakers, dialogue, and TTS instruct directions
+- **Confidence Review** - Low-confidence annotations are flagged for human review (accept / reject / override) instead of silently propagating errors
+- **Voice Audition & Assignment** - The pipeline generates a voice description for every character, auditions it against your voice catalog, and assigns voices automatically — one click from book to fully-voiced cast
 - **Speaker Aliases** - Map multiple speaker names to the same voice (e.g. "YOUNG ELENA" → "ELENA") so variants share a single voice configuration
-- **Smart Chunking** - Groups consecutive lines by speaker (up to 500 chars) for natural flow
-- **Context Preservation** - Passes character roster and last 3 script entries between chunks for name and style continuity
 
 ### Voice Generation
 - **Built-in TTS Engine** - Qwen3-TTS runs locally with no external server required
@@ -36,25 +34,22 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **LoRA Voice Training** - Fine-tune the Base model on custom voice datasets to create persistent voice identities with instruct-following
 - **Built-in LoRA Presets** - Pre-trained voice adapters included out of the box, ready to assign to characters
 - **Dataset Builder** - Interactive tool for creating LoRA training datasets with per-sample text, emotion, and audio preview
-- **Batch Processing** - Generate dozens of chunks simultaneously with 3-6x real-time throughput
+- **Batch Processing** - Generate dozens of spans simultaneously with 3-6x real-time throughput
 - **Codec Compilation** - Optional `torch.compile` optimization for 3-4x faster batch decoding
 - **Non-verbal Sounds** - LLM writes natural vocalizations ("Ahh!", "Mmm...", "Haha!") with context-aware instruct directions
 - **Natural Pauses** - Configurable silence between speakers (default 500ms) and same-speaker segments (default 250ms)
 
 ### Web UI Editor
-- **Streamlined Interface** - 5-step core pipeline (Setup, Script, Voices, Editor, Result) plus advanced tools (Designer, Dataset, Training)
-- **Chunk Editor** - Edit speaker, text, and instruct for any line
-- **Selective Regeneration** - Re-render individual chunks without regenerating everything
+- **Streamlined Interface** - Core pipeline tabs (Setup, Script, Voices, Editor) plus advanced tools (Designer, Preparer, Dataset, Training)
+- **Span Editor** - Edit speaker, text, and instruct for any line
+- **Structural Operations** - Split, merge, move, and delete spans directly in the editor
 - **Batch Processing** - Optimized batch rendering with sub-batching for efficient GPU utilization
-- **Live Progress** - Real-time logs and status tracking for all operations
-- **Audio Preview** - Play individual chunks or sequence through the entire audiobook
-- **Script Library** - Save and load annotated scripts with voice configurations
+- **Live Progress** - Real-time walk status and render progress tracking
+- **Audio Preview** - Preview voices and listen to rendered audio before final download
 
 ### Export Options
-- **Combined Audiobook** - Single MP3 with all voices and natural pauses
-- **Individual Voicelines** - Separate MP3 per line for DAW editing (Audacity, etc.)
-- **Audacity Export** - One-click zip with per-speaker WAV tracks, LOF project file, and labels for automatic multi-track import into Audacity
-- **M4B Audiobook** - Chaptered M4B (AAC) with per-chunk or auto-detected chapter markers for audiobook players (Audiobookshelf, Apple Books, VLC, etc.)
+- **M4B Audiobook** - Chaptered M4B (AAC) with embedded chapter markers for audiobook players (Audiobookshelf, Apple Books, VLC, etc.)
+- **Raw Chunks** - Download the rendered audio chunks as a ZIP for DAW editing or manual assembly
 
 ## Requirements
 
@@ -129,7 +124,7 @@ Alexandria does **not** include an LLM — it connects to one over an API. Befor
 | [Ollama](https://ollama.ai/) | `http://localhost:11434/v1` | `ollama run qwen3` |
 | [OpenAI API](https://platform.openai.com/) | `https://api.openai.com/v1` | Get an API key |
 
-If the LLM server isn't running when you click "Generate Script", the generation will fail. Check the Pinokio terminal for error details.
+If the LLM server isn't running when you start the annotation walks, the generation will fail. Check the Pinokio terminal for error details.
 
 ### 2. First TTS Generation Downloads ~3.5 GB
 
@@ -159,7 +154,7 @@ The very first batch generation in a session takes longer than subsequent ones:
 | 16 GB | Comfortable for most use cases, batches of 10-20 chunks |
 | 24 GB+ | Full speed, batches of 40-60 chunks with codec compilation |
 
-- If you run out of VRAM, reduce **Parallel Workers** or **Max Chars/Batch** in the Setup tab
+- If you run out of VRAM, reduce **Parallel Workers** in the Setup tab
 - Close other GPU applications (games, other AI tools) before generating
 - Switching between voice types (Custom → Clone → LoRA) unloads and reloads models, which temporarily frees VRAM
 
@@ -177,7 +172,7 @@ For common issues and solutions, see [Troubleshooting](https://github.com/Finran
 
 ## Quick Start
 
-The interface is split into a **5-step core pipeline** (green tabs, numbered) and **advanced tools** (blue tabs, unnumbered). You only need the core pipeline to produce an audiobook.
+The interface is split into a **core pipeline** (green tabs, numbered) and **advanced tools** (blue tabs, unnumbered). You only need the core pipeline to produce an audiobook.
 
 ### Core Pipeline
 
@@ -190,34 +185,33 @@ Configure your LLM connection and TTS engine. At minimum you need:
 - Click **Save Configuration** when done
 
 **Step 2 — Script**
-- Select your book file (.txt, .md, or .epub) using the file picker — it uploads automatically
-- Click **Generate Annotated Script** — this sends the book to your LLM to split it into annotated chunks with speaker labels and voice directions
-- *(Optional)* Click **Review Script** if the generated script has issues — this runs a second LLM pass to fix speaker misattributions or formatting problems
-- You can save the script for later use with the Save feature below
+- Select your book file (.txt, .md, or .epub) using the file picker — it uploads and onboarded into the pipeline automatically
+- Click **Run All Walks** — this runs the 9-walk LLM annotation pipeline (scene segmentation → character discovery → alias resolution → scene presence → span attribution → character description → voice audition → voice assignment → delivery) to build the annotated script
+- Watch walk progress in real time; each walk's status is shown as it completes
+- *(Optional)* Click **Re-onboard** if you need to reload the book from scratch
 
 **Step 3 — Voices**
-Each character detected in the script gets a voice card. For each speaker:
-- Choose a voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, or Voice Design
+The pipeline's voice assignment walk (2h) automatically assigns a voice to every character from your voice catalog:
+- Open the **Voices** tab to review the character list and each character's assigned voice
+- Change any assignment via the dropdown — this saves to the character ledger immediately
+- For each voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, or Voice Design
 - For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
-- **Generate Personas** — Click to have the LLM analyze the script, create voice descriptions for each character, generate reference audio, and assign clone voices automatically. Toggle "Advanced" for batch size control. This is the fastest way to assign unique voices to all characters
-- **Speaker Aliases** — Use the "Alias of" dropdown on any voice card to map a speaker to another character's voice (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
-- Changes save automatically — see [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types) for guidance on each type
+- **Speaker Aliases** — Map one speaker to another character's voice config (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
+- See [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types) for guidance on each type
 
 **Step 4 — Editor**
-- Click **Render Pending** to generate audio for all chunks in batch
-- Listen to individual chunks or click **Play Sequence** to preview in order
-- Edit any chunk's text, speaker, or instruct inline and regenerate it individually
-- When satisfied, click **Merge All** to combine everything into the final audiobook
-
-**Step 5 — Result**
-- Listen to the finished audiobook in the browser
-- Download as MP3, or click **Export to Audacity** for per-speaker WAV tracks
+- Click **Render** to generate audio for all spans in batch
+- Edit any span's text, speaker, or instruct inline and regenerate it
+- Use **Split / Merge / Move / Delete** operations to restructure the script
+- Resolve low-confidence annotations flagged by the confidence review
+- When satisfied, click **Merge** to combine everything into the final M4B, then **Download**
 
 ### Advanced Tools (Optional)
 
 These tabs are for power users who want more control over voice creation:
 
 - **Designer** — Create new voices from text descriptions (e.g., "A warm elderly woman with a gentle raspy voice"). Save them to use as clone references in the Voices tab
+- **Preparer** — Batch-prepare voice datasets from uploaded audio (used as LoRA training data)
 - **Dataset** — Build LoRA training datasets interactively, one sample at a time with audio preview
 - **Training** — Train LoRA adapters on voice datasets to create persistent voice identities that follow instruct directions
 
@@ -226,6 +220,13 @@ These tabs are for power users who want more control over voice creation:
 ### Setup Tab
 Configure connections to your LLM and TTS engine.
 
+**LLM Settings:**
+- **Base URL** - LLM server URL (LM Studio / Ollama / OpenAI / any OpenAI-compatible API)
+- **API Key** - Your API key (`local` for local servers)
+- **Model Name** - The model to use
+- **Reasoning Effort** - Optional thinking-effort setting for reasoning models
+- **Temperature** - LLM sampling temperature used for annotation walks
+
 **TTS Settings:**
 - **Mode** - `local` (built-in engine) or `external` (connect to Gradio server)
 - **Device** - `auto` (recommended), `cuda`, `cpu`, or `mps`
@@ -233,44 +234,36 @@ Configure connections to your LLM and TTS engine.
 - **Parallel Workers** - Batch size for fast batch rendering (higher = more VRAM usage)
 - **Batch Seed** - Fixed seed for reproducible batch output (leave empty for random)
 - **Compile Codec** - Enable `torch.compile` for 3-4x faster batch decoding (adds ~30-60s warmup on first generation)
+- **Batch Group by Type** - Split batches by voice type to avoid mixed-type dispatch
 - **Sub-batching** - Split batches by text length to reduce wasted GPU compute on padding (enabled by default)
 - **Min Sub-batch Size** - Minimum chunks per sub-batch before allowing a split (default: 4)
 - **Length Ratio** - Maximum longest/shortest text length ratio before forcing a sub-batch split (default: 5)
+- **Max Sub-batch Items** - Upper bound on chunks per sub-batch
 - **Speaker Change Pause** - Silence in milliseconds between different speakers during merge (default: 500)
 - **Same Speaker Pause** - Silence in milliseconds when the same speaker continues during merge (default: 250)
 
-**Prompt Settings (Advanced):**
-- **Generation Settings** - Chunk size and max tokens for LLM responses
-- **LLM Sampling Parameters** - Temperature, Top P, Top K, Min P, and Presence Penalty
-- **Banned Tokens** - Comma-separated list of tokens to ban from LLM output (useful for disabling thinking mode on models like GLM4, DeepSeek-R1, etc.)
-- **Prompt Customization** - System and user prompts used for script generation. Defaults are loaded from `default_prompts.txt` and can be customized per-session in the UI. Click "Reset to Defaults" to reload the file-based defaults (picks up edits without restarting the app)
-
 ### Script Tab
-Upload a text file (.txt, .md, or .epub) and generate the annotated script. EPUB files are automatically converted to plain text on upload. The LLM converts your book into a structured JSON format with:
+Upload a text file (.txt, .md, or .epub) and run the annotation walks. EPUB files are automatically converted to plain text on upload. The pipeline runs 9 serial LLM walks that convert your book into a structured span graph with:
 - Speaker identification (NARRATOR vs character names)
 - Dialogue text with natural vocalizations (written as pronounceable text, not tags)
 - Style directions for TTS delivery
+- Character descriptions, voice auditions, and voice assignments
 
-**Review Script** - After generation, click "Review Script" to run a second LLM pass that detects and fixes common annotation errors:
-1. Attribution tags left in dialogue ("said he", "she replied") are stripped
-2. Narration mixed into character entries is split out as NARRATOR
-3. Dialogue embedded in narrator entries is extracted as the correct speaker
-4. Short consecutive narrator entries covering the same scene are merged
-5. Invalid instruct fields (physical actions instead of voice directions) are corrected
-
-Review prompts are customizable in `review_prompts.txt` (same format as `default_prompts.txt`).
+- **Onboard** - Upload and load the book into the pipeline
+- **Run All Walks** - Execute the 9-walk annotation DAG in sequence
+- **Walk status** - Per-walk progress shown in real time; each walk can also be re-run individually
+- **Cancel Walks** - Stop a running walk cycle
+- **Re-onboard** - Reload the book and reset the pipeline state
 
 ### Voices Tab
-After script generation, voices are automatically loaded from the annotated script. For each speaker:
+The pipeline assigns a voice to every character during walk 2h. The Voices tab lets you review and adjust those assignments:
 
-**Persona Generation:**
-Click **Generate Personas** to automatically assign voices to all characters. The LLM analyzes dialogue in the script and produces a voice description and sample text for each speaker. These are fed to the VoiceDesign model to generate reference audio, which is saved and assigned as a clone voice. The result is a fully-voiced cast with no manual configuration.
-
-- **Standard mode** — Processes all speakers at once
-- **Advanced mode** — Toggle "Advanced" to control batch size (default 40) for large casts. In advanced mode, speakers are processed in discovery batches, with the LLM receiving dialogue samples to infer voice characteristics
+- **Character list** - Every character from the character ledger with its assigned voice
+- **Assignment dropdown** - Change a character's voice from the catalog; saved immediately via `PUT /api/pipeline/characters/{id}/voice`
+- **Voice catalog** - Create and manage voice configs (Custom, Clone, LoRA, Voice Design) that can be assigned to characters
 
 **Speaker Aliases:**
-Each voice card has an "Alias of" dropdown. Setting a speaker as an alias of another speaker means it will use the target's voice configuration during audio generation. Useful for:
+Each voice config can be set as an alias of another. Setting a speaker as an alias of another speaker means it will use the target's voice configuration during audio generation. Useful for:
 - Character name variants (e.g., "DR. SMITH" → "SMITH")
 - Age variants (e.g., "YOUNG ELENA" → "ELENA")
 - Reducing the number of voices to configure
@@ -339,40 +332,13 @@ Build LoRA training datasets interactively, one sample at a time.
 
 ### Editor Tab
 Fine-tune your audiobook before export:
-- **View all chunks** in a table with status indicators
+- **View all spans** in a table with status indicators and confidence scores
 - **Edit inline** - Click to modify speaker, text, or instruct
-- **Generate single** - Regenerate just one chunk after editing
-- **Batch render** - Process all pending chunks (see Render Modes below)
-- **Play sequence** - Preview audio playback in order
-- **Merge all** - Combine chunks into final audiobook
-
-### Render Modes
-
-Alexandria offers two methods for batch rendering audio:
-
-#### Render Pending (Standard)
-The default rendering mode. Sends individual TTS calls in parallel using the configured worker count.
-
-- **Per-speaker seeds** - Each voice uses its configured seed for reproducible output
-- **Voice cloning support** - Works with both custom voices and cloned voices
-
-#### Batch (Fast)
-High-speed rendering that sends multiple lines to the TTS engine in a single batched call. Chunks are sorted by text length and processed in optimized sub-batches to minimize padding waste.
-
-- **3-6x real-time throughput** - With codec compilation enabled, batches of 20-60 chunks process at 3-6x real-time speed
-- **Sub-batching** - Automatically groups similarly-sized chunks together for efficient GPU utilization
-- **Single seed** - All voices share the `Batch Seed` from config (set empty for random)
-- **All voice types supported** - Custom, Clone, and LoRA voices are batched; Voice Design is sequential
-- **Parallel Workers** setting controls batch size (higher values use more VRAM)
-
-### Result Tab
-Download your completed audiobook as MP3, export as **M4B** with chapter markers for audiobook players, or click **Export to Audacity** for per-speaker WAV tracks.
-
-- **Download MP3** - Standard merged audiobook
-- **Export M4B** - AAC audiobook with chapter markers. By default, chapters are auto-detected from headings in the script (e.g. "Chapter 1", "Prologue"). Toggle **Per-chunk chapters** for fine-grained navigation where every line becomes a chapter.
-- **Export to Audacity** - Zip with per-speaker WAV tracks. Unzip and open `project.lof` in Audacity to load all tracks, then import `labels.txt` via File > Import > Labels for chunk annotations.
-
-> **Note:** Some Linux audiobook players (e.g. Cozy) have limited M4B support and may not detect the file. The M4B output has been tested with VLC, Haruna, and Audiobookshelf.
+- **Structural operations** - Split, merge, move, or delete a span
+- **Render** - Generate audio for all pending spans in batch (with progress polling)
+- **Confidence review** - Accept, reject, or override low-confidence annotations
+- **Merge** - Combine rendered chunks into the final M4B audiobook
+- **Download** - Download the merged M4B (or the raw chunks as a ZIP)
 
 ## Performance
 
@@ -383,7 +349,6 @@ Download your completed audiobook as MP3, export as **M4B** with chapter markers
 | TTS Mode | `local` | Built-in engine, no external server |
 | Compile Codec | `true` | 3-4x faster decoding after one-time warmup |
 | Parallel Workers | 20-60 | Higher = more throughput, more VRAM |
-| Render Mode | Batch (Fast) | Uses batched TTS calls |
 
 ### Benchmarks
 
@@ -424,7 +389,7 @@ These are applied transparently and require no configuration.
 
 ## Script Format
 
-The generated script is a JSON array with `speaker`, `text`, and `instruct` fields:
+The annotated script is a JSON array with `speaker`, `text`, and `instruct` fields (one entry per span):
 
 ```json
 [
@@ -446,40 +411,14 @@ Vocalizations are written as real pronounceable text that the TTS speaks directl
 
 ## Output Files
 
+Rendering produces per-span audio chunks in a job-specific output directory, which the pipeline then merges into a single M4B:
+
 **Final Audiobook:**
-- `cloned_audiobook.mp3` - Combined audiobook with natural pauses
+- `audiobook.m4b` - AAC audiobook with embedded chapter markers (Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players)
 
-**Individual Voicelines (for DAW editing):**
-```
-voicelines/
-├── voiceline_0001_narrator.mp3
-├── voiceline_0002_elena.mp3
-├── voiceline_0003_marcus.mp3
-└── ...
-```
-
-Files are numbered in timeline order with speaker names for easy:
-- Import into Audacity or other DAWs
-- Placement on separate character tracks
-- Fine-tuning of timing and effects
-
-**Audacity Export (per-speaker tracks):**
-```
-audacity_export.zip
-├── project.lof       # Open this in Audacity to import all tracks
-├── labels.txt        # Import via File > Import > Labels for chunk annotations
-├── narrator.wav      # Full-length track with only NARRATOR audio
-├── elena.wav         # Full-length track with only ELENA audio
-├── marcus.wav        # Full-length track with only MARCUS audio
-└── ...
-```
-
-Each WAV track is padded to the same total duration with silence where other speakers are talking. Playing all tracks simultaneously sounds identical to the merged MP3.
-
-**M4B Audiobook (chaptered):**
-- `audiobook.m4b` - AAC audiobook with embedded chapter markers
-- Chapters auto-detected from script headings, or per-chunk when toggled
-- Compatible with Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players
+**Render job output (per render):**
+- `chunk_0000.wav`, `chunk_0001.wav`, ... - One WAV per span, numbered in timeline order
+- The `GET /api/pipeline/download/{job_id}` endpoint serves the merged `audiobook.m4b` when available, otherwise packages the chunks into `audiobook.zip` for manual assembly
 
 ## API Reference
 
@@ -487,11 +426,8 @@ Alexandria exposes a REST API for programmatic access:
 
 ### Configuration
 ```bash
-# Get current config (empty prompts fall through to file defaults)
+# Get current config
 curl http://127.0.0.1:4200/api/config
-
-# Get file-based default prompts (hot-reloads from default_prompts.txt)
-curl http://127.0.0.1:4200/api/default_prompts
 
 # Save config
 curl -X POST http://127.0.0.1:4200/api/config \
@@ -537,61 +473,20 @@ curl -X POST http://127.0.0.1:4200/api/pipeline/review/accept \
   -d '{"item_id": "<item_id>"}'
 ```
 
-### Voice Management
+### Voice Catalog
 ```bash
-# Get voices and config
-curl http://127.0.0.1:4200/api/voices
+# List all voice configs
+curl http://127.0.0.1:4200/api/pipeline/voices
 
-# Parse voices from script
-curl -X POST http://127.0.0.1:4200/api/parse_voices
-
-# Save voice config
-curl -X POST http://127.0.0.1:4200/api/save_voice_config \
+# Create a voice config
+curl -X POST http://127.0.0.1:4200/api/pipeline/voices \
   -H "Content-Type: application/json" \
-  -d '{"NARRATOR": {"type": "custom", "voice": "Ryan", "character_style": "calm"}}'
-```
+  -d '{"name": "NARRATOR", "type": "custom", "voice": "Ryan", "character_style": "calm"}'
 
-### Chunk Management
-```bash
-# Get all chunks
-curl http://127.0.0.1:4200/api/chunks
-
-# Update a chunk
-curl -X POST http://127.0.0.1:4200/api/chunks/5 \
+# Assign a voice to a character
+curl -X PUT http://127.0.0.1:4200/api/pipeline/characters/<character_id>/voice \
   -H "Content-Type: application/json" \
-  -d '{"text": "Updated dialogue", "instruct": "Excited, bright energy."}'
-
-# Generate audio for single chunk
-curl -X POST http://127.0.0.1:4200/api/chunks/5/generate
-
-# Standard batch render (parallel individual calls)
-curl -X POST http://127.0.0.1:4200/api/generate_batch \
-  -H "Content-Type: application/json" \
-  -d '{"indices": [0, 1, 2, 3, 4]}'
-
-# Fast batch render (batched TTS calls, much faster)
-curl -X POST http://127.0.0.1:4200/api/generate_batch_fast \
-  -H "Content-Type: application/json" \
-  -d '{"indices": [0, 1, 2, 3, 4]}'
-
-# Merge all chunks into final audiobook
-curl -X POST http://127.0.0.1:4200/api/merge
-```
-
-### Saved Scripts
-```bash
-# List saved scripts
-curl http://127.0.0.1:4200/api/scripts
-
-# Save current script
-curl -X POST http://127.0.0.1:4200/api/scripts/save \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-novel"}'
-
-# Load a saved script
-curl -X POST http://127.0.0.1:4200/api/scripts/load \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-novel"}'
+  -d '{"voice_assignment_id": "<voice_id>"}'
 ```
 
 ### Character Ledger
@@ -640,9 +535,6 @@ curl -X DELETE http://127.0.0.1:4200/api/lora/datasets/dataset_id_here
 curl -X POST http://127.0.0.1:4200/api/lora/train \
   -H "Content-Type: application/json" \
   -d '{"name": "narrator_warm", "dataset_id": "my_voice", "epochs": 25, "lr": "5e-6", "lora_r": 32, "lora_alpha": 64}'
-
-# Check training status
-curl http://127.0.0.1:4200/api/status/lora_training
 
 # List trained adapters
 curl http://127.0.0.1:4200/api/lora/models
@@ -703,31 +595,35 @@ curl -X POST http://127.0.0.1:4200/api/dataset_builder/save \
 curl -X DELETE http://127.0.0.1:4200/api/dataset_builder/my_voice_dataset
 ```
 
-### Audio Download
+### Rendering & Download
 ```bash
-# Download audiobook (after merging in editor)
-curl http://127.0.0.1:4200/api/audiobook --output audiobook.mp3
+# Start a render job (replace <book_id> with your book)
+curl -X POST http://127.0.0.1:4200/api/pipeline/render \
+  -H "Content-Type: application/json" \
+  -d '{"book_id": "<book_id>", "use_batch": true}'
+# → {"job_id": "...", "status": "started"}
 
-# Export to Audacity (per-speaker tracks + LOF + labels)
-curl -X POST http://127.0.0.1:4200/api/export_audacity
+# Poll render status until completed
+curl http://127.0.0.1:4200/api/pipeline/render_status/<job_id>
 
-# Poll for completion
-curl http://127.0.0.1:4200/api/status/audacity_export
+# Merge rendered chunks into audiobook.m4b
+curl -X POST http://127.0.0.1:4200/api/pipeline/merge \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "<job_id>"}'
 
-# Download the zip
-curl http://127.0.0.1:4200/api/export_audacity --output audacity_export.zip
+# Download the merged M4B (or audiobook.zip of raw chunks)
+curl http://127.0.0.1:4200/api/pipeline/download/<job_id> --output audiobook.m4b
 ```
 
 ## Python Integration
 
 ```python
 import requests
+import time
 
 BASE = "http://127.0.0.1:4200"
 
 # Onboard EPUB — extracts text, populates spine, returns book_id
-import time
-
 with open("mybook.epub", "rb") as f:
     onboard = requests.post(f"{BASE}/api/pipeline/onboard", files={"file": f}).json()
 book_id = onboard["book_id"]
@@ -742,29 +638,29 @@ while True:
         break
     time.sleep(2)
 
-# Configure voices
-voice_config = {
-    "NARRATOR": {"type": "custom", "voice": "Ryan", "character_style": "calm narrator"},
-    "HERO": {"type": "custom", "voice": "Aiden", "character_style": "brave, determined"}
-}
-requests.post(f"{BASE}/api/save_voice_config", json=voice_config)
+# Assign a voice to a character (optional; walks 2g/2h already assign voices)
+characters = requests.get(f"{BASE}/api/pipeline/characters/{book_id}").json()
+narrator = next(c for c in characters if c["name"] == "NARRATOR")
+requests.put(
+    f"{BASE}/api/pipeline/characters/{narrator['id']}/voice",
+    json={"voice_assignment_id": "NARRATOR"},
+)
 
-# Fast batch render all chunks
-chunks = requests.get(f"{BASE}/api/chunks").json()
-indices = [c["id"] for c in chunks]
-requests.post(f"{BASE}/api/generate_batch_fast", json={"indices": indices})
-# ... poll until all chunks status == "done" ...
-requests.post(f"{BASE}/api/merge")
+# Render the audiobook
+job = requests.post(f"{BASE}/api/pipeline/render", json={"book_id": book_id, "use_batch": True}).json()
+job_id = job["job_id"]
 
-# Download
-with open("output.mp3", "wb") as f:
-    f.write(requests.get(f"{BASE}/api/audiobook").content)
+# Poll until render completes
+while True:
+    status = requests.get(f"{BASE}/api/pipeline/render_status/{job_id}").json()
+    if status["status"] == "completed":
+        break
+    time.sleep(2)
 
-# Export to Audacity
-requests.post(f"{BASE}/api/export_audacity")
-# ... poll /api/status/audacity_export until not running ...
-with open("audacity_export.zip", "wb") as f:
-    f.write(requests.get(f"{BASE}/api/export_audacity").content)
+# Merge into audiobook.m4b and download
+requests.post(f"{BASE}/api/pipeline/merge", json={"job_id": job_id})
+with open("audiobook.m4b", "wb") as f:
+    f.write(requests.get(f"{BASE}/api/pipeline/download/{job_id}").content)
 ```
 
 ## JavaScript Integration
@@ -796,32 +692,29 @@ async function waitForWalks(bookId) {
 }
 await waitForWalks(bookId);
 
-// Configure and generate
-await fetch(`${BASE}/api/save_voice_config`, {
+// Render the audiobook
+const render = await fetch(`${BASE}/api/pipeline/render`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    NARRATOR: { type: "custom", voice: "Ryan", character_style: "calm" }
-  })
+  body: JSON.stringify({ book_id: bookId, use_batch: true }),
 });
+const { job_id: jobId } = await render.json();
 
-// Fast batch render all chunks
-const chunks = await (await fetch(`${BASE}/api/chunks`)).json();
-const indices = chunks.map(c => c.id);
-await fetch(`${BASE}/api/generate_batch_fast`, {
+// Poll until render completes
+while (true) {
+  const res = await fetch(`${BASE}/api/pipeline/render_status/${jobId}`);
+  const status = await res.json();
+  if (status.status === "completed") break;
+  await new Promise(r => setTimeout(r, 2000));
+}
+
+// Merge into audiobook.m4b and download
+await fetch(`${BASE}/api/pipeline/merge`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ indices })
+  body: JSON.stringify({ job_id: jobId }),
 });
-// ... poll until all chunks done ...
-
-// Merge into final audiobook
-await fetch(`${BASE}/api/merge`, { method: "POST" });
-
-// Export to Audacity
-await fetch(`${BASE}/api/export_audacity`, { method: "POST" });
-// ... poll /api/status/audacity_export until not running ...
-// Download zip from GET /api/export_audacity
+window.location.href = `${BASE}/api/pipeline/download/${jobId}`;
 ```
 
 ## Recommended LLM Models
@@ -834,7 +727,7 @@ For script generation, non-thinking models work best:
 - **Llama 3.1/3.2** - Good character distinction
 - **Mistral/Mixtral** - Fast and reliable
 
-**Thinking models** (DeepSeek-R1, GLM4-air, etc.) can interfere with JSON output. If you must use one, add `<think>` to the **Banned Tokens** field in Setup to disable thinking mode.
+**Thinking models** (DeepSeek-R1, GLM4-air, etc.) can interfere with JSON output. If you must use one, prefer a non-thinking variant or a separate endpoint for annotation walks.
 
 ## Troubleshooting
 
@@ -855,13 +748,12 @@ For script generation, non-thinking models work best:
 - Check the Pinokio terminal for model loading errors
 - Ensure sufficient VRAM (16+ GB recommended for bfloat16)
 - For external mode, ensure the Gradio TTS server is running at the configured URL
-- Check voice_config.json has valid settings for all speakers
+- Verify every character has a valid voice assigned in the Voices tab (voice configs are stored in the pipeline's voice_config table)
 - For clone voices, verify reference audio exists and transcript is accurate
 
 ### Slow batch generation
 - Enable **Compile Codec** in Setup (adds warmup time but 3-4x faster after)
 - Increase **Parallel Workers** (batch size) if VRAM allows
-- Use **Batch (Fast)** render mode instead of Standard
 - If you see MIOpen warnings on AMD, these are handled automatically
 
 ### Out of memory errors
@@ -884,35 +776,50 @@ Conda's bundled ffmpeg on Windows often lacks the MP3 encoder (libmp3lame). Alex
 - The system automatically fixes common encoding issues
 - If problems persist, ensure your input text is UTF-8 encoded
 
-## Prompt Customization
+## Development & Testing
 
-LLM prompts are stored in plain-text files at the project root, split into system prompt and user prompt sections by a `---SEPARATOR---` delimiter:
+Backend tests live in `tests/pipeline/` (pytest):
 
-- **`default_prompts.txt`** — Prompts for script generation (annotation)
-- **`review_prompts.txt`** — Prompts for script review (error correction)
+```bash
+# Full backend suite (pipeline tests + guard suite)
+pytest tests/pipeline -q
 
-**How it works:**
-- `app/default_prompts.py` and `app/review_prompts.py` read their respective files and export the prompts
-- Prompts hot-reload from disk on every request, so edits take effect immediately without restarting the app
-- `config.json` stores user overrides for generation prompts — when its prompt fields are empty, the file defaults are used
-- The "Reset to Defaults" button in the Web UI fetches the latest file defaults via `/api/default_prompts`
+# With the app-level API tests (requires a live LLM server; environmental
+# failures for missing TTS/LLM dependencies are expected)
+pytest --import-mode=importlib app/test_api.py tests/pipeline -q
+```
 
-**To customize prompts:**
-1. **Temporary (per-session):** Edit generation prompts directly in the Setup tab's Prompt Customization section
-2. **Permanent (all sessions):** Edit `default_prompts.txt` or `review_prompts.txt` directly — changes are picked up on the next request
+Frontend (in `frontend/`):
 
-**Non-English books:** The default LLM prompts are written for English text and reference English-specific conventions (attribution tags like "said he", quotation marks, etc.). When processing books in other languages, you'll get better results by editing the prompts to match that language's dialogue conventions — for example, French guillemets (« »), Japanese brackets (「」), or language-appropriate attribution patterns. Set the TTS **Language** dropdown to match as well.
+```bash
+npm run build    # production build (outputs to ../app/static/dist)
+npx tsc --noEmit # TypeScript type check
+
+# Frontend unit tests — require vitest (installed in the pipeline-only
+# cutover's final phase; not yet enabled if the install step was skipped)
+npx vitest run
+```
 
 ## Project Structure
 
 ```
 Alexandria/
 ├── app/
-│   ├── app.py                 # FastAPI server
+│   ├── app.py                 # FastAPI server (config, voice_design, lora, dataset_builder, preparer)
+│   ├── engine.py              # TTS engine factory (get_tts_engine / reset_tts_engine, module cache)
 │   ├── tts.py                 # TTS engine (local + external backends)
 │   ├── train_lora.py          # LoRA training subprocess script
+│   ├── hf_utils.py            # Hugging Face model download utilities
+│   ├── utils.py               # Shared utilities (LLM client, config resolution)
 │   ├── pipeline/              # v3 Annotation Pipeline (SQLite-WAL, two-graph model)
-│   │   ├── api.py             # Pipeline REST endpoints (/api/pipeline/*)
+│   │   ├── api.py             # Pipeline router entry point (includes sub-routers)
+│   │   ├── api_onboard.py     # Onboard / re-onboard endpoints
+│   │   ├── api_walks.py       # Walk execution + status endpoints
+│   │   ├── api_operations.py  # Structural operations + span text editing
+│   │   ├── api_review.py      # Confidence review endpoints
+│   │   ├── api_export.py      # Export / render / merge / download endpoints
+│   │   ├── api_characters.py  # Character ledger + voice assignment
+│   │   ├── api_voices.py      # Voice catalog CRUD + preview
 │   │   ├── adapter.py         # Pipeline adapter + schema init
 │   │   ├── extract.py         # EPUB text extraction
 │   │   ├── populate.py        # Spine population
@@ -932,21 +839,18 @@ Alexandria/
 │   │       ├── walk_2g_voice_audition.py
 │   │       ├── walk_2h_voice_assignment.py
 │   │       └── walk_2i_delivery.py
-│   ├── utils.py               # Shared utilities (atomic JSON writes)
-│   ├── default_prompts.py     # Generation prompt loader (reads default_prompts.txt)
-│   ├── review_prompts.py      # Review prompt loader (reads review_prompts.txt)
-│   ├── project.py             # Chunk management & batch generation
-│   ├── parse_voices.py        # Voice extraction
 │   ├── config.json            # Runtime configuration (gitignored)
 │   ├── static/index.html      # Web UI
+│   ├── static/dist/           # Built frontend bundle (generated, never hand-edited)
 │   └── requirements.txt       # Python dependencies
+├── frontend/                  # Frontend source (TypeScript, bundled to app/static/dist)
+│   └── src/tabs/              # script, voices, editor, setup, designer, preparer, dataset-builder, training
 ├── builtin_lora/              # Pre-trained LoRA voice presets
 ├── dataset_builder/           # Dataset builder project workspace (gitignored)
 ├── designed_voices/           # Saved Voice Designer outputs (gitignored)
 ├── lora_datasets/             # Uploaded/generated training datasets (gitignored)
 ├── lora_models/               # Trained LoRA adapters (gitignored)
-├── default_prompts.txt        # LLM prompts for script generation
-├── review_prompts.txt         # LLM prompts for script review
+├── data/                      # SQLite pipeline database (pipeline.db, gitignored)
 ├── install.js                 # Pinokio installer
 ├── start.js                   # Pinokio launcher
 ├── reset.js                   # Reset script

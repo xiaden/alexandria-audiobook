@@ -183,7 +183,7 @@ function pollPreparerLogs(taskName: string): void {
         running: boolean;
         status?: string;
         tasks?: Array<{ status: string }>;
-      }>(`/api/status/${taskName}`);
+      }>(`/api/preparer/status/${taskName}`);
 
       const newLines = statusData.logs.slice(offset);
       offset = statusData.logs.length;

@@ -1,7 +1,6 @@
 /**
  * Spec-first tests for Script tab (frontend/src/tabs/script.ts).
- * Tests cover: pipeline API calls, walk status display, button behavior,
- * pipeline toggle integration.
+ * Tests cover: pipeline API calls, walk status display, button behavior.
  *
  * NOTE: No test framework is installed in frontend/package.json.
  * These tests are written with vitest-compatible syntax.
@@ -23,14 +22,12 @@ import {
   initScript,
 } from '../../src/tabs/script';
 import { WALK_ORDER, WALK_DISPLAY_NAMES } from '../../src/pipeline/walks';
-import { state } from '../../src/state';
 import * as API from '../../src/api';
 
 // Mock the API module
 vi.mock('../../src/api', () => ({
   get: vi.fn(),
   post: vi.fn(),
-  upload: vi.fn(),
 }));
 
 // Mock utils to avoid DOM side effects
@@ -40,19 +37,6 @@ vi.mock('../../src/utils', () => ({
   escapeHtml: (s: string) => s,
 }));
 
-// Mock dependent tab modules
-vi.mock('../../src/tabs/editor', () => ({
-  loadChunks: vi.fn(),
-}));
-
-vi.mock('../../src/tabs/voices', () => ({
-  loadVoices: vi.fn(),
-}));
-
-vi.mock('../../src/tabs/designer', () => ({
-  resetDesignerForm: vi.fn(),
-  loadDesignedVoices: vi.fn(),
-}));
 
 // Mock global fetch for pipelineOnboard (uses fetch directly, not API.post)
 const mockFetch = vi.fn();
@@ -409,65 +393,6 @@ describe('startWalkPolling / stopWalkPolling', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Pipeline toggle integration
-// ---------------------------------------------------------------------------
-
-describe('pipeline toggle integration', () => {
-  beforeEach(() => {
-    document.body.innerHTML = `
-      <div id="pipeline-disabled-notice" style="display:none;"></div>
-      <div id="pipeline-section" style="display:none;">
-        <button id="btn-onboard-epub"></button>
-        <div id="walk-execution-section" style="display:none;">
-          <button id="btn-run-all-walks"></button>
-          <button id="btn-reonboard"></button>
-          <div id="walk-status-container"></div>
-        </div>
-      </div>
-      <div id="legacy-script-section" style="display:none;"></div>
-      <div id="saved-scripts-list"></div>
-      <div id="script-logs"></div>
-    `;
-    state.pipelineEnabled = false;
-    vi.clearAllMocks();
-  });
-
-  it('should show pipeline-disabled notice when pipelineEnabled is false', () => {
-    state.pipelineEnabled = false;
-    // initScript attaches to DOMContentLoaded, so we simulate the logic:
-    const pipelineSection = document.getElementById('pipeline-section');
-    const pipelineNotice = document.getElementById('pipeline-disabled-notice');
-
-    if (state.pipelineEnabled) {
-      if (pipelineSection) pipelineSection.style.display = '';
-      if (pipelineNotice) pipelineNotice.style.display = 'none';
-    } else {
-      if (pipelineSection) pipelineSection.style.display = 'none';
-      if (pipelineNotice) pipelineNotice.style.display = '';
-    }
-
-    expect(pipelineSection!.style.display).toBe('none');
-    expect(pipelineNotice!.style.display).toBe('');
-  });
-
-  it('should show pipeline section when pipelineEnabled is true', () => {
-    state.pipelineEnabled = true;
-    const pipelineSection = document.getElementById('pipeline-section');
-    const pipelineNotice = document.getElementById('pipeline-disabled-notice');
-
-    if (state.pipelineEnabled) {
-      if (pipelineSection) pipelineSection.style.display = '';
-      if (pipelineNotice) pipelineNotice.style.display = 'none';
-    } else {
-      if (pipelineSection) pipelineSection.style.display = 'none';
-      if (pipelineNotice) pipelineNotice.style.display = '';
-    }
-
-    expect(pipelineSection!.style.display).toBe('');
-    expect(pipelineNotice!.style.display).toBe('none');
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Run All Walks button behavior
@@ -548,32 +473,3 @@ describe('Re-onboard button', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Saved scripts (preserved functionality)
-// ---------------------------------------------------------------------------
-
-describe('saved scripts preservation', () => {
-  beforeEach(() => {
-    document.body.innerHTML = `
-      <div id="saved-scripts-list">
-        <p class="text-muted mb-0">No saved scripts yet.</p>
-      </div>
-      <input id="save-script-name" />
-    `;
-    vi.clearAllMocks();
-  });
-
-  it('should show "No saved scripts yet." when list is empty', async () => {
-    vi.mocked(API.get).mockResolvedValueOnce([]);
-
-    // The loadSavedScripts function is not exported, but it's called in initScript.
-    // We verify the container element exists.
-    const container = document.getElementById('saved-scripts-list');
-    expect(container!.textContent).toContain('No saved scripts yet.');
-  });
-
-  it('should have a save-script-name input', () => {
-    const input = document.getElementById('save-script-name');
-    expect(input).not.toBeNull();
-  });
-});

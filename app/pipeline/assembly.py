@@ -61,6 +61,7 @@ def export_annotated_script(
     rows = storage.execute_query(
         """
         SELECT
+            span.id,
             span.text,
             span.instruct,
             c.name    AS character_name
@@ -96,6 +97,7 @@ def export_annotated_script(
         speaker = row["character_name"] if row["character_name"] else "NARRATOR"
         result.append(
             {
+                "id": row["id"],
                 "speaker": speaker,
                 "text": row["text"] or "",
                 "instruct": row["instruct"] or "",

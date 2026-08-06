@@ -1,281 +1,642 @@
-<img width="475" height="467" alt="Alexandria Logo" src="https://github.com/user-attachments/assets/fa2c36d3-a5f3-49ab-9dfe-30933359dfbd" />
+<p align="center">
+  <img src="docs/screenshots/banner.png" alt="Alexandria Audiobook Generator" width="60%">
+</p>
 
-# Alexandria 有声书生成器
+<h1 align="center">Alexandria 有声书生成器</h1>
 
-[English](README.md) | 中文
+<p align="center">
+  [English](README.md) | 中文
+</p>
 
-> **致新用户：** 感谢大家的关注！Alexandria 近期突然获得了大量关注，新用户涌入的速度远超预期。作为一个小型项目，我们可能无法及时回复每一个 Issue。在提交问题之前，请先仔细阅读本文档和 [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki)，其中涵盖了大部分常见问题的解答。感谢大家的耐心与理解！
+> 新用户？从这里开始：阅读[快速入门](#快速入门)部分了解如何使用，或查看[安装](#安装)部分开始安装。
 
 利用 AI 驱动的脚本标注和文本转语音技术，将任何书籍或小说转化为全配音有声书。内置 Qwen3-TTS 引擎，支持批量处理，并提供浏览器端编辑器，可逐行精调后导出。
 
-## 示例音频：[sample.mp3](https://github.com/user-attachments/files/25276110/sample.mp3)
+[🎧 试听音频](docs/sample.mp3)
 
 ## 截图
 
-<img src="https://github.com/user-attachments/assets/874b5e30-56d2-4292-b754-4408fc53f5d6" width="30%"></img> <img src="https://github.com/user-attachments/assets/488cde02-6b93-47fa-874b-97a618ae482c" width="30%"></img> <img src="https://github.com/user-attachments/assets/4c0805a6-bb9d-42c1-a9ff-79bb29d0613c" width="30%"></img> <img src="https://github.com/user-attachments/assets/8e58a5bf-ed8f-4864-8545-1e3d9681b0cf" width="30%"></img> <img src="https://github.com/user-attachments/assets/531830da-8668-4189-a0dc-020e6661bfb6" width="30%"></img>
+<p align="center">
+  <img src="docs/screenshots/1.png" width="45%">
+  <img src="docs/screenshots/2.png" width="45%">
+  <img src="docs/screenshots/3.png" width="45%">
+  <img src="docs/screenshots/4.png" width="45%">
+</p>
 
 ## 主要功能
 
 ### AI 驱动流水线
-- **本地与云端 LLM 支持** — 兼容任何 OpenAI 兼容 API（LM Studio、Ollama、OpenAI 等）
-- **自动脚本标注** — LLM 将文本解析为包含说话人、对话和 TTS 指令的 JSON 格式
-- **LLM 脚本审校** — 可选的二次 LLM 校验，修复常见标注错误
-- **角色生成** — LLM 分析脚本为每个角色创建声音描述，通过 VoiceDesign 生成参考音频并自动分配克隆声音 — 一键完成从脚本到全角色配音
-- **说话人别名** — 将多个说话人名映射到同一声音（例如"年轻的艾琳娜" → "艾琳娜"），共享声音配置
-- **智能分块** — 按说话人连续分组（最多 500 字符），保持自然语流
-- **上下文保持** — 在分块间传递角色名单和最后 3 条脚本条目，确保角色和风格连贯
+- **本地与云端 LLM 支持** - 使用本地 LLM 服务器（LM Studio、Ollama）或任何 OpenAI 兼容的云端 API
+- **自动脚本标注** - 串行 9 步行走式 LLM 流水线（2a→2i）将书籍转换为带说话人、文本和 TTS 指令的 span 结构
+- **置信度审校** - 自动接受高置信度结果，将低置信度项标出供人工审校（接受/拒绝/覆盖）
+- **声音试听与分配** - 行走 2g/2h 自动为角色试听并分配声音
+- **说话人别名** - 将多个说话人名称映射到同一声音（如 小林→林峰）
 
 ### 语音生成
-- **内置 TTS 引擎** — Qwen3-TTS 本地运行，无需外部服务器
-- **多语言支持** — 中文、英语、法语、德语、意大利语、日语、韩语、葡萄牙语、俄语、西班牙语，或自动检测
-- **预置声音** — 9 种预训练声音，支持基于指令的情感/语调控制
-- **声音克隆** — 仅需 5-15 秒参考音频即可克隆任何声音
-- **声音设计器** — 通过文字描述创建新声音（例如："温暖、低沉的男性声音，语调沉稳"）
-- **LoRA 声音训练** — 在自定义语音数据集上微调 Base 模型，创建持久的声音身份
-- **内置 LoRA 预设** — 开箱即用的预训练声音适配器
-- **数据集构建器** — 交互式工具，逐条创建训练数据集，支持预览
-- **批量处理** — 同时生成数十个语音块，吞吐量达实时速度的 3-6 倍
-- **编解码器编译** — 可选的 `torch.compile` 优化，批量解码速度提升 3-4 倍
+- **内置 TTS 引擎** - 无需外部 TTS 服务器；Qwen3-TTS 权重自动下载（约 3.5 GB）
+- **多语言支持** - 中文、英语、法语、德语、意大利语、日语、韩语、葡萄牙语、俄语、西班牙语，或自动检测
+- **预置声音** - 9 个预先训练的声音，每个都支持指令情感/语气控制
+- **声音克隆** - 使用 5-15 秒的参考音频克隆任何声音
+- **声音设计器** - 用文字描述设计声音（Qwen3-TTS VoiceDesign 模型）
+- **LoRA 声音训练** - 在声音设计器或克隆声音之上训练自定义 LoRA
+- **内置 LoRA 预设** - 内置调优的 LoRA 预设
+- **数据集构建器** - 为 LoRA 训练构建数据集
+- **批量处理** - 批量合成音频，速度提升 3-6 倍
+- **编解码器编译** - 使用 torch.compile 提升 3-4 倍速度
+- **自然停顿** - 说话人切换时 500ms 停顿，同一说话人 250ms 停顿
 
 ### Web UI 编辑器
-- **简洁界面** — 5 步核心流水线（设置、脚本、声音、编辑器、结果）加高级工具（设计器、数据集、训练）
-- **分块编辑** — 编辑任意行的说话人、文本和指令
-- **选择性重新生成** — 单独重新渲染某一分块
-- **实时进度** — 所有操作的实时日志和状态跟踪
-- **音频预览** — 单独播放或按顺序预览整本有声书
+- **简洁界面** - 核心流水线标签页（设置、脚本、声音、编辑器）加高级工具（设计器、预处理、数据集、训练）
+- **跨度编辑器** - 编辑任意行的说话人、文本和指令
+- **结构操作** - 在流水线编辑器中拆分、合并、移动或删除跨度
+- **批量处理** - 优化批量渲染，子批处理充分利用 GPU
+- **实时进度** - 所有操作的实时日志和状态跟踪
 
 ### 导出选项
-- **合并有声书** — 包含所有声音和自然停顿的单个 MP3 文件
-- **单独语音行** — 每行单独导出 MP3，方便在 DAW 中编辑
-- **Audacity 导出** — 一键导出 ZIP，包含按说话人分轨的 WAV 文件、LOF 项目文件和标签
-- **M4B 有声书** — 带章节标记的 M4B 格式（AAC），支持自动检测章节或逐块章节，适用于 Audiobookshelf、Apple Books、VLC 等播放器
-
----
+- **M4B 有声书** - 带章节标记的 M4B（AAC），支持自动检测或逐块章节，适用于有声书播放器（Audiobookshelf、Apple Books、VLC 等）
+- **原始语音块** - 以 ZIP 形式下载每行的 WAV/MP3 语音块
 
 ## 系统要求
 
-- [Pinokio](https://pinokio.computer/)
-- LLM 服务器（以下任选其一）：
-  - [LM Studio](https://lmstudio.ai/)（本地）— 推荐使用 Qwen3 或类似模型
-  - [Ollama](https://ollama.ai/)（本地）
-  - [OpenAI API](https://platform.openai.com/)（云端）
-  - 任何 OpenAI 兼容 API
-- **GPU：** 最低 8 GB 显存，推荐 16 GB 以上 — 详见下方兼容性表格
-  - 每个 TTS 模型占用约 3.4 GB 显存；剩余显存决定批量大小
-  - 所有平台均可使用 CPU 模式，但速度明显较慢
-- **内存：** 推荐 16 GB（最低 8 GB）
-- **磁盘：** 约 20 GB（8 GB venv/PyTorch + 约 7 GB 模型权重 + 音频工作空间）
+- **Pinokio**（推荐）或手动安装
+- **LLM 服务器** - 任意 OpenAI 兼容 API（LM Studio、Ollama、OpenAI、Together、Groq、DeepSeek 等）
+- **GPU** - 最低 8GB 显存；推荐 16GB+（每个 TTS 模型约 3.4GB）
+- **内存** - 推荐 16GB，最低 8GB
+- **磁盘空间** - 约 20GB（虚拟环境 8GB + 模型权重 7GB + 工作区文件）
 
 ### GPU 兼容性
 
-| GPU | 操作系统 | 状态 | 驱动要求 | 备注 |
-|-----|---------|------|---------|------|
-| **NVIDIA** | Windows | 完全支持 | 驱动 550+（CUDA 12.8） | 包含 Flash Attention 加速编码 |
-| **NVIDIA** | Linux | 完全支持 | 驱动 550+（CUDA 12.8） | 包含 Flash Attention + Triton |
-| **AMD** | Linux | 完全支持 | ROCm 6.3+ | 自动应用 ROCm 优化 |
-| **AMD** | Windows | 仅 CPU | 不适用 | 不支持 GPU 加速 — 如需 AMD GPU 加速请使用 Linux |
-| **Apple Silicon** | macOS | 仅 CPU | 不适用 | 暂不支持 MPS 加速，可运行但速度较慢 |
+| 操作系统 | GPU | 兼容性 |
+|---------|-----|--------|
+| Windows | NVIDIA | ✅ 完整支持（CUDA 12.8、Flash Attention） |
+| Linux | NVIDIA | ✅ 完整支持（CUDA 12.8、Flash Attention） |
+| Linux | AMD | ✅ 完整支持（ROCm 6.3+） |
+| Windows | AMD | ⚠️ 仅 CPU |
+| macOS | Apple Silicon | ⚠️ 仅 CPU（不支持 MPS） |
 
-> **提示：** 无需外部 TTS 服务器。Alexandria 内置 Qwen3-TTS 引擎，模型权重在首次使用时自动从 Hugging Face 下载（每个模型变体约 3.5 GB）。
-
----
+> 无需外部 TTS 服务器。Qwen3-TTS 内置，首次生成时自动下载权重（约 3.5 GB/变体）。
 
 ## 安装
 
 ### 方式 A：Pinokio（推荐）
 
-1. 安装 [Pinokio](https://pinokio.computer/)（如尚未安装）
-2. 在 Pinokio 中打开 Alexandria：**[通过 Pinokio 安装](https://beta.pinokio.co/apps/github-com-finrandojin-alexandria-audiobook)**
-   - 或手动操作：在 Pinokio 中点击 **Download**，粘贴 `https://github.com/Finrandojin/alexandria-audiobook`
-3. 点击 **Install** 安装依赖
-4. 点击 **Start** 启动 Web 界面
+1. 安装 [Pinokio](https://pinokio.computer)
+2. 进入 **Discover** 并搜索 "alexandria"
+3. 点击 **Install** 并等待完成
 
-### 方式 B：Google Colab（无需安装）
+### 方式 B：Google Colab
 
-没有 GPU 或系统不兼容？在浏览器中使用免费 T4 GPU 运行 Alexandria：
+免费 T4 GPU，无需安装：
 
-[![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Finrandojin/alexandria-audiobook/blob/main/alexandria_colab.ipynb)
+1. 打开 [Alexandria 有声书生成器 - Colab](https://colab.research.google.com/github/lazdavila/alexandria-audiobook/blob/main/colab.ipynb)
+2. 点击 **Connect** → **Runtime Type** → **T4 GPU**
+3. 点击 **Run All** 并按照笔记本中的说明设置 ngrok 公共 URL
 
-需要免费的 [ngrok 账号](https://dashboard.ngrok.com/signup) 用于 Web UI 隧道。详细说明请参阅 notebook。
-
----
-
-## 首次启动 — 必读
-
-如果你是第一次运行 Alexandria，请在操作前仔细阅读本节。
+## 首次启动 — 预期情况
 
 ### 1. 必须先启动 LLM 服务器
 
-Alexandria **不包含** LLM — 它通过 API 连接到外部 LLM。在生成脚本之前，你必须先启动以下任一服务：
+Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 
-| 服务器 | 默认 URL | 安装方式 |
-|--------|---------|---------|
-| [LM Studio](https://lmstudio.ai/) | `http://localhost:1234/v1` | 下载安装，加载模型，启动服务器 |
-| [Ollama](https://ollama.ai/) | `http://localhost:11434/v1` | 安装后运行 `ollama run qwen3` |
-| [OpenAI API](https://platform.openai.com/) | `https://api.openai.com/v1` | 获取 API Key |
+| 服务器 | URL | 默认模型 |
+|--------|-----|---------|
+| LM Studio | `http://localhost:1234/v1` | 任意已加载模型 |
+| Ollama | `http://localhost:11434/v1` | 任意已拉取模型 |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o` |
 
-如果在点击"Generate Script"时 LLM 服务器未运行，生成将会失败。请查看 Pinokio 终端获取错误详情。
+在 Setup 标签页中设置 Base URL 和 API Key，点击 **Save Configuration**。脚本生成时若未检测到服务器，会显示错误。
 
-### 2. 首次 TTS 生成会下载约 3.5 GB 模型
+### 2. 首次 TTS 下载
 
-TTS 模型**不包含在安装中**，首次生成音频时会自动从 Hugging Face 下载：
+首次生成音频时会自动下载 TTS 模型权重（每个变体约 3.5 GB），并在后台缓存。下载速度取决于网速。可通过 Pinokio 终端查看进度。
 
-- **每个模型变体约 3.5 GB**（CustomVoice、Base/克隆、VoiceDesign）
-- 只有你使用的变体才会下载（大多数用户从 CustomVoice 开始）
-- 下载在后台进行 — **请在 Pinokio 终端中查看进度**
-- 此时 Web UI 可能看起来没有响应，这是正常的 — 它在等待下载完成
-- 首次下载后，模型将缓存在本地，后续加载只需几秒钟
+> **中国大陆用户：** 如 HuggingFace 下载缓慢，设置环境变量 `HF_ENDPOINT=https://hf-mirror.com`（可选 `HF_TOKEN`）后重新启动。
 
-> **提示：** 如果下载似乎卡住了，请检查网络连接。如果失败，重启应用再试 — 会从断点处继续下载。
+### 3. 首批生成预热
 
-> **中国大陆用户：** 如果 Hugging Face 下载缓慢或无法连接，请在启动前设置镜像：将环境变量 `HF_ENDPOINT` 设为 `https://hf-mirror.com`。也可以在 start.js 的 `env` 字段中添加：`env: { HF_ENDPOINT: "https://hf-mirror.com" }`。如果遇到速率限制，可注册免费的 [Hugging Face 账号](https://huggingface.co/join) 并设置 `HF_TOKEN` 为你的访问令牌。
+第一批批量生成比后续批次慢：
+- **AMD GPU** - MIOpen 自动调优需要 30-60 秒（一次性）
+- **Codec 编译** - torch.compile 首次运行时编译（一次性）
 
-### 3. 首批生成需要额外预热时间
+### 4. 显存决定
 
-每个会话中的首次批量生成比后续生成更慢：
+| 显存 | 推荐并行批处理大小 |
+|------|------------------|
+| 8GB | 小块（每次 2-5 块） |
+| 16GB | 中等批次（10-20 块） |
+| 24GB+ | 大块（40-60 块）+ Codec 编译 |
 
-- **MIOpen 自动调优**（AMD GPU）：GPU 核心优化器每个会话运行一次，增加约 30-60 秒
-- **编解码器编译**（如已启用）：一次性约 30-60 秒预热，之后所有批次速度提升 3-4 倍
-- **这是正常现象。** 首批之后，生成速度会稳定下来
+如果显存不足，请降低 Setup 标签页中的 **Parallel Workers**。
 
-### 4. 显存决定你能做什么
+### 5. 出问题去哪看
 
-| 可用显存 | 可行操作 |
-|---------|---------|
-| 8 GB | 一次只能加载一个模型，小批量（2-5 个语音块），可能需要 CPU 卸载 |
-| 16 GB | 大多数用例都能舒适运行，批量 10-20 个语音块 |
-| 24 GB+ | 全速运行，批量 40-60 个语音块，搭配编解码器编译 |
-
-- 如果显存不足，请在设置标签页中降低 **Parallel Workers** 或 **Max Chars/Batch**
-- 生成前关闭其他 GPU 应用程序（游戏、其他 AI 工具）
-- 切换声音类型（Custom → Clone → LoRA）时会卸载并重新加载模型，暂时释放显存
-
-### 5. 出问题时去哪里查看
-
-Web UI 显示的是高层状态，**详细日志在 Pinokio 终端中**：
-
-- 点击 Pinokio 侧栏中的 **Terminal** 查看实时输出
-- 模型加载、下载进度、显存估算和错误信息都会显示在这里
-- 如果 UI 中生成静默失败，终端会显示原因
-
----
+所有日志（TTS、LLM 调用、错误）都打印到 **Pinokio 终端**。
 
 ## 快速入门
 
-界面分为 **5 步核心流水线**（绿色标签页，带编号）和 **高级工具**（蓝色标签页，无编号）。只需核心流水线即可生成有声书。
+界面分为**核心流水线标签页**（绿色标签页）和**高级工具**（蓝色标签页）。
 
-### 核心流水线
+### 第 1 步：设置
+配置 LLM 端点（Base URL、API Key、Model Name），TTS 模式设为 `local`，然后点击 **Save Configuration**。
 
-**第 1 步 — 设置**
-配置 LLM 连接和 TTS 引擎，至少需要：
-- **LLM Base URL**：`http://localhost:1234/v1`（LM Studio）或 `http://localhost:11434/v1`（Ollama）
-- **LLM API Key**：你的 API 密钥（本地服务器使用 `local`）
-- **LLM Model Name**：要使用的模型（例如 `qwen2.5-14b`）
-- **TTS Mode**：`local`（内置引擎，推荐）— 直接加载模型，无需外部服务器
-- 完成后点击 **Save Configuration**
+### 第 2 步：脚本
+在脚本标签页中上传 `.txt`、`.md` 或 `.epub` 文件（EPUB 自动转换为纯文本）。点击 **Onboard Book** 导入书籍，然后点击 **Run All Walks** 运行完整的 9 步标注流水线（2a→2i）。行走进度显示在标签页中；任何行走均可取消或单独重新运行。如需重新导入（例如替换源文件），使用 **Re-onboard**。
 
-**第 2 步 — 脚本**
-- 使用文件选择器选取书籍文件（.txt、.md 或 .epub）— 选择后自动上传，EPUB 文件会自动转换为纯文本
-- 点击 **Generate Annotated Script** — 将书籍发送给 LLM，分割为带有说话人标签和语音指令的标注块
-- *（可选）* 如果生成的脚本有问题，点击 **Review Script** — 运行二次 LLM 校验，修复说话人归属错误或格式问题
-- 可以使用下方的保存功能将脚本保存供以后使用
+### 第 3 步：声音
+在声音标签页中，为每个检测到的角色从声音目录中选择声音。声音类型包括 Custom（9 个预置）、Clone（参考音频）、LoRA（训练适配器）和 Voice Design（文字描述）。使用**说话人别名**（Alias of 下拉菜单）将多个说话人名称映射到同一声音。更改通过流水线 API 自动保存。
 
-**第 3 步 — 声音**
-脚本中检测到的每个角色都会有一张声音卡片。为每个说话人：
-- 选择声音类型：Custom Voice（最简单）、Clone Voice、LoRA Voice 或 Voice Design
-- 使用 Custom Voice 时，从 9 个预设中选择（Ryan、Serena、Aiden 等），可选设置角色风格（例如"沉稳的旁白语调"）
-- **生成角色** — 点击后 LLM 分析脚本，为每个角色创建声音描述、生成参考音频并自动分配克隆声音。切换"Advanced"可控制批量大小。这是为所有角色分配独特声音的最快方式
-- **说话人别名** — 使用声音卡片上的"Alias of"下拉菜单将一个说话人映射到另一个角色的声音（例如将"年轻的艾琳娜"设为"艾琳娜"的别名）
-- 更改自动保存 — 各类型详细说明参见 [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types)
+### 第 4 步：编辑器
+点击 **Render** 批量生成所有待处理 span 的音频，并实时显示进度。渲染完成后，可内联编辑任何 span（说话人/文本/指令）或使用结构操作拆分/合并/移动/删除跨度，然后点击 **Merge** 合成最终有声书，最后 **Download** 下载 M4B 文件。低置信度项目出现在审校列表中，可逐项接受、拒绝或覆盖。
 
-**第 4 步 — 编辑器**
-- 点击 **Render Pending** 批量生成所有语音块的音频
-- 点击单个语音块试听，或点击 **Play Sequence** 按顺序预览
-- 可以内联编辑任何语音块的文本、说话人或指令，然后单独重新生成
-- 满意后点击 **Merge All** 将所有内容合并为最终有声书
+### 高级工具
 
-**第 5 步 — 结果**
-- 在浏览器中试听完成的有声书
-- 下载 MP3，导出 **M4B**（带章节标记），或点击 **Export to Audacity** 导出按说话人分轨的 WAV 文件
-- M4B 导出支持填写书名、作者、朗读者等元数据，并可嵌入封面图片
+- **声音设计器** - 用文字描述设计自定义声音并预览
+- **预处理** - 上传和准备 LoRA 训练数据集
+- **数据集** - 构建带人工标注样本的 LoRA 训练数据集
+- **训练** - 在声音设计器或克隆声音之上训练自定义 LoRA
 
-### 高级工具（可选）
+## Web 界面
 
-这些标签页面向需要更多声音控制的高级用户：
+### 设置标签页
 
-- **设计器** — 通过文字描述创建新声音（例如"温和的年长女性，声音略带沙哑"）。保存后可在声音标签页中用作克隆参考
-- **数据集** — 交互式构建 LoRA 训练数据集，逐条创建并支持音频预览
-- **训练** — 在语音数据集上训练 LoRA 适配器，创建持久的声音身份，支持指令跟随
+**LLM 设置：** Base URL、API Key、Model Name、Reasoning Effort、Temperature。
 
----
+**TTS 设置：**
+| 设置 | 说明 |
+|------|------|
+| TTS Mode | `local`（内置）或 `external`（远程 Gradio 服务器） |
+| Device | `auto`、`cuda`、`cpu`、`mps` |
+| Language | 语音语言（`auto` 检测或指定） |
+| Parallel Workers | 并行合成的工作线程数（1-10） |
+| Batch Seed | 批处理的随机种子（-1 = 随机） |
+| Compile Codec | 使用 torch.compile 编译解码器（3-4 倍速度提升） |
+| Batch Group by Type | 按声音类型分组批处理 |
+| Sub-batching | 将大批拆分为子批次以节省显存 |
+| Min Sub-batch Size | 最小子批大小（默认 4） |
+| Length Ratio | 子批长度比例（默认 5） |
+| Max Sub-batch Items | 单个子批次的最大项数 |
+| Speaker Change Pause | 说话人切换时的停顿（默认 500ms） |
+| Same Speaker Pause | 同一说话人内的停顿（默认 250ms） |
+
+### 脚本标签页
+
+1. 上传 `.txt`、`.md` 或 `.epub` 文件
+2. 点击 **Onboard Book** - 从 EPUB 提取文本并建立书籍结构
+3. 点击 **Run All Walks** - 运行完整标注流水线（2a→2i）
+4. 行走状态显示在标签页中；任何行走均可取消，可单独重新运行，全部完成后进入编辑器审校
+
+**Re-onboard** - 重新导入书籍（替换源文件并重建结构）。
+
+### 声音标签页
+
+- 角色列表（来自行走 2b 的角色发现）显示在左侧，每个角色带声音分配下拉菜单
+- 点击分配下拉菜单中的声音名称，立即通过 `PUT /api/pipeline/characters/{id}/voice` 保存
+- 声音目录管理：创建、编辑、删除声音；点击 **Preview** 播放声音预览
+- **说话人别名：** 将多个说话人名称映射到同一声音（如 小林→林峰），自动进行传递解析和循环检测
+
+### 声音设计器标签页
+
+1. 描述要设计的声音（如 "低沉、洪亮的男声，带轻微回音"）
+2. 点击 **Generate** - 声音由 Qwen3-TTS VoiceDesign 模型生成
+3. 点击 **Preview** 试听，满意后 **Save to Library** 保存到声音库
+
+### 训练标签页
+
+**数据集：**
+- **上传数据集** - 上传 ZIP 压缩的 WAV 文件（24kHz 单声道）和 `metadata.jsonl`
+- **生成数据集** - 自动从克隆/设计声音生成训练数据集
+- **数据集构建器** - 构建带人工标注样本的 LoRA 训练数据集
+
+**训练配置：** 适配器名称、训练轮数、学习率、LoRA Rank、LoRA Alpha、语言、批量大小（+ 梯度累积）。建议从 15-30 轮开始，观察损失曲线。
+
+### 数据集构建器标签页
+
+1. 创建项目，包含声音描述和可选的全局种子
+2. 添加并编辑样本（多行文本），批量生成音频
+3. 预览生成的音频，取消整个批次，保存为数据集
+4. 保存的数据集可在训练标签页中使用
+
+### 编辑器标签页
+
+- 显示所有 span 的表格，带状态指示器（TTS 进度）和置信度标签
+- 内联编辑任意 span（说话人/文本/指令）
+- 结构操作：拆分、合并、移动、删除 span
+- **Render** - 批量渲染所有待处理 span，实时进度轮询
+- 置信度审校：接受/拒绝/覆盖低置信度项
+- **Merge** - 将渲染的音频块合并为单个 M4B 文件
+- **Download** - 下载合并的 M4B 有声书
+
+## 性能
+
+### 推荐设置
+
+| 设置 | 建议 |
+|------|------|
+| TTS Mode | `local` |
+| Compile Codec | `true` |
+| Parallel Workers | 20-60（显存允许时） |
+
+### 基准测试
+
+**AMD RX 7900 XTX（24GB）** 使用 `rocm` 栈：
+
+| 模式 | 速度 |
+|------|------|
+| 标准 | ~1x |
+| 批量（无 codec） | ~2x |
+| 批量 + codec | 3-6x |
+
+> 273 块的有声书（约 54 分钟音频）批量 + codec 约 16 分钟。
+
+### ROCm AMD GPU 说明（Linux）
+
+- 使用 `bfloat16` 以获得最佳性能和稳定性（AMD 不支持 float16）
+- 首次生成时自动运行 MIOpen fast-find 优化
+- **ROCm 7.x 降频问题：** 如生成速度缓慢，每次开机后运行一次：
+  ```bash
+  echo 5 | sudo tee /sys/class/drm/card1/device/pp_power_profile_mode
+  ```
+- 验证计算内核正在运行：`COMPUTE=ON`
+
+## 脚本格式
+
+流水线的标注行走输出结构化 JSON，其中包含 span，每个 span 具有：
+
+- `speaker`（必需）- 说话人名称
+- `text`（必需）- 对话文本
+- `instruct`（可选）- TTS 的 2-3 句语音指令
+
+示例：
+
+```json
+{
+  "speaker": "NARRATOR",
+  "text": "The morning sun crept across the dusty windowsill.",
+  "instruct": "Soft, hushed tone; slow and contemplative."
+}
+```
+
+## 输出文件
+
+### M4B 有声书（推荐）
+
+最终有声书为带章节标记的 `audiobook.m4b`（AAC 128kbps）。章节自动检测（基于脚本标题）或按块生成。下载后兼容 Audiobookshelf、Apple Books、VLC 等播放器。
+
+### 原始语音块
+
+每个渲染作业在作业目录中生成 `chunk_0000.wav`、`chunk_0001.wav` 等文件（按时间顺序编号）。下载端点服务 `audiobook.m4b`（合并后）或 `audiobook.zip`（未合并的语音块，ZIP 打包）。
+
+## API 参考
+
+Alexandria 使用 **Pipeline API**（`/api/pipeline/*`，25 个端点）作为唯一的脚本/声音/渲染界面。所有示例假设服务器运行在 `http://127.0.0.1:4200`。
+
+### 配置
+
+**获取当前配置：**
+```bash
+curl http://127.0.0.1:4200/api/config
+```
+
+**更新配置：**
+```bash
+curl -X POST http://127.0.0.1:4200/api/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "llm": {
+      "base_url": "http://localhost:1234/v1",
+      "api_key": "your-api-key",
+      "model_name": "qwen3-14b",
+      "task_overrides": {}
+    },
+    "tts": {
+      "mode": "local",
+      "device": "auto",
+      "language": "auto",
+      "parallel_workers": 20,
+      "batch_seed": -1,
+      "compile_codec": true,
+      "sub_batch_enabled": true,
+      "sub_batch_min_size": 4,
+      "sub_batch_ratio": 5,
+      "pause_between_speakers_ms": 500,
+      "pause_same_speaker_ms": 250
+    }
+  }'
+```
+
+### 流水线（脚本生成）
+
+```bash
+# 导入书籍
+curl -X POST http://127.0.0.1:4200/api/pipeline/onboard \
+  -F "file=@mybook.epub"
+
+# 运行所有标注行走（2a→2i）
+curl -X POST http://127.0.0.1:4200/api/pipeline/run_all_walks \
+  -H "Content-Type: application/json" \
+  -d '{"book_id": "123"}'
+
+# 检查行走进度
+curl http://127.0.0.1:4200/api/pipeline/walk_status/123
+
+# 获取审校项
+curl http://127.0.0.1:4200/api/pipeline/review/123
+
+# 接受审校项
+curl -X POST http://127.0.0.1:4200/api/pipeline/review/accept \
+  -H "Content-Type: application/json" \
+  -d '{"item_id": "..."}'
+```
+
+### 声音目录
+
+```bash
+# 列出所有声音
+curl http://127.0.0.1:4200/api/pipeline/voices
+
+# 创建自定义声音
+curl -X POST http://127.0.0.1:4200/api/pipeline/voices \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Marcus",
+    "type": "custom",
+    "voice": "Ryan",
+    "character_style": "Deep, authoritative"
+  }'
+
+# 预览声音
+curl -X POST http://127.0.0.1:4200/api/pipeline/voices/<voice_id>/preview \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world"}'
+
+# 为角色分配声音
+curl -X PUT http://127.0.0.1:4200/api/pipeline/characters/<character_id>/voice \
+  -H "Content-Type: application/json" \
+  -d '{"voice_assignment_id": "marcus"}'
+```
+
+### 角色账本
+
+```bash
+# 获取角色的全部角色及其分配
+curl http://127.0.0.1:4200/api/pipeline/characters/123
+```
+
+### 渲染与下载
+
+```bash
+# 渲染有声书（批处理）
+curl -X POST http://127.0.0.1:4200/api/pipeline/render \
+  -H "Content-Type: application/json" \
+  -d '{"book_id": "123", "use_batch": true}'
+# → {"job_id": "abc", "status": "started"}
+
+# 轮询渲染状态
+curl http://127.0.0.1:4200/api/pipeline/render_status/abc
+
+# 将语音块合并为 M4B
+curl -X POST http://127.0.0.1:4200/api/pipeline/merge \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "abc"}'
+
+# 下载合并的有声书
+curl -L http://127.0.0.1:4200/api/pipeline/download/abc -o audiobook.m4b
+```
+
+### 声音设计器
+
+```bash
+# 预览声音设计
+curl -X POST http://127.0.0.1:4200/api/voice_design/preview \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Deep, resonant male voice"}'
+
+# 保存到声音库
+curl -X POST http://127.0.0.1:4200/api/voice_design/save \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Marcus", "description": "Deep, resonant male voice"}'
+```
+
+### LoRA 训练
+
+```bash
+# 上传训练数据集（ZIP）
+curl -X POST http://127.0.0.1:4200/api/lora/upload_dataset \
+  -F "file=@dataset.zip" -F "name=my_dataset"
+
+# 生成数据集
+curl -X POST http://127.0.0.1:4200/api/lora/generate_dataset \
+  -H "Content-Type: application/json" \
+  -d '{"voice_id": "...", "lines": ["..."], "name": "my_dataset"}'
+
+# 启动训练
+curl -X POST http://127.0.0.1:4200/api/lora/train \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-lora", "dataset_id": "...", "epochs": 15, "learning_rate": 5e-6, "lora_r": 64, "lora_alpha": 128}'
+
+# 列出训练好的模型
+curl http://127.0.0.1:4200/api/lora/models
+```
+
+### 数据集构建器
+
+```bash
+# 列出项目
+curl http://127.0.0.1:4200/api/dataset_builder/list
+
+# 创建项目
+curl -X POST http://127.0.0.1:4200/api/dataset_builder/create \
+  -H "Content-Type: application/json" \
+  -d '{"name": "marcus-dataset", "description": "...", "seed": -1}'
+
+# 生成样本
+curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_sample \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "...", "rows": [{"text": "Hello world"}]}'
+
+# 保存项目为数据集
+curl -X POST http://127.0.0.1:4200/api/dataset_builder/save \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "..."}'
+```
+
+## Python 集成
+
+```python
+import requests
+
+BASE = "http://127.0.0.1:4200"
+
+# 1. 导入书籍
+with open("mybook.epub", "rb") as f:
+    r = requests.post(f"{BASE}/api/pipeline/onboard", files={"file": f})
+book_id = r.json()["book_id"]
+
+# 2. 运行所有标注行走
+requests.post(f"{BASE}/api/pipeline/run_all_walks", json={"book_id": book_id})
+
+# 3. 等待行走完成
+while True:
+    status = requests.get(f"{BASE}/api/pipeline/walk_status/{book_id}").json()
+    if all(w.get("status") == "completed" for w in status.values()):
+        break
+    time.sleep(2)
+
+# 4.（可选）为角色分配声音
+characters = requests.get(f"{BASE}/api/pipeline/characters/{book_id}").json()
+for c in characters:
+    requests.put(f"{BASE}/api/pipeline/characters/{c['id']}/voice",
+                 json={"voice_assignment_id": "marcus"})
+
+# 5. 渲染有声书
+job = requests.post(f"{BASE}/api/pipeline/render",
+                    json={"book_id": book_id, "use_batch": True}).json()
+job_id = job["job_id"]
+
+# 6. 轮询渲染状态
+while True:
+    st = requests.get(f"{BASE}/api/pipeline/render_status/{job_id}").json()
+    if st["status"] == "completed":
+        break
+    time.sleep(2)
+
+# 7. 合并并下载 M4B
+requests.post(f"{BASE}/api/pipeline/merge", json={"job_id": job_id})
+r = requests.get(f"{BASE}/api/pipeline/download/{job_id}")
+with open("audiobook.m4b", "wb") as f:
+    f.write(r.content)
+```
+
+## JavaScript 集成
+
+```javascript
+const BASE = "http://127.0.0.1:4200";
+
+// 1. 导入书籍
+const form = new FormData();
+form.append("file", fileInput.files[0]);
+const onboard = await fetch(`${BASE}/api/pipeline/onboard`, {
+  method: "POST",
+  body: form,
+}).then((r) => r.json());
+const bookId = onboard.book_id;
+
+// 2. 运行所有标注行走
+await fetch(`${BASE}/api/pipeline/run_all_walks`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ book_id: bookId }),
+});
+
+// 3. 等待行走完成
+async function waitForWalks() {
+  while (true) {
+    const status = await fetch(`${BASE}/api/pipeline/walk_status/${bookId}`).then((r) => r.json());
+    if (Object.values(status).every((w) => w.status === "completed")) break;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+await waitForWalks();
+
+// 4. 渲染
+const { job_id: jobId } = await fetch(`${BASE}/api/pipeline/render`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ book_id: bookId, use_batch: true }),
+}).then((r) => r.json());
+
+// 5. 等待渲染完成
+while (true) {
+  const st = await fetch(`${BASE}/api/pipeline/render_status/${jobId}`).then((r) => r.json());
+  if (st.status === "completed") break;
+  await new Promise((r) => setTimeout(r, 2000));
+}
+
+// 6. 合并并下载
+await fetch(`${BASE}/api/pipeline/merge`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ job_id: jobId }),
+});
+window.location.href = `${BASE}/api/pipeline/download/${jobId}`;
+```
+
+## 推荐 LLM 模型
+
+| 模型 | 推荐用途 | 说明 |
+|------|---------|------|
+| Qwen3-next 80B-A3B-instruct | 最佳质量 | MoE，与 Alexandria 同款（Qwen 系列） |
+| Gemma3 27B | 最佳开源 | 高质量标注 |
+| Qwen2.5 | 推荐 | 广泛兼容 |
+| Qwen3（非思维链） | 推荐 | 快速，质量高 |
+| Llama 3.1 / 3.2 | 可选 | 质量不一 |
+| Mistral / Mixtral | 可选 | 质量不一 |
+
+**思维链模型**（DeepSeek-R1、GLM4-air 等）可能干扰 JSON 输出。如必须使用，建议选用非思维链变体或单独的端点用于标注行走。
 
 ## 常见问题
 
 ### 脚本生成失败
-- 确认 LLM 服务器正在运行且可访问
-- 验证模型名称与已加载模型一致
-- 尝试使用其他模型 — 某些模型在 JSON 输出方面表现不佳
-- 思维链模型（DeepSeek-R1、GLM4 等）可能干扰 JSON 输出。如需使用，请在设置中的 **Banned Tokens** 字段添加 `<think>` 以禁用思考模式
 
-### 模型下载失败或速度很慢
-- TTS 模型（每个约 3.5 GB）在首次使用时从 Hugging Face 下载
-- **中国大陆用户**：设置环境变量 `HF_ENDPOINT=https://hf-mirror.com` 使用国内镜像
-- 如遇速率限制，注册免费 [Hugging Face 账号](https://huggingface.co/join) 并设置 `HF_TOKEN`
-- 下载中断后会自动续传 — 重启应用即可
+- 确认 LLM 服务器正在运行且可访问
+- 确认 Setup 标签页中的模型名称正确
+- 脚本生成日志会打印 JSON 解析错误（在 Pinokio 终端中查看）
+
+### 模型下载失败或缓慢
+
+中国大陆用户可设置 HuggingFace 镜像以加快下载：
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+可选：`export HF_TOKEN=your_token` 用于 gated 模型。下载支持断点续传。
 
 ### TTS 生成失败
-- 查看 Pinokio 终端中的模型加载错误
-- 确保有足够的显存（推荐 16 GB 以上 bfloat16）
-- 检查 voice_config.json 中所有说话人的设置是否有效
-- 克隆声音时，确认参考音频存在且转录文本准确
+
+- 检查 Pinokio 终端中的错误信息
+- 显存不足：确保 GPU 至少有 16GB（或使用 CPU 模式 `device: cpu`）
+- 若使用外部 Gradio TTS 服务器，确认其正在运行
+- 确认每个角色在声音标签页中都分配了有效的声音（声音配置存储在流水线的 `voice_config` 表中）
+- 克隆声音：使用 5-15 秒清晰、干净的参考音频
 
 ### 生成速度慢
-- 在设置中启用 **Compile Codec**（首次预热后速度提升 3-4 倍）
-- 如果显存允许，增加 **Parallel Workers**（批量大小）
-- 使用 **Batch (Fast)** 渲染模式而非 Standard
-- 首批生成较慢是正常现象（参见上方"首次启动"部分）
 
-### 显存不足 / OOM 错误
-- 在设置中降低 **Max Chars/Batch**（特别是使用克隆/LoRA 声音且参考音频较长时）
-- 降低 **Parallel Workers**（批量大小）
-- 关闭其他 GPU 密集型应用程序
-- 如果仍然不行，尝试 `device: cpu`（速度会慢很多）
+- 在 Setup 标签页中启用 **Compile Codec**
+- 增加 **Parallel Workers**（如显存允许）
+- 批量渲染会自动进行（`use_batch: true`）
 
-### MP3 文件损坏或很小（428 字节）
-Conda 自带的 ffmpeg 在 Windows 上通常缺少 MP3 编码器（libmp3lame）。Alexandria 会自动检测并回退到 WAV 格式。如需 MP3 输出：
-- 安装带 MP3 支持的 ffmpeg：`conda install -c conda-forge ffmpeg`
-- 或移除 conda 的 ffmpeg 以使用系统自带的：`conda remove ffmpeg`
+### 显存不足 / OOM
+
+- 降低 **Parallel Workers**（如 5-10）
+- 使用 `device: cpu`（较慢但可运行）
+- 减小子批次大小（Sub-batching）
+
+### 音频损坏 / 输出文件很小（428 字节）
+
+通常与 `ffmpeg`/`libmp3lame` 缺失或损坏有关：
+
+```bash
+# 如果使用 Pinokio conda 环境
+conda install -c conda-forge ffmpeg
+# 或
+pip install imageio-ffmpeg
+```
 
 ### 中文书籍处理提示
-- 在设置标签页的 **Language** 下拉菜单中选择"Chinese"或"Auto"
-- 默认 LLM 提示是为英文编写的 — 处理中文书籍时，建议在设置标签页的"Prompt Customization"部分修改提示，使其适配中文对话约定（如使用「」引号等）
-- 提示文件 `default_prompts.txt` 和 `review_prompts.txt` 可永久修改，更改即时生效无需重启
 
----
-
-## 推荐 LLM 模型
-
-用于脚本生成，非思维链模型效果最佳：
-- **Qwen3-next**（80B-A3B-instruct）— JSON 输出和指令方向优秀
-- **Gemma3**（推荐 27B）— JSON 输出和指令方向出色
-- **Qwen2.5**（任意大小）— JSON 输出稳定
-- **Qwen3**（非思维链变体）
-- **Llama 3.1/3.2** — 角色区分能力强
-- **Mistral/Mixtral** — 速度快，稳定可靠
-
----
+1. 将 TTS **Language** 设置为 `Chinese` 或 `Auto`
+2. 在声音标签页中为每个角色分配中文声音
+3. 标注行走内置中文对话约定（无需修改任何提示文件）
 
 ## 更多文档
 
-完整文档请参阅：
-- [English README](README.md) — 完整英文文档，包含 API 参考和项目结构
-- [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki) — 详细指南：声音类型、LoRA 训练、批量生成等
+- **[English README](README.md)** - 完整的英文文档，包含更多 API 参考和项目结构
+- **Wiki** - 查看[文档](https://github.com/lazdavila/alexandria-audiobook/wiki)获取更多信息
 
 ## 致谢
 
-- [Ayush Naphade](https://github.com/aayushnaphade) — 角色生成、说话人别名解析和上下文脚本审校功能（[PR #42](https://github.com/Finrandojin/alexandria-audiobook/pull/42)）。欢迎访问他的项目 [Lily](https://lily.rayoneai.in/)！
-- [Michii](https://github.com/on22s) — 系统健康仪表板，实时GPU/磁盘监控（[PR #45](https://github.com/Finrandojin/alexandria-audiobook/pull/45)）
+- [Ayush Naphade](https://github.com/ayushnaphade) - PR#42 角色生成、说话人别名、上下文脚本审校（→ Lily）
+- [Michii](https://github.com/michii) - PR#45 系统健康仪表板
 
 ## 许可证
 
-MIT
+[MIT](LICENSE)

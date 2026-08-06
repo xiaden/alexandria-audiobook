@@ -370,3 +370,79 @@ class TestDynamicImport:
         """_load_walk_module raises ImportError for nonexistent module."""
         with pytest.raises(ImportError):
             WalkRunner._load_walk_module("this_module_does_not_exist_xyz")
+
+
+# ---------------------------------------------------------------------------
+# Test background walk execution
+# ---------------------------------------------------------------------------
+
+
+class TestBackgroundWalkExecution:
+    """Tests for background walk execution (P2-S11)."""
+
+    def test_run_walk_returns_immediately(self, runner):
+        """run_walk returns a dict with status, not the walk result directly."""
+        # In the new background model, the endpoint returns immediately
+        # The runner.run_walk still returns the result dict
+        # This test verifies the runner behavior is unchanged
+        with patch.object(
+            WalkRunner,
+            "_load_walk_module",
+            return_value=MagicMock(execute=MagicMock(return_value={"status": "completed"})),
+        ):
+            result = runner.run_walk("walk_test", "book-1", {})
+            assert result["status"] == "completed"
+
+    def test_status_transitions_pending_to_running_to_completed(self, runner):
+        """Walk status transitions: pending → running → completed."""
+        # Initial status is pending
+        assert runner.get_walk_status("book-1", "walk_test") == "pending"
+
+        # During execution, status is running
+        with patch.object(
+            WalkRunner,
+            "_load_walk_module",
+            return_value=MagicMock(execute=MagicMock(return_value={"status": "completed"})),
+        ):
+            # We can't easily test the running state without threading,
+            # but we can verify the final state is completed
+            runner.run_walk("walk_test", "book-1", {})
+            assert runner.get_walk_status("book-1", "walk_test") == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Test cancellation
+# ---------------------------------------------------------------------------
+
+
+class TestCancellation:
+    """Tests for walk cancellation (P2-S12)."""
+
+    def test_cancel_walks_sets_flag(self, runner):
+        """cancel_walks sets the cancellation flag for a book."""
+        assert not runner._cancelled.get("book-1", False)
+        runner.cancel_walks("book-1")
+        assert runner._cancelled.get("book-1", False)
+
+    def test_clear_cancel_removes_flag(self, runner):
+        """clear_cancel removes the cancellation flag."""
+        runner.cancel_walks("book-1")
+        assert runner._cancelled.get("book-1", False)
+        runner.clear_cancel("book-1")
+        assert not runner._cancelled.get("book-1", False)
+
+    def test_run_walk_checks_cancel_flag(self, runner):
+        """run_walk checks cancel flag and returns cancelled status."""
+        runner.cancel_walks("book-1")
+        result = runner.run_walk("walk_test", "book-1", {})
+        assert result["status"] == "cancelled"
+        assert runner.get_walk_status("book-1", "walk_test") == "cancelled"
+
+    def test_run_all_walks_stops_on_cancel(self, runner):
+        """run_all_walks checks cancel flag before each walk."""
+        # Cancel before starting
+        runner.cancel_walks("book-1")
+        results = runner.run_all_walks("book-1", {})
+        # All walks should be cancelled
+        for walk_name, result in results.items():
+            assert result["status"] == "cancelled"

@@ -9,6 +9,7 @@ import './state';
 import './utils';
 import './templates';
 import { initTheme } from './theme';
+import { initState } from './state';
 
 // Import tab modules
 import { initSetup } from './tabs/setup';
@@ -19,10 +20,10 @@ import { initPreparer } from './tabs/preparer';
 import { initDatasetBuilder } from './tabs/dataset-builder';
 import { initTraining } from './tabs/training';
 import { initEditor } from './tabs/editor';
-import { initAudio } from './tabs/audio';
 
 // Initialize all tabs after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
+    initState();
     initTheme();
     initSetup();
     initScript();
@@ -32,5 +33,4 @@ document.addEventListener('DOMContentLoaded', () => {
     initDatasetBuilder();
     initTraining();
     initEditor();
-    initAudio();
 });

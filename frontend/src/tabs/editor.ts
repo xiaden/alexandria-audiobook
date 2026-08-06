@@ -1,25 +1,19 @@
 /**
- * Editor tab module — Routing layer for span/pipeline and legacy/chunk editing.
+ * Editor tab module — Pipeline span editor.
  *
  * This file is the thin routing layer that:
- *   1. Re-exports all public API from editor-pipeline and editor-legacy
- *      so that existing importers (script.ts, tests) continue to work.
- *   2. Contains `initEditor()` which wires up DOM event listeners,
- *      delegating to the appropriate sub-module functions.
+ *   1. Re-exports the public API from editor-pipeline so that existing
+ *      importers (script.ts, tests) continue to work.
+ *   2. Contains `initEditor()` which wires up DOM event listeners for the
+ *      pipeline span editor.
  *
- * Pipeline mode (state.pipelineEnabled = true):
+ * The editor operates against the /api/pipeline/* endpoints only:
  *   - Loads spans via GET /api/pipeline/export/{book_id}
  *   - Operations via POST /api/pipeline/operation (split/merge/move/delete)
  *   - Confidence review via GET /api/pipeline/review/{book_id}
  *   - Render via POST /api/pipeline/render
- *
- * Legacy mode (state.pipelineEnabled = false):
- *   - Loads chunks via GET /api/chunks
- *   - Operations via /api/chunks/{id}/* endpoints
- *   - Render via /api/generate_batch and /api/generate_batch_fast
  */
 
-import { state } from '../state';
 import { showToast } from '../utils';
 
 // Import pipeline module functions
@@ -35,6 +29,7 @@ import {
   pipelineReviewOverride,
   pipelineRenderAudiobook,
   pipelineExportSpans,
+  pipelineUpdateSpanText,
   // Span display
   toPipelineSpans,
   loadSpans,
@@ -54,32 +49,17 @@ import {
   // TTS rendering
   pipelineRenderAll,
   cancelPipelineRender,
+  downloadPipelineRender,
+  mergePipelineAudiobook,
   // Getters
   getCachedSpans,
   getCachedReviewItems,
   getSelectedIndices,
 } from './editor-pipeline';
 
-// Import legacy module functions
-import {
-  loadChunks,
-  toggleChunkExpand,
-  insertChunkAfter,
-  deleteChunk,
-  undoDeleteChunk,
-  stopOthers,
-  playSequence,
-  updateChunk,
-  generateChunk,
-  cancelRender,
-  startRender,
-  mergeAudiobook,
-} from './editor-legacy';
-
 // ---------------------------------------------------------------------------
 // Re-exports for backward compatibility
 // ---------------------------------------------------------------------------
-// script.ts imports loadChunks from './editor'
 // Tests import all pipeline functions from '../../src/tabs/editor'
 
 // Re-export pipeline types
@@ -125,6 +105,7 @@ export {
 export {
   pipelineRenderAll,
   cancelPipelineRender,
+  downloadPipelineRender,
 };
 
 // Re-export pipeline getters
@@ -132,12 +113,6 @@ export {
   getCachedSpans,
   getCachedReviewItems,
   getSelectedIndices,
-};
-
-// Re-export legacy functions (loadChunks is imported by script.ts)
-export {
-  loadChunks,
-  mergeAudiobook,
 };
 
 // ---------------------------------------------------------------------------
@@ -150,41 +125,6 @@ export {
  */
 export function initEditor(): void {
   document.addEventListener('DOMContentLoaded', () => {
-    // Play Sequence button
-    const btnPlaySeq = document.getElementById('btn-play-seq');
-    if (btnPlaySeq) {
-      btnPlaySeq.removeAttribute('onclick');
-      btnPlaySeq.addEventListener('click', playSequence);
-    }
-
-    // Legacy Render Pending button
-    const btnBatchFast = document.getElementById('btn-batch-fast-legacy');
-    if (btnBatchFast) {
-      btnBatchFast.removeAttribute('onclick');
-      btnBatchFast.addEventListener('click', () => startRender(false));
-    }
-
-    // Legacy Regenerate All button
-    const btnRegenAll = document.getElementById('btn-regen-all-legacy');
-    if (btnRegenAll) {
-      btnRegenAll.removeAttribute('onclick');
-      btnRegenAll.addEventListener('click', () => startRender(true));
-    }
-
-    // Legacy Cancel Render button
-    const btnCancelRender = document.getElementById('btn-cancel-render-legacy');
-    if (btnCancelRender) {
-      btnCancelRender.removeAttribute('onclick');
-      btnCancelRender.addEventListener('click', () => cancelRender());
-    }
-
-    // Legacy Merge Audiobook button
-    const btnMerge = document.getElementById('btn-merge-legacy');
-    if (btnMerge) {
-      btnMerge.removeAttribute('onclick');
-      btnMerge.addEventListener('click', () => mergeAudiobook());
-    }
-
     // Pipeline Render button
     const btnPipelineRender = document.getElementById('btn-pipeline-render');
     if (btnPipelineRender) {
@@ -203,10 +143,16 @@ export function initEditor(): void {
       btnCancelPipeline.addEventListener('click', () => cancelPipelineRender());
     }
 
+    // Pipeline Download Audiobook button
+    const btnPipelineDownload = document.getElementById('btn-pipeline-download');
+    if (btnPipelineDownload) {
+      btnPipelineDownload.addEventListener('click', () => downloadPipelineRender());
+    }
+
     // Pipeline Merge Audiobook button
     const btnPipelineMergeAudiobook = document.getElementById('btn-pipeline-merge-audiobook');
     if (btnPipelineMergeAudiobook) {
-      btnPipelineMergeAudiobook.addEventListener('click', () => mergeAudiobook());
+      btnPipelineMergeAudiobook.addEventListener('click', () => mergePipelineAudiobook());
     }
 
     // Pipeline merge button (for merging selected spans)
@@ -215,75 +161,13 @@ export function initEditor(): void {
       btnPipelineMerge.addEventListener('click', () => handleMerge());
     }
 
-    // Tab-switch handler: load chunks/spans when editor tab is activated
+    // Tab-switch handler: load spans when editor tab is activated
     const editorTabBtn = document.querySelector('[data-tab="editor"]');
     if (editorTabBtn) {
       editorTabBtn.addEventListener('click', () => {
-        if (state.pipelineEnabled) {
-          loadSpans();
-          loadReviewItems();
-        } else {
-          loadChunks();
-        }
+        loadSpans();
+        loadReviewItems();
       });
-    }
-
-    // Event delegation for legacy chunk table actions
-    const chunksTableBody = document.getElementById('chunks-table-body');
-    if (chunksTableBody) {
-      chunksTableBody.addEventListener('click', (e) => {
-        const target = e.target as HTMLElement;
-        const actionEl = target.closest('[data-action]') as HTMLElement;
-        if (!actionEl) return;
-
-        const action = actionEl.dataset.action;
-        const chunkId = actionEl.dataset.chunkId ? parseInt(actionEl.dataset.chunkId, 10) : null;
-
-        switch (action) {
-          case 'toggle-chunk-expand':
-            toggleChunkExpand(actionEl);
-            break;
-          case 'insert-chunk-after':
-            if (chunkId !== null) insertChunkAfter(chunkId);
-            break;
-          case 'delete-chunk':
-            if (chunkId !== null) deleteChunk(chunkId);
-            break;
-          case 'generate-chunk':
-            if (chunkId !== null) generateChunk(chunkId);
-            break;
-        }
-      });
-
-      chunksTableBody.addEventListener('change', (e) => {
-        const target = e.target as HTMLElement;
-        const actionEl = target.closest('[data-action]') as HTMLElement;
-        if (!actionEl) return;
-
-        const action = actionEl.dataset.action;
-        const chunkId = actionEl.dataset.chunkId ? parseInt(actionEl.dataset.chunkId, 10) : null;
-
-        if (action === 'update-chunk' && chunkId !== null) {
-          const field = actionEl.dataset.field;
-          const value = (target as HTMLInputElement | HTMLTextAreaElement).value;
-          if (field) updateChunk(chunkId, field, value);
-        } else if (action === 'update-chunk-pause' && chunkId !== null) {
-          const input = target as HTMLInputElement;
-          const value = input.value === '' ? null : parseInt(input.value, 10);
-          updateChunk(chunkId, 'pause_after', value);
-        } else if (action === 'update-chunk-speaker' && chunkId !== null) {
-          const value = (target as HTMLSelectElement).value;
-          updateChunk(chunkId, 'speaker', value);
-        }
-      });
-
-      chunksTableBody.addEventListener('play', (e) => {
-        const target = e.target as HTMLElement;
-        if (target.tagName === 'AUDIO' && target.dataset.action === 'stop-others') {
-          const id = target.dataset.id ? parseInt(target.dataset.id, 10) : null;
-          if (id !== null) stopOthers(id);
-        }
-      }, true);
     }
 
     // Event delegation for pipeline span table actions
@@ -304,10 +188,10 @@ export function initEditor(): void {
         } else if (btn.classList.contains('btn-span-move')) {
           // For move: prompt for target index
           const cachedSpans = getCachedSpans();
-          const toStr = prompt(`Move span #${index} to position (0-${cachedSpans.length - 1}):`);
+          const toStr = prompt(`Move span #${index} to position (1-${cachedSpans.length}):`);
           if (toStr !== null) {
             const toIndex = parseInt(toStr, 10);
-            if (!isNaN(toIndex) && toIndex >= 0 && toIndex < cachedSpans.length) {
+            if (!isNaN(toIndex) && toIndex >= 1 && toIndex <= cachedSpans.length) {
               handleMove(toIndex);
             } else {
               showToast('Invalid target position', 'error');
@@ -315,6 +199,50 @@ export function initEditor(): void {
           }
         } else if (btn.classList.contains('btn-span-delete')) {
           handleDelete(index);
+        }
+      });
+
+      // Inline text editing: blur handler for contenteditable span-text elements
+      spansTableBody.addEventListener('focusout', async (e) => {
+        const target = e.target as HTMLElement;
+        if (!target.classList.contains('span-text')) return;
+
+        const spanId = target.dataset.spanId;
+        if (!spanId) return;
+
+        const newText = (target.textContent || '').trim();
+        if (!newText) {
+          showToast('Span text cannot be empty', 'error');
+          // Restore original text from cache
+          const cachedSpans = getCachedSpans();
+          const idx = parseInt(target.dataset.index || '0', 10);
+          const span = cachedSpans.find(s => s.global_index === idx);
+          if (span) {
+            target.textContent = span.text;
+          }
+          return;
+        }
+
+        try {
+          await pipelineUpdateSpanText(spanId, newText);
+          // Update local cache
+          const cachedSpans = getCachedSpans();
+          const idx = parseInt(target.dataset.index || '0', 10);
+          const span = cachedSpans.find(s => s.global_index === idx);
+          if (span) {
+            span.text = newText;
+          }
+          showToast('Span text updated', 'success');
+        } catch (err) {
+          console.error('Failed to update span text:', err);
+          showToast('Failed to update span text', 'error');
+          // Restore original text
+          const cachedSpans = getCachedSpans();
+          const idx = parseInt(target.dataset.index || '0', 10);
+          const span = cachedSpans.find(s => s.global_index === idx);
+          if (span) {
+            target.textContent = span.text;
+          }
         }
       });
     }
@@ -339,16 +267,5 @@ export function initEditor(): void {
         }
       });
     }
-
-    // Event delegation for undo delete chunk links (legacy mode)
-    document.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement;
-      const link = target.closest('[data-action="undo-delete-chunk"]') as HTMLElement;
-      if (link) {
-        e.preventDefault();
-        const toastId = link.dataset.toastId;
-        if (toastId) undoDeleteChunk(toastId);
-      }
-    });
   });
 }

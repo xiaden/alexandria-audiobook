@@ -149,7 +149,7 @@ async function startLoraTraining(): Promise<void> {
 
 /**
  * Poll LoRA training status every 2 seconds.
- * Fetches GET /api/status/lora_training, updates progress bar, epoch/loss displays, and logs.
+ * Fetches GET /api/lora/status, updates progress bar, epoch/loss displays, and logs.
  * Stops polling when training is no longer running.
  */
 function pollLoraTraining(): void {
@@ -163,7 +163,7 @@ function pollLoraTraining(): void {
 
   loraPoller = setInterval(async () => {
     try {
-      const status = await API.get<{ logs: string[]; running: boolean }>('/api/status/lora_training');
+      const status = await API.get<{ logs: string[]; running: boolean }>('/api/lora/status');
       logsEl.innerText = status.logs.join('\n');
       logsEl.scrollTop = logsEl.scrollHeight;
 

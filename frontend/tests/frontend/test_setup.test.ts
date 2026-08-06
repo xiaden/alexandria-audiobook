@@ -1,6 +1,6 @@
 /**
  * Spec-first tests for Setup tab (frontend/src/tabs/setup.ts).
- * Tests cover: WALK_TASK_NAMES constant, collectTaskOverrides, pipeline toggle, loadConfig.
+ * Tests cover: WALK_TASK_NAMES constant, collectTaskOverrides, loadConfig.
  *
  * NOTE: No test framework is installed in frontend/package.json.
  * These tests are written with vitest-compatible syntax.
@@ -11,14 +11,13 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { WALK_TASK_NAMES, collectTaskOverrides, loadConfig } from '../../src/tabs/setup';
-import { state } from '../../src/state';
+import { state, setPipelineBookId, initState } from '../../src/state';
 import * as API from '../../src/api';
 
 // Mock the API module
 vi.mock('../../src/api', () => ({
   get: vi.fn(),
   post: vi.fn(),
-  upload: vi.fn(),
 }));
 
 // Mock showToast to avoid DOM dependencies
@@ -123,29 +122,41 @@ describe('collectTaskOverrides', () => {
   });
 });
 
-describe('pipeline toggle', () => {
+describe('localStorage persistence', () => {
   beforeEach(() => {
-    document.body.innerHTML = `
-      <input type="checkbox" id="pipeline-toggle" />
-    `;
-    // Reset state
-    state.pipelineEnabled = false;
+    state.pipelineBookId = null;
+    localStorage.clear();
   });
 
-  it('should update state.pipelineEnabled when toggle is checked', async () => {
-    const toggle = document.getElementById('pipeline-toggle') as HTMLInputElement;
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event('change'));
-
-    // The handlePipelineToggle function reads the checkbox and updates state
-    // We need to import and call it, or simulate the initSetup event binding
-    // For this test, we verify the state interface has the field
-    expect(state).toHaveProperty('pipelineEnabled');
-    expect(typeof state.pipelineEnabled).toBe('boolean');
+  it('setPipelineBookId() should persist to localStorage', () => {
+    setPipelineBookId('book-456');
+    expect(state.pipelineBookId).toBe('book-456');
+    expect(localStorage.getItem('alexandria-pipeline-book-id')).toBe('book-456');
   });
 
-  it('should default pipelineEnabled to false in AppState', () => {
-    expect(state.pipelineEnabled).toBe(false);
+  it('setPipelineBookId(null) should clear localStorage value', () => {
+    setPipelineBookId('book-789');
+    setPipelineBookId(null);
+    expect(state.pipelineBookId).toBe(null);
+    expect(localStorage.getItem('alexandria-pipeline-book-id')).toBe('');
+  });
+
+  it('initState() should restore pipelineBookId from localStorage', () => {
+    localStorage.setItem('alexandria-pipeline-book-id', 'restored-book');
+    initState();
+    expect(state.pipelineBookId).toBe('restored-book');
+  });
+
+  it('initState() should not restore empty bookId', () => {
+    localStorage.setItem('alexandria-pipeline-book-id', '');
+    initState();
+    expect(state.pipelineBookId).toBe(null);
+  });
+
+  it('initState() should handle missing localStorage keys gracefully', () => {
+    // No keys set
+    initState();
+    expect(state.pipelineBookId).toBe(null);
   });
 });
 
@@ -167,12 +178,12 @@ describe('loadConfig', () => {
         <tbody>
           <tr data-task="scene_segmentation">
             <td><input data-field="model_name" /></td>
-            <td><select data-field="reasoning_effort"><option value="">Default</option></select></td>
+            <td><select data-field="reasoning_effort"><option value="">Default</option><option value="low">Low</option><option value="high">High</option></select></td>
             <td><input data-field="temperature" /></td>
           </tr>
           <tr data-task="delivery">
             <td><input data-field="model_name" /></td>
-            <td><select data-field="reasoning_effort"><option value="">Default</option></select></td>
+            <td><select data-field="reasoning_effort"><option value="">Default</option><option value="low">Low</option><option value="high">High</option></select></td>
             <td><input data-field="temperature" /></td>
           </tr>
         </tbody>
@@ -280,5 +291,57 @@ describe('loadConfig', () => {
     const legacyModel = legacyRow?.querySelector('[data-field="model_name"]') as HTMLInputElement;
     // Value remains unchanged because loadConfig skips unknown tasks
     expect(legacyModel?.value).toBe('should-not-change');
+  });
+
+  it('should accept pipeline-only config shape (llm + tts, ignoring legacy prompts/generation keys)', async () => {
+    const pipelineOnlyConfig = {
+      llm: {
+        base_url: 'http://localhost:1234/v1',
+        api_key: 'legacy-key-present',
+        model_name: 'gpt-4',
+        reasoning_effort: 'high',
+        temperature: 0.5,
+        task_overrides: {},
+      },
+      tts: {
+        mode: 'external',
+        url: 'http://localhost:7860',
+        device: 'auto',
+        language: 'English',
+        parallel_workers: 2,
+      },
+      // Legacy pre-pipeline keys — loadConfig must ignore these entirely
+      prompts: { default_prompt: 'legacy' },
+      generation: { max_tokens: 512 },
+    };
+
+    vi.mocked(API.get).mockResolvedValueOnce(pipelineOnlyConfig);
+
+    await loadConfig();
+
+    const llmUrl = document.getElementById('llm-url') as HTMLInputElement;
+    const llmModel = document.getElementById('llm-model') as HTMLInputElement;
+    const llmReasoning = document.getElementById('llm-reasoning') as HTMLSelectElement;
+    const llmTemp = document.getElementById('llm-temperature') as HTMLInputElement;
+    const ttsMode = document.getElementById('tts-mode') as HTMLSelectElement;
+    const ttsUrl = document.getElementById('tts-url') as HTMLInputElement;
+    const ttsDevice = document.getElementById('tts-device') as HTMLSelectElement;
+    const ttsLang = document.getElementById('tts-language') as HTMLSelectElement;
+    const workers = document.getElementById('parallel-workers') as HTMLInputElement;
+
+    // llm fields populated
+    expect(llmUrl?.value).toBe('http://localhost:1234/v1');
+    expect(llmModel?.value).toBe('gpt-4');
+    expect(llmReasoning?.value).toBe('high');
+    expect(llmTemp?.value).toBe('0.5');
+    // tts fields populated
+    expect(ttsMode?.value).toBe('external');
+    expect(ttsUrl?.value).toBe('http://localhost:7860');
+    expect(ttsDevice?.value).toBe('auto');
+    expect(ttsLang?.value).toBe('English');
+    expect(workers?.value).toBe('2');
+    // prompts/generation keys are ignored — no elements exist for them
+    expect(document.getElementById('default-prompt')).toBeNull();
+    expect(document.getElementById('max-tokens')?.value).toBe('');
   });
 });

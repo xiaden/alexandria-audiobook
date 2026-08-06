@@ -2,84 +2,81 @@
 
 The Alexandria audiobook frontend is a multi-tab web application. The **Editor** tab is the primary UI for script manipulation and TTS rendering.
 
-## Editor Tab Architecture
+## Tab Structure
 
-The editor tab is split into three files:
+The frontend is organized into core pipeline tabs (script, voices, editor, setup) and advanced tool tabs (designer, preparer, dataset-builder, training):
+
+| Tab | Module | Purpose |
+|-----|--------|---------|
+| Setup | `src/tabs/setup.ts` | LLM endpoint config (base URL / API key / model / reasoning / temperature) and TTS settings (mode, device, language, parallel workers, batch seed, codec compilation, sub-batching, pauses) |
+| Script | `src/tabs/script.ts` | Book onboarding (`POST /api/pipeline/onboard`), run walks (`POST /api/pipeline/run_walks`, `run_all_walks`), walk status polling (`GET /api/pipeline/walk_status/{book_id}`), cancel walks, re-onboard |
+| Voices | `src/tabs/voices.ts` | Character list with voice assignment dropdowns (`GET /api/pipeline/characters/{book_id}`, `PUT /api/pipeline/characters/{id}/voice`) and voice catalog management (`GET/POST/PUT/DELETE /api/pipeline/voices`, preview) |
+| Editor | `src/tabs/editor.ts` + `src/tabs/editor-pipeline.ts` | Span-based editing against `/api/pipeline/*` endpoints: structural operations, inline span text edits, confidence review, render, merge, download |
+| Designer | `src/tabs/designer.ts` | Voice Designer — describe a voice, generate and preview it, save to the library (`/api/voice_design/*`) |
+| Preparer | `src/tabs/preparer.ts` | Voice Training Dataset Preparer — upload and prepare LoRA training datasets (`/api/preparer/*`) |
+| Dataset Builder | `src/tabs/dataset-builder.ts` | Build LoRA training datasets with per-sample preview (`/api/dataset_builder/*`) |
+| Training | `src/tabs/training.ts` | Upload/generate datasets and run LoRA training (`/api/lora/*`, `/api/clone_voices/*`) |
+
+## Editor Tab Architecture
 
 | File | Role |
 |------|------|
-| `src/tabs/editor.ts` | **Routing layer.** Re-exports all public API from the two sub-modules and contains `initEditor()` which wires DOM event listeners. |
-| `src/tabs/editor-pipeline.ts` | **Pipeline mode.** Span-based editing against `/api/pipeline/*` endpoints. Active when `state.pipelineEnabled = true`. |
-| `src/tabs/editor-legacy.ts` | **Legacy mode.** Chunk-based editing against `/api/chunks/*` endpoints. Active when `state.pipelineEnabled = false` (current default). |
+| `src/tabs/editor.ts` | Routing layer. Re-exports `initEditor` and delegates rendering to `editor-pipeline.ts`. |
+| `src/tabs/editor-pipeline.ts` | The single editor implementation. Span-based editing against `/api/pipeline/*` endpoints. |
 
-### Mode Routing
+There is no mode routing — the pipeline is the only editor path.
 
-The `pipelineEnabled` toggle (set in Setup tab, persisted in `state.ts`) determines which mode is active:
+## Editor Operations
 
-- **Pipeline mode** (`pipelineEnabled = true`): loads spans via `GET /api/pipeline/export/{book_id}`, shows the `#pipeline-editor-section`, and routes operations through `/api/pipeline/*`.
-- **Legacy mode** (`pipelineEnabled = false`): loads chunks via `GET /api/chunks`, shows the `#legacy-editor-section`, and routes operations through `/api/chunks/*`.
+The editor submits structural operations to the pipeline:
 
-The tab-switch handler in `initEditor()` calls `loadSpans()` + `loadReviewItems()` or `loadChunks()` depending on the toggle.
+| Operation | Description | Params |
+|-----------|-------------|--------|
+| `split` | Split a span at a character offset | `span_id`, `offset` |
+| `merge` | Merge a span into its predecessor | `span_id` |
+| `move` | Move a span up/down in the scene | `span_id`, `direction` |
+| `delete` | Delete a span | `span_id` |
 
-## Pipeline Mode Operations
-
-All structural operations go through a single endpoint:
-
-```
+```ts
 POST /api/pipeline/operation
-Body: { operation, book_id, ...params }
+{ "operation": "split", "book_id": "123", "span_id": "...", "offset": 12 }
 ```
 
-| Operation | Params | Description |
-|-----------|--------|-------------|
-| `split` | `presentation_index`, `split_point` | Split a span at a character offset |
-| `merge` | `presentation_index_left`, `presentation_index_right` | Merge two adjacent spans |
-| `move` | `presentation_index_from`, `presentation_index_to` | Move a span to a new position |
-| `delete` | `presentation_index` | Delete a span |
-
-Other pipeline endpoints:
+Other pipeline endpoints used by the editor:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/pipeline/export/{book_id}` | GET | Load spans for the editor |
+| `/api/pipeline/export/{book_id}` | GET | Load the annotated script for a book |
+| `/api/pipeline/span/{span_id}/text` | PUT | Inline edit a span's text |
 | `/api/pipeline/review/{book_id}` | GET | Load confidence review items |
 | `/api/pipeline/review/accept` | POST | Accept a review item |
 | `/api/pipeline/review/reject` | POST | Reject a review item |
-| `/api/pipeline/review/override` | POST | Override a review item with a new value |
-| `/api/pipeline/render` | POST | Render audiobook via pipeline TTS |
-
-## Legacy Mode Operations
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/chunks` | GET | Load all chunks |
-| `/api/chunks/{id}` | POST | Update a chunk field |
-| `/api/chunks/{id}/insert` | POST | Insert a new chunk after the given ID |
-| `/api/chunks/{id}` | DELETE | Delete a chunk (with undo support) |
-| `/api/chunks/{id}/generate` | POST | Generate audio for a single chunk |
-| `/api/chunks/restore` | POST | Restore a deleted chunk (undo) |
-| `/api/generate_batch` | POST | Batch render all pending chunks (sequential TTS) |
-| `/api/generate_batch_fast` | POST | Batch render with fast/parallel TTS |
-| `/api/merge` | POST | Merge all rendered chunks into final M4B audiobook |
+| `/api/pipeline/review/override` | POST | Override a review item |
+| `/api/pipeline/render` | POST | Start a render job (returns `job_id`) |
+| `/api/pipeline/render_status/{job_id}` | GET | Poll render progress |
+| `/api/pipeline/cancel_render` | POST | Cancel a running render job |
+| `/api/pipeline/merge` | POST | Merge rendered chunks into `audiobook.m4b` |
+| `/api/pipeline/download/{job_id}` | GET | Download the merged M4B (or a ZIP of raw chunks) |
 
 ## Confidence Review System
 
-Pipeline mode includes a confidence review UI. When the pipeline produces low-confidence character attributions (between the auto-accept ≥0.7 and auto-reject <0.5 thresholds), they are surfaced to the user as review items.
+The review system surfaces spans the annotation walks flagged as low-confidence:
 
-Each review item shows:
-- Character name and confidence percentage
-- The junction table (e.g., `character_span`) and reason
-- Three actions: **Accept**, **Reject**, or **Override** (with a custom JSON value)
-
-Review items are loaded from `GET /api/pipeline/review/{book_id}` and rendered in the `#review-items-container`.
+- Items between the auto-accept threshold (≥ 0.7) and auto-reject threshold (< 0.5) are shown for human review
+- Each item shows the character name, confidence %, and the junction/reasoning that triggered the flag
+- The reviewer can **Accept**, **Reject**, or **Override** each item
+- Items are loaded from `GET /api/pipeline/review/{book_id}` into `#review-items-container`
 
 ## TTS Rendering
 
-Both modes support batch TTS rendering and final audiobook merging:
+Rendering is pipeline-only:
 
-| Mode | Render | Cancel | Merge |
-|------|--------|--------|-------|
-| Pipeline | `POST /api/pipeline/render` → `pipelineRenderAll()` | `POST /api/cancel_audio` → `cancelPipelineRender()` | `POST /api/merge` → `mergeAudiobook()` |
-| Legacy | `POST /api/generate_batch` or `/api/generate_batch_fast` → `renderAll()` / `renderBatchFast()` | `POST /api/cancel_audio` → `cancelRender()` | `POST /api/merge` → `mergeAudiobook()` |
+| Step | Endpoint | Frontend |
+|------|----------|----------|
+| Render | `POST /api/pipeline/render` → `renderPipeline()` | starts a background job, returns `job_id` |
+| Progress | `GET /api/pipeline/render_status/{job_id}` | polls every ~2s, updates progress bar and log |
+| Cancel | `POST /api/pipeline/cancel_render` → `cancelPipelineRender()` | cancels a running render job |
+| Merge | `POST /api/pipeline/merge` → `mergePipelineAudiobook()` | combines rendered chunks into `audiobook.m4b` |
+| Download | `GET /api/pipeline/download/{job_id}` → `downloadPipelineRender()` | downloads the merged M4B (or `audiobook.zip` of raw chunks) |
 
-The legacy mode selects between batch endpoints based on the TTS mode dropdown (`#tts-mode`): "external" uses `generate_batch`, "local" uses `generate_batch_fast`.
+The render request body is `{ book_id, use_batch, output_dir?, batch_seed? }`; batch mode (default) renders all pending spans in a single batched TTS call.

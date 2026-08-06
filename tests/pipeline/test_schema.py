@@ -155,7 +155,11 @@ class TestGraph2CharacterColumns:
 
     def test_voice_config_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "voice_config")}
-        assert set(cols.keys()) == {"id", "name", "description"}
+        assert set(cols.keys()) == {
+            "id", "name", "description",
+            "type", "voice", "character_style", "seed",
+            "ref_audio", "ref_text", "adapter_id", "adapter_path", "alias_of",
+        }
 
 
 # ---------------------------------------------------------------------------

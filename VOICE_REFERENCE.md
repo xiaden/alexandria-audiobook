@@ -2,6 +2,15 @@
 
 A comprehensive vocal direction lexicon compiled from professional acting glossaries and voice-over direction databases, combined with empirical findings from Qwen3-TTS VoiceDesign testing.
 
+## Where Voice Configs Live
+
+Voice entries (including designed voices from this reference) are stored in the pipeline's **`voice_config` DB table** (SQLite, `data/pipeline.db`), not a `voice_config.json` file. The table has 12 columns: `id`, `name`, `description`, `type` (`custom | clone | builtin_lora | lora | design`), `voice`, `character_style`, `seed`, `ref_audio`, `ref_text`, `adapter_id`, `adapter_path`, `alias_of`. `default_style` is a backward-compat alias for `character_style` (not stored).
+
+- `description` fields are written from this lexicon's Part 1 vocabulary (Texture/Timbre for `description`, Emotion/Tone for `instruct`)
+- The `NARRATOR` voice is DB-first (`id='NARRATOR'`, fallback `type=custom voice=Ryan`)
+- Catalog management: `GET/POST/PUT/DELETE /api/pipeline/voices`; preview: `POST /api/pipeline/voices/{voice_id}/preview`; character assignment: `PUT /api/pipeline/characters/{id}/voice`
+- The TTS engine is created by the `app/engine.py` factory (`get_tts_engine()`, module cache, `ALEXANDRIA_CONFIG_PATH` env or `app/config.json`); `reset_tts_engine()` tears it down
+
 ---
 
 # Part 1: Director's Vocal Lexicon

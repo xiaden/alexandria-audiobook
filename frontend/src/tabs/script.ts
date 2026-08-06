@@ -1,51 +1,21 @@
 /**
- * Script tab module — Pipeline onboard, walk execution, walk status display,
- * saved scripts, and log polling.
+ * Script tab module — Pipeline onboard, walk execution, and walk status display.
  *
- * When state.pipelineEnabled is true, the tab shows the pipeline UI:
+ * The tab shows the pipeline UI:
  *   - Onboard EPUB → POST /api/pipeline/onboard
  *   - Walk execution buttons (individual + Run All)
  *   - Walk status display with polling
  *   - Re-onboard button
- *
- * When state.pipelineEnabled is false, a notice is shown directing the user
- * to enable pipeline mode in the Setup tab (old endpoints have been removed).
- *
- * Preserved from previous version:
- *   - File upload handler (still uses /api/upload for initial file load)
- *   - Saved scripts list (load, save, delete)
- *   - pollLogs (used by Audio tab and still available for script logs)
  */
 
 import * as API from '../api';
 import { showToast, showConfirm, escapeHtml } from '../utils';
 import { state } from '../state';
-import { loadChunks } from './editor';
-import { loadVoices } from './voices';
-import { resetDesignerForm, loadDesignedVoices } from './designer';
 import { WALK_ORDER, WALK_DISPLAY_NAMES } from '../pipeline/walks';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/** Status response from /api/status/{taskName} */
-interface TaskStatus {
-  running: boolean;
-  logs: string[];
-}
-
-/** Script entry from /api/scripts */
-interface SavedScript {
-  name: string;
-  created: number;
-  has_voice_config: boolean;
-}
-
-/** Response from /api/upload */
-interface UploadResult {
-  filename: string;
-}
 
 /** Response from POST /api/pipeline/onboard */
 interface OnboardResult {
@@ -144,6 +114,17 @@ export async function pipelineWalkStatus(bookId: string): Promise<WalkStatusMap>
 }
 
 /**
+ * Cancel running walks for a book.
+ * POST /api/pipeline/cancel_walks
+ * @param bookId - Book UUID
+ */
+export async function pipelineCancelWalks(bookId: string): Promise<unknown> {
+  return API.post('/api/pipeline/cancel_walks', {
+    book_id: bookId,
+  });
+}
+
+/**
  * Re-onboard a book: clear walk outputs, bump version.
  * POST /api/pipeline/reonboard
  * @param bookId - Book UUID
@@ -193,6 +174,7 @@ export function renderWalkStatuses(statuses: WalkStatusMap): void {
  * Start polling walk status for the current book.
  * Polls GET /api/pipeline/walk_status/{book_id} every 2 seconds.
  * Stops when all walks are completed or failed (no more 'running').
+ * Shows error toast if any walk fails.
  */
 export function startWalkPolling(): void {
   stopWalkPolling();
@@ -204,6 +186,15 @@ export function startWalkPolling(): void {
       const statuses = await pipelineWalkStatus(currentBookId);
       renderWalkStatuses(statuses);
       updateWalkButtons(statuses);
+
+      // Detect failed walks and show error toast
+      for (const [walkName, status] of Object.entries(statuses)) {
+        if (status === 'failed') {
+          const label = WALK_DISPLAY_NAMES[walkName] || walkName;
+          showToast(`Walk "${label}" failed. Check logs for details.`, 'error');
+          break; // Show only one error toast per poll cycle
+        }
+      }
 
       // Stop polling if no walks are running
       const anyRunning = Object.values(statuses).some(s => s === 'running');
@@ -376,12 +367,31 @@ async function handleRunAllWalks(): Promise<void> {
 
   try {
     await pipelineRunAllWalks(currentBookId);
-    showToast('All walks completed.', 'success');
+    showToast('Walks started. Running in background...', 'info');
     startWalkPolling();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     showToast('Run all walks failed: ' + msg, 'error');
     updateRunAllButton(false);
+  }
+}
+
+/**
+ * Handle the "Cancel Walks" button click.
+ * POSTs to /api/pipeline/cancel_walks and shows confirmation toast.
+ */
+async function handleCancelWalks(): Promise<void> {
+  if (!currentBookId) {
+    showToast('No book onboarded yet.', 'warning');
+    return;
+  }
+
+  try {
+    await pipelineCancelWalks(currentBookId);
+    showToast('Walks cancelled.', 'info');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast('Cancel walks failed: ' + msg, 'error');
   }
 }
 
@@ -420,258 +430,31 @@ async function handleReonboard(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Poll logs (preserved from previous version — used by Audio tab)
-// ---------------------------------------------------------------------------
-
-/**
- * Poll task logs from the server and display them in an element.
- * Polls GET /api/status/{taskName} every 1s until the task is no longer running.
- * Appends logs to the specified element and auto-scrolls to the bottom.
- * @param taskName - Task name to poll (e.g., 'script', 'review', 'audio')
- * @param elementId - DOM element ID to display logs in
- */
-export function pollLogs(taskName: string, elementId: string): void {
-  const el = document.getElementById(elementId);
-  if (!el) return;
-
-  const interval = setInterval(async () => {
-    try {
-      const status = await API.get<TaskStatus>(`/api/status/${taskName}`);
-      el.innerText = status.logs.join('\n');
-      el.scrollTop = el.scrollHeight;
-
-      if (!status.running) {
-        clearInterval(interval);
-        // Audio tab specific: load audio player when complete
-        if (taskName === 'audio' && status.logs.some(l => l.includes('complete'))) {
-          const audio = document.getElementById('main-audio') as HTMLAudioElement;
-          if (audio) {
-            audio.src = `/api/audiobook?t=${new Date().getTime()}`;
-            const playerContainer = document.getElementById('audio-player-container');
-            if (playerContainer) playerContainer.style.display = 'block';
-            const downloadLink = document.getElementById('download-link') as HTMLAnchorElement;
-            if (downloadLink) downloadLink.href = audio.src;
-          }
-        }
-        // Script/review completion: refresh editor chunks if editor tab is visible
-        if ((taskName === 'script' || taskName === 'review') && status.logs.some(l => l.includes('completed successfully'))) {
-          const editorTabBtn = document.querySelector('[data-tab="editor"]');
-          if (editorTabBtn && (editorTabBtn as HTMLElement).classList.contains('active')) {
-            loadChunks();
-          }
-        }
-      }
-    } catch (e) {
-      console.error('Poll error', e);
-      clearInterval(interval);
-    }
-  }, 1000);
-}
-
-// ---------------------------------------------------------------------------
-// Saved scripts (preserved from previous version)
-// ---------------------------------------------------------------------------
-
-/**
- * Load the list of saved scripts from the server and render them.
- * Fetches GET /api/scripts and populates #saved-scripts-list with script entries.
- */
-async function loadSavedScripts(): Promise<void> {
-  try {
-    const scripts = await API.get<SavedScript[]>('/api/scripts');
-    const container = document.getElementById('saved-scripts-list');
-    if (!container) return;
-
-    if (!scripts.length) {
-      container.innerHTML = '<p class="text-muted mb-0">No saved scripts yet.</p>';
-      return;
-    }
-
-    container.innerHTML = scripts.map(s => {
-      const date = new Date(s.created * 1000).toLocaleDateString('en-US', {
-        month: 'short', day: 'numeric', year: 'numeric',
-      });
-      const voiceBadge = s.has_voice_config
-        ? '<span class="badge bg-info ms-2" title="Includes voice configuration">voices</span>'
-        : '';
-      return `
-        <div class="d-flex align-items-center justify-content-between py-2 border-bottom">
-          <div>
-            <strong>${escapeHtml(s.name)}</strong>${voiceBadge}
-            <small class="text-muted ms-2">${date}</small>
-          </div>
-          <div>
-            <button class="btn btn-sm btn-outline-success me-1" data-action="load-script" data-name="${escapeHtml(s.name)}"><i class="fas fa-upload me-1"></i>Load</button>
-            <button class="btn btn-sm btn-outline-danger" data-action="delete-script" data-name="${escapeHtml(s.name)}"><i class="fas fa-trash"></i></button>
-          </div>
-        </div>`;
-    }).join('');
-  } catch (e) {
-    console.error('Failed to load saved scripts:', e);
-  }
-}
-
-/**
- * Save the current script with a user-provided name.
- * Reads name from #save-script-name input, POSTs to /api/scripts/save.
- */
-async function saveScript(): Promise<void> {
-  const nameInput = document.getElementById('save-script-name') as HTMLInputElement;
-  const name = nameInput?.value.trim();
-  if (!name) {
-    showToast('Please enter a name for the script.', 'warning');
-    return;
-  }
-  try {
-    await API.post('/api/scripts/save', { name });
-    if (nameInput) nameInput.value = '';
-    loadSavedScripts();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    showToast('Error saving script: ' + msg, 'error');
-  }
-}
-
-/**
- * Load a saved script by name.
- * Confirms with the user, POSTs to /api/scripts/load, then refreshes related UI.
- * @param name - Script name to load
- */
-async function loadScript(name: string): Promise<void> {
-  if (!await showConfirm(`Load "${name}"? This will replace your current script and chunks.`)) return;
-  try {
-    await API.post('/api/scripts/load', { name });
-    showToast(`Script "${name}" loaded.`, 'success');
-    loadChunks(true);
-    loadVoices();
-    resetDesignerForm();
-    loadDesignedVoices();
-    loadSavedScripts();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    showToast('Error loading script: ' + msg, 'error');
-  }
-}
-
-/**
- * Delete a saved script by name.
- * Confirms with the user, sends DELETE to /api/scripts/{name}.
- * @param name - Script name to delete
- */
-async function deleteScript(name: string): Promise<void> {
-  if (!await showConfirm(`Delete saved script "${name}"? This cannot be undone.`)) return;
-  try {
-    const res = await fetch(`/api/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' });
-    if (!res.ok) {
-      const err = await res.json();
-      showToast(err.detail || 'Failed to delete script.', 'error');
-      return;
-    }
-    loadSavedScripts();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    showToast('Error deleting script: ' + msg, 'error');
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 
 /**
  * Initialize the Script tab.
  * Attaches event listeners for:
- *   - File upload (still uses /api/upload for initial file load)
  *   - Pipeline onboard button (POST /api/pipeline/onboard)
  *   - Individual walk run buttons (data-walk-run attribute)
  *   - Run All Walks button
  *   - Re-onboard button
- *   - Saved scripts actions (load, delete)
- *   - Save script button
  *
- * Shows pipeline UI when state.pipelineEnabled is true; otherwise shows
- * a notice to enable pipeline mode.
+ * The pipeline UI is the only UI — it is shown unconditionally.
  */
 export function initScript(): void {
   document.addEventListener('DOMContentLoaded', () => {
-    // ----- File upload handler (preserved — still uses /api/upload) -----
-    const fileInput = document.getElementById('file-upload') as HTMLInputElement;
-    if (fileInput) {
-      fileInput.addEventListener('change', async () => {
-        const statusEl = document.getElementById('upload-status');
-        if (!fileInput.files || fileInput.files.length === 0) return;
-
-        if (statusEl) {
-          statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Loading file...</span>';
-        }
-        try {
-          const res = await API.upload<UploadResult>(fileInput.files[0]);
-          if (statusEl) {
-            statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Loaded: ${escapeHtml(res.filename)}</span>`;
-          }
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          if (statusEl) {
-            statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>Failed to load file: ${escapeHtml(msg)}</span>`;
-          }
-        }
-      });
-    }
-
-    // ----- Pipeline mode toggle -----
+    // Pipeline section is the only UI — make it visible
     const pipelineSection = document.getElementById('pipeline-section');
-    const legacySection = document.getElementById('legacy-script-section');
-    const pipelineNotice = document.getElementById('pipeline-disabled-notice');
+    if (pipelineSection) pipelineSection.style.display = '';
 
-    if (state.pipelineEnabled) {
-      // Show pipeline UI
-      if (pipelineSection) pipelineSection.style.display = '';
-      if (legacySection) legacySection.style.display = 'none';
-      if (pipelineNotice) pipelineNotice.style.display = 'none';
-      initPipelineUI();
-    } else {
-      // Show notice that pipeline mode must be enabled
-      if (pipelineSection) pipelineSection.style.display = 'none';
-      if (pipelineNotice) pipelineNotice.style.display = '';
-      // Legacy section: old endpoints are removed, so hide it
-      if (legacySection) legacySection.style.display = 'none';
-    }
-
-    // ----- Saved scripts (always visible) -----
-    const savedScriptsList = document.getElementById('saved-scripts-list');
-    if (savedScriptsList) {
-      savedScriptsList.addEventListener('click', (e) => {
-        const target = e.target as HTMLElement;
-        const button = target.closest('button[data-action]') as HTMLButtonElement;
-        if (!button) return;
-
-        const action = button.getAttribute('data-action');
-        const name = button.getAttribute('data-name');
-        if (!name) return;
-
-        if (action === 'load-script') {
-          loadScript(name);
-        } else if (action === 'delete-script') {
-          deleteScript(name);
-        }
-      });
-    }
-
-    // Save script button
-    const saveBtn = document.querySelector('button[onclick="saveScript()"]');
-    if (saveBtn) {
-      saveBtn.removeAttribute('onclick');
-      saveBtn.addEventListener('click', () => saveScript());
-    }
-
-    // Load saved scripts on init
-    loadSavedScripts();
+    initPipelineUI();
   });
 }
 
 /**
  * Initialize pipeline-specific UI event listeners.
- * Called when state.pipelineEnabled is true.
  */
 function initPipelineUI(): void {
   // Onboard button
@@ -696,6 +479,12 @@ function initPipelineUI(): void {
   const btnRunAll = document.getElementById('btn-run-all-walks');
   if (btnRunAll) {
     btnRunAll.addEventListener('click', () => handleRunAllWalks());
+  }
+
+  // Cancel Walks button
+  const btnCancelWalks = document.getElementById('btn-cancel-walks');
+  if (btnCancelWalks) {
+    btnCancelWalks.addEventListener('click', () => handleCancelWalks());
   }
 
   // Re-onboard button

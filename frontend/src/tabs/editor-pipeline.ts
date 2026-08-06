@@ -1,12 +1,9 @@
 /**
- * Pipeline-mode editor functions.
+ * Pipeline editor functions.
  *
  * This module contains the span-based editing code that operates against the
- * pipeline /api/pipeline/* endpoints. It is used when `state.pipelineEnabled`
- * is true.
- *
- * When pipeline mode is inactive, the editor-legacy module handles chunk-based
- * editing instead. The routing layer (editor.ts) decides which module to call.
+ * pipeline /api/pipeline/* endpoints. The editor is always in pipeline mode;
+ * there is no legacy chunk editor anymore.
  *
  * Pipeline endpoints used:
  *   - POST /api/pipeline/operation (split/merge/move/delete)
@@ -16,13 +13,15 @@
  *   - POST /api/pipeline/review/override
  *   - GET  /api/pipeline/export/{book_id}
  *   - POST /api/pipeline/render
- *   - POST /api/cancel_audio
+ *   - POST /api/pipeline/cancel_render
+ *   - GET  /api/pipeline/render_status/{job_id}
+ *   - POST /api/pipeline/merge
+ *   - GET  /api/pipeline/download/{job_id}
  */
 
 import * as API from '../api';
 import { state } from '../state';
 import { showToast, showConfirm, escapeHtml } from '../utils';
-import { setIsRenderingAll } from './editor-legacy';
 
 // ---------------------------------------------------------------------------
 // Pipeline types
@@ -30,6 +29,7 @@ import { setIsRenderingAll } from './editor-legacy';
 
 /** A span from the pipeline export endpoint */
 export interface PipelineSpan {
+  id: string;
   global_index: number;
   speaker: string;
   text: string;
@@ -108,7 +108,7 @@ export async function pipelineReviewOverride(
 export async function pipelineRenderAudiobook(
   useBatch = true,
   batchSeed?: number,
-): Promise<{ job_id: string }> {
+): Promise<{ job_id: string; status?: string }> {
   return API.post('/api/pipeline/render', {
     book_id: state.pipelineBookId,
     use_batch: useBatch,
@@ -117,9 +117,56 @@ export async function pipelineRenderAudiobook(
 }
 
 /**
+ * Poll the status of a render job
+ */
+export async function pipelineRenderStatus(
+  jobId: string,
+): Promise<{ job_id: string; status: string; output_dir: string | null; error: string | null }> {
+  return API.get(`/api/pipeline/render_status/${jobId}`);
+}
+
+/**
+ * Cancel a running render job
+ */
+export async function pipelineCancelRender(
+  jobId: string,
+): Promise<{ status: string; job_id: string }> {
+  return API.post('/api/pipeline/cancel_render', { job_id: jobId });
+}
+
+/**
+ * Merge rendered audio chunks into a single M4B file
+ */
+export async function pipelineMergeAudiobook(
+  jobId: string,
+): Promise<{ status: string; output_path: string }> {
+  return API.post('/api/pipeline/merge', {
+    book_id: state.pipelineBookId,
+    job_id: jobId,
+  });
+}
+
+/**
+ * Update the text of a span via PUT
+ */
+export async function pipelineUpdateSpanText(
+  spanId: string,
+  text: string,
+): Promise<{ status: string; span_id: string }> {
+  return API.put(`/api/pipeline/span/${spanId}/text`, { text });
+}
+
+/**
+ * Build the download URL for a rendered audiobook
+ */
+export function pipelineDownloadUrl(jobId: string): string {
+  return `/api/pipeline/download/${jobId}`;
+}
+
+/**
  * Export the annotated script for the current book (pipeline spans)
  */
-export async function pipelineExportSpans(): Promise<Array<{ speaker: string; text: string; instruct: string | null }>> {
+export async function pipelineExportSpans(): Promise<Array<{ id: string; speaker: string; text: string; instruct: string | null }>> {
   if (!state.pipelineBookId) return [];
   return API.get(`/api/pipeline/export/${state.pipelineBookId}`);
 }
@@ -145,10 +192,11 @@ let _selectedIndices: Set<number> = new Set();
  * Convert raw export data to PipelineSpan array with global_index
  */
 export function toPipelineSpans(
-  raw: Array<{ speaker: string; text: string; instruct: string | null }>,
+  raw: Array<{ id: string; speaker: string; text: string; instruct: string | null }>,
 ): PipelineSpan[] {
   return raw.map((item, idx) => ({
-    global_index: idx,
+    id: item.id || '',
+    global_index: idx + 1,
     speaker: item.speaker || '',
     text: item.text || '',
     instruct: item.instruct || '',
@@ -214,7 +262,7 @@ export function renderSpanRow(span: PipelineSpan): string {
         </button>
       </td>
       <td><span class="fw-bold">${escapeHtml(span.speaker)}</span></td>
-      <td><div class="span-text">${escapeHtml(span.text)}</div></td>
+      <td><div class="span-text" contenteditable="true" data-span-id="${escapeHtml(span.id)}" data-index="${span.global_index}" title="Click to edit span text" style="min-width: 200px; padding: 4px 8px; border: 1px solid transparent; border-radius: 4px; cursor: text;">${escapeHtml(span.text)}</div></td>
       <td><div class="span-instruct text-muted small">${escapeHtml(span.instruct)}</div></td>
       <td class="text-center align-middle">
         <div class="btn-group btn-group-sm" role="group">
@@ -530,8 +578,20 @@ export async function handleReviewOverride(itemId: string): Promise<void> {
 // TTS rendering — pipeline mode
 // ---------------------------------------------------------------------------
 
+/** Currently active render job ID (set when render starts, cleared when finished) */
+let _currentRenderJobId: string | null = null;
+
+/** Interval handle for render-status polling */
+let _renderPollTimer: ReturnType<typeof setInterval> | null = null;
+
 /**
- * Render the audiobook using the pipeline render endpoint
+ * Render the audiobook using the pipeline render endpoint.
+ *
+ * The backend executes the render as a background job and returns
+ * immediately with a job_id.  This function polls
+ * ``GET /api/pipeline/render_status/{job_id}`` every 2 seconds until
+ * the job reaches a terminal state (``completed``, ``failed``, or
+ * ``cancelled``).
  */
 export async function pipelineRenderAll(): Promise<void> {
   if (!state.pipelineBookId) {
@@ -539,7 +599,6 @@ export async function pipelineRenderAll(): Promise<void> {
     return;
   }
 
-  setIsRenderingAll(true);
   const btnRender = document.getElementById('btn-pipeline-render');
   const btnRegen = document.getElementById('btn-pipeline-regen');
   const btnCancel = document.getElementById('btn-pipeline-cancel');
@@ -549,31 +608,67 @@ export async function pipelineRenderAll(): Promise<void> {
   if (btnCancel) btnCancel.style.display = 'inline-block';
 
   try {
+    // Start the render — returns immediately with a job_id
     const result = await pipelineRenderAudiobook(true);
-    showToast(`Render complete — job ID: ${result.job_id}`, 'success');
+    _currentRenderJobId = result.job_id;
+    showToast(`Render started — job ID: ${result.job_id}`, 'info');
 
-    // Show job ID to user
-    const jobDisplay = document.getElementById('pipeline-render-job');
-    if (jobDisplay) {
-      jobDisplay.textContent = `Job: ${result.job_id}`;
-      jobDisplay.classList.remove('d-none');
+    // Poll for status every 2 seconds
+    await new Promise<void>((resolve, reject) => {
+      _renderPollTimer = setInterval(async () => {
+        if (!_currentRenderJobId) {
+          if (_renderPollTimer) clearInterval(_renderPollTimer);
+          _renderPollTimer = null;
+          resolve();
+          return;
+        }
+        try {
+           const status = await pipelineRenderStatus(_currentRenderJobId);
+           if (status.status === 'completed') {
+             if (_renderPollTimer) clearInterval(_renderPollTimer);
+             _renderPollTimer = null;
+             // Store job_id in global state for merge/download
+             state.pipelineRenderJobId = _currentRenderJobId;
+             showToast('Render complete', 'success');
+             resolve();
+          } else if (status.status === 'failed') {
+            if (_renderPollTimer) clearInterval(_renderPollTimer);
+            _renderPollTimer = null;
+            reject(new Error(status.error || 'Render failed'));
+          } else if (status.status === 'cancelled') {
+            if (_renderPollTimer) clearInterval(_renderPollTimer);
+            _renderPollTimer = null;
+            reject(new Error('Render cancelled'));
+          }
+          // else: still running — keep polling
+        } catch (e) {
+          if (_renderPollTimer) clearInterval(_renderPollTimer);
+          _renderPollTimer = null;
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      }, 2000);
+    });
+
+    // Show download button on success
+    const btnDownload = document.getElementById('btn-pipeline-download');
+    if (btnDownload && _currentRenderJobId) {
+      btnDownload.style.display = 'inline-block';
+      btnDownload.setAttribute('data-job-id', _currentRenderJobId);
     }
-
-    // Render completed synchronously — restore controls immediately
-    await cancelPipelineRender(true);
 
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     showToast('Render failed: ' + msg, 'error');
+  } finally {
+    _currentRenderJobId = null;
     await cancelPipelineRender(true);
   }
 }
 
 /**
- * Cancel pipeline rendering UI state
+ * Cancel pipeline rendering UI state and (optionally) the active job.
  */
 export async function cancelPipelineRender(skipApi = false): Promise<void> {
-  setIsRenderingAll(false);
   const btnRender = document.getElementById('btn-pipeline-render');
   const btnRegen = document.getElementById('btn-pipeline-regen');
   const btnCancel = document.getElementById('btn-pipeline-cancel');
@@ -582,12 +677,67 @@ export async function cancelPipelineRender(skipApi = false): Promise<void> {
   if (btnRegen) btnRegen.style.display = 'inline-block';
   if (btnCancel) btnCancel.style.display = 'none';
 
-  if (!skipApi) {
+  if (!skipApi && _currentRenderJobId) {
     try {
-      await API.post('/api/cancel_audio', {});
+      await pipelineCancelRender(_currentRenderJobId);
     } catch (e) {
       console.error('Cancel error:', e);
     }
+  }
+}
+
+/**
+ * Download the rendered audiobook file for the given job.
+ * Uses state.pipelineRenderJobId if no jobId is provided.
+ */
+export async function downloadPipelineRender(jobId?: string): Promise<void> {
+  const id = jobId ?? state.pipelineRenderJobId ?? _currentRenderJobId;
+  if (!id) {
+    showToast('No render job to download', 'warning');
+    return;
+  }
+  // Trigger a browser download via a temporary anchor
+  const a = document.createElement('a');
+  a.href = pipelineDownloadUrl(id);
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+/**
+ * Merge rendered audio chunks into a single M4B audiobook file.
+ * After merge completes, the download button can retrieve the merged file.
+ */
+export async function mergePipelineAudiobook(): Promise<void> {
+  const jobId = state.pipelineRenderJobId ?? _currentRenderJobId;
+  if (!jobId) {
+    showToast('No render job to merge. Render the audiobook first.', 'warning');
+    return;
+  }
+  if (!state.pipelineBookId) {
+    showToast('No book onboarded', 'warning');
+    return;
+  }
+
+  showToast('Merging audiobook...', 'info');
+
+  try {
+    const result = await pipelineMergeAudiobook(jobId);
+    if (result.status === 'ok') {
+      showToast('Merge complete', 'success');
+      // Ensure download button is enabled/visible
+      const btnDownload = document.getElementById('btn-pipeline-download');
+      if (btnDownload) {
+        btnDownload.style.display = 'inline-block';
+        btnDownload.setAttribute('data-job-id', jobId);
+      }
+    } else {
+      showToast('Merge returned unexpected status: ' + result.status, 'error');
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast('Merge failed: ' + msg, 'error');
   }
 }
 

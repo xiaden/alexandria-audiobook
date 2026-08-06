@@ -12,6 +12,8 @@ responsibility-specific modules:
 - ``api_operations`` — structural operation endpoints
 - ``api_review`` — confidence review endpoints
 - ``api_export`` — export and render endpoints
+- ``api_characters`` — character ledger endpoints
+- ``api_voices`` — voice catalog and preview endpoints
 
 Uses dependency injection for storage so tests can inject InMemorySQLiteAdapter.
 """
@@ -26,6 +28,8 @@ from app.pipeline.api_walks import router as _walks_router
 from app.pipeline.api_operations import router as _operations_router
 from app.pipeline.api_review import router as _review_router
 from app.pipeline.api_export import router as _export_router
+from app.pipeline.api_characters import router as _characters_router
+from app.pipeline.api_voices import router as _voices_router
 
 # Re-export dependencies for backward compatibility with tests
 from app.pipeline.api_onboard import get_storage  # noqa: F401
@@ -50,3 +54,5 @@ router.include_router(_walks_router)
 router.include_router(_operations_router)
 router.include_router(_review_router)
 router.include_router(_export_router)
+router.include_router(_characters_router)
+router.include_router(_voices_router)

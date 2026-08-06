@@ -2,6 +2,7 @@
 
 > **Design Document:** `artifacts/designs/pending/DD-epub-audiobook-pipeline-rewrite-v3.md`
 > **Status:** ACTIVE — v3 design (SQLite-WAL two-graph model, 9-walk serial DAG)
+> **Feature cutover:** COMPLETE — pipeline-only mode. Plan Q (terminal) executed 11 phases / 70 steps: legacy dual-path surface removed, pipeline unconditional, negative-space guard suite green, frontend dead-poll gap resolved and vitest-enabled (142 tests). Superseded plans P archived; O pending archival (50 steps never marked complete by its executor — bookkeeping gap, see Plan Q P11-S13).
 > **Supersedes:** All prior v2 plans and contracts referencing file-based `pipeline_state/` JSON storage, 6-walk DAG, content_hash, Jaccard reconciliation.
 
 ## Plan Dependency Graph
@@ -36,6 +37,10 @@ Plan M (Frontend Legacy Code Cleanup)
 Plan N (Pipeline API Split by Responsibility)
     ↓
 Plan O (Voice Workflow Parity Restoration) ← NEW: restores voice catalog, assignment, preview
+    ↓
+Plan P (Pipeline Frontend UX Fixes) ← NEW: index contract, observability, editing, merge/download, state persistence
+    ↓
+Plan Q (Pipeline-Only Cutover — terminal plan) ← NEW: delete legacy editor/voice/chunk/config paths, project.py, prompt files, legacy endpoints/tests/docs; engine factory decoupling; negative-space guard suite
 ```
 
 ## Plan List
@@ -56,17 +61,25 @@ Plan O (Voice Workflow Parity Restoration) ← NEW: restores voice catalog, assi
 | L | Walk-Order Canonical Contract | 5 | 16 | ~14K |
 | M | Frontend Legacy Code Cleanup | 5 | 16 | ~18K |
 | N | Pipeline API Split by Responsibility | 4 | 16 | ~16K |
-| O | Voice Workflow Parity Restoration | 8 | 38 | ~28K |
+| O | Voice Workflow Parity Restoration | 29 | 70 | ~46K |
+| P | Pipeline Frontend UX Fixes | 8 | 69 | ~35K |
+| Q | Pipeline-Only Cutover (terminal) | 11 | 70 | ~38K |
 
-**Total:** 15 plans, 62 phases, 347 steps, ~273K weighted chars
+**Total:** 17 plans, 104 phases, 543 steps, ~384K weighted chars
 
 ## Execution Order
 
-Plans are sequentially ordered A→N. Each plan depends on all prior plans. No parallel execution of plans (each builds on the previous).
+Plans are sequentially ordered A→Q. Each plan depends on all prior plans. No parallel execution of plans (each builds on the previous).
 
 **Recommended execution:** Sequential, one plan at a time. Each plan should be validated (all tests pass) before proceeding to the next.
 
 **Plan H status:** INCOMPLETE — Phases 2 and 3 (e2e and presentation tests) were never created despite being marked complete. Plan I addresses this gap.
+
+**Plan P dependency:** Depends on Plan O (Voice Workflow Parity) for Phase 6 (voice assignment verification). Phase 6 verifies that Plan O-E's `PUT /api/pipeline/characters/{id}/voice` endpoint works and frontend calls it correctly.
+
+**Plan Q (terminal):** Depends on O and P. Deletes the legacy dual-path surface (ProjectManager/chunk editor, legacy voice/merge/batch/export endpoints, prompt files, the dual-mode toggle, audio tab, legacy tests/docs) and makes the pipeline unconditional. Introduces `app/engine.py` (see CONTRACTS.md). On completion, Plans O and P are archived as subsumed.
+
+**Plan Q status:** COMPLETE (all 11 phases executed; final counts 11 phases / 70 steps). Feature is cut over — pipeline-only. Guard suite `tests/pipeline/test_legacy_removed.py` stays 12/12; combined backend suite 758 passed / 40 environmental fails (MissingSchema + SKIP, no code failures). Frontend: tsc clean, `npm run build` regenerates dist without legacy markers, vitest 142/142 green. Known residuals: (1) `app/pipeline/adapter.py` SQLiteAdapter thread-affinity defect (sqlite3 connection created in threadpool by the sync `get_storage()` dependency, used on the event-loop thread) — blocks HTTP smoke-testing of DB-touching pipeline endpoints (characters/voices/review/preview/char-voice); NOT caused by Plan Q, pre-existing since Phase 1 (see Plan Q P11-S12 Blocked annotation); (2) Plan O archival blocked on 50 unmarked steps (P11-S13).
 
 ## Key Design Decisions (from DD v3)
 

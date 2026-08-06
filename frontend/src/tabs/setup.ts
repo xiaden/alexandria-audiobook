@@ -5,7 +5,6 @@
 
 import * as API from '../api';
 import { showToast } from '../utils';
-import { state } from '../state';
 
 /**
  * Canonical walk task names matching WalkRunner.WALK_ORDER in runner.py.
@@ -58,43 +57,9 @@ interface TTSConfig {
   pause_same_speaker_ms?: number | null;
 }
 
-interface PromptsConfig {
-  system_prompt?: string;
-  user_prompt?: string;
-  review_system_prompt?: string;
-  review_user_prompt?: string;
-  persona_system_prompt?: string;
-  persona_user_prompt?: string;
-  persona_advanced_prompt?: string;
-}
-
-interface GenerationConfig {
-  chunk_size?: number;
-  max_tokens?: number;
-  temperature?: number;
-  top_p?: number;
-  top_k?: number;
-  min_p?: number;
-  presence_penalty?: number;
-  banned_tokens?: string[];
-  merge_narrators?: boolean;
-}
-
 interface AppConfig {
   llm: LLMConfig;
   tts: TTSConfig;
-  prompts?: PromptsConfig;
-  generation?: GenerationConfig;
-}
-
-interface DefaultPrompts {
-  system_prompt?: string;
-  user_prompt?: string;
-  review_system_prompt?: string;
-  review_user_prompt?: string;
-  persona_system_prompt?: string;
-  persona_user_prompt?: string;
-  persona_advanced_prompt?: string;
 }
 
 /** Human-readable label for a reasoning_effort value ('' / null = 'Default'). */
@@ -125,16 +90,10 @@ function toggleTTSMode(): void {
 
 /**
  * Load configuration from the server and populate all form fields.
- * Fetches GET /api/config, populates LLM, TTS, prompts, and generation settings.
- * Also populates the per-task LLM override table.
+ * Fetches GET /api/config and populates LLM settings, the per-task LLM
+ * override table, and TTS settings.
  */
 export async function loadConfig(): Promise<void> {
-  // Set defaults before fetching
-  const chunkSizeEl = document.getElementById('chunk-size') as HTMLInputElement;
-  const maxTokensEl = document.getElementById('max-tokens') as HTMLInputElement;
-  if (chunkSizeEl) chunkSizeEl.value = '3000';
-  if (maxTokensEl) maxTokensEl.value = '4096';
-
   try {
     const config = await API.get<AppConfig>('/api/config');
 
@@ -227,142 +186,9 @@ export async function loadConfig(): Promise<void> {
     }
 
     toggleTTSMode();
-
-    // Load custom prompts if they exist and are non-empty
-    if (config.prompts) {
-      const promptFields: Array<[keyof PromptsConfig, string]> = [
-        ['system_prompt', 'system-prompt'],
-        ['user_prompt', 'user-prompt'],
-        ['review_system_prompt', 'review-system-prompt'],
-        ['review_user_prompt', 'review-user-prompt'],
-        ['persona_system_prompt', 'persona-system-prompt'],
-        ['persona_user_prompt', 'persona-user-prompt'],
-        ['persona_advanced_prompt', 'persona-advanced-prompt'],
-      ];
-      for (const [key, id] of promptFields) {
-        const val = config.prompts[key];
-        if (val) {
-          const el = document.getElementById(id) as HTMLTextAreaElement;
-          if (el) el.value = val;
-        }
-      }
-    }
-
-    // If review/persona prompts are still empty, fetch defaults
-    const reviewSystemEl = document.getElementById('review-system-prompt') as HTMLTextAreaElement;
-    const reviewUserEl = document.getElementById('review-user-prompt') as HTMLTextAreaElement;
-    const personaSystemEl = document.getElementById('persona-system-prompt') as HTMLTextAreaElement;
-    const personaUserEl = document.getElementById('persona-user-prompt') as HTMLTextAreaElement;
-    const personaAdvancedEl = document.getElementById('persona-advanced-prompt') as HTMLTextAreaElement;
-
-    if (!reviewSystemEl?.value || !reviewUserEl?.value ||
-        !personaSystemEl?.value || !personaUserEl?.value) {
-      try {
-        const defaults = await API.get<DefaultPrompts>('/api/default_prompts');
-        if (!reviewSystemEl?.value && defaults.review_system_prompt) {
-          reviewSystemEl.value = defaults.review_system_prompt;
-        }
-        if (!reviewUserEl?.value && defaults.review_user_prompt) {
-          reviewUserEl.value = defaults.review_user_prompt;
-        }
-        if (!personaSystemEl?.value && defaults.persona_system_prompt) {
-          personaSystemEl.value = defaults.persona_system_prompt;
-        }
-        if (!personaUserEl?.value && defaults.persona_user_prompt) {
-          personaUserEl.value = defaults.persona_user_prompt;
-        }
-        if (!personaAdvancedEl?.value && defaults.persona_advanced_prompt) {
-          personaAdvancedEl.value = defaults.persona_advanced_prompt;
-        }
-      } catch (e) {
-        console.warn('Could not fetch default prompts', e);
-      }
-    }
-
-    // Load generation settings
-    if (config.generation) {
-      if (config.generation.chunk_size && chunkSizeEl) {
-        chunkSizeEl.value = String(config.generation.chunk_size);
-      }
-      if (config.generation.max_tokens && maxTokensEl) {
-        maxTokensEl.value = String(config.generation.max_tokens);
-      }
-      const genNumberFields: Array<[keyof GenerationConfig, string]> = [
-        ['temperature', 'temperature'],
-        ['top_p', 'top-p'],
-        ['top_k', 'top-k'],
-        ['min_p', 'min-p'],
-        ['presence_penalty', 'presence-penalty'],
-      ];
-      for (const [key, id] of genNumberFields) {
-        const val = config.generation[key];
-        if (val != null) {
-          const el = document.getElementById(id) as HTMLInputElement;
-          if (el) el.value = String(val);
-        }
-      }
-      const bannedTokensEl = document.getElementById('banned-tokens') as HTMLInputElement;
-      if (config.generation.banned_tokens && config.generation.banned_tokens.length > 0 && bannedTokensEl) {
-        bannedTokensEl.value = config.generation.banned_tokens.join(', ');
-      }
-      const mergeNarratorsEl = document.getElementById('merge-narrators') as HTMLInputElement;
-      if (mergeNarratorsEl) mergeNarratorsEl.checked = !!config.generation.merge_narrators;
-    }
   } catch (e) {
     console.error('Failed to load config', e);
   }
-}
-
-/**
- * Reset prompts and generation settings to factory defaults.
- * Fetches GET /api/default_prompts and resets all prompt textareas
- * and generation setting inputs to their default values.
- */
-async function resetPrompts(): Promise<void> {
-  try {
-    const defaults = await API.get<DefaultPrompts>('/api/default_prompts');
-
-    const systemPromptEl = document.getElementById('system-prompt') as HTMLTextAreaElement;
-    const userPromptEl = document.getElementById('user-prompt') as HTMLTextAreaElement;
-    if (systemPromptEl) systemPromptEl.value = defaults.system_prompt || '';
-    if (userPromptEl) userPromptEl.value = defaults.user_prompt || '';
-
-    const reviewSystemEl = document.getElementById('review-system-prompt') as HTMLTextAreaElement;
-    const reviewUserEl = document.getElementById('review-user-prompt') as HTMLTextAreaElement;
-    const personaSystemEl = document.getElementById('persona-system-prompt') as HTMLTextAreaElement;
-    const personaUserEl = document.getElementById('persona-user-prompt') as HTMLTextAreaElement;
-    const personaAdvancedEl = document.getElementById('persona-advanced-prompt') as HTMLTextAreaElement;
-
-    if (reviewSystemEl && defaults.review_system_prompt) reviewSystemEl.value = defaults.review_system_prompt;
-    if (reviewUserEl && defaults.review_user_prompt) reviewUserEl.value = defaults.review_user_prompt;
-    if (personaSystemEl && defaults.persona_system_prompt) personaSystemEl.value = defaults.persona_system_prompt;
-    if (personaUserEl && defaults.persona_user_prompt) personaUserEl.value = defaults.persona_user_prompt;
-    if (personaAdvancedEl && defaults.persona_advanced_prompt) personaAdvancedEl.value = defaults.persona_advanced_prompt;
-  } catch (e) {
-    console.error('Failed to fetch default prompts', e);
-    showToast('Failed to load default prompts from server.', 'error');
-  }
-
-  // Reset generation settings to defaults
-  const chunkSizeEl = document.getElementById('chunk-size') as HTMLInputElement;
-  const maxTokensEl = document.getElementById('max-tokens') as HTMLInputElement;
-  const temperatureEl = document.getElementById('temperature') as HTMLInputElement;
-  const topPEl = document.getElementById('top-p') as HTMLInputElement;
-  const topKEl = document.getElementById('top-k') as HTMLInputElement;
-  const minPEl = document.getElementById('min-p') as HTMLInputElement;
-  const presencePenaltyEl = document.getElementById('presence-penalty') as HTMLInputElement;
-  const bannedTokensEl = document.getElementById('banned-tokens') as HTMLInputElement;
-  const mergeNarratorsEl = document.getElementById('merge-narrators') as HTMLInputElement;
-
-  if (chunkSizeEl) chunkSizeEl.value = '3000';
-  if (maxTokensEl) maxTokensEl.value = '4096';
-  if (temperatureEl) temperatureEl.value = '0.6';
-  if (topPEl) topPEl.value = '0.8';
-  if (topKEl) topKEl.value = '0';
-  if (minPEl) minPEl.value = '0';
-  if (presencePenaltyEl) presencePenaltyEl.value = '0';
-  if (bannedTokensEl) bannedTokensEl.value = '';
-  if (mergeNarratorsEl) mergeNarratorsEl.checked = false;
 }
 
 /**
@@ -394,17 +220,13 @@ export function collectTaskOverrides(): Record<string, TaskOverride> {
 
 /**
  * Handle config form submission.
- * Collects all field values including per-task overrides, builds config object,
- * and POSTs to /api/config.
+ * Collects all field values including per-task overrides, builds config object
+ * (llm + tts only), and POSTs to /api/config.
  */
 async function handleConfigSubmit(e: Event): Promise<void> {
   e.preventDefault();
 
-  const chunkSizeEl = document.getElementById('chunk-size') as HTMLInputElement;
-  const maxTokensEl = document.getElementById('max-tokens') as HTMLInputElement;
   const parallelWorkersEl = document.getElementById('parallel-workers') as HTMLInputElement;
-
-  let chunkSize = parseInt(chunkSizeEl?.value || '') || 3000;
 
   // Validate parallel workers
   let parallelWorkers = parseInt(parallelWorkersEl?.value || '') || 2;
@@ -433,22 +255,6 @@ async function handleConfigSubmit(e: Event): Promise<void> {
   const pauseBetweenSpeakersEl = document.getElementById('pause-between-speakers') as HTMLInputElement;
   const pauseSameSpeakerEl = document.getElementById('pause-same-speaker') as HTMLInputElement;
 
-  const systemPromptEl = document.getElementById('system-prompt') as HTMLTextAreaElement;
-  const userPromptEl = document.getElementById('user-prompt') as HTMLTextAreaElement;
-  const reviewSystemPromptEl = document.getElementById('review-system-prompt') as HTMLTextAreaElement;
-  const reviewUserPromptEl = document.getElementById('review-user-prompt') as HTMLTextAreaElement;
-  const personaSystemPromptEl = document.getElementById('persona-system-prompt') as HTMLTextAreaElement;
-  const personaUserPromptEl = document.getElementById('persona-user-prompt') as HTMLTextAreaElement;
-  const personaAdvancedPromptEl = document.getElementById('persona-advanced-prompt') as HTMLTextAreaElement;
-
-  const temperatureEl = document.getElementById('temperature') as HTMLInputElement;
-  const topPEl = document.getElementById('top-p') as HTMLInputElement;
-  const topKEl = document.getElementById('top-k') as HTMLInputElement;
-  const minPEl = document.getElementById('min-p') as HTMLInputElement;
-  const presencePenaltyEl = document.getElementById('presence-penalty') as HTMLInputElement;
-  const bannedTokensEl = document.getElementById('banned-tokens') as HTMLInputElement;
-  const mergeNarratorsEl = document.getElementById('merge-narrators') as HTMLInputElement;
-
   const config = {
     llm: {
       base_url: llmUrlEl?.value || '',
@@ -474,28 +280,6 @@ async function handleConfigSubmit(e: Event): Promise<void> {
       pause_between_speakers_ms: parseInt(pauseBetweenSpeakersEl?.value || '') || 500,
       pause_same_speaker_ms: parseInt(pauseSameSpeakerEl?.value || '') || 250,
     },
-    prompts: {
-      system_prompt: systemPromptEl?.value || '',
-      user_prompt: userPromptEl?.value || '',
-      review_system_prompt: reviewSystemPromptEl?.value || '',
-      review_user_prompt: reviewUserPromptEl?.value || '',
-      persona_system_prompt: personaSystemPromptEl?.value || '',
-      persona_user_prompt: personaUserPromptEl?.value || '',
-      persona_advanced_prompt: personaAdvancedPromptEl?.value || '',
-    },
-    generation: {
-      chunk_size: chunkSize,
-      max_tokens: parseInt(maxTokensEl?.value || '') || 4096,
-      temperature: parseFloat(temperatureEl?.value || '0.6'),
-      top_p: parseFloat(topPEl?.value || '0.8'),
-      top_k: parseInt(topKEl?.value || '0'),
-      min_p: parseFloat(minPEl?.value || '0'),
-      presence_penalty: parseFloat(presencePenaltyEl?.value || '0'),
-      banned_tokens: bannedTokensEl?.value
-        ? bannedTokensEl.value.split(',').map(t => t.trim()).filter(t => t)
-        : [],
-      merge_narrators: mergeNarratorsEl?.checked || false,
-    },
   };
 
   try {
@@ -508,20 +292,9 @@ async function handleConfigSubmit(e: Event): Promise<void> {
 }
 
 /**
- * Handle pipeline toggle switch change.
- * Updates the global AppState.pipelineEnabled flag.
- */
-function handlePipelineToggle(): void {
-  const toggleEl = document.getElementById('pipeline-toggle') as HTMLInputElement;
-  if (toggleEl) {
-    state.pipelineEnabled = toggleEl.checked;
-  }
-}
-
-/**
  * Initialize the Setup tab.
- * Attaches event listeners for config form submission, TTS mode toggle,
- * pipeline toggle, prompt reset, and collapse chevron. Loads config on init.
+ * Attaches event listeners for config form submission and the TTS mode
+ * toggle. Loads config on init.
  */
 export function initSetup(): void {
   document.addEventListener('DOMContentLoaded', () => {
@@ -537,32 +310,6 @@ export function initSetup(): void {
     const ttsModeEl = document.getElementById('tts-mode');
     if (ttsModeEl) {
       ttsModeEl.addEventListener('change', () => toggleTTSMode());
-    }
-
-    // Pipeline mode toggle
-    const pipelineToggle = document.getElementById('pipeline-toggle');
-    if (pipelineToggle) {
-      pipelineToggle.addEventListener('change', () => handlePipelineToggle());
-    }
-
-    // Reset prompts button
-    const resetBtn = document.querySelector('[onclick="resetPrompts()"]');
-    if (resetBtn) {
-      // Remove the inline onclick and use addEventListener instead
-      resetBtn.removeAttribute('onclick');
-      resetBtn.addEventListener('click', () => resetPrompts());
-    }
-
-    // Toggle chevron on collapse
-    const promptSettings = document.getElementById('promptSettings');
-    const promptChevron = document.getElementById('prompt-chevron');
-    if (promptSettings && promptChevron) {
-      promptSettings.addEventListener('show.bs.collapse', () => {
-        promptChevron.classList.replace('fa-chevron-right', 'fa-chevron-down');
-      });
-      promptSettings.addEventListener('hide.bs.collapse', () => {
-        promptChevron.classList.replace('fa-chevron-down', 'fa-chevron-right');
-      });
     }
 
     // Load config on init

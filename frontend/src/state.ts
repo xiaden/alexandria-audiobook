@@ -3,7 +3,7 @@
  * Ported from app/static/index.html scattered window._ caches and let declarations
  */
 
-/** Voice information from /api/voices */
+/** Voice information from /api/pipeline/voices */
 export interface Voice {
   name: string;
   config?: VoiceConfig;
@@ -28,7 +28,7 @@ export interface VoiceConfig {
   description?: string;
 }
 
-/** Chunk information from /api/chunks */
+/** Chunk information (legacy state, no live endpoint) */
 export interface Chunk {
   id: number;
   text: string;
@@ -91,9 +91,9 @@ export interface DsbRow {
 export interface AppState {
   /** Current script entries (from /api/script) */
   currentScript: unknown[];
-  /** Audio chunks (from /api/chunks) */
+  /** Audio chunks (legacy state, no live endpoint) */
   chunks: Chunk[];
-  /** Available voices (from /api/voices) */
+  /** Available voices (from /api/pipeline/voices) */
   voices: Voice[];
   /** Designed voices cache (from /api/voice_design/list) */
   designedVoices: DesignedVoice[];
@@ -115,10 +115,10 @@ export interface AppState {
   isPlayingSequence: boolean;
   /** Editor: rendering all flag */
   isRenderingAll: boolean;
-  /** Setup: pipeline mode enabled (toggle switch in Setup tab) */
-  pipelineEnabled: boolean;
   /** Pipeline: current book ID from successful onboard (shared across tabs) */
   pipelineBookId: string | null;
+  /** Pipeline: current render job ID (set after render completes, used for merge/download) */
+  pipelineRenderJobId: string | null;
 }
 
 /** Module-level state singleton */
@@ -136,9 +136,58 @@ export const state: AppState = {
   cachedChunks: [],
   isPlayingSequence: false,
   isRenderingAll: false,
-  pipelineEnabled: false,
   pipelineBookId: null,
+  pipelineRenderJobId: null,
 };
+
+// ---------------------------------------------------------------------------
+// localStorage persistence helpers
+// ---------------------------------------------------------------------------
+
+const LS_PIPELINE_BOOK_ID = 'alexandria-pipeline-book-id';
+
+/**
+ * Save a value to localStorage. Silently ignores errors (e.g. private mode,
+ * quota exceeded) so callers never need try/catch.
+ */
+function saveKey(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* localStorage unavailable; value still applies for this session */
+  }
+}
+
+/**
+ * Load a value from localStorage. Returns null if the key is missing or
+ * localStorage is unavailable.
+ */
+function loadKey(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Set pipelineBookId in state and persist to localStorage.
+ */
+export function setPipelineBookId(bookId: string | null): void {
+  state.pipelineBookId = bookId;
+  saveKey(LS_PIPELINE_BOOK_ID, bookId ?? '');
+}
+
+/**
+ * Restore persisted pipeline state from localStorage.
+ * Call once on page load before any tab init runs.
+ */
+export function initState(): void {
+  const storedBookId = loadKey(LS_PIPELINE_BOOK_ID);
+  if (storedBookId && storedBookId !== '') {
+    state.pipelineBookId = storedBookId;
+  }
+}
 
 /** Available built-in voices for custom voice selection */
 export const AVAILABLE_VOICES = [

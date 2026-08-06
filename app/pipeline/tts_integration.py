@@ -20,13 +20,22 @@ from __future__ import annotations
 import os
 import tempfile
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.assembly import export_annotated_script
 
 if TYPE_CHECKING:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class CancelledError(Exception):
+    """Raised when a render job is cancelled via the cancel_check callback."""
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +63,12 @@ def _build_voice_config(
 ) -> dict[str, dict]:
     """Build a speaker → voice-config mapping for all speakers in *script*.
 
-    For ``'NARRATOR'`` the module-level ``NARRATOR_VOICE`` constant is used.
+    For ``'NARRATOR'`` the ``voice_config`` table is queried for a row with
+    ``id='NARRATOR'``.  If found, all columns from that row are used to build
+    the voice config (type, voice, description, etc.).  If no NARRATOR row
+    exists in the database, the module-level ``NARRATOR_VOICE`` constant is
+    used as a fallback.
+
     For character speakers the ``voice_assignment_id`` is looked up from the
     ``character`` table and the corresponding ``voice_config`` row provides
     the voice name and description.
@@ -84,7 +98,29 @@ def _build_voice_config(
     # Add NARRATOR if present in script
     has_narrator = any(e["speaker"] == "NARRATOR" for e in script)
     if has_narrator:
-        voice_config["NARRATOR"] = dict(NARRATOR_VOICE)
+        # Try to resolve NARRATOR from voice_config table first
+        narrator_rows = storage.execute_query(
+            "SELECT type, voice, description, character_style, seed, "
+            "ref_audio, ref_text, adapter_id, adapter_path, alias_of "
+            "FROM voice_config WHERE id = 'NARRATOR'",
+        )
+        if narrator_rows:
+            row = narrator_rows[0]
+            voice_config["NARRATOR"] = {
+                "type": row.get("type") or "custom",
+                "voice": row.get("voice") or "",
+                "character_style": row.get("character_style") or "",
+                "seed": row.get("seed") or "-1",
+                "ref_audio": row.get("ref_audio"),
+                "ref_text": row.get("ref_text"),
+                "adapter_id": row.get("adapter_id"),
+                "adapter_path": row.get("adapter_path"),
+                "description": row.get("description") or "",
+                "alias_of": row.get("alias_of"),
+            }
+        else:
+            # Fallback to hardcoded constant
+            voice_config["NARRATOR"] = dict(NARRATOR_VOICE)
 
     # Resolve character speakers via character → voice_config tables
     if speaker_names:
@@ -94,8 +130,18 @@ def _build_voice_config(
             f"""
             SELECT c.name AS character_name,
                    c.voice_assignment_id,
-                   vc.name AS voice_name,
-                   vc.description AS voice_description
+                   vc.id AS vc_id,
+                   vc.name AS vc_name,
+                   vc.description AS vc_description,
+                   vc.type AS vc_type,
+                   vc.voice AS vc_voice,
+                   vc.character_style AS vc_character_style,
+                   vc.seed AS vc_seed,
+                   vc.ref_audio AS vc_ref_audio,
+                   vc.ref_text AS vc_ref_text,
+                   vc.adapter_id AS vc_adapter_id,
+                   vc.adapter_path AS vc_adapter_path,
+                   vc.alias_of AS vc_alias_of
               FROM character c
               LEFT JOIN voice_config vc ON c.voice_assignment_id = vc.id
              WHERE c.name IN ({placeholders})
@@ -111,11 +157,18 @@ def _build_voice_config(
         # Build voice config for each speaker
         for speaker in speaker_names:
             info = char_voice_map.get(speaker)
-            if info and info.get("voice_assignment_id") and info.get("voice_name"):
+            if info and info.get("voice_assignment_id") and info.get("vc_id"):
                 voice_config[speaker] = {
-                    "type": "custom",
-                    "voice": info["voice_name"],
-                    "description": info.get("voice_description") or "",
+                    "type": info.get("vc_type") or "custom",
+                    "voice": info.get("vc_name") or "",
+                    "character_style": info.get("vc_character_style") or "",
+                    "seed": info.get("vc_seed") or "-1",
+                    "ref_audio": info.get("vc_ref_audio"),
+                    "ref_text": info.get("vc_ref_text"),
+                    "adapter_id": info.get("vc_adapter_id"),
+                    "adapter_path": info.get("vc_adapter_path"),
+                    "description": info.get("vc_description") or "",
+                    "alias_of": info.get("vc_alias_of"),
                 }
             else:
                 # Fallback: character exists but has no voice assignment
@@ -172,6 +225,8 @@ def render_audiobook(
     use_batch: bool = True,
     output_dir: str | None = None,
     batch_seed: int = BATCH_SEED_RANDOM,
+    job_id: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> str:
     """Render an audiobook from the pipeline's annotated script.
 
@@ -199,14 +254,28 @@ def render_audiobook(
         directory is created automatically.
     batch_seed:
         Seed for reproducible batch generation (``BATCH_SEED_RANDOM`` for random).
+    job_id:
+        Optional pre-allocated job identifier.  When ``None`` a new UUID is
+        generated.  The API layer passes the job_id it registered in its
+        render-job tracker so the returned value matches the tracked entry.
+    cancel_check:
+        Optional zero-argument callable returning ``True`` when the render
+        should abort.  Invoked before each chunk (individual mode) or once
+        before the batch dispatch (batch mode).  When triggered, raises
+        :class:`CancelledError`.
 
     Returns
     -------
     str
-        A UUID job identifier for tracking the render job.
+        The job identifier for this render.
+
+    Raises
+    ------
+    CancelledError
+        If ``cancel_check()`` returns ``True`` during rendering.
     """
-    # Generate a unique job ID
-    job_id = str(uuid.uuid4())
+    # Generate (or reuse) the job identifier
+    resolved_job_id = job_id if job_id is not None else str(uuid.uuid4())
 
     # Step 1: Get annotated script from assembly
     script = export_annotated_script(book_id, storage)
@@ -219,15 +288,22 @@ def render_audiobook(
 
     # Step 4: Handle empty script
     if not script:
-        return job_id
+        return resolved_job_id
 
     # Step 5: Build chunks and dispatch
     if use_batch:
+        # Check cancellation once before the batch dispatch
+        if cancel_check is not None and cancel_check():
+            raise CancelledError("Render cancelled before batch dispatch")
         chunks = _build_chunks(script)
         tts_engine.generate_batch(chunks, voice_config, resolved_dir, batch_seed)
     else:
-        # Individual generation — loop over each entry
+        # Individual generation — check cancellation before each chunk
         for i, entry in enumerate(script):
+            if cancel_check is not None and cancel_check():
+                raise CancelledError(
+                    f"Render cancelled before chunk {i}"
+                )
             speaker = entry["speaker"]
             text = entry["text"]
             instruct = entry.get("instruct", "")
@@ -236,4 +312,4 @@ def render_audiobook(
                 text, instruct, speaker, voice_config, output_path
             )
 
-    return job_id
+    return resolved_job_id

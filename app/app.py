@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional
 import re
 import time
 import queue
@@ -16,19 +16,15 @@ import threading
 import zipfile
 import subprocess
 import aiofiles
-from utils import atomic_json_write, PARA_MARKER, CHAP_MARKER
-from html.parser import HTMLParser
-import xml.etree.ElementTree as ET
+from utils import atomic_json_write
 
-# Import ProjectManager
-from project import ProjectManager
-from default_prompts import load_default_prompts
-from review_prompts import load_review_prompts
-from persona_prompts import load_persona_prompts
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
 
 # Pipeline API router (Phase 1 of pipeline rewrite)
 from app.pipeline.api import router as pipeline_router
+
+# TTS engine factory (replaces legacy project engine access)
+from app.engine import get_tts_engine, reset_tts_engine
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -40,13 +36,7 @@ app = FastAPI(title="Alexandria Audiobook")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
 CONFIG_PATH = os.environ.get("ALEXANDRIA_CONFIG_PATH") or os.path.join(BASE_DIR, "config.json")
-VOICE_CONFIG_PATH = os.path.join(ROOT_DIR, "voice_config.json")
-SCRIPT_PATH = os.path.join(ROOT_DIR, "annotated_script.json")
-AUDIOBOOK_PATH = os.path.join(ROOT_DIR, "cloned_audiobook.mp3")
-M4B_PATH = os.path.join(ROOT_DIR, "audiobook.m4b")
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
-SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
-CHUNKS_PATH = os.path.join(ROOT_DIR, "chunks.json")
 DESIGNED_VOICES_DIR = os.path.join(ROOT_DIR, "designed_voices")
 CLONE_VOICES_DIR = os.path.join(ROOT_DIR, "clone_voices")
 LORA_MODELS_DIR = os.path.join(ROOT_DIR, "lora_models")
@@ -57,7 +47,6 @@ PREPARER_SCRIPT_PATH = os.path.join(BASE_DIR, "alexandria_preparer.py")
 PREPARER_OUTPUT_DIR = os.path.join(ROOT_DIR, "preparer_output")
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
-os.makedirs(SCRIPTS_DIR, exist_ok=True)
 os.makedirs(DESIGNED_VOICES_DIR, exist_ok=True)
 os.makedirs(CLONE_VOICES_DIR, exist_ok=True)
 os.makedirs(LORA_MODELS_DIR, exist_ok=True)
@@ -90,22 +79,6 @@ app.mount("/builtin_lora", StaticFiles(directory=BUILTIN_LORA_DIR), name="builti
 
 # Dataset builder directory for preview audio
 app.mount("/dataset_builder", StaticFiles(directory=DATASET_BUILDER_DIR), name="dataset_builder")
-
-# Initialize Project Manager
-project_manager = ProjectManager(ROOT_DIR)
-
-# Reset any chunks stuck in "generating" from a prior interrupted session
-_startup_chunks = project_manager.load_chunks()
-if _startup_chunks:
-    _reset_count = 0
-    for chunk in _startup_chunks:
-        if chunk.get("status") == "generating":
-            chunk["status"] = "pending"
-            _reset_count += 1
-    if _reset_count:
-        project_manager.save_chunks(_startup_chunks)
-        print(f"Startup: reset {_reset_count} stuck 'generating' chunk(s) to 'pending'")
-    del _startup_chunks, _reset_count
 
 # CORS for development
 app.add_middleware(
@@ -260,54 +233,9 @@ class TTSConfig(BaseModel):
     pause_between_speakers_ms: int = 500  # silence (ms) between different speakers during merge
     pause_same_speaker_ms: int = 250  # silence (ms) when same speaker continues during merge
 
-class GenerationConfig(BaseModel):
-    chunk_size: int = 3000
-    max_tokens: int = 4096
-    temperature: float = 0.6
-    top_p: float = 0.8
-    top_k: int = 0
-    min_p: float = 0
-    presence_penalty: float = 0.0
-    banned_tokens: List[str] = []
-    merge_narrators: bool = False
-    review_batch_size: int = 25
-
-class PromptConfig(BaseModel):
-    system_prompt: Optional[str] = None
-    user_prompt: Optional[str] = None
-    review_system_prompt: Optional[str] = None
-    review_user_prompt: Optional[str] = None
-    persona_system_prompt: Optional[str] = None
-    persona_user_prompt: Optional[str] = None
-    persona_advanced_prompt: Optional[str] = None
-
 class AppConfig(BaseModel):
     llm: LLMConfig
     tts: TTSConfig
-    prompts: Optional[PromptConfig] = None
-    generation: Optional[GenerationConfig] = None
-
-class VoiceConfigItem(BaseModel):
-    type: str = "custom"
-    voice: Optional[str] = "Ryan"
-    character_style: Optional[str] = ""
-    default_style: Optional[str] = ""  # backward compat, prefer character_style
-    seed: Optional[str] = "-1"
-    ref_audio: Optional[str] = None
-    ref_text: Optional[str] = None
-    adapter_id: Optional[str] = None
-    adapter_path: Optional[str] = None
-    description: Optional[str] = ""  # voice description (for design type)
-    alias_of: Optional[str] = None  # canonical speaker this voice aliases (clone routing)
-
-class ChunkUpdate(BaseModel):
-    text: Optional[str] = None
-    instruct: Optional[str] = None
-    speaker: Optional[str] = None
-    pause_after: Optional[int] = None
-
-class BatchGenerateRequest(BaseModel):
-    indices: List[int]
 
 class VoiceDesignPreviewRequest(BaseModel):
     description: str
@@ -398,10 +326,6 @@ class BatchPreparerRequest(BaseModel):
 # Global state for process tracking
 process_state = {
     "script": {"running": False, "logs": []},
-    "persona": {"running": False, "logs": [], "cancel": False, "process": None},
-    "audio": {"running": False, "logs": [], "cancel": False},
-    "audacity_export": {"running": False, "logs": []},
-    "m4b_export": {"running": False, "logs": []},
     "review": {"running": False, "logs": []},
     "lora_training": {"running": False, "logs": []},
     "dataset_gen": {"running": False, "logs": []},
@@ -512,18 +436,13 @@ async def get_config():
     """Return the full application configuration as JSON.
 
     Reads ``config.json`` from disk (or builds a default when the file is
-    missing), fills in any missing prompt fields from their respective
-    prompt files, and materialises Pydantic defaults via
+    missing) and materialises Pydantic defaults via
     ``AppConfig.model_validate`` so that new optional fields such as
     ``task_overrides`` and ``reasoning_effort`` are always present in the
     response — even when absent from the on-disk config.
 
-    Also attaches ``current_file`` (the basename of the loaded input file)
-    when ``state.json`` references one that still exists.
-
     Returns:
-        Dict matching the ``AppConfig`` schema, plus an optional
-        ``current_file`` key.
+        Dict matching the ``AppConfig`` schema.
     """
     default_config = {
         "llm": {
@@ -535,93 +454,14 @@ async def get_config():
             "mode": "local",
             "url": "http://127.0.0.1:7860",
             "device": "auto"
-        },
-        "prompts": {
-            "system_prompt": "",
-            "user_prompt": ""
         }
     }
 
     if not os.path.exists(CONFIG_PATH):
-        sys_prompt, usr_prompt = load_default_prompts()
-        default_config["prompts"]["system_prompt"] = sys_prompt
-        default_config["prompts"]["user_prompt"] = usr_prompt
-        try:
-            rev_sys, rev_usr = load_review_prompts()
-            default_config["prompts"]["review_system_prompt"] = rev_sys
-            default_config["prompts"]["review_user_prompt"] = rev_usr
-        except RuntimeError:
-            pass
-        try:
-            per_sys, per_usr, per_adv = load_persona_prompts()
-            default_config["prompts"]["persona_system_prompt"] = per_sys
-            default_config["prompts"]["persona_user_prompt"] = per_usr
-            default_config["prompts"]["persona_advanced_prompt"] = per_adv
-        except RuntimeError:
-            pass
         config = default_config
     else:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             config = json.load(f)
-
-    # Ensure prompts section exists with defaults from file
-    if "prompts" not in config:
-        sys_prompt, usr_prompt = load_default_prompts()
-        prompts = {"system_prompt": sys_prompt, "user_prompt": usr_prompt}
-        try:
-            rev_sys, rev_usr = load_review_prompts()
-            prompts["review_system_prompt"] = rev_sys
-            prompts["review_user_prompt"] = rev_usr
-        except RuntimeError:
-            pass
-        try:
-            per_sys, per_usr, per_adv = load_persona_prompts()
-            prompts["persona_system_prompt"] = per_sys
-            prompts["persona_user_prompt"] = per_usr
-            prompts["persona_advanced_prompt"] = per_adv
-        except RuntimeError:
-            pass
-        config["prompts"] = prompts
-    else:
-        if not config["prompts"].get("system_prompt") or not config["prompts"].get("user_prompt"):
-            sys_prompt, usr_prompt = load_default_prompts()
-            if not config["prompts"].get("system_prompt"):
-                config["prompts"]["system_prompt"] = sys_prompt
-            if not config["prompts"].get("user_prompt"):
-                config["prompts"]["user_prompt"] = usr_prompt
-        if not config["prompts"].get("review_system_prompt") or not config["prompts"].get("review_user_prompt"):
-            try:
-                rev_sys, rev_usr = load_review_prompts()
-                if not config["prompts"].get("review_system_prompt"):
-                    config["prompts"]["review_system_prompt"] = rev_sys
-                if not config["prompts"].get("review_user_prompt"):
-                    config["prompts"]["review_user_prompt"] = rev_usr
-            except RuntimeError:
-                pass  # review_prompts.txt missing or malformed — leave fields empty
-        if not config["prompts"].get("persona_system_prompt") or not config["prompts"].get("persona_user_prompt") or not config["prompts"].get("persona_advanced_prompt"):
-            try:
-                per_sys, per_usr, per_adv = load_persona_prompts()
-                if not config["prompts"].get("persona_system_prompt"):
-                    config["prompts"]["persona_system_prompt"] = per_sys
-                if not config["prompts"].get("persona_user_prompt"):
-                    config["prompts"]["persona_user_prompt"] = per_usr
-                if not config["prompts"].get("persona_advanced_prompt"):
-                    config["prompts"]["persona_advanced_prompt"] = per_adv
-            except RuntimeError:
-                pass
-
-    # Include current input file info if available
-    state_path = os.path.join(ROOT_DIR, "state.json")
-    current_file = None
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, "r", encoding="utf-8") as sf:
-                state = json.load(sf)
-            input_path = state.get("input_file_path", "")
-            if input_path and os.path.exists(input_path):
-                current_file = os.path.basename(input_path)
-        except (json.JSONDecodeError, ValueError):
-            pass
 
     # Materialize Pydantic defaults so new optional fields (task_overrides,
     # reasoning_effort) are present even when absent from config.json on disk.
@@ -629,31 +469,7 @@ async def get_config():
     # a config dict missing the task_overrides key entirely.
     validated = AppConfig.model_validate(config)
     result = validated.model_dump()
-    if current_file is not None:
-        result["current_file"] = current_file
 
-    return result
-
-@app.get("/api/default_prompts")
-async def get_default_prompts():
-    system_prompt, user_prompt = load_default_prompts()
-    result = {
-        "system_prompt": system_prompt,
-        "user_prompt": user_prompt
-    }
-    try:
-        review_sys, review_usr = load_review_prompts()
-        result["review_system_prompt"] = review_sys
-        result["review_user_prompt"] = review_usr
-    except RuntimeError:
-        pass
-    try:
-        persona_sys, persona_usr, persona_adv = load_persona_prompts()
-        result["persona_system_prompt"] = persona_sys
-        result["persona_user_prompt"] = persona_usr
-        result["persona_advanced_prompt"] = persona_adv
-    except RuntimeError:
-        pass
     return result
 
 @app.post("/api/config")
@@ -662,599 +478,9 @@ async def save_config(config: AppConfig):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config.model_dump(), f, indent=2, ensure_ascii=False)
     # Reset engine so it picks up new TTS settings on next use
-    project_manager.engine = None
+    reset_tts_engine()
     return {"status": "saved"}
 
-class _HTMLTextExtractor(HTMLParser):
-    """Strip HTML tags from EPUB content, preserving block-level structure.
-
-    Block elements are separated by a ``<[para]>`` marker (PARA_MARKER) so that
-    paragraph boundaries survive the flattening to plain text and are recoverable
-    by the pipeline chunker.
-    """
-    BLOCK_TAGS = frozenset({
-        'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-        'li', 'blockquote', 'br', 'hr', 'tr', 'section', 'article',
-    })
-    SKIP_TAGS = frozenset({'style', 'script'})
-
-    def __init__(self):
-        super().__init__()
-        self.parts = []
-        self._pending_newline = False
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag in self.SKIP_TAGS:
-            self._skip_depth += 1
-        elif tag in self.BLOCK_TAGS:
-            self._pending_newline = True
-
-    def handle_endtag(self, tag):
-        if tag.lower() in self.SKIP_TAGS and self._skip_depth > 0:
-            self._skip_depth -= 1
-
-    def handle_data(self, data):
-        if self._skip_depth > 0:
-            return
-        if self._pending_newline and self.parts:
-            self.parts.append('\n' + PARA_MARKER + '\n')
-            self._pending_newline = False
-        self.parts.append(data)
-
-    def get_text(self):
-        return ''.join(self.parts)
-
-
-def extract_epub_text(epub_path: str) -> str:
-    """Extract plain text from an EPUB file, ordered by spine (reading order).
-
-    Parses the EPUB ZIP structure directly using stdlib only:
-    META-INF/container.xml -> .opf manifest+spine -> XHTML content files.
-
-    Chapter seams are marked with a ``<[chap]>`` marker (CHAP_MARKER); paragraph
-    seams within a chapter with ``<[para]>`` (PARA_MARKER). Both are stripped by
-    the chunker before text reaches the LLM.
-    """
-    with zipfile.ZipFile(epub_path, 'r') as zf:
-        # 1. Find the OPF file path from container.xml
-        container_xml = zf.read('META-INF/container.xml')
-        container = ET.fromstring(container_xml)
-        ns = {'c': 'urn:oasis:names:tc:opendocument:xmlns:container'}
-        rootfile_el = container.find('.//c:rootfile', ns)
-        if rootfile_el is None:
-            raise ValueError("Invalid EPUB: no rootfile found in container.xml")
-        opf_path = rootfile_el.get('full-path')
-
-        # 2. Parse the OPF to get manifest (id->href) and spine (reading order)
-        opf_xml = zf.read(opf_path)
-        opf = ET.fromstring(opf_xml)
-        # Detect OPF namespace (varies between EPUB 2 and 3)
-        opf_ns = opf.tag.split('}')[0] + '}' if '}' in opf.tag else ''
-
-        # Build manifest: id -> href (resolve relative to OPF directory)
-        opf_dir = opf_path.rsplit('/', 1)[0] + '/' if '/' in opf_path else ''
-        manifest = {}
-        for item in opf.findall(f'.//{opf_ns}item'):
-            item_id = item.get('id')
-            href = item.get('href')
-            media_type = item.get('media-type', '')
-            if item_id and href and 'html' in media_type:
-                manifest[item_id] = opf_dir + href
-
-        # Get spine order
-        spine_ids = []
-        for itemref in opf.findall(f'.//{opf_ns}itemref'):
-            idref = itemref.get('idref')
-            if idref:
-                spine_ids.append(idref)
-
-        # 3. Extract text from each spine item in order
-        chapters = []
-        for item_id in spine_ids:
-            href = manifest.get(item_id)
-            if href is None:
-                continue
-            try:
-                html_bytes = zf.read(href)
-            except KeyError:
-                continue
-            html_content = html_bytes.decode('utf-8', errors='replace')
-            extractor = _HTMLTextExtractor()
-            extractor.feed(html_content)
-            text = extractor.get_text().strip()
-            if text:
-                chapters.append(text)
-
-    return ('\n' + CHAP_MARKER + '\n').join(chapters)
-
-
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    file_path = os.path.join(UPLOADS_DIR, file.filename)
-    async with aiofiles.open(file_path, 'wb') as out_file:
-        content = await file.read()
-        await out_file.write(content)
-
-    # Convert EPUB to plain text
-    if file.filename.lower().endswith('.epub'):
-        try:
-            text = extract_epub_text(file_path)
-        except Exception as e:
-            os.remove(file_path)
-            raise HTTPException(status_code=400, detail=f"Failed to process EPUB: {e}")
-        if not text.strip():
-            os.remove(file_path)
-            raise HTTPException(status_code=400, detail="No readable text content found in EPUB.")
-        txt_path = file_path.rsplit('.', 1)[0] + '.txt'
-        with open(txt_path, 'w', encoding='utf-8') as f:
-            f.write(text)
-        file_path = txt_path
-
-    # Save input path to state.json to be compatible with original scripts if needed
-    state_path = os.path.join(ROOT_DIR, "state.json")
-    state = {}
-    if os.path.exists(state_path):
-        with open(state_path, "r", encoding="utf-8") as f:
-            try:
-                state = json.load(f)
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-    state["input_file_path"] = file_path
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-
-    return {"filename": file.filename, "path": file_path}
-
-
-@app.get("/api/annotated_script")
-async def get_annotated_script():
-    """Return the current working annotated_script.json."""
-    if not os.path.exists(SCRIPT_PATH):
-        raise HTTPException(status_code=404, detail="No annotated script found")
-    with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-@app.get("/api/status/{task_name}")
-async def get_status(task_name: str):
-    if task_name not in process_state:
-        raise HTTPException(status_code=404, detail="Task not found")
-    state = dict(process_state[task_name])
-    state.pop("process", None)
-    return state
-
-@app.get("/api/voices")
-async def get_voices():
-    # Parse voices directly from the current script (no stale cache)
-    voices_list = []
-    if os.path.exists(SCRIPT_PATH):
-        try:
-            with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
-                script_data = json.load(f)
-            voices_set = set()
-            for entry in script_data:
-                speaker = (entry.get("speaker") or entry.get("type") or "").strip()
-                if speaker:
-                    voices_set.add(speaker)
-            voices_list = sorted(voices_set)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    if not voices_list:
-        return []
-
-    # Combine with config
-    voice_config = {}
-    if os.path.exists(VOICE_CONFIG_PATH):
-        try:
-            with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
-                voice_config = json.load(f)
-        except (json.JSONDecodeError, ValueError):
-            voice_config = {}
-
-    missing_speakers = {voice_name for voice_name in voices_list if voice_name not in voice_config}
-
-    result = []
-    for voice_name in voices_list:
-        config = voice_config.get(voice_name, {})
-        result.append({
-            "name": voice_name,
-            "config": config,
-            "persona_pending": voice_name in missing_speakers
-        })
-    return result
-
-
-@app.post("/api/cancel_persona")
-async def cancel_persona():
-    if not process_state["persona"]["running"]:
-        return {"status": "idle"}
-
-    process_state["persona"]["cancel"] = True
-    process_state["persona"]["logs"].append("[CANCEL] Cancellation requested")
-
-    proc = process_state["persona"].get("process")
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-        except Exception as e:
-            logger.warning(f"Failed to terminate persona process cleanly: {e}")
-
-    return {"status": "cancelling"}
-
-@app.post("/api/save_voice_config")
-async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
-    # Read existing to preserve any fields not sent?
-    # For now, we assume frontend sends full config or we just overwrite specific keys
-
-    current_config = {}
-    if os.path.exists(VOICE_CONFIG_PATH):
-        with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
-            try:
-                current_config = json.load(f)
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-    # Update current config with new data. Merge (not replace) so fields the
-    # frontend does not re-send on every card save -- e.g. persona metadata
-    # (description/character_style) and alias_of on aliased voices -- are
-    # preserved rather than silently dropped. exclude_unset=True means only
-    # fields the client actually sent are merged, so Pydantic defaults (None or
-    # empty-string) do not clobber existing values; explicit empty values the
-    # client sent are still applied (clearing a field works).
-    for voice_name, config in config_data.items():
-        entry = dict(current_config.get(voice_name, {}) or {})
-        entry.update(config.model_dump(exclude_unset=True))
-        current_config[voice_name] = entry
-
-    atomic_json_write(current_config, VOICE_CONFIG_PATH)
-
-    return {"status": "saved"}
-
-@app.get("/api/audiobook")
-async def get_audiobook():
-    if not os.path.exists(AUDIOBOOK_PATH):
-        raise HTTPException(status_code=404, detail="Audiobook not found")
-    return FileResponse(AUDIOBOOK_PATH, filename="audiobook.mp3", media_type="audio/mpeg")
-
-# --- Chunk Management Endpoints ---
-
-@app.get("/api/chunks")
-async def get_chunks():
-    chunks = project_manager.load_chunks()
-    return chunks
-
-class ChunkRestoreRequest(BaseModel):
-    chunk: dict
-    at_index: int
-
-@app.post("/api/chunks/restore")
-async def restore_chunk(request: ChunkRestoreRequest):
-    """Re-insert a previously deleted chunk at a specific index."""
-    chunks = project_manager.restore_chunk(request.at_index, request.chunk)
-    if chunks is None:
-        raise HTTPException(status_code=400, detail="Failed to restore chunk")
-    return {"status": "ok", "total": len(chunks)}
-
-@app.post("/api/chunks/{index}")
-async def update_chunk(index: int, update: ChunkUpdate):
-    data = update.model_dump(exclude_unset=True)
-    logger.info(f"Updating chunk {index} with data: {data}")
-    chunk = project_manager.update_chunk(index, data)
-    if not chunk:
-        raise HTTPException(status_code=404, detail="Chunk not found")
-    logger.info(f"Chunk {index} updated, instruct is now: '{chunk.get('instruct', '')}'")
-    return chunk
-
-@app.post("/api/chunks/{index}/insert")
-async def insert_chunk(index: int):
-    """Insert an empty chunk after the given index."""
-    chunks = project_manager.insert_chunk(index)
-    if chunks is None:
-        raise HTTPException(status_code=404, detail="Invalid chunk index")
-    return {"status": "ok", "total": len(chunks)}
-
-@app.delete("/api/chunks/{index}")
-async def delete_chunk(index: int):
-    """Delete a chunk at the given index."""
-    result = project_manager.delete_chunk(index)
-    if result is None:
-        raise HTTPException(status_code=400, detail="Cannot delete chunk (invalid index or last remaining chunk)")
-    deleted, chunks = result
-    return {"status": "ok", "deleted": deleted, "total": len(chunks)}
-
-@app.post("/api/chunks/{index}/generate")
-async def generate_chunk_endpoint(index: int, background_tasks: BackgroundTasks):
-    chunks = project_manager.load_chunks()
-    if not (0 <= index < len(chunks)):
-        raise HTTPException(status_code=404, detail="Invalid chunk index")
-    if not chunks[index].get("text", "").strip():
-        raise HTTPException(status_code=400, detail="Cannot generate audio for an empty line")
-
-    def task():
-        project_manager.generate_chunk_audio(index)
-
-    background_tasks.add_task(task)
-    return {"status": "started"}
-
-@app.post("/api/merge")
-async def merge_audio_endpoint(background_tasks: BackgroundTasks):
-    # Reuse audio process state for merge if possible, or just background it
-    # For simplicity, we just background it and frontend will assume it works
-    # Or we can link it to process_state["audio"]
-
-    def task():
-        process_state["audio"]["running"] = True
-        process_state["audio"]["logs"] = ["Starting merge..."]
-        try:
-            success, msg = project_manager.merge_audio()
-            if success:
-                process_state["audio"]["logs"].append(f"Merge complete: {msg}")
-            else:
-                process_state["audio"]["logs"].append(f"Merge failed: {msg}")
-        except Exception as e:
-            process_state["audio"]["logs"].append(f"Merge error: {e}")
-        finally:
-            # Full conversion is done — free TTS models from VRAM
-            engine = project_manager.engine
-            if engine is not None:
-                try:
-                    engine.unload_models()
-                except Exception as e:
-                    process_state["audio"]["logs"].append(f"Model unload warning: {e}")
-            process_state["audio"]["running"] = False
-
-    background_tasks.add_task(task)
-    return {"status": "started"}
-
-@app.post("/api/unload")
-async def unload_models_endpoint():
-    """Manually free cached TTS models from VRAM."""
-    engine = project_manager.engine
-    if engine is None:
-        return {"status": "noop", "unloaded": []}
-    unloaded = engine.unload_models()
-    return {"status": "ok", "unloaded": unloaded}
-
-@app.post("/api/export_audacity")
-async def export_audacity_endpoint(background_tasks: BackgroundTasks):
-    if process_state["audacity_export"]["running"]:
-        raise HTTPException(status_code=400, detail="Audacity export already running")
-
-    def task():
-        process_state["audacity_export"]["running"] = True
-        process_state["audacity_export"]["logs"] = ["Starting Audacity export..."]
-        try:
-            success, msg = project_manager.export_audacity()
-            if success:
-                process_state["audacity_export"]["logs"].append(f"Export complete: {msg}")
-            else:
-                process_state["audacity_export"]["logs"].append(f"Export failed: {msg}")
-        except Exception as e:
-            process_state["audacity_export"]["logs"].append(f"Export error: {e}")
-        finally:
-            process_state["audacity_export"]["running"] = False
-
-    background_tasks.add_task(task)
-    return {"status": "started"}
-
-@app.get("/api/export_audacity")
-async def get_audacity_export():
-    zip_path = os.path.join(ROOT_DIR, "audacity_export.zip")
-    if not os.path.exists(zip_path):
-        raise HTTPException(status_code=404, detail="Audacity export not found. Generate it first.")
-    return FileResponse(zip_path, filename="audacity_export.zip", media_type="application/zip")
-
-class M4bExportRequest(BaseModel):
-    per_chunk_chapters: bool = False
-    title: str = ""
-    author: str = ""
-    narrator: str = ""
-    year: str = ""
-    description: str = ""
-
-@app.post("/api/merge_m4b")
-async def merge_m4b_endpoint(request: M4bExportRequest, background_tasks: BackgroundTasks):
-    if process_state["m4b_export"]["running"]:
-        raise HTTPException(status_code=400, detail="M4B export already running")
-
-    def task():
-        process_state["m4b_export"]["running"] = True
-        process_state["m4b_export"]["logs"] = ["Starting M4B export..."]
-        try:
-            meta = {
-                "title": request.title,
-                "author": request.author,
-                "narrator": request.narrator,
-                "year": request.year,
-                "description": request.description,
-                "cover_path": os.path.join(ROOT_DIR, "m4b_cover.jpg") if os.path.exists(os.path.join(ROOT_DIR, "m4b_cover.jpg")) else "",
-            }
-            success, msg = project_manager.merge_m4b(per_chunk_chapters=request.per_chunk_chapters, metadata=meta)
-            if success:
-                process_state["m4b_export"]["logs"].append(f"Export complete: {msg}")
-            else:
-                process_state["m4b_export"]["logs"].append(f"Export failed: {msg}")
-        except Exception as e:
-            process_state["m4b_export"]["logs"].append(f"Export error: {e}")
-        finally:
-            process_state["m4b_export"]["running"] = False
-
-    background_tasks.add_task(task)
-    return {"status": "started"}
-
-@app.get("/api/audiobook_m4b")
-async def get_audiobook_m4b():
-    if not os.path.exists(M4B_PATH):
-        raise HTTPException(status_code=404, detail="M4B audiobook not found. Export it first.")
-    return FileResponse(M4B_PATH, filename="audiobook.m4b", media_type="audio/mp4")
-
-@app.post("/api/m4b_cover")
-async def upload_m4b_cover(file: UploadFile = File(...)):
-    """Upload a cover image for M4B export."""
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    cover_path = os.path.join(ROOT_DIR, "m4b_cover.jpg")
-    content = await file.read()
-    with open(cover_path, "wb") as f:
-        f.write(content)
-    return {"status": "uploaded", "path": cover_path}
-
-@app.delete("/api/m4b_cover")
-async def delete_m4b_cover():
-    """Remove the uploaded cover image."""
-    cover_path = os.path.join(ROOT_DIR, "m4b_cover.jpg")
-    if os.path.exists(cover_path):
-        os.remove(cover_path)
-    return {"status": "removed"}
-
-@app.post("/api/generate_batch")
-async def generate_batch_endpoint(request: BatchGenerateRequest, background_tasks: BackgroundTasks):
-    """Generate multiple chunks in parallel using configured worker count."""
-    if process_state["audio"]["running"]:
-        raise HTTPException(status_code=400, detail="Audio generation already running")
-
-    # Load worker count from config
-    workers = 2
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                workers = max(1, cfg.get("tts", {}).get("parallel_workers", 2))
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    indices = request.indices
-    total = len(indices)
-
-    def progress_callback(completed, failed, total):
-        """Update logs with progress."""
-        process_state["audio"]["logs"].append(
-            f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
-        )
-
-    def cancel_check():
-        return process_state["audio"]["cancel"]
-
-    def task():
-        process_state["audio"]["running"] = True
-        process_state["audio"]["cancel"] = False
-        process_state["audio"]["logs"] = [
-            f"Starting parallel generation of {total} chunks with {workers} workers..."
-        ]
-        try:
-            results = project_manager.generate_chunks_parallel(
-                indices, workers, progress_callback, cancel_check=cancel_check
-            )
-            completed = len(results["completed"])
-            failed = len(results["failed"])
-            cancelled = results.get("cancelled", 0)
-            msg = f"Batch generation complete: {completed} succeeded, {failed} failed"
-            if cancelled:
-                msg += f", {cancelled} cancelled"
-            process_state["audio"]["logs"].append(msg)
-            if results["failed"]:
-                for idx, err in results["failed"]:
-                    process_state["audio"]["logs"].append(f"  Chunk {idx} failed: {err}")
-        except Exception as e:
-            logger.error(f"Batch generation error: {e}")
-            process_state["audio"]["logs"].append(f"Batch generation error: {e}")
-        finally:
-            process_state["audio"]["running"] = False
-            process_state["audio"]["cancel"] = False
-
-    background_tasks.add_task(task)
-    return {"status": "started", "workers": workers, "total_chunks": total}
-
-@app.post("/api/generate_batch_fast")
-async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background_tasks: BackgroundTasks):
-    """Generate multiple chunks using batch TTS API with single seed. Faster but less flexible.
-    Requires custom Qwen3-TTS with /generate_batch endpoint."""
-    if process_state["audio"]["running"]:
-        raise HTTPException(status_code=400, detail="Audio generation already running")
-
-    # Load batch_seed and batch_size from config
-    batch_seed = -1
-    batch_size = 4
-    batch_group_by_type = False
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                tts_cfg = cfg.get("tts", {})
-                seed_val = tts_cfg.get("batch_seed")
-                if seed_val is not None and seed_val != "":
-                    batch_seed = int(seed_val)
-                batch_size = max(1, tts_cfg.get("parallel_workers", 4))
-                batch_group_by_type = tts_cfg.get("batch_group_by_type", False)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    indices = request.indices
-    total = len(indices)
-
-    def progress_callback(completed, failed, total):
-        process_state["audio"]["logs"].append(
-            f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
-        )
-
-    def cancel_check():
-        return process_state["audio"]["cancel"]
-
-    def task():
-        process_state["audio"]["running"] = True
-        process_state["audio"]["cancel"] = False
-        process_state["audio"]["logs"] = [
-            f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed})..."
-        ]
-        try:
-            results = project_manager.generate_chunks_batch(
-                indices, batch_seed, batch_size, progress_callback,
-                batch_group_by_type=batch_group_by_type,
-                cancel_check=cancel_check,
-            )
-            completed = len(results["completed"])
-            failed = len(results["failed"])
-            cancelled = results.get("cancelled", 0)
-            msg = f"Batch generation complete: {completed} succeeded, {failed} failed"
-            if cancelled:
-                msg += f", {cancelled} cancelled"
-            process_state["audio"]["logs"].append(msg)
-            if results["failed"]:
-                for idx, err in results["failed"]:
-                    process_state["audio"]["logs"].append(f"  Chunk {idx} failed: {err}")
-        except Exception as e:
-            logger.error(f"Batch generation error: {e}")
-            process_state["audio"]["logs"].append(f"Batch generation error: {e}")
-        finally:
-            process_state["audio"]["running"] = False
-            process_state["audio"]["cancel"] = False
-
-    background_tasks.add_task(task)
-    return {"status": "started", "batch_seed": batch_seed, "batch_size": batch_size, "total_chunks": total}
-
-@app.post("/api/cancel_audio")
-async def cancel_audio():
-    """Cancel ongoing audio generation and reset in-progress chunks."""
-    if process_state["audio"]["running"]:
-        process_state["audio"]["cancel"] = True
-        process_state["audio"]["logs"].append("[CANCEL] Cancellation requested")
-        return {"status": "cancelling"}
-    
-    reset_count = 0
-    chunks = project_manager.load_chunks()
-    if chunks:
-        for chunk in chunks:
-            if chunk.get("status") == "generating":
-                chunk["status"] = "pending"
-                reset_count += 1
-        if reset_count:
-            project_manager.save_chunks(chunks)
-    return {"status": "not_running", "reset_chunks": reset_count}
-
-## ── Saved Scripts ──────────────────────────────────────────────
 
 def _sanitize_name(name: str) -> str:
     """Make a string safe for use as a filename."""
@@ -1262,85 +488,6 @@ def _sanitize_name(name: str) -> str:
     name = re.sub(r'\s+', '_', name)
     return name.lower()
 
-@app.get("/api/scripts")
-async def list_saved_scripts():
-    """List all saved scripts in the scripts/ directory."""
-    scripts = []
-    for f in os.listdir(SCRIPTS_DIR):
-        if f.endswith(".json") and not f.endswith(".voice_config.json"):
-            name = f[:-5]  # strip .json
-            filepath = os.path.join(SCRIPTS_DIR, f)
-            companion = os.path.join(SCRIPTS_DIR, f"{name}.voice_config.json")
-            scripts.append({
-                "name": name,
-                "created": os.path.getmtime(filepath),
-                "has_voice_config": os.path.exists(companion)
-            })
-    scripts.sort(key=lambda x: x["created"], reverse=True)
-    return scripts
-
-class ScriptSaveRequest(BaseModel):
-    name: str
-
-@app.post("/api/scripts/save")
-async def save_script(request: ScriptSaveRequest):
-    """Save the current annotated_script.json (and voice_config.json) under a name."""
-    if not os.path.exists(SCRIPT_PATH):
-        raise HTTPException(status_code=404, detail="No annotated script to save. Generate a script first.")
-
-    safe_name = _sanitize_name(request.name)
-    if not safe_name:
-        raise HTTPException(status_code=400, detail="Invalid script name.")
-
-    dest = os.path.join(SCRIPTS_DIR, f"{safe_name}.json")
-    shutil.copy2(SCRIPT_PATH, dest)
-
-    if os.path.exists(VOICE_CONFIG_PATH):
-        shutil.copy2(VOICE_CONFIG_PATH, os.path.join(SCRIPTS_DIR, f"{safe_name}.voice_config.json"))
-
-    logger.info(f"Script saved as '{safe_name}'")
-    return {"status": "saved", "name": safe_name}
-
-class ScriptLoadRequest(BaseModel):
-    name: str
-
-@app.post("/api/scripts/load")
-async def load_script(request: ScriptLoadRequest):
-    """Load a saved script, replacing the current annotated_script.json and chunks."""
-    if process_state["audio"]["running"]:
-        raise HTTPException(status_code=409, detail="Cannot load a script while audio generation is running.")
-
-    src = os.path.join(SCRIPTS_DIR, f"{request.name}.json")
-    if not os.path.exists(src):
-        raise HTTPException(status_code=404, detail=f"Saved script '{request.name}' not found.")
-
-    shutil.copy2(src, SCRIPT_PATH)
-
-    companion = os.path.join(SCRIPTS_DIR, f"{request.name}.voice_config.json")
-    if os.path.exists(companion):
-        shutil.copy2(companion, VOICE_CONFIG_PATH)
-
-    # Delete chunks so they regenerate from the loaded script
-    if os.path.exists(CHUNKS_PATH):
-        os.remove(CHUNKS_PATH)
-
-    logger.info(f"Script '{request.name}' loaded")
-    return {"status": "loaded", "name": request.name}
-
-@app.delete("/api/scripts/{name}")
-async def delete_script(name: str):
-    """Delete a saved script."""
-    filepath = os.path.join(SCRIPTS_DIR, f"{name}.json")
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail=f"Saved script '{name}' not found.")
-
-    os.remove(filepath)
-    companion = os.path.join(SCRIPTS_DIR, f"{name}.voice_config.json")
-    if os.path.exists(companion):
-        os.remove(companion)
-
-    logger.info(f"Script '{name}' deleted")
-    return {"status": "deleted", "name": name}
 
 ## ── Voice Designer ──────────────────────────────────────────────
 
@@ -1363,7 +510,7 @@ def _save_manifest(path, manifest):
 @app.post("/api/voice_design/preview")
 async def voice_design_preview(request: VoiceDesignPreviewRequest):
     """Generate a preview voice from a text description."""
-    engine = project_manager.get_engine()
+    engine = get_tts_engine()
     if not engine:
         raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
 
@@ -1619,7 +766,7 @@ async def lora_generate_dataset(request: LoraGenerateDatasetRequest, background_
             f"Generating {total} samples with VoiceDesign..."
         ]
         try:
-            engine = project_manager.get_engine()
+            engine = get_tts_engine()
             if not engine:
                 process_state["dataset_gen"]["logs"].append("Error: TTS engine not initialized")
                 return
@@ -1740,11 +887,9 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
     output_dir = os.path.join(LORA_MODELS_DIR, adapter_id)
 
     # Unload TTS engine to free GPU
-    if project_manager.engine is not None:
-        logger.info("Unloading TTS engine for LoRA training...")
-        project_manager.engine = None
-        from utils import clear_gpu_cache
-        clear_gpu_cache()
+    reset_tts_engine()
+    from utils import clear_gpu_cache
+    clear_gpu_cache()
 
     # Build subprocess command
     command = [
@@ -1789,6 +934,14 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
 
     background_tasks.add_task(on_training_complete)
     return {"status": "started", "adapter_id": adapter_id}
+
+@app.get("/api/lora/status")
+async def lora_status():
+    """Get LoRA training process status."""
+    return {
+        "logs": process_state["lora_training"]["logs"],
+        "running": process_state["lora_training"]["running"],
+    }
 
 @app.get("/api/lora/models")
 async def lora_list_models():
@@ -1883,7 +1036,7 @@ async def lora_test_model(request: LoraTestRequest):
     elif not os.path.isdir(adapter_dir):
         raise HTTPException(status_code=404, detail="Adapter files not found")
 
-    engine = project_manager.get_engine()
+    engine = get_tts_engine()
     if not engine:
         raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
 
@@ -1949,7 +1102,7 @@ async def lora_preview(adapter_id: str):
         return {"status": "cached", "audio_url": f"{url_prefix}/preview_sample.wav"}
 
     # Generate preview
-    engine = project_manager.get_engine()
+    engine = get_tts_engine()
     if not engine:
         raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
 
@@ -2073,7 +1226,7 @@ async def dataset_builder_update_rows(request: DatasetBuilderUpdateRowsRequest):
 @app.post("/api/dataset_builder/generate_sample")
 async def dataset_builder_generate_sample(request: DatasetSampleGenRequest):
     """Generate a single dataset sample using VoiceDesign."""
-    engine = project_manager.get_engine()
+    engine = get_tts_engine()
     if not engine:
         raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
 
@@ -2162,7 +1315,7 @@ async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
         process_state["dataset_builder"]["logs"] = []
         process_state["dataset_builder"]["cancel"] = False
 
-        engine = project_manager.get_engine()
+        engine = get_tts_engine()
         if not engine:
             process_state["dataset_builder"]["logs"].append("[ERROR] Failed to initialize TTS engine")
             process_state["dataset_builder"]["running"] = False
@@ -2523,6 +1676,15 @@ async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: 
 async def preparer_batch_cancel():
     process_state["batch_preparer"]["cancel"] = True
     return {"status": "cancel_requested"}
+
+@app.get("/api/preparer/status/{task_name}")
+async def preparer_status(task_name: str):
+    """Get preparer subprocess status for a task."""
+    if task_name not in {"preparer", "batch_preparer"}:
+        raise HTTPException(status_code=404, detail=f"Unknown task: {task_name}")
+    state = process_state[task_name]
+    # Exclude the live subprocess handle (Popen) — not JSON-serializable.
+    return {k: v for k, v in state.items() if k != "process"}
 
 
 if __name__ == "__main__":

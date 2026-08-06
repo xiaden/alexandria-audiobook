@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
@@ -127,3 +127,39 @@ async def execute_operation(
         raise HTTPException(status_code=400, detail=str(exc))
 
     return {"status": "ok", "operation": request.operation}
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/pipeline/span/{span_id}/text
+# ---------------------------------------------------------------------------
+
+
+class SpanTextUpdateRequest(BaseModel):
+    """Request body for PUT /api/pipeline/span/{span_id}/text."""
+
+    text: str = Field(..., description="New text for the span")
+
+
+@router.put("/span/{span_id}/text")
+async def update_span_text(
+    span_id: str,
+    request: SpanTextUpdateRequest,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Update the text of a span identified by *span_id*.
+
+    Returns ``{status: 'ok', span_id: str}`` on success.
+    Raises 400 if *text* is empty after stripping whitespace.
+    Raises 404 if no span with *span_id* exists.
+    """
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Span text must not be empty")
+
+    # Verify span exists
+    rows = storage.execute_query("SELECT id FROM span WHERE id = ?", (span_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Span '{span_id}' not found")
+
+    storage.execute_update("UPDATE span SET text = ? WHERE id = ?", (text, span_id))
+    return {"status": "ok", "span_id": span_id}

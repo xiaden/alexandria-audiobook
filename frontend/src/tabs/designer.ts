@@ -6,7 +6,6 @@
 import * as API from '../api';
 import { showToast, showConfirm, escapeHtml } from '../utils';
 import { state, type DesignedVoice } from '../state';
-import { debouncedSaveVoices } from './voices';
 
 /** Response from /api/voice_design/preview */
 interface DesignPreviewResult {
@@ -180,23 +179,6 @@ async function saveDesignedVoice(): Promise<void> {
     editingDesignedVoiceId = null;
     loadDesignedVoices();
 
-    // If editing a generated persona, propagate alias choice to voice card and trigger save
-    const sourceNameEl = document.getElementById('design-source-name') as HTMLInputElement;
-    const aliasSelectEl = document.getElementById('design-alias-select') as HTMLSelectElement;
-    const source = sourceNameEl?.value || '';
-    const selectedAlias = aliasSelectEl?.value || '';
-
-    if (source) {
-      const card = document.querySelector(`.voice-card[data-voice="${source}"]`);
-      if (card) {
-        const aliasSel = card.querySelector<HTMLSelectElement>('.alias-select');
-        if (aliasSel) {
-          aliasSel.value = selectedAlias || '';
-          // Trigger save via existing auto-save debounce
-          debouncedSaveVoices();
-        }
-      }
-    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     showToast('Error saving voice: ' + msg, 'error');
@@ -282,10 +264,10 @@ async function openDesignedVoiceForEdit(voiceId: string): Promise<void> {
 
     // Try to read existing alias from voices config
     try {
-      const voices = await API.get<Array<{ name: string; config?: { alias_of?: string } }>>('/api/voices');
+      const voices = await API.get<Array<{ name: string; alias_of?: string | null }>>('/api/pipeline/voices');
       const entry = voices.find(v => v.name === voice.name);
       if (aliasSelect) {
-        aliasSelect.value = (entry?.config?.alias_of) || '';
+        aliasSelect.value = entry?.alias_of || '';
       }
     } catch {
       if (aliasSelect) aliasSelect.value = '';

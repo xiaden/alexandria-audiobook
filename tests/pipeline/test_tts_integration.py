@@ -581,3 +581,419 @@ class TestBatchSeed:
         """Custom batch_seed is passed to generate_batch."""
         render_audiobook("b1", storage, fake_engine, batch_seed=42)
         assert fake_engine.batch_calls[0]["batch_seed"] == 42
+
+
+# ---------------------------------------------------------------------------
+# Tests: _build_voice_config includes all voice type fields
+# ---------------------------------------------------------------------------
+
+
+class TestBuildVoiceConfigAllFields:
+    def test_voice_config_includes_type_field(self):
+        """Voice config includes the actual type from DB, not hardcoded 'custom'."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        # Insert a clone voice
+        s.execute_insert(
+            "INSERT INTO voice_config (id, name, description, type) "
+            "VALUES ('clone-vc', 'CloneVoice', 'A cloned voice', 'clone')"
+        )
+        s.execute_insert(
+            "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+            "VALUES ('c1', 'Alice', '[]', 'clone-vc')"
+        )
+        script = [{"speaker": "Alice", "text": "Hello", "instruct": ""}]
+        vc = _build_voice_config(script, s)
+        assert "Alice" in vc
+        assert vc["Alice"]["type"] == "clone"
+
+    def test_voice_config_includes_all_fields(self):
+        """Voice config includes all fields from voice_config table."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        # Insert a fully-populated clone voice
+        s.execute_insert(
+            "INSERT INTO voice_config "
+            "(id, name, description, type, voice, character_style, seed, "
+            "ref_audio, ref_text, adapter_id, adapter_path, alias_of) "
+            "VALUES ('clone-full', 'CloneVoice', 'A cloned voice', 'clone', "
+            "'CloneVoice', 'neutral', '42', 'some/path/audio.wav', "
+            "'Reference text', NULL, 'ada/path', 'canonical-speaker')"
+        )
+        s.execute_insert(
+            "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+            "VALUES ('c1', 'Alice', '[]', 'clone-full')"
+        )
+        script = [{"speaker": "Alice", "text": "Hello", "instruct": ""}]
+        vc = _build_voice_config(script, s)
+        assert "Alice" in vc
+        alice = vc["Alice"]
+        assert alice["type"] == "clone"
+        assert alice["voice"] == "CloneVoice"
+        assert alice["character_style"] == "neutral"
+        assert alice["seed"] == "42"
+        assert alice["ref_audio"] == "some/path/audio.wav"
+        assert alice["ref_text"] == "Reference text"
+        assert alice["adapter_id"] is None
+        assert alice["adapter_path"] == "ada/path"
+        assert alice["description"] == "A cloned voice"
+        assert alice["alias_of"] == "canonical-speaker"
+
+    def test_voice_config_null_type_defaults_to_custom(self):
+        """Voice config with NULL type in DB defaults to 'custom'."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        # Insert a voice with only id, name, description (type defaults to 'custom')
+        s.execute_insert(
+            "INSERT INTO voice_config (id, name, description) "
+            "VALUES ('vc1', 'Warm Female', 'A warm voice')"
+        )
+        s.execute_insert(
+            "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+            "VALUES ('c1', 'Alice', '[]', 'vc1')"
+        )
+        script = [{"speaker": "Alice", "text": "Hello", "instruct": ""}]
+        vc = _build_voice_config(script, s)
+        assert vc["Alice"]["type"] == "custom"
+
+    def test_voice_config_design_type(self):
+        """Voice config correctly returns design type and description."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        s.execute_insert(
+            "INSERT INTO voice_config (id, name, description, type) "
+            "VALUES ('design-vc', 'DesignedVoice', 'A warm elderly male voice', 'design')"
+        )
+        s.execute_insert(
+            "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+            "VALUES ('c1', 'Gandalf', '[]', 'design-vc')"
+        )
+        script = [{"speaker": "Gandalf", "text": "You shall not pass", "instruct": ""}]
+        vc = _build_voice_config(script, s)
+        assert vc["Gandalf"]["type"] == "design"
+        assert vc["Gandalf"]["description"] == "A warm elderly male voice"
+
+
+# ---------------------------------------------------------------------------
+# Tests: NARRATOR voice resolved from database (Plan F Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestNarratorFromDatabase:
+    """NARRATOR voice resolution: DB row takes priority over hardcoded constant."""
+
+    def test_narrator_voice_from_db_overrides_constant(self):
+        """When a NARRATOR row exists in voice_config, its values are used instead of NARRATOR_VOICE constant."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        # Insert a NARRATOR row with type="clone" and voice="CustomNarrator"
+        s.execute_insert(
+            "INSERT INTO voice_config "
+            "(id, name, description, type, voice, character_style, seed, "
+            "ref_audio, ref_text, adapter_id, adapter_path, alias_of) "
+            "VALUES ('NARRATOR', 'NARRATOR', 'Default narrator', 'clone', "
+            "'CustomNarrator', 'neutral', '42', 'refs/narrator.wav', "
+            "'Narrator reference text', NULL, NULL, NULL)"
+        )
+        script = [{"speaker": "NARRATOR", "text": "Once upon a time", "instruct": ""}]
+        vc = _build_voice_config(script, s)
+        assert "NARRATOR" in vc
+        # DB values should be used, NOT the hardcoded constant
+        assert vc["NARRATOR"]["type"] == "clone"
+        assert vc["NARRATOR"]["voice"] == "CustomNarrator"
+        assert vc["NARRATOR"]["description"] == "Default narrator"
+        assert vc["NARRATOR"]["character_style"] == "neutral"
+        assert vc["NARRATOR"]["seed"] == "42"
+        assert vc["NARRATOR"]["ref_audio"] == "refs/narrator.wav"
+        assert vc["NARRATOR"]["ref_text"] == "Narrator reference text"
+
+    def test_narrator_fallback_to_constant_when_not_in_db(self):
+        """When no NARRATOR row exists in voice_config, falls back to NARRATOR_VOICE constant."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        # Do NOT insert a NARRATOR row
+        script = [{"speaker": "NARRATOR", "text": "Once upon a time", "instruct": ""}]
+        vc = _build_voice_config(script, s)
+        assert "NARRATOR" in vc
+        # Should use the hardcoded constant
+        assert vc["NARRATOR"] == NARRATOR_VOICE
+        assert vc["NARRATOR"]["type"] == "custom"
+        assert vc["NARRATOR"]["voice"] == "Ryan"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Integration — clone voice routing through render_audiobook
+# ---------------------------------------------------------------------------
+
+
+class TestCloneVoiceIntegration:
+    """Integration test: clone voice type flows through render_audiobook to TTSEngine."""
+
+    def _populate_clone_storage(self, storage: InMemorySQLiteAdapter) -> None:
+        """Insert a minimal document spine with a clone voice assigned to a character."""
+        # -- Clone voice config -----------------------------------------------
+        storage.execute_insert(
+            "INSERT INTO voice_config "
+            "(id, name, description, type, ref_audio, ref_text) "
+            "VALUES ('clone-vc', 'CloneVoice', 'A cloned voice', 'clone', "
+            "'refs/alice.wav', 'Alice reference text')"
+        )
+
+        # -- Series + Book ----------------------------------------------------
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert(
+            "INSERT INTO book (id, series_id, position) VALUES ('b1', 's1', 1)"
+        )
+
+        # -- Chapters ---------------------------------------------------------
+        storage.execute_insert(
+            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
+        )
+        storage.execute_insert(
+            "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
+        )
+
+        # -- Scenes -----------------------------------------------------------
+        storage.execute_insert("INSERT INTO scene (id) VALUES ('sc1')")
+        storage.execute_insert(
+            "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES ('sc1', 'ch1', 1)"
+        )
+
+        # -- Paragraphs -------------------------------------------------------
+        storage.execute_insert("INSERT INTO paragraph (id) VALUES ('p1')")
+        storage.execute_insert(
+            "INSERT INTO scene_paragraph (child_id, parent_id, position) VALUES ('p1', 'sc1', 1)"
+        )
+
+        # -- Spans ------------------------------------------------------------
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp1', 'quotation', 'Hello from Alice!', 'cheerfully')"
+        )
+        storage.execute_insert(
+            "INSERT INTO paragraph_span (child_id, parent_id, position) VALUES ('sp1', 'p1', 1)"
+        )
+
+        # -- Character with clone voice ---------------------------------------
+        storage.execute_insert(
+            "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+            "VALUES ('c1', 'Alice', '[]', 'clone-vc')"
+        )
+
+        # -- character_span (speaker junction) --------------------------------
+        storage.execute_insert(
+            "INSERT INTO character_span (character_id, span_id, relation_type, source, confidence) "
+            "VALUES ('c1', 'sp1', 'speaker', 'walk', 0.95)"
+        )
+
+    def test_clone_voice_type_flows_to_tts_engine(self, fake_engine):
+        """render_audiobook passes clone voice type through to TTSEngine voice_config."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        self._populate_clone_storage(s)
+
+        render_audiobook("b1", s, fake_engine)
+
+        # Verify voice_config passed to generate_batch has clone type for Alice
+        assert len(fake_engine.batch_calls) == 1
+        voice_config = fake_engine.batch_calls[0]["voice_config"]
+        assert "Alice" in voice_config
+        assert voice_config["Alice"]["type"] == "clone"
+        assert voice_config["Alice"]["voice"] == "CloneVoice"
+        assert voice_config["Alice"]["ref_audio"] == "refs/alice.wav"
+        assert voice_config["Alice"]["ref_text"] == "Alice reference text"
+
+    def test_clone_voice_individual_mode(self, fake_engine):
+        """render_audiobook with use_batch=False passes clone voice type to generate_voice."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        self._populate_clone_storage(s)
+
+        render_audiobook("b1", s, fake_engine, use_batch=False)
+
+        # Verify voice_config passed to generate_voice has clone type for Alice
+        assert len(fake_engine.voice_calls) == 1
+        voice_config = fake_engine.voice_calls[0]["voice_config"]
+        assert "Alice" in voice_config
+        assert voice_config["Alice"]["type"] == "clone"
+        assert voice_config["Alice"]["ref_audio"] == "refs/alice.wav"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Integration — all five voice types route through render_audiobook
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceTypeRouting:
+    """Integration test: each supported voice type flows through render_audiobook.
+
+    The real TTSEngine dispatches on the ``type`` field inside ``generate_voice``
+    (app/tts.py): clone → generate_clone_voice, lora/builtin_lora →
+    generate_lora_voice, design → generate_design_voice, else →
+    generate_custom_voice.  This test proves the routing contract by verifying
+    that ``render_audiobook`` delivers the correct ``type`` (and type-specific
+    fields) to the engine for every speaker — no TTS models are instantiated.
+    """
+
+    def _populate_routing_storage(self, storage: InMemorySQLiteAdapter) -> None:
+        """Insert a document spine with five characters, one per voice type."""
+        # -- Voice configs: one row per supported type ----------------------
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, description, type, voice) "
+            "VALUES ('vc-custom', 'CustomVoice', 'A plain custom voice', "
+            "'custom', 'CustomVoice')"
+        )
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, description, type, "
+            "ref_audio, ref_text) "
+            "VALUES ('vc-clone', 'CloneVoice', 'A cloned voice', 'clone', "
+            "'refs/clone.wav', 'Clone reference text')"
+        )
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, description, type, adapter_path) "
+            "VALUES ('vc-builtin-lora', 'BuiltinLoraVoice', 'A built-in LoRA voice', "
+            "'builtin_lora', 'builtin_lora/voice_alpha')"
+        )
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, description, type, "
+            "adapter_path, character_style) "
+            "VALUES ('vc-lora', 'LoraVoice', 'A trained LoRA voice', 'lora', "
+            "'adapters/voice_beta', 'neutral')"
+        )
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, description, type) "
+            "VALUES ('vc-design', 'DesignVoice', 'A warm elderly male voice', "
+            "'design')"
+        )
+
+        # -- Series + Book --------------------------------------------------
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert(
+            "INSERT INTO book (id, series_id, position) VALUES ('b1', 's1', 1)"
+        )
+
+        # -- Chapters -------------------------------------------------------
+        storage.execute_insert(
+            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
+        )
+        storage.execute_insert(
+            "INSERT INTO book_chapter (child_id, parent_id, position) "
+            "VALUES ('ch1', 'b1', 1)"
+        )
+
+        # -- Scenes ---------------------------------------------------------
+        storage.execute_insert("INSERT INTO scene (id) VALUES ('sc1')")
+        storage.execute_insert(
+            "INSERT INTO chapter_scene (child_id, parent_id, position) "
+            "VALUES ('sc1', 'ch1', 1)"
+        )
+
+        # -- Paragraphs -----------------------------------------------------
+        for i in range(1, 6):
+            storage.execute_insert(f"INSERT INTO paragraph (id) VALUES ('p{i}')")
+            storage.execute_insert(
+                "INSERT INTO scene_paragraph (child_id, parent_id, position) "
+                f"VALUES ('p{i}', 'sc1', {i})"
+            )
+
+        # -- Spans ----------------------------------------------------------
+        spans = [
+            ("sp1", "quotation", "Custom voice line.", "calmly"),
+            ("sp2", "quotation", "Clone voice line.", "warmly"),
+            ("sp3", "quotation", "Built-in LoRA voice line.", "brightly"),
+            ("sp4", "quotation", "LoRA voice line.", "softly"),
+            ("sp5", "quotation", "Design voice line.", "grandly"),
+        ]
+        for span_id, span_type, text, instruct in spans:
+            storage.execute_insert(
+                "INSERT INTO span (id, span_type, text, instruct) "
+                f"VALUES ('{span_id}', '{span_type}', '{text}', '{instruct}')"
+            )
+            storage.execute_insert(
+                "INSERT INTO paragraph_span (child_id, parent_id, position) "
+                f"VALUES ('{span_id}', 'p{span_id[2]}', 1)"
+            )
+
+        # -- Characters, each assigned a different voice type ---------------
+        assignments = [
+            ("c1", "Cara", "vc-custom"),
+            ("c2", "Clyde", "vc-clone"),
+            ("c3", "Billie", "vc-builtin-lora"),
+            ("c4", "Lorne", "vc-lora"),
+            ("c5", "Delia", "vc-design"),
+        ]
+        for char_id, name, vc_id in assignments:
+            storage.execute_insert(
+                "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+                f"VALUES ('{char_id}', '{name}', '[]', '{vc_id}')"
+            )
+
+        # -- character_span (speaker junctions) -----------------------------
+        for i, (char_id, _name, _vc_id) in enumerate(assignments, start=1):
+            storage.execute_insert(
+                "INSERT INTO character_span "
+                "(character_id, span_id, relation_type, source, confidence) "
+                f"VALUES ('{char_id}', 'sp{i}', 'speaker', 'walk', 0.95)"
+            )
+
+    def test_voice_type_routing(self, fake_engine):
+        """render_audiobook routes each voice type to the correct engine method."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        self._populate_routing_storage(s)
+
+        render_audiobook("b1", s, fake_engine)
+
+        # The voice_config delivered to the engine carries the per-speaker
+        # `type` (and type-specific fields) that TTSEngine.generate_voice
+        # dispatches on:
+        #   clone        → generate_clone_voice   (uses ref_audio, ref_text)
+        #   lora         → generate_lora_voice    (uses adapter_path)
+        #   builtin_lora → generate_lora_voice    (uses adapter_path)
+        #   design       → generate_design_voice  (uses description)
+        #   custom       → generate_custom_voice
+        assert len(fake_engine.batch_calls) == 1
+        voice_config = fake_engine.batch_calls[0]["voice_config"]
+
+        # All five characters are present as speakers, no extras
+        expected_speakers = {"Cara", "Clyde", "Billie", "Lorne", "Delia"}
+        assert set(voice_config) == expected_speakers
+
+        expected = {
+            "Cara": {
+                "type": "custom",
+                "voice": "CustomVoice",
+                "description": "A plain custom voice",
+            },
+            "Clyde": {
+                "type": "clone",
+                "voice": "CloneVoice",
+                "ref_audio": "refs/clone.wav",
+                "ref_text": "Clone reference text",
+            },
+            "Billie": {
+                "type": "builtin_lora",
+                "voice": "BuiltinLoraVoice",
+                "adapter_path": "builtin_lora/voice_alpha",
+            },
+            "Lorne": {
+                "type": "lora",
+                "voice": "LoraVoice",
+                "adapter_path": "adapters/voice_beta",
+                "character_style": "neutral",
+            },
+            "Delia": {
+                "type": "design",
+                "voice": "DesignVoice",
+                "description": "A warm elderly male voice",
+            },
+        }
+        for speaker, fields in expected.items():
+            assert speaker in voice_config, f"{speaker} missing from voice_config"
+            assert (
+                voice_config[speaker]["type"] == fields["type"]
+            ), f"{speaker} should route as {fields['type']}"
+            for key, value in fields.items():
+                assert (
+                    voice_config[speaker][key] == value
+                ), f"{speaker}.{key}: expected {value!r}, got {voice_config[speaker][key]!r}"

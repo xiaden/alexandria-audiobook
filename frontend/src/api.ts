@@ -46,16 +46,16 @@ export async function post<T = unknown>(endpoint: string, body: unknown): Promis
 }
 
 /**
- * Upload a file to the API
- * @param file - File to upload
+ * Perform a PUT request to the API
+ * @param endpoint - API endpoint (e.g., '/api/pipeline/characters/{id}/voice')
+ * @param body - Request body (will be JSON.stringify'd)
  * @returns Parsed JSON response
  */
-export async function upload<T = unknown>(file: File): Promise<T> {
-  const formData = new FormData();
-  formData.append('file', file);
-  const res = await fetch('/api/upload', {
-    method: 'POST',
-    body: formData
+export async function put<T = unknown>(endpoint: string, body: unknown): Promise<T> {
+  const res = await fetch(endpoint, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
   await handleError(res);
   return res.json();

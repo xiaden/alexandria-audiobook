@@ -145,14 +145,22 @@ def storage():
 
 class TestExportAnnotatedScriptFormat:
     def test_returns_list_of_dicts(self, storage):
-        """Output is a list of dicts with speaker, text, instruct keys."""
+        """Output is a list of dicts with id, speaker, text, instruct keys."""
         script = export_annotated_script("b1", storage)
         assert isinstance(script, list)
         assert len(script) > 0
         for entry in script:
+            assert "id" in entry
             assert "speaker" in entry
             assert "text" in entry
             assert "instruct" in entry
+
+    def test_id_is_string(self, storage):
+        """ID values are strings."""
+        script = export_annotated_script("b1", storage)
+        for entry in script:
+            assert isinstance(entry["id"], str)
+            assert len(entry["id"]) > 0
 
     def test_speaker_is_string(self, storage):
         """Speaker values are strings."""
@@ -280,25 +288,29 @@ class TestEmptyBook:
 
 class TestMixedSpeakerAndNarrator:
     def test_full_script_output(self, storage):
-        """Full script has correct speaker/text/instruct for all spans."""
+        """Full script has correct id/speaker/text/instruct for all spans."""
         script = export_annotated_script("b1", storage)
         assert len(script) == 4
         assert script[0] == {
+            "id": "sp1",
             "speaker": "Alice",
             "text": "Hello there!",
             "instruct": "cheerfully",
         }
         assert script[1] == {
+            "id": "sp2",
             "speaker": "NARRATOR",
             "text": "She walked away.",
             "instruct": "",
         }
         assert script[2] == {
+            "id": "sp3",
             "speaker": "Bob",
             "text": "Goodbye.",
             "instruct": "sadly",
         }
         assert script[3] == {
+            "id": "sp4",
             "speaker": "NARRATOR",
             "text": "No one spoke.",
             "instruct": "",

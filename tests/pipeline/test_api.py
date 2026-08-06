@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import sys
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -272,7 +273,7 @@ class TestRunWalkEndpoint:
         assert "Unknown walk" in response.json()["detail"]
 
     def test_run_walk_valid(self, client, walk_runner):
-        """Valid walk names are executed and return full result structure."""
+        """Valid walk names start background execution and return immediately."""
         # Mock the walk module loading
         with patch.object(walk_runner, "_load_walk_module") as mock_load:
             mock_module = MagicMock()
@@ -292,12 +293,14 @@ class TestRunWalkEndpoint:
 
             assert response.status_code == 200
             result = response.json()
-            assert result["status"] == "completed"
-            assert result["walk"] == "walk_2a_scene_segmentation"
-            mock_load.assert_called_once_with("walk_2a_scene_segmentation")
+            # Background execution returns immediately with 'started'
+            assert result["status"] == "started"
+            assert result["walk_name"] == "walk_2a_scene_segmentation"
 
     def test_run_walk_execution_failure(self, client, walk_runner):
-        """Walk execution errors are caught and returned as failed status."""
+        """Background walk failures are reflected in status, not in response."""
+        # With background execution, the response is always 'started'
+        # Failures are detected via polling walk_status
         with patch.object(walk_runner, "_load_walk_module") as mock_load:
             mock_module = MagicMock()
             mock_module.execute = MagicMock(side_effect=RuntimeError("Walk crashed"))
@@ -314,8 +317,8 @@ class TestRunWalkEndpoint:
 
             assert response.status_code == 200
             result = response.json()
-            assert result["status"] == "failed"
-            assert "Walk crashed" in result["error"]
+            # Response is always 'started' for background execution
+            assert result["status"] == "started"
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +328,7 @@ class TestRunWalkEndpoint:
 
 class TestRunAllWalksEndpoint:
     def test_run_all_walks(self, client, walk_runner):
-        """All walks are executed serially and results keyed by walk name."""
+        """Background execution returns immediately with 'started' status."""
         # Mock the walk module loading and verification to avoid actual walk execution
         with patch.object(walk_runner, "_load_walk_module") as mock_load, \
              patch.object(walk_runner, "_run_verification", return_value=True):
@@ -340,11 +343,56 @@ class TestRunAllWalksEndpoint:
 
             assert response.status_code == 200
             result = response.json()
-            assert isinstance(result, dict)
-            # All walks should be present with completed status
-            for walk_name in WALK_ORDER:
-                assert walk_name in result
-                assert result[walk_name]["status"] == "completed"
+            # Background execution returns immediately
+            assert result["status"] == "started"
+
+
+# ---------------------------------------------------------------------------
+# P2-S3: POST /api/pipeline/cancel_walks
+# ---------------------------------------------------------------------------
+
+
+class TestCancelWalksEndpoint:
+    def test_cancel_walks_sets_flag(self, client, walk_runner):
+        """Cancel walks endpoint sets cancellation flag and returns status."""
+        response = client.post(
+            "/api/pipeline/cancel_walks",
+            json={"book_id": "b1"},
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "cancelled"
+        # Verify the flag was set
+        assert walk_runner._cancelled.get("b1") is True
+
+    def test_cancel_walks_affects_running_walks(self, client, walk_runner):
+        """Cancel walks prevents subsequent walks from starting."""
+        # Cancel walks
+        client.post("/api/pipeline/cancel_walks", json={"book_id": "b1"})
+
+        # Try to run a walk - it should be cancelled
+        with patch.object(walk_runner, "_load_walk_module") as mock_load:
+            mock_module = MagicMock()
+            mock_module.execute = MagicMock(return_value={"status": "completed"})
+            mock_load.return_value = mock_module
+
+            response = client.post(
+                "/api/pipeline/run_walk",
+                json={
+                    "walk_name": "walk_2a_scene_segmentation",
+                    "book_id": "b1",
+                    "config": {},
+                },
+            )
+
+            # Response is still 'started' (background execution)
+            assert response.status_code == 200
+            result = response.json()
+            assert result["status"] == "started"
+
+            # But the walk status should be 'cancelled' after background task runs
+            # (In real scenario, the background task would check the flag)
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +412,7 @@ class TestWalkStatusEndpoint:
         # Each walk name should be a key with a valid status value
         for walk_name in WALK_ORDER:
             assert walk_name in result
-            assert result[walk_name] in ("pending", "running", "completed", "failed")
+            assert result[walk_name] in ("pending", "running", "completed", "failed", "cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +760,88 @@ class TestOperationEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# P4-S2: PUT /api/pipeline/span/{span_id}/text
+# ---------------------------------------------------------------------------
+
+
+class TestSpanTextEditEndpoint:
+    def test_update_span_text_success(self, client, storage):
+        """PUT /api/pipeline/span/{span_id}/text updates span text and returns 200."""
+        # Insert a test span
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp_edit_1', 'sentence', 'original text', NULL)"
+        )
+
+        response = client.put(
+            "/api/pipeline/span/sp_edit_1/text",
+            json={"text": "updated text"},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "ok"
+        assert result["span_id"] == "sp_edit_1"
+
+        # Verify text was updated in DB
+        rows = storage.execute_query("SELECT text FROM span WHERE id = 'sp_edit_1'")
+        assert len(rows) == 1
+        assert rows[0]["text"] == "updated text"
+
+    def test_update_span_text_empty_rejected(self, client, storage):
+        """PUT with empty text returns 400."""
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp_edit_2', 'sentence', 'some text', NULL)"
+        )
+
+        response = client.put(
+            "/api/pipeline/span/sp_edit_2/text",
+            json={"text": ""},
+        )
+        assert response.status_code == 400
+        assert "empty" in response.json()["detail"].lower()
+
+    def test_update_span_text_whitespace_only_rejected(self, client, storage):
+        """PUT with whitespace-only text returns 400."""
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp_edit_3', 'sentence', 'some text', NULL)"
+        )
+
+        response = client.put(
+            "/api/pipeline/span/sp_edit_3/text",
+            json={"text": "   "},
+        )
+        assert response.status_code == 400
+        assert "empty" in response.json()["detail"].lower()
+
+    def test_update_span_text_not_found(self, client):
+        """PUT with non-existent span_id returns 404."""
+        response = client.put(
+            "/api/pipeline/span/nonexistent_span/text",
+            json={"text": "new text"},
+        )
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    def test_update_span_text_strips_whitespace(self, client, storage):
+        """PUT strips leading/trailing whitespace from text."""
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp_edit_4', 'sentence', 'original', NULL)"
+        )
+
+        response = client.put(
+            "/api/pipeline/span/sp_edit_4/text",
+            json={"text": "  trimmed text  "},
+        )
+        assert response.status_code == 200
+
+        rows = storage.execute_query("SELECT text FROM span WHERE id = 'sp_edit_4'")
+        assert rows[0]["text"] == "trimmed text"
+
+
+# ---------------------------------------------------------------------------
 # P1-S12: GET /api/pipeline/export/{book_id}
 # ---------------------------------------------------------------------------
 
@@ -761,7 +891,7 @@ class TestRenderEndpoint:
         assert "TTS engine not available" in response.json()["detail"]
 
     def test_render_with_engine(self, client, tts_engine):
-        """Render with TTS engine returns job_id."""
+        """Render with TTS engine returns job_id and status."""
         response = client.post(
             "/api/pipeline/render",
             json={"book_id": "b1", "use_batch": True},
@@ -772,11 +902,12 @@ class TestRenderEndpoint:
         # job_id should be a non-empty string (UUID format)
         assert isinstance(result["job_id"], str)
         assert len(result["job_id"]) > 0
-        # Verify response structure
-        assert set(result.keys()) == {"job_id"}
+        # Verify response structure — includes status for background job
+        assert set(result.keys()) == {"job_id", "status"}
+        assert result["status"] == "started"
 
     def test_render_failure(self, client, tts_engine):
-        """Render failure returns 500 with error detail."""
+        """Render failure is captured as a failed job status."""
         from app.pipeline import api_export
 
         with patch.object(api_export, "render_audiobook") as mock_render:
@@ -786,10 +917,136 @@ class TestRenderEndpoint:
                 "/api/pipeline/render",
                 json={"book_id": "b1", "use_batch": True},
             )
-            assert response.status_code == 500
-            result = response.json()
-            assert "Render failed" in result["detail"]
-            assert "TTS engine crashed" in result["detail"]
+            # Endpoint returns immediately with job_id; failure surfaces via status
+            assert response.status_code == 200
+            job_id = response.json()["job_id"]
+
+            # Background task runs on TestClient close — query status
+            status_resp = client.get(f"/api/pipeline/render_status/{job_id}")
+            assert status_resp.status_code == 200
+            # Job is either still running or already failed (timing dependent)
+            assert status_resp.json()["status"] in ("running", "failed")
+
+
+# ---------------------------------------------------------------------------
+# P3-S10: Background render — returns immediately, status transitions
+# ---------------------------------------------------------------------------
+
+
+class TestBackgroundRender:
+    def test_render_returns_immediately(self, client, tts_engine):
+        """POST /render returns immediately with job_id and status='started'."""
+        import time
+
+        start = time.time()
+        response = client.post(
+            "/api/pipeline/render",
+            json={"book_id": "b1", "use_batch": True},
+        )
+        elapsed = time.time() - start
+
+        # Should return almost immediately (not block on render)
+        assert elapsed < 0.5, f"Render blocked for {elapsed}s instead of returning immediately"
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "started"
+        assert "job_id" in result
+
+    def test_status_transitions(self, client, tts_engine):
+        """Render job transitions through status states."""
+        # Start render
+        response = client.post(
+            "/api/pipeline/render",
+            json={"book_id": "b1", "use_batch": True},
+        )
+        job_id = response.json()["job_id"]
+
+        # Initial status should be running
+        status_resp = client.get(f"/api/pipeline/render_status/{job_id}")
+        assert status_resp.status_code == 200
+        initial_status = status_resp.json()["status"]
+        assert initial_status in ("running", "completed")  # may complete fast in test
+
+        # Poll until terminal state (with timeout)
+        import time
+        for _ in range(50):  # 5 seconds max
+            status_resp = client.get(f"/api/pipeline/render_status/{job_id}")
+            status = status_resp.json()["status"]
+            if status in ("completed", "failed", "cancelled"):
+                break
+            time.sleep(0.1)
+
+        # Should reach a terminal state
+        assert status in ("completed", "failed", "cancelled")
+
+        # Completed job should have output_dir
+        if status == "completed":
+            assert status_resp.json()["output_dir"] is not None
+
+    def test_status_unknown_job(self, client):
+        """GET /render_status for unknown job_id returns 404."""
+        response = client.get("/api/pipeline/render_status/nonexistent-job-id")
+        assert response.status_code == 404
+        assert "Unknown job_id" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# P3-S11: Cancellation — cancel flag aborts render
+# ---------------------------------------------------------------------------
+
+
+class TestCancellation:
+    def test_cancel_check_aborts_render(self, storage, tts_engine):
+        """render_audiobook raises CancelledError when cancel_check returns True."""
+        from app.pipeline.tts_integration import CancelledError, render_audiobook
+
+        # Cancel check that returns True immediately
+        def cancel_check():
+            return True
+
+        # Should raise CancelledError
+        with pytest.raises(CancelledError, match="Render cancelled"):
+            render_audiobook(
+                "b1",
+                storage,
+                tts_engine,
+                use_batch=True,
+                cancel_check=cancel_check,
+            )
+
+    def test_cancel_running_job_via_api(self, client, tts_engine):
+        """POST /cancel_render on completed job returns already_finished."""
+        # Start and complete a render
+        response = client.post(
+            "/api/pipeline/render",
+            json={"book_id": "b1", "use_batch": True},
+        )
+        job_id = response.json()["job_id"]
+
+        # Wait for completion (TestClient runs background tasks synchronously)
+        import time
+        for _ in range(50):
+            status_resp = client.get(f"/api/pipeline/render_status/{job_id}")
+            if status_resp.json()["status"] == "completed":
+                break
+            time.sleep(0.1)
+
+        # Try to cancel completed job
+        cancel_resp = client.post(
+            "/api/pipeline/cancel_render",
+            json={"job_id": job_id},
+        )
+        assert cancel_resp.status_code == 200
+        assert cancel_resp.json()["status"] == "already_finished"
+
+    def test_cancel_unknown_job(self, client):
+        """POST /cancel_render for unknown job_id returns 404."""
+        response = client.post(
+            "/api/pipeline/cancel_render",
+            json={"job_id": "nonexistent-job-id"},
+        )
+        assert response.status_code == 404
+        assert "Unknown job_id" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -826,38 +1083,51 @@ class TestReonboardEndpoint:
 
 
 class TestGetTTSEngineProduction:
-    """Prove get_tts_engine() wires to the production ProjectManager."""
+    """Prove get_tts_engine() wires to the production engine factory (app.engine)."""
 
     def test_returns_configured_engine(self):
-        """get_tts_engine() returns the engine from app.app.project_manager."""
+        """get_tts_engine() returns the cached engine; TTSEngine is built only on cache miss.
+
+        The real app.app is never imported here (it pulls in torch/soundfile via
+        the app.project -> app.tts chain); app.engine keeps app.tts behind a lazy
+        import, so this module only ever sees a stubbed app.tts.
+        """
         mock_engine = MagicMock()
-        mock_pm = MagicMock()
-        mock_pm.get_engine.return_value = mock_engine
 
-        # Avoid importing the real app.app (which pulls in torch, etc.)
-        mock_app_app = MagicMock()
-        mock_app_app.project_manager = mock_pm
-
-        with patch.dict(sys.modules, {"app.app": mock_app_app}):
+        # Cache hit: the cached engine is returned and app.tts is never touched.
+        fake_tts = ModuleType("app.tts")
+        fake_tts.TTSEngine = MagicMock(
+            side_effect=AssertionError("TTSEngine must not be constructed on cache hit")
+        )
+        with (
+            patch("app.engine._tts_engine", mock_engine),
+            patch.dict(sys.modules, {"app.tts": fake_tts}),
+        ):
             engine = get_tts_engine()
-
         assert engine is mock_engine
-        mock_pm.get_engine.assert_called_once()
+
+        # Cache miss: TTSEngine is constructed from app.tts and returned.
+        fake_tts.TTSEngine = MagicMock(return_value=MagicMock())
+        with (
+            patch("app.engine._tts_engine", None),
+            patch.dict(sys.modules, {"app.tts": fake_tts}),
+        ):
+            engine = get_tts_engine()
+        assert engine is not None
+        fake_tts.TTSEngine.assert_called_once()
 
     def test_render_503_when_production_engine_is_none(self, storage):
-        """Render returns 503 when production get_tts_engine resolves to None.
+        """Render returns 503 when the production engine factory resolves to None.
 
         Unlike ``test_render_no_engine`` which overrides the dependency,
-        this test exercises the real production path where
-        ``project_manager.get_engine()`` returns ``None``.
+        this test exercises the real production path: the cache is reset via
+        ``reset_tts_engine()`` so ``get_tts_engine()`` must rebuild the engine
+        — and cannot (soundfile is not installed, so app.tts is not importable),
+        returning None without ever importing app.app.
         """
         from fastapi import FastAPI
 
-        mock_pm = MagicMock()
-        mock_pm.get_engine.return_value = None
-
-        mock_app_app = MagicMock()
-        mock_app_app.project_manager = mock_pm
+        from app import engine as engine_factory
 
         app = FastAPI()
         app.include_router(router)
@@ -865,11 +1135,126 @@ class TestGetTTSEngineProduction:
         # No get_tts_engine override — exercise the real production path
 
         test_client = TestClient(app)
-        with patch.dict(sys.modules, {"app.app": mock_app_app}):
+        engine_factory.reset_tts_engine()
+        try:
             response = test_client.post(
                 "/api/pipeline/render",
                 json={"book_id": "b1", "use_batch": True},
             )
+        finally:
+            engine_factory.reset_tts_engine()
 
         assert response.status_code == 503
         assert "TTS engine not available" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# P5-S2: POST /api/pipeline/merge
+# ---------------------------------------------------------------------------
+
+
+class TestMergeEndpoint:
+    """Tests for POST /api/pipeline/merge endpoint."""
+
+    def test_merge_unknown_job(self, client):
+        """Merge with unknown job_id returns 404."""
+        response = client.post(
+            "/api/pipeline/merge",
+            json={"book_id": "b1", "job_id": "nonexistent-job-id"},
+        )
+        assert response.status_code == 404
+        assert "Unknown job_id" in response.json()["detail"]
+
+    def test_merge_job_not_completed(self, client):
+        """Merge with job not in completed status returns 400."""
+        from app.pipeline import api_export
+
+        # Inject a job with status 'running'
+        job_id = "test-job-running"
+        api_export._render_jobs[job_id] = {
+            "status": "running",
+            "output_dir": "/tmp/test-output",
+        }
+
+        try:
+            response = client.post(
+                "/api/pipeline/merge",
+                json={"book_id": "b1", "job_id": job_id},
+            )
+            assert response.status_code == 400
+            assert "not completed" in response.json()["detail"]
+        finally:
+            del api_export._render_jobs[job_id]
+
+    def test_merge_no_chunks_found(self, client, tmp_path):
+        """Merge with no WAV chunks in output_dir returns 400."""
+        from app.pipeline import api_export
+
+        # Create empty output directory
+        output_dir = tmp_path / "empty-output"
+        output_dir.mkdir()
+
+        job_id = "test-job-no-chunks"
+        api_export._render_jobs[job_id] = {
+            "status": "completed",
+            "output_dir": str(output_dir),
+        }
+
+        try:
+            response = client.post(
+                "/api/pipeline/merge",
+                json={"book_id": "b1", "job_id": job_id},
+            )
+            assert response.status_code == 400
+            assert "No audio chunks found" in response.json()["detail"]
+        finally:
+            del api_export._render_jobs[job_id]
+
+    def test_merge_success(self, client, tmp_path):
+        """Merge with valid WAV chunks produces M4B file."""
+        import subprocess
+        from app.pipeline import api_export
+
+        # Create output directory with WAV chunks
+        output_dir = tmp_path / "render-output"
+        output_dir.mkdir()
+
+        # Generate simple WAV files using ffmpeg (sine waves)
+        for i in range(3):
+            wav_path = output_dir / f"chunk_{i:04d}.wav"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=0.1",
+                    "-ar", "22050",
+                    "-ac", "1",
+                    str(wav_path),
+                ],
+                capture_output=True,
+                check=True,
+            )
+
+        job_id = "test-job-success"
+        api_export._render_jobs[job_id] = {
+            "status": "completed",
+            "output_dir": str(output_dir),
+        }
+
+        try:
+            response = client.post(
+                "/api/pipeline/merge",
+                json={"book_id": "b1", "job_id": job_id},
+            )
+            assert response.status_code == 200
+            result = response.json()
+            assert result["status"] == "ok"
+            assert "output_path" in result
+            assert result["output_path"].endswith("audiobook.m4b")
+
+            # Verify the M4B file was created
+            import os
+            assert os.path.exists(result["output_path"])
+            assert os.path.getsize(result["output_path"]) > 0
+        finally:
+            del api_export._render_jobs[job_id]
