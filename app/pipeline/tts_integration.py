@@ -19,14 +19,12 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import uuid
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.assembly import export_annotated_script
-
-if TYPE_CHECKING:
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +211,142 @@ def _build_chunks(script: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Render job / chunk row persistence (rows = truth)
+# ---------------------------------------------------------------------------
+
+
+def _now_ms() -> int:
+    """Current wall-clock time as INTEGER unix milliseconds (schema convention)."""
+    return int(time.time() * 1000)
+
+
+def _ensure_render_job_row(
+    storage: PipelineStorage,
+    job_id: str,
+    book_id: str,
+    mode: str,
+    output_dir: str | None,
+) -> None:
+    """Create the ``render_job`` row (status ``running``) unless one exists.
+
+    The API layer (``POST /render``) pre-creates the row so the tracked
+    ``job_id`` matches its in-process tracker; direct callers of
+    ``render_audiobook`` get the row created here.  Rows are the source of
+    truth, so every render has exactly one row — the pre-created row is
+    reused untouched when present.
+    """
+    existing = storage.execute_query(
+        "SELECT job_id FROM render_job WHERE job_id = ?",
+        (job_id,),
+    )
+    if existing:
+        return
+    now = _now_ms()
+    storage.execute_insert(
+        "INSERT INTO render_job "
+        "(job_id, book_id, mode, status, output_dir, created_ms, started_ms) "
+        "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+        (job_id, book_id, mode, output_dir, now, now),
+    )
+
+
+def _insert_chunk_row(
+    storage: PipelineStorage, job_id: str, idx: int, wav_path: str
+) -> None:
+    """Record a per-chunk ``render_chunk`` row (status ``pending``).
+
+    Individual mode only — batch mode persists job-level rows only.
+    """
+    storage.execute_insert(
+        "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
+        "VALUES (?, ?, 'pending', ?)",
+        (job_id, idx, wav_path),
+    )
+
+
+def _mark_chunk_done(
+    storage: PipelineStorage, job_id: str, idx: int, wav_path: str
+) -> None:
+    """Transition a chunk row to ``done`` after the WAV write returns.
+
+    fsync discipline for the WAV file itself lands in Plan C; Phase 3
+    treats ``generate_voice`` returning as the durability boundary.
+    """
+    storage.execute_update(
+        "UPDATE render_chunk SET status = 'done', wav_path = ? "
+        "WHERE job_id = ? AND idx = ?",
+        (wav_path, job_id, idx),
+    )
+
+
+def _mark_chunk_failed(
+    storage: PipelineStorage, job_id: str, idx: int, error: str
+) -> None:
+    """Transition a chunk row to ``failed`` with the recorded error."""
+    storage.execute_update(
+        "UPDATE render_chunk SET status = 'failed', error = ? "
+        "WHERE job_id = ? AND idx = ?",
+        (error, job_id, idx),
+    )
+
+
+def _format_batch_failure(failed: list[tuple[int, str] | int]) -> str:
+    """Render ``generate_batch``'s ``failed`` list as a readable string.
+
+    Entries are ``(index, error)`` tuples per the ``TTSEngine`` contract;
+    bare indices are tolerated defensively.
+    """
+    parts = []
+    for item in failed:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            parts.append(f"chunk {item[0]}: {item[1]}")
+        else:
+            parts.append(f"chunk {item}")
+    return "; ".join(parts)
+
+
+def _finalize_job(
+    storage: PipelineStorage,
+    job_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    resolved_dir: str | None = None,
+) -> None:
+    """Write the final ``render_job`` transition inside a single transaction.
+
+    ``completed`` also records ``output_dir`` and ``output_artifact_path``
+    (the ``audiobook.m4b`` path when present, otherwise the output dir).
+    ``failed`` records the error; ``cancelled`` transitions status only.
+    Always stamps ``finished_ms``.
+    """
+    with storage.transaction():
+        if status == "completed":
+            artifact_path = resolved_dir
+            if resolved_dir:
+                m4b_path = os.path.join(resolved_dir, "audiobook.m4b")
+                if os.path.isfile(m4b_path):
+                    artifact_path = m4b_path
+            storage.execute_update(
+                "UPDATE render_job SET status = 'completed', output_dir = ?, "
+                "output_artifact_path = ?, finished_ms = ? WHERE job_id = ?",
+                (resolved_dir, artifact_path, _now_ms(), job_id),
+            )
+        elif status == "failed":
+            storage.execute_update(
+                "UPDATE render_job SET status = 'failed', error = ?, "
+                "finished_ms = ? WHERE job_id = ?",
+                (error, _now_ms(), job_id),
+            )
+        else:  # cancelled
+            storage.execute_update(
+                "UPDATE render_job SET status = 'cancelled', finished_ms = ? "
+                "WHERE job_id = ?",
+                (_now_ms(), job_id),
+            )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -230,11 +364,12 @@ def render_audiobook(
 ) -> str:
     """Render an audiobook from the pipeline's annotated script.
 
-    Bridges the deterministic assembly output (``export_annotated_script``)
-    to the existing ``TTSEngine``.  Speakers are mapped to voice
-    configurations: ``'NARRATOR'`` uses the default narrator voice, and
-    character speakers are resolved via the ``character.voice_assignment_id``
-    → ``voice_config`` lookup chain.
+    Generates audio via ``TTSEngine.generate_batch`` (batch mode) or
+    ``TTSEngine.generate_voice`` (individual mode).  Persists progress to
+    ``render_job`` / ``render_chunk`` rows (rows = truth): the job row is
+    created ``running`` at start and transitions to ``completed`` in the
+    final transaction; individual mode writes one ``render_chunk`` row per
+    chunk (``pending`` → ``done`` after the WAV write returns).
 
     Parameters
     ----------
@@ -273,43 +408,86 @@ def render_audiobook(
     ------
     CancelledError
         If ``cancel_check()`` returns ``True`` during rendering.
+    RuntimeError
+        If batch generation reports no completed chunks (all failed).
     """
     # Generate (or reuse) the job identifier
     resolved_job_id = job_id if job_id is not None else str(uuid.uuid4())
 
-    # Step 1: Get annotated script from assembly
-    script = export_annotated_script(book_id, storage)
+    # Rows = truth: ensure the render_job row exists with status 'running'.
+    # The API layer pre-creates it; direct callers get it created here.
+    mode = "batch" if use_batch else "individual"
+    _ensure_render_job_row(storage, resolved_job_id, book_id, mode, output_dir)
 
-    # Step 2: Build voice config mapping
-    voice_config = _build_voice_config(script, storage)
+    resolved_dir = output_dir
+    try:
+        # Step 1: Get annotated script from assembly
+        script = export_annotated_script(book_id, storage)
 
-    # Step 3: Determine output directory
-    resolved_dir = output_dir or tempfile.mkdtemp(prefix=f"audiobook_{book_id}_")
+        # Step 2: Build voice config mapping
+        voice_config = _build_voice_config(script, storage)
 
-    # Step 4: Handle empty script
-    if not script:
-        return resolved_job_id
+        # Step 3: Determine output directory
+        resolved_dir = output_dir or tempfile.mkdtemp(prefix=f"audiobook_{book_id}_")
 
-    # Step 5: Build chunks and dispatch
-    if use_batch:
-        # Check cancellation once before the batch dispatch
-        if cancel_check is not None and cancel_check():
-            raise CancelledError("Render cancelled before batch dispatch")
-        chunks = _build_chunks(script)
-        tts_engine.generate_batch(chunks, voice_config, resolved_dir, batch_seed)
-    else:
-        # Individual generation — check cancellation before each chunk
-        for i, entry in enumerate(script):
+        # Step 4: Handle empty script — nothing to render, job completes
+        if not script:
+            _finalize_job(storage, resolved_job_id, "completed", resolved_dir=resolved_dir)
+            return resolved_job_id
+
+        # Step 5: Build chunks and dispatch
+        if use_batch:
+            # Check cancellation once before the batch dispatch
             if cancel_check is not None and cancel_check():
-                raise CancelledError(
-                    f"Render cancelled before chunk {i}"
-                )
-            speaker = entry["speaker"]
-            text = entry["text"]
-            instruct = entry.get("instruct", "")
-            output_path = os.path.join(resolved_dir, f"chunk_{i:04d}.wav")
-            tts_engine.generate_voice(
-                text, instruct, speaker, voice_config, output_path
+                raise CancelledError("Render cancelled before batch dispatch")
+            chunks = _build_chunks(script)
+            result = tts_engine.generate_batch(
+                chunks, voice_config, resolved_dir, batch_seed
             )
+            # Batch mode persists job-level rows only (no per-chunk rows), so
+            # interpret the engine's report at job level.  A ``None`` result
+            # (some engines / test doubles) reports no failures — treat as
+            # all chunks completed.  When every reported outcome is a
+            # failure the job itself failed; any completed chunk means the
+            # job completed (partial batch failures surface in Plan C
+            # reconciliation and are not representable without chunk rows).
+            if result is None:
+                result = {"completed": [c["index"] for c in chunks], "failed": []}
+            failed = list(result.get("failed") or [])
+            completed = list(result.get("completed") or [])
+            if failed and not completed:
+                raise RuntimeError(
+                    f"Batch render failed: all {len(failed)} chunks failed "
+                    f"({_format_batch_failure(failed)})"
+                )
+        else:
+            # Individual generation — check cancellation before each chunk
+            for i, entry in enumerate(script):
+                if cancel_check is not None and cancel_check():
+                    raise CancelledError(f"Render cancelled before chunk {i}")
+                speaker = entry["speaker"]
+                text = entry["text"]
+                instruct = entry.get("instruct", "")
+                output_path = os.path.join(resolved_dir, f"chunk_{i:04d}.wav")
+                _insert_chunk_row(storage, resolved_job_id, i, output_path)
+                try:
+                    tts_engine.generate_voice(
+                        text, instruct, speaker, voice_config, output_path
+                    )
+                except Exception as exc:
+                    # Record the failed chunk, then propagate — the caller
+                    # (and the finalize below) marks the job failed.
+                    _mark_chunk_failed(storage, resolved_job_id, i, str(exc))
+                    raise
+                _mark_chunk_done(storage, resolved_job_id, i, output_path)
+    except CancelledError:
+        _finalize_job(storage, resolved_job_id, "cancelled")
+        raise
+    except Exception as exc:
+        _finalize_job(storage, resolved_job_id, "failed", error=str(exc))
+        raise
+
+    # Final transaction: job completed + output artifact path
+    _finalize_job(storage, resolved_job_id, "completed", resolved_dir=resolved_dir)
 
     return resolved_job_id

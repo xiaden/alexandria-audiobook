@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -79,6 +80,60 @@ class PipelineStorage(ABC):
     @abstractmethod
     def execute_delete(self, sql: str, params: tuple = ()) -> int:
         """Execute a DELETE and return ``rowcount``."""
+
+
+# ---------------------------------------------------------------------------
+# Startup reconciliation (contract rule #5)
+# ---------------------------------------------------------------------------
+
+# A running row whose last activity is at least this old is treated as stale
+# (leftover from a dead process) and flipped to ``interrupted`` on startup.
+# A grace period keeps the flip conservative: rows that started or heartbeated
+# within the window are never touched (no false positives on live work).
+_STALE_RUN_GRACE_MS = 5 * 60 * 1000  # 5 minutes
+
+# Terminal cause stamped on rows flipped by startup reconciliation.
+_INTERRUPTED_ERROR = "interrupted by process restart"
+
+
+def _reconcile_stale_runs(conn: sqlite3.Connection) -> dict[str, int]:
+    """Flip stale running rows to ``interrupted`` in one pass (startup-only).
+
+    Exactly one UPDATE per table (contract rule #5 — no on-read sweeper, no
+    periodic reaper).  A row is stale when its last activity predates the
+    cutoff (``now - _STALE_RUN_GRACE_MS``):
+
+    - ``render_job``: ``started_ms < cutoff`` (no heartbeat column exists)
+    - ``walk_run``: ``created_ms < cutoff`` AND no recent heartbeat
+      (``heartbeat_ms IS NULL OR heartbeat_ms < cutoff``)
+
+    Terminal rows (completed/failed/cancelled/interrupted/pending) are never
+    touched — the predicate matches ``status = 'running'`` only.
+
+    Returns per-table counts of flipped rows, e.g. ``{"render_job": 2,
+    "walk_run": 1}``.  Safe to call on an empty database.
+    """
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - _STALE_RUN_GRACE_MS
+    was_in_transaction = conn.in_transaction
+    cursor = conn.execute(
+        "UPDATE render_job "
+        "SET status = 'interrupted', error = ?, finished_ms = ? "
+        "WHERE status = 'running' AND started_ms < ?",
+        (_INTERRUPTED_ERROR, now_ms, cutoff),
+    )
+    render_count = cursor.rowcount
+    cursor = conn.execute(
+        "UPDATE walk_run "
+        "SET status = 'interrupted', error = ?, finished_ms = ? "
+        "WHERE status = 'running' AND created_ms < ? "
+        "AND (heartbeat_ms IS NULL OR heartbeat_ms < ?)",
+        (_INTERRUPTED_ERROR, now_ms, cutoff, cutoff),
+    )
+    walk_count = cursor.rowcount
+    if not was_in_transaction:
+        conn.commit()
+    return {"render_job": render_count, "walk_run": walk_count}
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +275,16 @@ class SQLiteAdapter(PipelineStorage):
             self._conn.commit()
         return cursor.rowcount
 
+    def reconcile_stale_runs(self) -> dict[str, int]:
+        """Startup-only: flip stale running rows to ``interrupted`` (one pass).
+
+        Contract rule #5 — runs exactly once at startup, before the API
+        accepts requests.  Returns per-table counts of flipped rows, e.g.
+        ``{"render_job": 2, "walk_run": 1}``.
+        """
+        self._ensure_owner_thread()
+        return _reconcile_stale_runs(self._conn)
+
 
 # ---------------------------------------------------------------------------
 # In-memory adapter (for testing)
@@ -346,3 +411,12 @@ class InMemorySQLiteAdapter(PipelineStorage):
         if not was_in_transaction:
             self._conn.commit()
         return cursor.rowcount
+
+    def reconcile_stale_runs(self) -> dict[str, int]:
+        """Startup-only: flip stale running rows to ``interrupted`` (one pass).
+
+        Mirror of ``SQLiteAdapter.reconcile_stale_runs`` (same schema and
+        interface).  Returns per-table counts of flipped rows.
+        """
+        self._ensure_owner_thread()
+        return _reconcile_stale_runs(self._conn)

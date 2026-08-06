@@ -8,6 +8,10 @@ Covers:
 - All execute_* methods return correct types
 - init_db() creates the schema (tables exist after init_db)
 - 100% adapter coverage target
+- Startup reconciliation (reconcile_stale_runs): stale running rows
+  (render_job/walk_run) flip to interrupted in ONE pass; terminal rows and
+  fresh rows untouched; idempotent; file-backed crash-recovery scenario
+- Production storage bootstrap invokes reconcile exactly once at startup
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import threading
 import time
 
 import pytest
+from unittest.mock import MagicMock
 
 from app.pipeline.adapter import (
     ConcurrentTransactionError,
@@ -952,3 +957,284 @@ class TestTransactionBeginFailure:
         thread.start()
         thread.join()
         assert captured.get("ok") is True
+
+# ---------------------------------------------------------------------------
+# P4-S1: reconcile_stale_runs — startup-only stale running → interrupted
+# ---------------------------------------------------------------------------
+
+# 1 hour in the past — comfortably older than the reconcile cutoff, so a row
+# timestamped this far back is definitely "started before the cutoff".
+_STALE_AGE_MS = 3_600_000
+
+
+def _insert_render_job(
+    adapter,
+    job_id: str,
+    status: str,
+    started_ms: int,
+    created_ms: int | None = None,
+) -> None:
+    """Insert a render_job row with explicit timestamps.
+
+    render_job has NO heartbeat column (schema registered in CONTRACTS.md §
+    Universal Upgrade), so ``started_ms`` is the only liveness signal.
+    """
+    adapter.execute_insert(
+        "INSERT INTO render_job "
+        "(job_id, book_id, mode, status, output_dir, created_ms, started_ms) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            job_id,
+            "b1",
+            "batch",
+            status,
+            "/tmp/out",
+            created_ms if created_ms is not None else started_ms,
+            started_ms,
+        ),
+    )
+
+
+def _insert_walk_run(
+    adapter,
+    run_id: str,
+    status: str,
+    created_ms: int,
+    heartbeat_ms: int | None = None,
+) -> None:
+    """Insert a walk_run row with explicit timestamps (created_ms + optional
+    heartbeat_ms — walk_run DOES carry a heartbeat column)."""
+    adapter.execute_insert(
+        "INSERT INTO walk_run "
+        "(run_id, book_id, walk_name, status, created_ms, heartbeat_ms) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, "b1", "walk_2a", status, created_ms, heartbeat_ms),
+    )
+
+
+class TestReconcileStaleRuns:
+    """``reconcile_stale_runs()`` must flip stale ``running`` rows to
+    ``interrupted`` in ONE pass, and only stale ones.
+
+    Crash-recovery scenario is FILE-BACKED only: ``:memory:`` conceals crash
+    recovery (the crash scenario is: process dies mid-run with
+    status='running', rows persist on disk, the NEXT process startup
+    reconciles them). Per the DD test strategy, the file-backed fixture
+    writes with one adapter instance, closes it (process death), reopens a
+    NEW adapter on the same file, then reconciles.
+    """
+
+    @staticmethod
+    def _reopen(db_path: str) -> SQLiteAdapter:
+        """Simulate a fresh process start on an existing database file."""
+        adapter = SQLiteAdapter(db_path=db_path)
+        adapter.init_db()
+        return adapter
+
+    def test_crash_recovery_flips_stale_running_rows_on_reopen(self, tmp_path):
+        """A process dying mid-run leaves running rows on disk; the next
+        startup's single reconcile pass flips them to interrupted."""
+        db_path = str(tmp_path / "crash.db")
+        stale = int(time.time() * 1000) - _STALE_AGE_MS
+
+        # Process 1: starts jobs, dies without finalizing any row.
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_render_job(writer, "rj-stale", "running", started_ms=stale)
+        _insert_walk_run(
+            writer, "wr-stale", "running", created_ms=stale, heartbeat_ms=stale
+        )
+        _insert_walk_run(writer, "wr-nohb", "running", created_ms=stale)
+        writer.close()
+
+        # Process 2: same file, one startup reconcile pass.
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.reconcile_stale_runs()
+            assert counts == {"render_job": 1, "walk_run": 2}
+
+            rj = adapter.execute_query(
+                "SELECT status, error, finished_ms FROM render_job "
+                "WHERE job_id = ?",
+                ("rj-stale",),
+            )[0]
+            assert rj["status"] == "interrupted"
+            assert rj["error"] == "interrupted by process restart"
+            assert rj["finished_ms"] is not None
+
+            for run_id in ("wr-stale", "wr-nohb"):
+                wr = adapter.execute_query(
+                    "SELECT status, error, finished_ms FROM walk_run "
+                    "WHERE run_id = ?",
+                    (run_id,),
+                )[0]
+                assert wr["status"] == "interrupted"
+                assert wr["error"] == "interrupted by process restart"
+                assert wr["finished_ms"] is not None
+        finally:
+            adapter.close()
+
+    def test_reconcile_leaves_fresh_running_rows_untouched(self, tmp_path):
+        """Rows started just before reconcile (within the grace window) are
+        NOT stale — they must survive untouched."""
+        db_path = str(tmp_path / "fresh.db")
+        now = int(time.time() * 1000)
+
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_render_job(writer, "rj-fresh", "running", started_ms=now)
+        _insert_walk_run(
+            writer, "wr-fresh", "running", created_ms=now, heartbeat_ms=now
+        )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.reconcile_stale_runs()
+            assert counts == {"render_job": 0, "walk_run": 0}
+            jobs = adapter.execute_query(
+                "SELECT job_id, status FROM render_job"
+            )
+            assert jobs == [{"job_id": "rj-fresh", "status": "running"}]
+            runs = adapter.execute_query(
+                "SELECT run_id, status FROM walk_run"
+            )
+            assert runs == [{"run_id": "wr-fresh", "status": "running"}]
+        finally:
+            adapter.close()
+
+    def test_reconcile_leaves_terminal_rows_untouched(self, tmp_path):
+        """completed/failed/cancelled/interrupted (and pending) rows are never
+        flipped — the predicate targets status='running' only, even when the
+        timestamps are old."""
+        db_path = str(tmp_path / "terminal.db")
+        stale = int(time.time() * 1000) - _STALE_AGE_MS
+
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        for status in ("completed", "failed", "cancelled", "interrupted"):
+            _insert_render_job(writer, f"rj-{status}", status, started_ms=stale)
+            _insert_walk_run(writer, f"wr-{status}", status, created_ms=stale)
+        _insert_walk_run(writer, "wr-pending", "pending", created_ms=stale)
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.reconcile_stale_runs()
+            assert counts == {"render_job": 0, "walk_run": 0}
+            jobs = {
+                row["job_id"]: row["status"]
+                for row in adapter.execute_query(
+                    "SELECT job_id, status FROM render_job"
+                )
+            }
+            assert jobs == {
+                f"rj-{s}": s for s in ("completed", "failed", "cancelled", "interrupted")
+            }
+            runs = {
+                row["run_id"]: row["status"]
+                for row in adapter.execute_query(
+                    "SELECT run_id, status FROM walk_run"
+                )
+            }
+            assert runs == {
+                **{
+                    f"wr-{s}": s
+                    for s in ("completed", "failed", "cancelled", "interrupted")
+                },
+                "wr-pending": "pending",
+            }
+        finally:
+            adapter.close()
+
+    def test_reconcile_is_idempotent_second_call_flips_nothing(self, tmp_path):
+        """One pass only: after the first reconcile flips the stale rows, a
+        second call must flip nothing new (contract rule #5 — no sweeper)."""
+        db_path = str(tmp_path / "idempotent.db")
+        stale = int(time.time() * 1000) - _STALE_AGE_MS
+
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_render_job(writer, "rj-stale", "running", started_ms=stale)
+        _insert_walk_run(writer, "wr-stale", "running", created_ms=stale)
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            first = adapter.reconcile_stale_runs()
+            assert first == {"render_job": 1, "walk_run": 1}
+            second = adapter.reconcile_stale_runs()
+            assert second == {"render_job": 0, "walk_run": 0}
+        finally:
+            adapter.close()
+
+    def test_reconcile_is_safe_on_empty_db(self, tmp_path):
+        """Reconcile must be a no-op on a freshly initialised (empty) DB."""
+        adapter = SQLiteAdapter(db_path=str(tmp_path / "empty.db"))
+        adapter.init_db()
+        try:
+            assert adapter.reconcile_stale_runs() == {
+                "render_job": 0,
+                "walk_run": 0,
+            }
+        finally:
+            adapter.close()
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_reconcile_flips_stale_rows_on_both_adapters(
+        self, adapter_name, request
+    ):
+        """Both adapters expose the same reconcile behavior (mirror parity):
+        stale rows flip, fresh rows survive."""
+        adapter = request.getfixturevalue(adapter_name)
+        stale = int(time.time() * 1000) - _STALE_AGE_MS
+        now = int(time.time() * 1000)
+        _insert_render_job(adapter, "rj-stale", "running", started_ms=stale)
+        _insert_render_job(adapter, "rj-fresh", "running", started_ms=now)
+        _insert_walk_run(
+            adapter, "wr-stale", "running", created_ms=stale, heartbeat_ms=stale
+        )
+        _insert_walk_run(adapter, "wr-nohb", "running", created_ms=stale)
+        _insert_walk_run(
+            adapter, "wr-fresh", "running", created_ms=now, heartbeat_ms=now
+        )
+
+        counts = adapter.reconcile_stale_runs()
+
+        assert counts == {"render_job": 1, "walk_run": 2}
+        flipped_jobs = {
+            row["job_id"]
+            for row in adapter.execute_query(
+                "SELECT job_id FROM render_job WHERE status = 'interrupted'"
+            )
+        }
+        assert flipped_jobs == {"rj-stale"}
+        flipped_runs = {
+            row["run_id"]
+            for row in adapter.execute_query(
+                "SELECT run_id FROM walk_run WHERE status = 'interrupted'"
+            )
+        }
+        assert flipped_runs == {"wr-stale", "wr-nohb"}
+
+
+class TestReconcileStartupWiring:
+    """The production storage bootstrap must run exactly one reconcile pass,
+    after init_db(), before the API serves any request."""
+
+    def test_production_storage_bootstrap_runs_reconcile_once(self, monkeypatch):
+        import app.pipeline.api_onboard as api_onboard
+
+        fake = MagicMock()
+        monkeypatch.setattr(api_onboard, "_storage", None)
+        monkeypatch.setattr(api_onboard, "SQLiteAdapter", lambda db_path: fake)
+
+        first = api_onboard._get_production_storage()
+        assert first is fake
+        fake.init_db.assert_called_once_with()
+        fake.reconcile_stale_runs.assert_called_once_with()
+
+        # The singleton short-circuits subsequent calls: no second reconcile.
+        second = api_onboard._get_production_storage()
+        assert second is fake
+        fake.reconcile_stale_runs.assert_called_once_with()

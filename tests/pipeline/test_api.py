@@ -991,6 +991,76 @@ class TestBackgroundRender:
 
 
 # ---------------------------------------------------------------------------
+# P3-S3: render_status reads render_job / render_chunk rows (rows = truth)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderStatusFromRows:
+    """GET /render_status is backed by the render_job row, not the dict."""
+
+    def test_status_reads_render_job_row(self, client, storage):
+        """A job registered only as a row is served from the row."""
+        job_id = "row-status-1"
+        storage.execute_insert(
+            "INSERT INTO render_job "
+            "(job_id, book_id, mode, status, output_dir) "
+            "VALUES (?, 'b1', 'batch', 'completed', '/tmp/out')",
+            (job_id,),
+        )
+        response = client.get(f"/api/pipeline/render_status/{job_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["job_id"] == job_id
+        assert data["status"] == "completed"
+        assert data["output_dir"] == "/tmp/out"
+        assert data["mode"] == "batch"
+
+    def test_individual_mode_returns_chunk_counts(self, client, storage):
+        """Individual-mode jobs report per-chunk counts from render_chunk rows."""
+        job_id = "row-status-2"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status) "
+            "VALUES (?, 'b1', 'individual', 'running')",
+            (job_id,),
+        )
+        for idx, status in ((0, "done"), (1, "done"), (2, "failed")):
+            storage.execute_insert(
+                "INSERT INTO render_chunk (job_id, idx, status) VALUES (?, ?, ?)",
+                (job_id, idx, status),
+            )
+        response = client.get(f"/api/pipeline/render_status/{job_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["mode"] == "individual"
+        assert data["completed_chunks"] == 2
+        assert data["total_chunks"] == 3
+        assert data["failed_chunks"] == 1
+
+    def test_row_backed_end_to_end_individual_render(self, client, tts_engine):
+        """An individual render via the API ends with completed chunks in the row."""
+        import time
+
+        response = client.post(
+            "/api/pipeline/render",
+            json={"book_id": "b1", "use_batch": False},
+        )
+        assert response.status_code == 200
+        job_id = response.json()["job_id"]
+        for _ in range(50):
+            status_resp = client.get(f"/api/pipeline/render_status/{job_id}")
+            status = status_resp.json()["status"]
+            if status in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+        assert status == "completed"
+        data = status_resp.json()
+        # The test_api storage fixture's book b1 has exactly one span
+        assert data["completed_chunks"] == 1
+        assert data["total_chunks"] == 1
+        assert data["failed_chunks"] == 0
+
+
+# ---------------------------------------------------------------------------
 # P3-S11: Cancellation — cancel flag aborts render
 # ---------------------------------------------------------------------------
 
@@ -1258,3 +1328,254 @@ class TestMergeEndpoint:
             assert os.path.getsize(result["output_path"]) > 0
         finally:
             del api_export._render_jobs[job_id]
+
+
+# ---------------------------------------------------------------------------
+# P5-S1: Persisted cancel + jobs/chunks/runs endpoint surface
+# ---------------------------------------------------------------------------
+
+
+class TestCancelRenderPersistence:
+    """POST /cancel_render marks cancel intent; the row lands on 'cancelled'.
+
+    Schema-compatible interpretation (manager decision L20 — documented at
+    the cancel_render endpoint): the render_job.status CHECK constraint
+    allows only ('pending','running','completed','failed','cancelled',
+    'interrupted','expired') and render_job has NO cancel flag column, so
+    the CONTRACTS/DD wording "status cancelling + persisted cancel flag"
+    is not storable.  The cancel intent is carried by the in-process
+    cancel_event; the row reaches the terminal schema-valid status
+    'cancelled' when the background job task observes the event (P3
+    CancelledError path).  404-unknown and already_finished are covered by
+    the pre-existing TestCancellation tests.
+    """
+
+    def test_cancel_running_job_marks_intent_and_row_cancelled(self, client, storage):
+        """Cancel on a running job sets the event and the row ends 'cancelled'."""
+        import threading
+        import time
+
+        from app.pipeline import api_export
+        from app.pipeline.tts_integration import CancelledError
+
+        job_id = "cancel-run-1"
+        cancel_event = threading.Event()
+        api_export._render_jobs[job_id] = {
+            "status": "running",
+            "output_dir": None,
+            "error": None,
+            "cancel_event": cancel_event,
+        }
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, created_ms, "
+            "started_ms) VALUES (?, 'b1', 'batch', 'running', ?, ?)",
+            (job_id, now, now),
+        )
+        try:
+            resp = client.post("/api/pipeline/cancel_render", json={"job_id": job_id})
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "cancelled"
+            assert resp.json()["job_id"] == job_id
+            # Cancel intent is recorded on the in-process channel
+            assert cancel_event.is_set()
+
+            # The background job task observes the cancellation: the P3
+            # CancelledError path lands the row on the terminal status.
+            with patch.object(
+                api_export,
+                "render_audiobook",
+                side_effect=CancelledError("Render cancelled"),
+            ):
+                api_export._run_render_job(
+                    job_id, "b1", storage, MagicMock(), True, None, -1
+                )
+
+            rows = storage.execute_query(
+                "SELECT status, finished_ms FROM render_job WHERE job_id = ?",
+                (job_id,),
+            )
+            assert rows[0]["status"] == "cancelled"
+            assert rows[0]["finished_ms"] is not None
+            assert api_export._render_jobs[job_id]["status"] == "cancelled"
+        finally:
+            del api_export._render_jobs[job_id]
+
+
+class TestCancelWalksPersistence:
+    """POST /cancel_walks persists walk_run.cancel_requested=1 on active rows."""
+
+    def test_cancel_walks_writes_cancel_requested_on_active_rows(
+        self, client, storage, walk_runner, tmp_path
+    ):
+        """Cancel persists the flag on running rows; terminal rows untouched."""
+        import time
+
+        # Keep the runner's stop-files out of the repo data/ dir
+        walk_runner.stop_file_dir = str(tmp_path)
+
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES ('wr-run-1', 'b1', 'walk_2a_scene_segmentation', 'running', ?)",
+            (now,),
+        )
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES ('wr-done-1', 'b1', 'walk_2a_scene_segmentation', 'completed', ?)",
+            (now,),
+        )
+
+        resp = client.post("/api/pipeline/cancel_walks", json={"book_id": "b1"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cancelled"
+
+        rows = storage.execute_query(
+            "SELECT run_id, cancel_requested FROM walk_run WHERE book_id = 'b1' "
+            "ORDER BY run_id"
+        )
+        flags = {r["run_id"]: r["cancel_requested"] for r in rows}
+        assert flags["wr-run-1"] == 1
+        assert flags["wr-done-1"] == 0
+
+
+class TestExportJobsEndpoint:
+    """GET /api/pipeline/export/jobs/{job_id} returns the render_job row."""
+
+    def test_export_jobs_returns_job_detail(self, client, storage):
+        """A known job returns the full ExportJobDetail field set."""
+        job_id = "job-detail-1"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, error, output_dir, "
+            "output_artifact_path, created_ms, started_ms, finished_ms) "
+            "VALUES (?, 'b1', 'individual', 'completed', NULL, '/tmp/out', "
+            "'/tmp/out/audiobook.m4b', 1000, 1000, 2000)",
+            (job_id,),
+        )
+        resp = client.get(f"/api/pipeline/export/jobs/{job_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["job_id"] == job_id
+        assert data["book_id"] == "b1"
+        assert data["mode"] == "individual"
+        assert data["status"] == "completed"
+        assert data["error"] is None
+        assert data["output_dir"] == "/tmp/out"
+        assert data["output_artifact_path"] == "/tmp/out/audiobook.m4b"
+        assert data["created_ms"] == 1000
+        assert data["started_ms"] == 1000
+        assert data["finished_ms"] == 2000
+
+    def test_export_jobs_unknown_job_404(self, client):
+        """An unknown job_id returns 404."""
+        resp = client.get("/api/pipeline/export/jobs/nonexistent-job")
+        assert resp.status_code == 404
+        assert "Unknown job_id" in resp.json()["detail"]
+
+
+class TestExportJobsChunksEndpoint:
+    """GET /api/pipeline/export/jobs/{job_id}/chunks returns render_chunk rows."""
+
+    def test_export_jobs_chunks_returns_rows(self, client, storage):
+        """A known individual-mode job returns its chunk rows ordered by idx."""
+        job_id = "job-chunks-1"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status) "
+            "VALUES (?, 'b1', 'individual', 'completed')",
+            (job_id,),
+        )
+        storage.execute_insert(
+            "INSERT INTO render_chunk (job_id, idx, status, wav_path, error) "
+            "VALUES (?, 0, 'done', '/tmp/out/chunk_0000.wav', NULL)",
+            (job_id,),
+        )
+        storage.execute_insert(
+            "INSERT INTO render_chunk (job_id, idx, status, wav_path, error) "
+            "VALUES (?, 1, 'failed', NULL, 'TTS error on chunk 1')",
+            (job_id,),
+        )
+        resp = client.get(f"/api/pipeline/export/jobs/{job_id}/chunks")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+        assert len(data) == 2
+        first, second = data
+        assert first["job_id"] == job_id
+        assert first["idx"] == 0
+        assert first["status"] == "done"
+        assert first["wav_path"] == "/tmp/out/chunk_0000.wav"
+        assert first["error"] is None
+        assert second["idx"] == 1
+        assert second["status"] == "failed"
+        assert second["wav_path"] is None
+        assert second["error"] == "TTS error on chunk 1"
+
+    def test_export_jobs_chunks_empty_for_batch(self, client, storage):
+        """A batch-mode job (no chunk rows by contract) returns an empty list."""
+        job_id = "job-chunks-batch"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status) "
+            "VALUES (?, 'b1', 'batch', 'completed')",
+            (job_id,),
+        )
+        resp = client.get(f"/api/pipeline/export/jobs/{job_id}/chunks")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_export_jobs_chunks_unknown_job_404(self, client):
+        """An unknown job_id returns 404."""
+        resp = client.get("/api/pipeline/export/jobs/nonexistent-job/chunks")
+        assert resp.status_code == 404
+        assert "Unknown job_id" in resp.json()["detail"]
+
+
+class TestWalkRunsEndpoint:
+    """GET /api/pipeline/walks/{book_id}/runs returns walk_run rows newest-first."""
+
+    def test_walk_runs_newest_first(self, client, storage):
+        """Rows are returned ordered by created_ms DESC with the WalkRunRow fields."""
+        import time
+
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, heartbeat_ms, "
+            "created_ms, finished_ms, error) "
+            "VALUES ('wr-new', 'b1', 'walk_2a_scene_segmentation', 'completed', ?, ?, ?, NULL)",
+            (now, now, now),
+        )
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES ('wr-old', 'b1', 'walk_2b_persona_discovery', 'failed', ?)",
+            (now - 5000,),
+        )
+
+        resp = client.get("/api/pipeline/walks/b1/runs")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+        assert [r["run_id"] for r in data] == ["wr-new", "wr-old"]
+
+        newest = data[0]
+        assert newest["run_id"] == "wr-new"
+        assert newest["walk_name"] == "walk_2a_scene_segmentation"
+        assert newest["status"] == "completed"
+        assert newest["heartbeat_ms"] == now
+        assert newest["created_ms"] == now
+        assert newest["finished_ms"] == now
+        assert newest["error"] is None
+        # WalkRunRow DTO does not include cancel_requested/result_json
+        assert set(newest.keys()) == {
+            "run_id",
+            "walk_name",
+            "status",
+            "heartbeat_ms",
+            "created_ms",
+            "finished_ms",
+            "error",
+        }
+
+    def test_walk_runs_empty_book(self, client):
+        """A book with no runs returns an empty list."""
+        resp = client.get("/api/pipeline/walks/nonexistent/runs")
+        assert resp.status_code == 200
+        assert resp.json() == []

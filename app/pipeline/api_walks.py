@@ -142,10 +142,39 @@ async def cancel_walks(
     """Cancel any running walks for a book.
 
     Sets a cancellation flag that the runner checks before each walk.
+    The request is persisted — ``cancel_requested = 1`` on the book's
+    active (pending/running) ``walk_run`` rows with a heartbeat refresh,
+    plus a stop-file per active run so the cancel survives a restart.
     Returns ``{status: 'cancelled'}``.
     """
     runner.cancel_walks(request.book_id)
     return {"status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipeline/walks/{book_id}/runs
+# ---------------------------------------------------------------------------
+
+
+@router.get("/walks/{book_id}/runs")
+async def get_walk_runs(
+    book_id: str,
+    storage: PipelineStorage = Depends(get_storage),
+) -> list[dict]:
+    """Return the ``walk_run`` rows for a book, newest-first (WalkRunRow DTO).
+
+    Ordered by ``created_ms`` DESC so the most recent run appears first.
+    A book with no runs returns an empty list.  Rows = truth: the
+    response is the row's field set (run_id, walk_name, status,
+    heartbeat_ms, created_ms, finished_ms, error).
+    """
+    rows = storage.execute_query(
+        "SELECT run_id, walk_name, status, heartbeat_ms, created_ms, "
+        "finished_ms, error FROM walk_run WHERE book_id = ? "
+        "ORDER BY created_ms DESC",
+        (book_id,),
+    )
+    return rows
 
 
 # ---------------------------------------------------------------------------

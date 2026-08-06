@@ -14,15 +14,18 @@ Covers:
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+import time
 import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.pipeline.adapter import InMemorySQLiteAdapter
+from app.pipeline.adapter import ConcurrentTransactionError, InMemorySQLiteAdapter
 from app.pipeline.walks.order import WALK_ORDER
-from app.pipeline.walks.runner import WalkRunner
+from app.pipeline.walks.runner import HeartbeatStorage, WalkRunner
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,51 @@ def _make_mock_walk_module(execute_fn=None):
     mock_module = types.ModuleType("mock_walk")
     mock_module.execute = execute_fn or MagicMock(return_value={"status": "completed"})
     return mock_module
+
+
+class _FlakyStorage:
+    """Storage proxy that raises ConcurrentTransactionError on walk writes.
+
+    Simulates the non-owner-thread case from adapter.py: a write attempted
+    while another thread owns an open transaction. The first ``fail_attempts``
+    non-heartbeat writes (the walk's idempotent write) raise
+    ``ConcurrentTransactionError``; later ones delegate to the real adapter.
+    The runner's own walk_run bookkeeping always contains ``heartbeat_ms`` in
+    its SQL, so those writes pass through untouched and never pollute the
+    attempt counters. Each walk-write attempt also records a
+    ``time.monotonic()`` stamp so tests can assert the 50-100ms backoff gap.
+    """
+
+    def __init__(self, real, fail_attempts):
+        self._real = real
+        self._fail_attempts = fail_attempts
+        self._walk_write_attempts = 0
+        self._attempt_times: list[float] = []
+
+    def _dispatch(self, method, sql, params):
+        if "heartbeat_ms" not in sql:
+            self._walk_write_attempts += 1
+            self._attempt_times.append(time.monotonic())
+            if self._walk_write_attempts <= self._fail_attempts:
+                raise ConcurrentTransactionError(
+                    "write from thread 2 while transaction is owned by thread 1"
+                )
+        return getattr(self._real, method)(sql, params)
+
+    def execute_insert(self, sql, params=()):
+        return self._dispatch("execute_insert", sql, params)
+
+    def execute_update(self, sql, params=()):
+        return self._dispatch("execute_update", sql, params)
+
+    def execute_delete(self, sql, params=()):
+        return self._dispatch("execute_delete", sql, params)
+
+    def execute_query(self, sql, params=()):
+        return self._real.execute_query(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +136,14 @@ class TestRunWalk:
             patch.object(WalkRunner, "_run_verification", return_value=True),
         ):
             result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
-        mock_execute.assert_called_once_with("book-1", runner._storage, {})
+        mock_execute.assert_called_once()
+        call_args = mock_execute.call_args.args
+        assert call_args[0] == "book-1"
+        # Walk modules receive the heartbeat-tracking storage wrapper around
+        # the raw adapter (Phase 2 heartbeat mechanism).
+        assert isinstance(call_args[1], HeartbeatStorage)
+        assert call_args[1].storage is runner._storage
+        assert call_args[2] == {}
         assert result["status"] == "completed"
 
     def test_run_walk_returns_execute_result(self, runner):
@@ -112,7 +167,12 @@ class TestRunWalk:
             patch.object(WalkRunner, "_run_verification", return_value=True),
         ):
             runner.run_walk("walk_2a_scene_segmentation", "book-1", config)
-        mock_execute.assert_called_once_with("book-1", runner._storage, config)
+        mock_execute.assert_called_once()
+        call_args = mock_execute.call_args.args
+        assert call_args[0] == "book-1"
+        assert isinstance(call_args[1], HeartbeatStorage)
+        assert call_args[1].storage is runner._storage
+        assert call_args[2] == config
 
 
 # ---------------------------------------------------------------------------
@@ -446,3 +506,403 @@ class TestCancellation:
         # All walks should be cancelled
         for walk_name, result in results.items():
             assert result["status"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Test walk_run persistence (Phase 2: rows = truth)
+# ---------------------------------------------------------------------------
+
+
+class TestWalkRunPersistence:
+    """Spec-first tests: run_walk/run_all_walks write walk_run rows.
+
+    P2-S1 (RED): these fail against the in-memory-only implementation.
+    """
+
+    def test_run_walk_creates_running_row_at_start(self, runner):
+        """A walk_run row (status running, created_ms) exists while executing."""
+        seen = []
+
+        def execute_fn(book_id, storage, config):
+            rows = storage.execute_query(
+                "SELECT run_id, status, created_ms, heartbeat_ms "
+                "FROM walk_run WHERE book_id = ?",
+                (book_id,),
+            )
+            seen.append(rows)
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        assert result["status"] == "completed"
+        assert len(seen) == 1
+        assert len(seen[0]) == 1
+        assert seen[0][0]["status"] == "running"
+        assert seen[0][0]["created_ms"] is not None
+
+    def test_run_walk_writes_completed_row_with_result_json(self, runner):
+        """On success the row flips to completed with result_json + finished_ms."""
+        expected = {"status": "completed", "scenes": 3}
+        mock_module = _make_mock_walk_module(MagicMock(return_value=expected))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        rows = runner._storage.execute_query(
+            "SELECT status, result_json, finished_ms, heartbeat_ms "
+            "FROM walk_run WHERE book_id = ?",
+            ("book-1",),
+        )
+        assert len(rows) == 1
+        assert rows[0]["status"] == "completed"
+        assert json.loads(rows[0]["result_json"]) == expected
+        assert rows[0]["finished_ms"] is not None
+
+    def test_run_walk_writes_failed_row_on_exception(self, runner):
+        """On exception the row flips to failed with the error text."""
+        mock_module = _make_mock_walk_module(
+            MagicMock(side_effect=RuntimeError("boom"))
+        )
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        assert result["status"] == "failed"
+        rows = runner._storage.execute_query(
+            "SELECT status, error, finished_ms FROM walk_run WHERE book_id = ?",
+            ("book-1",),
+        )
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert "boom" in rows[0]["error"]
+        assert rows[0]["finished_ms"] is not None
+
+    def test_walk_writes_refresh_heartbeat(self, runner):
+        """Writes through the heartbeat wrapper refresh walk_run.heartbeat_ms.
+
+        Phase 2 heartbeat mechanism: the walk module receives a
+        HeartbeatStorage wrapper; each write through it stamps a fresh
+        heartbeat_ms on the run's row.
+        """
+        captured = {}
+
+        def execute_fn(book_id, storage, config):
+            rows = storage.execute_query(
+                "SELECT run_id, heartbeat_ms FROM walk_run WHERE book_id = ?",
+                (book_id,),
+            )
+            captured["run_id"] = rows[0]["run_id"]
+            captured["before"] = rows[0]["heartbeat_ms"]
+            # A write through the wrapper must refresh the row heartbeat.
+            storage.execute_update(
+                "UPDATE walk_run SET cancel_requested = cancel_requested "
+                "WHERE run_id = ?",
+                (captured["run_id"],),
+            )
+            after = storage.execute_query(
+                "SELECT heartbeat_ms FROM walk_run WHERE run_id = ?",
+                (captured["run_id"],),
+            )
+            captured["after"] = after[0]["heartbeat_ms"]
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        assert result["status"] == "completed"
+        assert captured["after"] >= captured["before"]
+        # Final transition also stamps heartbeat_ms.
+        rows = runner._storage.execute_query(
+            "SELECT heartbeat_ms FROM walk_run WHERE run_id = ?",
+            (captured["run_id"],),
+        )
+        assert rows[0]["heartbeat_ms"] >= captured["after"]
+
+    def test_run_all_walks_writes_row_per_walk(self, runner):
+        """run_all_walks records one walk_run row per walk, completed."""
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            results = runner.run_all_walks("book-1", {})
+        assert len(results) == len(WALK_ORDER)
+        rows = runner._storage.execute_query(
+            "SELECT walk_name, status FROM walk_run WHERE book_id = ?",
+            ("book-1",),
+        )
+        assert len(rows) == len(WALK_ORDER)
+        by_name = {row["walk_name"]: row["status"] for row in rows}
+        for walk_name in WALK_ORDER:
+            assert by_name[walk_name] == "completed"
+
+    def test_each_run_gets_a_fresh_run_id(self, runner):
+        """Every run_walk invocation records a distinct run_id (uuid4)."""
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+            runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        rows = runner._storage.execute_query(
+            "SELECT run_id FROM walk_run WHERE book_id = ?",
+            ("book-1",),
+        )
+        assert len(rows) == 2
+        assert rows[0]["run_id"] != rows[1]["run_id"]
+
+
+# ---------------------------------------------------------------------------
+# Test is_cancel_requested dispatcher (Phase 2: persisted cancel)
+# ---------------------------------------------------------------------------
+
+
+class TestCancelDispatcher:
+    """Spec-first tests: cancel_walks persists cancel_requested=1 on active
+    walk_run rows and is_cancel_requested(run_id) reads row + stop-file + event."""
+
+    def _run_one(self, runner):
+        """Run one walk to completion and return its run_id."""
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        rows = runner._storage.execute_query(
+            "SELECT run_id FROM walk_run WHERE book_id = ?",
+            ("book-1",),
+        )
+        return rows[0]["run_id"]
+
+    def test_is_cancel_requested_false_by_default(self, runner):
+        """A fresh, never-cancelled run reports not-cancelled."""
+        run_id = self._run_one(runner)
+        assert runner.is_cancel_requested(run_id) is False
+
+    def test_cancel_walks_persists_cancel_requested(self, runner):
+        """cancel_walks persists cancel_requested=1 on active walk_run rows."""
+        seen = {}
+
+        def execute_fn(book_id, storage, config):
+            rows = storage.execute_query(
+                "SELECT run_id FROM walk_run WHERE book_id = ?",
+                (book_id,),
+            )
+            seen["run_id"] = rows[0]["run_id"]
+            # Cancel while the walk is running (row is active)
+            runner.cancel_walks(book_id)
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        assert result["status"] == "completed"
+        run_id = seen["run_id"]
+        rows = runner._storage.execute_query(
+            "SELECT cancel_requested FROM walk_run WHERE run_id = ?",
+            (run_id,),
+        )
+        assert rows[0]["cancel_requested"] == 1
+        assert runner.is_cancel_requested(run_id) is True
+
+    def test_is_cancel_requested_reads_stop_file(self, runner, tmp_path):
+        """A persisted stop-file alone marks the run as cancelled."""
+        runner.stop_file_dir = str(tmp_path)
+        run_id = self._run_one(runner)
+        assert runner.is_cancel_requested(run_id) is False
+        path = runner._stop_file_path(run_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("1")
+        assert runner.is_cancel_requested(run_id) is True
+
+    def test_is_cancel_requested_reads_event(self, runner):
+        """The in-process per-book event alone marks a run as cancelled."""
+        run_id = self._run_one(runner)
+        # Cancel after completion: the row is no longer active, so only the
+        # in-process event is set (no persisted sources for this run_id).
+        runner.cancel_walks("book-1")
+        rows = runner._storage.execute_query(
+            "SELECT cancel_requested FROM walk_run WHERE run_id = ?",
+            (run_id,),
+        )
+        assert rows[0]["cancel_requested"] == 0
+        assert runner.is_cancel_requested(run_id) is True
+
+
+# ---------------------------------------------------------------------------
+# Test walk-side retry on ConcurrentTransactionError (Phase 7: P7-S1..S3)
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentTransactionRetry:
+    """Spec-first tests: the walk-unit write boundary retries
+    ``ConcurrentTransactionError`` with 50-100ms backoff x3 (4 total attempts
+    = initial + 3 retries, per contract rule #6), then fails the unit
+    (walk_run row marked failed with the error recorded).
+
+    The retry is a pure re-dispatch of a single write method — never a
+    re-execution of the walk unit — so the walk's SELECT -> LLM -> write flow
+    (including the LLM call) runs exactly once.
+    """
+
+    WALK = "walk_2a_scene_segmentation"
+    # The walk's idempotent write. Distinct from all runner bookkeeping SQL
+    # (walk_run rows always mention heartbeat_ms), so _FlakyStorage only
+    # fails this write.
+    WRITE_SQL = "UPDATE book SET version = version + 1 WHERE id = ?"
+
+    def _run_walk(self, runner, execute_fn):
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            return runner.run_walk(self.WALK, "book-1", {})
+
+    def test_concurrent_error_retries_up_to_3_then_fails_unit(self, runner):
+        """A write that keeps raising is attempted 4 times (initial + 3
+        retries), then the unit fails and the walk_run row is marked failed
+        with the error recorded.
+        """
+        flaky = _FlakyStorage(runner._storage, fail_attempts=10)
+        runner._storage = flaky
+
+        def execute_fn(book_id, storage, config):
+            storage.execute_update(self.WRITE_SQL, (book_id,))
+            return {"status": "completed"}
+
+        result = self._run_walk(runner, execute_fn)
+        assert result["status"] == "failed"
+        # The runner records str(exc) — the adapter's raise message, mirroring
+        # the real non-owner-thread text from adapter.py.
+        assert "transaction is owned by thread" in result["error"]
+        # Contract rule #6 / DD line 105: 'retry idempotent write x3, then
+        # fail unit' = 3 retries = 4 total attempts (initial + 3 retries).
+        assert flaky._walk_write_attempts == 4
+        # The re-raised error hits the runner's existing failure path, which
+        # records it on the walk_run row.
+        rows = flaky.execute_query(
+            "SELECT status, error FROM walk_run WHERE book_id = ?",
+            ("book-1",),
+        )
+        assert rows[0]["status"] == "failed"
+        assert "transaction is owned by thread" in rows[0]["error"]
+
+    def test_write_succeeds_on_second_attempt(self, runner):
+        """A write that fails once then succeeds completes on retry 2 — no
+        unit failure, exactly 2 write attempts."""
+        flaky = _FlakyStorage(runner._storage, fail_attempts=1)
+        runner._storage = flaky
+
+        def execute_fn(book_id, storage, config):
+            storage.execute_update(self.WRITE_SQL, (book_id,))
+            return {"status": "completed"}
+
+        result = self._run_walk(runner, execute_fn)
+        assert result["status"] == "completed"
+        assert flaky._walk_write_attempts == 2
+
+    def test_backoff_timestamps_50_100ms_apart(self, runner):
+        """Monotonic timestamps around the retries are ~50ms apart or more.
+
+        The wrapper sleeps uniform(0.05, 0.10) per the contract; monotonic
+        only guarantees the gap is at least the sleep duration. The lower
+        bound is asserted with a small tolerance for scheduler noise; the
+        100ms ceiling is asserted precisely via captured sleep() arguments in
+        ``test_retry_sleeps_50_100ms_per_contract``. CI timing sensitivity:
+        the upper bound here is deliberately loose.
+        """
+        flaky = _FlakyStorage(runner._storage, fail_attempts=10)
+        runner._storage = flaky
+
+        def execute_fn(book_id, storage, config):
+            storage.execute_update(self.WRITE_SQL, (book_id,))
+            return {"status": "completed"}
+
+        result = self._run_walk(runner, execute_fn)
+        assert result["status"] == "failed"
+        times = flaky._attempt_times
+        assert len(times) == 4
+        # >= 50ms per contract (allow 5ms tolerance for scheduler noise).
+        assert times[1] - times[0] >= 0.045
+        assert times[2] - times[1] >= 0.045
+        assert times[3] - times[2] >= 0.045
+        # Loose upper bound: a loaded CI machine can stretch a 100ms sleep.
+        assert times[1] - times[0] < 1.0
+        assert times[2] - times[1] < 1.0
+        assert times[3] - times[2] < 1.0
+
+    def test_retry_sleeps_50_100ms_per_contract(self, runner):
+        """Each backoff sleep() call is within [50ms, 100ms] — the exact
+        contract range, asserted via captured sleep arguments (immune to
+        scheduler noise)."""
+        flaky = _FlakyStorage(runner._storage, fail_attempts=10)
+        runner._storage = flaky
+        real_sleep = time.sleep
+        sleeps = []
+
+        def recording_sleep(seconds):
+            sleeps.append(seconds)
+            real_sleep(seconds)
+
+        def execute_fn(book_id, storage, config):
+            storage.execute_update(self.WRITE_SQL, (book_id,))
+            return {"status": "completed"}
+
+        with patch(
+            "app.pipeline.walks.runner.time.sleep", side_effect=recording_sleep
+        ):
+            result = self._run_walk(runner, execute_fn)
+        assert result["status"] == "failed"
+        # 4 attempts (initial + 3 retries) => 3 backoff sleeps.
+        assert len(sleeps) == 3
+        for seconds in sleeps:
+            assert 0.05 <= seconds <= 0.10
+
+    def test_retry_never_reinvokes_llm(self, runner):
+        """The retry re-dispatches only the write — the walk's LLM call runs
+        exactly once (the SELECT -> LLM -> write flow is never re-executed)."""
+        llm_calls = []
+        flaky = _FlakyStorage(runner._storage, fail_attempts=1)
+        runner._storage = flaky
+
+        def execute_fn(book_id, storage, config):
+            llm_calls.append("chat_completion")  # the walk's LLM call site
+            storage.execute_update(self.WRITE_SQL, (book_id,))
+            return {"status": "completed"}
+
+        result = self._run_walk(runner, execute_fn)
+        assert result["status"] == "completed"
+        assert llm_calls == ["chat_completion"]
+        assert flaky._walk_write_attempts == 2
+
+    def test_happy_path_writes_once_no_retry(self, runner):
+        """No contention: exactly one write attempt, no backoff sleeps."""
+        flaky = _FlakyStorage(runner._storage, fail_attempts=0)
+        runner._storage = flaky
+
+        def execute_fn(book_id, storage, config):
+            storage.execute_update(self.WRITE_SQL, (book_id,))
+            return {"status": "completed"}
+
+        result = self._run_walk(runner, execute_fn)
+        assert result["status"] == "completed"
+        assert flaky._walk_write_attempts == 1

@@ -48,8 +48,15 @@ def _get_production_storage() -> PipelineStorage:
     global _storage
     if _storage is None:
         db_path = os.environ.get("PIPELINE_DB_PATH", "./data/pipeline.db")
-        _storage = SQLiteAdapter(db_path)
-        _storage.init_db()
+        adapter = SQLiteAdapter(db_path)
+        adapter.init_db()
+        # Startup-only reconciliation (contract rule #5): one pass flips stale
+        # running render_job/walk_run rows to interrupted BEFORE the API serves
+        # any request.  No on-read sweeper, no periodic reaper — single-process
+        # deployment is race-free by construction.  Runs once, on first
+        # acquisition, before any request can be handled.
+        adapter.reconcile_stale_runs()
+        _storage = adapter
     return _storage
 
 

@@ -5,19 +5,30 @@ Each walk module lives under ``app.pipeline.walks`` and exposes an
 ``execute(book_id, storage, config)`` function. Walks run one at a time;
 each consumes the prior walk's output.
 
-Walk status is tracked in-memory (no schema change) with states:
-pending → running → completed | failed.
+Walk status is tracked in-memory (the ``_status`` dict — frontend contract)
+AND persisted: every ``run_walk`` invocation records a fresh ``walk_run``
+row (running → completed | failed | cancelled) with created_ms,
+finished_ms, result_json, error and heartbeat_ms (rows = truth).
+``is_cancel_requested`` is the single cancellation dispatcher over the DB
+row flag, a persisted stop-file, and the in-process per-book event.
 """
 
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+import os
+import random
+import time
+import uuid
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
+
+from app.pipeline.adapter import ConcurrentTransactionError
 
 from .order import WALK_ORDER
 
@@ -26,6 +37,65 @@ logger = logging.getLogger(__name__)
 # Type alias for verification functions.
 # Signature: (book_id, storage) -> bool
 VerifyFn = Callable[[str, "PipelineStorage"], bool]
+
+
+def _now_ms() -> int:
+    """Current time as INTEGER unix milliseconds (schema convention)."""
+    return int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Walk-side retry on ConcurrentTransactionError (contract rule #6)
+# ---------------------------------------------------------------------------
+
+# A ConcurrentTransactionError on the idempotent write phase is retried with a
+# 50-100ms backoff x3 (contract rule #6 / DD-universal-upgrade.md line 105:
+# "retry idempotent write phase x3, then fail unit"), i.e. 4 total attempts
+# (initial + 3 retries), then the unit fails. The retry wraps ONLY
+# the storage write call: it is a pure re-dispatch of one execute_* method
+# (SQL + params only), never a re-execution of the walk unit — so the walk's
+# SELECT -> LLM -> write flow (including the LLM call in _llm_helpers) is never
+# re-invoked by a retry.
+_MAX_WRITE_RETRIES = 3  # contract rule #6: retry the idempotent write x3
+# Total attempts = initial + 3 retries (contract counts retries, not attempts).
+_MAX_WRITE_ATTEMPTS = _MAX_WRITE_RETRIES + 1
+_BACKOFF_MIN_S = 0.05    # contract lower bound: 50 ms
+_BACKOFF_MAX_S = 0.10    # contract upper bound: 100 ms
+
+
+def _retry_write(write_fn: Callable[[], int]) -> int:
+    """Dispatch an idempotent storage write under the retry contract.
+
+    ``write_fn`` must be a thunk performing exactly one write-method dispatch
+    (``execute_insert``/``execute_update``/``execute_delete``) on the
+    underlying adapter — it closes over only the SQL and params, nothing else,
+    so a retry can never re-execute the walk unit or re-invoke an LLM call.
+    On ``ConcurrentTransactionError`` the write is re-dispatched after a
+    50-100ms sleep, for ``_MAX_WRITE_RETRIES`` retries (4 total attempts =
+    initial + 3 retries, per contract rule #6); the final error is re-raised
+    so the runner's existing failure path records it on the ``walk_run`` row
+    and marks the unit failed.
+    """
+    for attempt in range(1, _MAX_WRITE_ATTEMPTS + 1):
+        try:
+            return write_fn()
+        except ConcurrentTransactionError:
+            if attempt == _MAX_WRITE_ATTEMPTS:
+                logger.warning(
+                    "ConcurrentTransactionError persisted after %d attempts; "
+                    "failing walk unit",
+                    _MAX_WRITE_ATTEMPTS,
+                )
+                raise
+            logger.warning(
+                "ConcurrentTransactionError on write attempt %d/%d; "
+                "backing off %d-%d ms",
+                attempt,
+                _MAX_WRITE_ATTEMPTS,
+                int(_BACKOFF_MIN_S * 1000),
+                int(_BACKOFF_MAX_S * 1000),
+            )
+            time.sleep(random.uniform(_BACKOFF_MIN_S, _BACKOFF_MAX_S))
 
 
 def _verify_walk_2a(book_id: str, storage: "PipelineStorage") -> bool:
@@ -272,17 +342,87 @@ _VERIFICATIONS: dict[str, VerifyFn] = {
 }
 
 
+class HeartbeatStorage:
+    """Storage proxy that refreshes ``walk_run.heartbeat_ms`` after each write
+    and retries the write boundary on ``ConcurrentTransactionError``.
+
+    Walk modules receive this wrapper in place of the raw adapter so their
+    auto-commit writes double as per-unit heartbeat updates. No walk module
+    opens an explicit ``transaction()`` (verified: zero uses in
+    ``app/pipeline/walks/``), so per-write is the finest heartbeat
+    granularity available without modifying the 9 walk module files — the
+    per-unit transaction pattern is forward-looking (Plan D). Heartbeat is
+    observability-only (DD decision #14); the reconciliation contract only
+    needs the row to carry a heartbeat so a stale ``running`` row is
+    distinguishable from an active one.
+
+    Retry boundary (contract rule #6): every write method re-dispatches its
+    storage write through ``_retry_write``, so a ``ConcurrentTransactionError``
+    (non-owner-thread write / ``BEGIN IMMEDIATE`` timeout — see adapter.py)
+    is retried with a 50-100ms backoff x3 (4 total attempts: initial + 3
+    retries, per contract rule #6), then re-raised so the runner's failure
+    path fails the unit and records the error. The retry
+    is a pure re-dispatch of the single write (SQL + params) — the walk's
+    SELECT -> LLM -> write flow lives entirely inside the walk module, outside
+    this wrapper, so no retry can re-invoke the LLM call. Reads
+    (``execute_query``) are never retried: the contract applies only to the
+    idempotent write phase. All other attributes (``get_connection``,
+    ``transaction``, …) delegate to the wrapped adapter.
+    """
+
+    def __init__(self, storage: "PipelineStorage", run_id: str) -> None:
+        # object.__setattr__ avoids __getattr__ recursion during init.
+        object.__setattr__(self, "storage", storage)
+        object.__setattr__(self, "run_id", run_id)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.storage, name)
+
+    def execute_insert(self, sql: str, params: tuple = ()) -> int:
+        result = _retry_write(lambda: self.storage.execute_insert(sql, params))
+        self._touch()
+        return result
+
+    def execute_update(self, sql: str, params: tuple = ()) -> int:
+        result = _retry_write(lambda: self.storage.execute_update(sql, params))
+        self._touch()
+        return result
+
+    def execute_delete(self, sql: str, params: tuple = ()) -> int:
+        result = _retry_write(lambda: self.storage.execute_delete(sql, params))
+        self._touch()
+        return result
+
+    def _touch(self) -> None:
+        # The heartbeat stamp is itself an idempotent write on the same
+        # boundary, so it gets the same retry treatment.
+        _retry_write(
+            lambda: self.storage.execute_update(
+                "UPDATE walk_run SET heartbeat_ms = ? WHERE run_id = ?",
+                (_now_ms(), self.run_id),
+            )
+        )
+
+
 class WalkRunner:
     """Orchestrates serial execution of pipeline walk modules.
 
     Walks are loaded dynamically by name from ``app.pipeline.walks`` and
-    executed one at a time. Status is tracked in-memory per book.
+    executed one at a time. Status is tracked in-memory per book (the
+    ``_status`` dict drives ``get_walk_status`` — frontend contract
+    unchanged) and persisted to ``walk_run`` rows (rows = truth).
 
     Parameters
     ----------
     storage:
         Pipeline storage adapter for database operations.
     """
+
+    # Directory for persisted cancel stop-files. No location is defined in
+    # the DD or CONTRACTS ledger; chosen ``data/cancel/`` to match the
+    # adapter's ``./data/pipeline.db`` convention (covered by the
+    # gitignored ``data/`` directory). Overridable per instance (tests).
+    stop_file_dir: str = "data/cancel"
 
     def __init__(self, storage: PipelineStorage) -> None:
         self._storage = storage
@@ -295,6 +435,12 @@ class WalkRunner:
         self, walk_name: str, book_id: str, config: dict
     ) -> dict:
         """Execute a single walk by name.
+
+        Records a fresh ``walk_run`` row (status running) before the walk
+        module runs; on success flips the row to completed with
+        ``result_json``; on exception flips it to failed with the error
+        text. The row carries ``created_ms`` and ``heartbeat_ms`` at start
+        and ``finished_ms``/``heartbeat_ms`` at the final transition.
 
         Parameters
         ----------
@@ -310,11 +456,27 @@ class WalkRunner:
         -------
         dict
             Result dict from the walk's ``execute()`` function, or an
-            error dict with ``status='failed'`` on failure.
+            error dict with ``status='failed'`` on failure, or
+            ``{'status': 'cancelled', ...}`` when cancellation was requested
+            before execution.
         """
         self._ensure_book(book_id)
-        # Check cancellation flag before starting
-        if self._cancelled.get(book_id, False):
+        # Refuse a second concurrent walk for the same book (preserved).
+        if self._get_status(book_id, walk_name) == "running":
+            return {
+                "status": "failed",
+                "error": f"Walk '{walk_name}' is already running for book '{book_id}'",
+            }
+        run_id = str(uuid.uuid4())
+        now = _now_ms()
+        self._storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms, heartbeat_ms) "
+            "VALUES (?, ?, ?, 'running', ?, ?)",
+            (run_id, book_id, walk_name, now, now),
+        )
+        # Single cancellation dispatcher — honored before walk execution.
+        if self.is_cancel_requested(run_id):
+            self._finalize_run(run_id, "cancelled", error="Walk cancelled by user")
             self._set_status(book_id, walk_name, "cancelled")
             logger.info(
                 "Walk '%s' cancelled before start for book '%s'",
@@ -322,22 +484,21 @@ class WalkRunner:
                 book_id,
             )
             return {"status": "cancelled", "error": "Walk cancelled by user"}
-        if self._get_status(book_id, walk_name) == "running":
-            return {
-                "status": "failed",
-                "error": f"Walk '{walk_name}' is already running for book '{book_id}'",
-            }
         self._set_status(book_id, walk_name, "running")
         logger.info("Starting walk '%s' for book '%s'", walk_name, book_id)
         try:
             walk_module = self._load_walk_module(walk_name)
         except ImportError as exc:
+            self._finalize_run(run_id, "failed", error=str(exc))
             self._set_status(book_id, walk_name, "failed")
             logger.error("Failed to import walk '%s': %s", walk_name, exc)
             return {"status": "failed", "error": str(exc)}
         try:
-            result = walk_module.execute(book_id, self._storage, config)
+            result = walk_module.execute(
+                book_id, HeartbeatStorage(self._storage, run_id), config
+            )
         except Exception as exc:
+            self._finalize_run(run_id, "failed", error=str(exc))
             self._set_status(book_id, walk_name, "failed")
             logger.error(
                 "Walk '%s' raised exception for book '%s': %s",
@@ -347,6 +508,9 @@ class WalkRunner:
             )
             return {"status": "failed", "error": str(exc)}
         if not self._run_verification(walk_name, book_id):
+            self._finalize_run(
+                run_id, "failed", error=f"Verification failed for walk '{walk_name}'"
+            )
             self._set_status(book_id, walk_name, "failed")
             logger.error(
                 "Walk '%s' verification failed for book '%s'",
@@ -358,12 +522,17 @@ class WalkRunner:
                 "error": f"Verification failed for walk '{walk_name}'",
                 "result": result,
             }
+        self._finalize_run(run_id, "completed", result=result)
         self._set_status(book_id, walk_name, "completed")
         logger.info("Completed walk '%s' for book '%s'", walk_name, book_id)
         return result
 
     def run_all_walks(self, book_id: str, config: dict) -> dict:
         """Execute all walks in canonical order for a book.
+
+        Each walk goes through ``run_walk`` — its own ``walk_run`` row and
+        its own ``is_cancel_requested`` check before execution. Abort-on-
+        first-failure preserved.
 
         Parameters
         ----------
@@ -380,19 +549,6 @@ class WalkRunner:
         self._ensure_book(book_id)
         results: dict[str, dict] = {}
         for walk_name in WALK_ORDER:
-            # Check cancellation flag before each walk
-            if self._cancelled.get(book_id, False):
-                logger.info(
-                    "Walks cancelled before '%s' for book '%s'",
-                    walk_name,
-                    book_id,
-                )
-                self._set_status(book_id, walk_name, "cancelled")
-                results[walk_name] = {
-                    "status": "cancelled",
-                    "error": "Walk cancelled by user",
-                }
-                continue
             result = self.run_walk(walk_name, book_id, config)
             results[walk_name] = result
             if result.get("status") == "failed":
@@ -413,16 +569,63 @@ class WalkRunner:
         return self._get_status(book_id, walk_name)
 
     def cancel_walks(self, book_id: str) -> None:
-        """Set the cancellation flag for a book.
+        """Set the cancellation flag for a book and persist the request.
 
-        The runner checks this flag before each walk and aborts if set.
+        Three sources, all read by ``is_cancel_requested(run_id)``:
+
+        1. sets the in-process per-book event (existing semantics — tests
+           assert the ``_cancelled`` dict directly),
+        2. writes ``cancel_requested=1`` on the book's active
+           (pending/running) ``walk_run`` rows,
+        3. drops a stop-file per active run so the cancel intent survives
+           a process restart.
         """
         self._cancelled[book_id] = True
+        rows = self._storage.execute_query(
+            "SELECT run_id FROM walk_run WHERE book_id = ? "
+            "AND status IN ('pending', 'running')",
+            (book_id,),
+        )
+        for row in rows:
+            run_id = row["run_id"]
+            self._storage.execute_update(
+                "UPDATE walk_run SET cancel_requested = 1, heartbeat_ms = ? "
+                "WHERE run_id = ?",
+                (_now_ms(), run_id),
+            )
+            self._write_stop_file(run_id)
         logger.info("Walks cancelled for book '%s'", book_id)
 
     def clear_cancel(self, book_id: str) -> None:
         """Clear the cancellation flag for a book (e.g. before a new run)."""
         self._cancelled.pop(book_id, None)
+
+    def is_cancel_requested(self, run_id: str) -> bool:
+        """Single cancellation dispatcher: row flag OR stop-file OR event.
+
+        Reads, in order:
+
+        1. the ``walk_run`` row's ``cancel_requested`` flag (persisted by
+           ``cancel_walks``; survives process restart),
+        2. a persisted stop-file (``data/cancel/{run_id}.stop`` — chosen
+           convention: neither DD nor CONTRACTS define a stop-file
+           location; matches the adapter's ``./data/pipeline.db`` layout
+           and sits inside the gitignored ``data/``),
+        3. the in-process per-book event (``self._cancelled``), looked up
+           through the run's ``book_id``.
+        """
+        rows = self._storage.execute_query(
+            "SELECT book_id, cancel_requested FROM walk_run WHERE run_id = ?",
+            (run_id,),
+        )
+        if rows and rows[0]["cancel_requested"]:
+            return True
+        if os.path.exists(self._stop_file_path(run_id)):
+            return True
+        book_id = rows[0]["book_id"] if rows else None
+        if book_id is not None and self._cancelled.get(book_id, False):
+            return True
+        return False
 
     # -- Internal helpers ---------------------------------------------------
 
@@ -446,6 +649,53 @@ class WalkRunner:
         if book_id not in self._status:
             self._ensure_book(book_id)
         self._status[book_id][walk_name] = status
+
+    def _finalize_run(
+        self,
+        run_id: str,
+        status: str,
+        error: str | None = None,
+        result: dict | None = None,
+    ) -> None:
+        """Write the final status transition for a ``walk_run`` row.
+
+        ``result`` is JSON-encoded into ``result_json`` (completed);
+        ``error`` is stored on failure/cancel. Always stamps
+        ``finished_ms`` and refreshes ``heartbeat_ms``.
+        """
+        now = _now_ms()
+        if result is not None:
+            self._storage.execute_update(
+                "UPDATE walk_run SET status = ?, result_json = ?, "
+                "finished_ms = ?, heartbeat_ms = ? WHERE run_id = ?",
+                (status, json.dumps(result), now, now, run_id),
+            )
+        else:
+            self._storage.execute_update(
+                "UPDATE walk_run SET status = ?, error = ?, "
+                "finished_ms = ?, heartbeat_ms = ? WHERE run_id = ?",
+                (status, error, now, now, run_id),
+            )
+        # Best-effort stop-file cleanup: the row is now terminal and
+        # authoritative, so this run's persisted cancel marker is obsolete.
+        # If the process dies before removal, a stale stop-file remains, but
+        # is_cancel_requested checks the terminal row first (row flag ->
+        # stop-file -> event), so no false cancellation on a completed run.
+        try:
+            os.remove(self._stop_file_path(run_id))
+        except FileNotFoundError:
+            pass
+
+    def _stop_file_path(self, run_id: str) -> str:
+        """Path of the persisted stop-file for a run (``data/cancel/``)."""
+        return os.path.join(self.stop_file_dir, f"{run_id}.stop")
+
+    def _write_stop_file(self, run_id: str) -> None:
+        """Persist a stop-file for the run so cancel survives a restart."""
+        path = self._stop_file_path(run_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(_now_ms()))
 
     @staticmethod
     def _load_walk_module(walk_name: str):

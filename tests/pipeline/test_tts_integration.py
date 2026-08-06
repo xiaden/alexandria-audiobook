@@ -997,3 +997,180 @@ class TestVoiceTypeRouting:
                 assert (
                     voice_config[speaker][key] == value
                 ), f"{speaker}.{key}: expected {value!r}, got {voice_config[speaker][key]!r}"
+
+
+# ---------------------------------------------------------------------------
+# P3-S1: render_job / render_chunk row persistence (rows = truth)
+# ---------------------------------------------------------------------------
+
+
+class _RowInspectingBatchEngine(FakeTTSEngine):
+    """FakeTTSEngine that records render_job status during batch dispatch."""
+
+    def __init__(self, storage, job_id):
+        super().__init__()
+        self.storage = storage
+        self.job_id = job_id
+        self.status_during_batch = None
+
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+        rows = self.storage.execute_query(
+            "SELECT status FROM render_job WHERE job_id = ?", (self.job_id,)
+        )
+        self.status_during_batch = rows[0]["status"] if rows else None
+        return super().generate_batch(chunks, voice_config, output_dir, batch_seed)
+
+
+class _RowInspectingVoiceEngine(FakeTTSEngine):
+    """FakeTTSEngine that records render_chunk status around generate_voice."""
+
+    def __init__(self, storage, job_id):
+        super().__init__()
+        self.storage = storage
+        self.job_id = job_id
+        self.status_at_entry = []  # chunk row status when generate_voice starts
+        self.status_at_exit = []  # chunk row status when generate_voice returns
+
+    def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        idx = len(self.status_at_entry)
+        rows = self.storage.execute_query(
+            "SELECT status FROM render_chunk WHERE job_id = ? AND idx = ?",
+            (self.job_id, idx),
+        )
+        self.status_at_entry.append(rows[0]["status"] if rows else None)
+        result = super().generate_voice(
+            text, instruct_text, speaker, voice_config, output_path
+        )
+        rows = self.storage.execute_query(
+            "SELECT status FROM render_chunk WHERE job_id = ? AND idx = ?",
+            (self.job_id, len(self.status_at_exit)),
+        )
+        self.status_at_exit.append(rows[0]["status"] if rows else None)
+        return result
+
+
+class _AllFailedBatchEngine(FakeTTSEngine):
+    """FakeTTSEngine whose batch generation fails for every chunk."""
+
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+        super().generate_batch(chunks, voice_config, output_dir, batch_seed)
+        return {
+            "completed": [],
+            "failed": [(c["index"], f"boom {c['index']}") for c in chunks],
+        }
+
+
+class _FailingVoiceEngine(FakeTTSEngine):
+    """FakeTTSEngine whose individual generation always raises."""
+
+    def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        super().generate_voice(text, instruct_text, speaker, voice_config, output_path)
+        raise RuntimeError("voice boom")
+
+
+class TestRenderJobPersistence:
+    """P3-S1: render_audiobook persists render_job / render_chunk rows."""
+
+    def test_job_row_created_running_at_start(self, storage, fake_engine):
+        """A render_job row exists with status 'running' during generation."""
+        engine = _RowInspectingBatchEngine(storage, "job-running")
+        render_audiobook("b1", storage, engine, job_id="job-running")
+        assert engine.status_during_batch == "running"
+
+    def test_batch_mode_creates_no_chunk_rows(self, storage, fake_engine):
+        """Batch mode persists job-level rows only — no render_chunk rows."""
+        render_audiobook("b1", storage, fake_engine, job_id="job-batch")
+        rows = storage.execute_query(
+            "SELECT COUNT(*) AS cnt FROM render_chunk WHERE job_id = ?",
+            ("job-batch",),
+        )
+        assert rows[0]["cnt"] == 0
+
+    def test_individual_mode_chunk_rows_done_after_write(self, storage, fake_engine):
+        """Individual mode: chunk rows pending during generate_voice, done after it returns."""
+        engine = _RowInspectingVoiceEngine(storage, "job-ind")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            render_audiobook(
+                "b1",
+                storage,
+                engine,
+                use_batch=False,
+                job_id="job-ind",
+                output_dir=tmpdir,
+            )
+            assert engine.status_at_entry == ["pending", "pending", "pending"]
+            assert engine.status_at_exit == ["pending", "pending", "pending"]
+            rows = storage.execute_query(
+                "SELECT idx, status, wav_path FROM render_chunk "
+                "WHERE job_id = ? ORDER BY idx",
+                ("job-ind",),
+            )
+            assert [(r["idx"], r["status"]) for r in rows] == [
+                (0, "done"),
+                (1, "done"),
+                (2, "done"),
+            ]
+            assert rows[0]["wav_path"] == os.path.join(tmpdir, "chunk_0000.wav")
+
+    def test_final_transaction_sets_completed_and_artifact(self, storage, fake_engine):
+        """Final transaction marks the job completed and records output_artifact_path."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_id = render_audiobook(
+                "b1", storage, fake_engine, job_id="job-final", output_dir=tmpdir
+            )
+            rows = storage.execute_query(
+                "SELECT status, output_dir, output_artifact_path, finished_ms "
+                "FROM render_job WHERE job_id = ?",
+                (job_id,),
+            )
+            assert len(rows) == 1
+            assert rows[0]["status"] == "completed"
+            assert rows[0]["output_dir"] == tmpdir
+            # No audiobook.m4b exists → artifact path falls back to the output dir
+            assert rows[0]["output_artifact_path"] == tmpdir
+            assert rows[0]["finished_ms"] is not None
+
+    def test_individual_failure_records_failed_chunk_and_job(self, storage, fake_engine):
+        """generate_voice exception → failed chunk row + failed job row + re-raise."""
+        engine = _FailingVoiceEngine()
+        with pytest.raises(RuntimeError, match="voice boom"):
+            render_audiobook(
+                "b1", storage, engine, use_batch=False, job_id="job-fail"
+            )
+        chunk_rows = storage.execute_query(
+            "SELECT idx, status, error FROM render_chunk WHERE job_id = ? ORDER BY idx",
+            ("job-fail",),
+        )
+        assert chunk_rows[0]["status"] == "failed"
+        assert chunk_rows[0]["error"] == "voice boom"
+        job_rows = storage.execute_query(
+            "SELECT status, error FROM render_job WHERE job_id = ?", ("job-fail",)
+        )
+        assert job_rows[0]["status"] == "failed"
+        assert job_rows[0]["error"] == "voice boom"
+
+    def test_batch_all_failed_marks_job_failed(self, storage, fake_engine):
+        """generate_batch all-failed → job row failed with recorded error."""
+        engine = _AllFailedBatchEngine()
+        with pytest.raises(RuntimeError, match="Batch render failed"):
+            render_audiobook("b1", storage, engine, job_id="job-bf")
+        rows = storage.execute_query(
+            "SELECT status, error FROM render_job WHERE job_id = ?", ("job-bf",)
+        )
+        assert rows[0]["status"] == "failed"
+        assert "boom 0" in rows[0]["error"]
+
+    def test_empty_script_job_completed(self, fake_engine):
+        """A book with no spans still gets a completed job row."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        s.execute_insert("INSERT INTO series (id) VALUES ('s-empty')")
+        s.execute_insert(
+            "INSERT INTO book (id, series_id, position) VALUES ('b-empty', 's-empty', 1)"
+        )
+        job_id = render_audiobook("b-empty", s, fake_engine, job_id="job-empty")
+        rows = s.execute_query(
+            "SELECT status, output_artifact_path FROM render_job WHERE job_id = ?",
+            (job_id,),
+        )
+        assert rows[0]["status"] == "completed"
