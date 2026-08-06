@@ -2,12 +2,10 @@ name: Build and Publish Attested Image
 
 # Builds the Alexandria container image, attaches SLSA provenance + SBOM
 # attestations, signs it with Sigstore (keyless), and publishes to GHCR.
-# Fires on pushes to main, on version tags (v*), and manually.
+# Fires on version tags (v*) and manually.
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -48,13 +46,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-
-          flavor: |
-            latest=auto
+            type=raw,value=latest
 
       - name: Build and push image with provenance + SBOM
         id: build
