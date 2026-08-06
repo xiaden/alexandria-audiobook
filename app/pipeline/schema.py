@@ -3,6 +3,10 @@
 Graph1 TREE: series -> book -> chapter -> scene -> paragraph -> span
 Graph2 CHARACTER: character + junctions (character_series, character_book,
                   character_scene, character_span, character_metadata)
+Universal Upgrade (Plan A): render_job, render_chunk, walk_run,
+                  walk_review_item, walk_override, project_snapshot + 3
+                  (book_id, status) indices; book.single_speaker added via
+                  a guarded ALTER TABLE (idempotent on existing databases).
 
 All DDL is issued by ``create_schema(connection)`` which is idempotent
 (uses CREATE TABLE IF NOT EXISTS / CREATE VIEW IF NOT EXISTS).
@@ -192,6 +196,102 @@ JOIN book
 """
 
 
+# ---------------------------------------------------------------------------
+# Universal Upgrade — job/run/review/override/snapshot tables (Plan A)
+# ---------------------------------------------------------------------------
+
+_UNIVERSAL_UPGRADE_DDL = """
+CREATE TABLE IF NOT EXISTS render_job (
+    job_id TEXT PRIMARY KEY,
+    book_id TEXT,
+    mode TEXT NOT NULL CHECK (mode IN ('batch', 'individual')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'interrupted', 'expired')),
+    error TEXT,
+    output_dir TEXT,
+    output_artifact_path TEXT,
+    created_ms INTEGER,
+    started_ms INTEGER,
+    finished_ms INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_render_job_book_status
+    ON render_job (book_id, status);
+
+CREATE TABLE IF NOT EXISTS render_chunk (
+    job_id TEXT NOT NULL REFERENCES render_job(job_id),
+    idx INTEGER,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'failed', 'evicted')),
+    wav_path TEXT,
+    error TEXT,
+    PRIMARY KEY (job_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS walk_run (
+    run_id TEXT PRIMARY KEY,
+    book_id TEXT,
+    walk_name TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'interrupted', 'cancelled')),
+    cancel_requested INTEGER DEFAULT 0,
+    heartbeat_ms INTEGER,
+    result_json TEXT,
+    error TEXT,
+    created_ms INTEGER,
+    finished_ms INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_walk_run_book_status
+    ON walk_run (book_id, status);
+
+CREATE TABLE IF NOT EXISTS walk_review_item (
+    id TEXT PRIMARY KEY,
+    book_id TEXT,
+    run_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('voice_profile', 'voice_assignment', 'instruction')),
+    target_table TEXT,
+    target_id TEXT,
+    prior_value TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'resolved', 'superseded', 'stale')),
+    created_ms INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_walk_review_item_book_status
+    ON walk_review_item (book_id, status);
+
+CREATE TABLE IF NOT EXISTS walk_override (
+    book_id TEXT NOT NULL,
+    walk_name TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value_json TEXT,
+    PRIMARY KEY (book_id, walk_name, key)
+);
+
+CREATE TABLE IF NOT EXISTS project_snapshot (
+    name TEXT PRIMARY KEY,
+    book_id TEXT,
+    snapshot_json TEXT,
+    created_ms INTEGER
+);
+"""
+
+
+def _ensure_book_single_speaker_column(connection: sqlite3.Connection) -> None:
+    """Add ``single_speaker`` to the book table if it does not exist.
+
+    Registered contract: ``ALTER TABLE book ADD COLUMN single_speaker
+    INTEGER NOT NULL DEFAULT 0`` (render-boundary enforcement only).
+    Guarded via ``PRAGMA table_info`` so ``create_schema`` stays idempotent
+    on existing databases (same pattern as populate.py ``_ensure_*_column``).
+    """
+    cols = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(book)").fetchall()
+    }
+    if "single_speaker" not in cols:
+        connection.execute(
+            "ALTER TABLE book ADD COLUMN single_speaker INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def create_schema(connection: sqlite3.Connection) -> None:
     """Create all pipeline tables and views on *connection*.
 
@@ -204,4 +304,6 @@ def create_schema(connection: sqlite3.Connection) -> None:
         + _GRAPH2_CHARACTER_DDL
         + _GRAPH2_JUNCTION_DDL
         + _SPAN_PRESENTATION_VIEW
+        + _UNIVERSAL_UPGRADE_DDL
     )
+    _ensure_book_single_speaker_column(connection)

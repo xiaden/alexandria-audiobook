@@ -900,3 +900,49 @@ Plan Q deleted the legacy dual-path surface. These endpoints are removed (all no
 - `reconcile_annotations` / token_jaccard
 - `reattribution_scope`
 - Old dataclasses: Span, Chapter, Character with `seq`, `parent_span_id`, `content_hash`
+
+---
+
+## Universal Upgrade (DD-universal-upgrade) — Schema & API Registration
+
+> Contract-gate registration for [DD-universal-upgrade](../../pending/DD-universal-upgrade.md) (2026-08-06). Every endpoint/schema change below is part of the pipeline-only surface; no legacy endpoint is reintroduced. All new endpoints live in the 7 `api_*` modules behind `APIRouter(prefix='/api/pipeline')`.
+
+### Schema additions (Phase 0)
+
+- `ALTER TABLE book ADD COLUMN single_speaker INTEGER NOT NULL DEFAULT 0` — render-boundary enforcement only; `export_annotated_script` stays faithful.
+- `render_job(job_id TEXT PK, book_id, mode CHECK(batch|individual), status CHECK(pending|running|completed|failed|cancelled|interrupted|expired), error, output_dir, output_artifact_path, created_ms, started_ms, finished_ms)` + `idx_render_job_book_status(book_id, status)`.
+- `render_chunk(job_id FK, idx, status CHECK(pending|done|failed|evicted), wav_path, error, PK(job_id, idx))` — individual mode only; `done` only after WAV exists + fsynced; `evicted` = GC tombstone.
+- `walk_run(run_id TEXT PK, book_id, walk_name, status CHECK(pending|running|completed|failed|interrupted|cancelled), cancel_requested INTEGER DEFAULT 0, heartbeat_ms, result_json, error, created_ms, finished_ms)` + `idx_walk_run_book_status(book_id, status)`.
+- `walk_review_item(id TEXT PK, book_id, run_id, kind CHECK(voice_profile|voice_assignment|instruction), target_table, target_id, prior_value, status CHECK(pending|resolved|superseded|stale), created_ms)` + `idx_walk_review_item_book_status(book_id, status)` — written by walks 2g/2h/2i in the same transaction as junction writes; supersede at walk completion, per-target.
+- `walk_override(book_id, walk_name, key, value_json, PK(book_id, walk_name, key))`.
+- `project_snapshot(name TEXT PK, book_id, snapshot_json, created_ms)` — saved scripts; restore blocked during active runs.
+
+### Endpoint changes
+
+Modified (same path, new row-backed behavior):
+- `GET /api/pipeline/render_status/{job_id}` — reads `render_job` rows (api_export)
+- `POST /api/pipeline/cancel_render` — sets `cancelling` (api_export)
+- `GET /api/pipeline/download/{job_id}` — reads rows; FileResponse-404 subclass (api_export)
+- `POST /api/pipeline/cancel_walks` — persists `walk_run.cancel_requested=1` (api_walks)
+- `GET /api/pipeline/review/{book_id}` — union: junction live query + `walk_review_item`; `walkitem:` prefixed item_ids (api_review)
+- `POST /api/pipeline/review/accept|reject|override` — prefix dispatch (`junction:`/`walkitem:`); walk-side value-restore (api_review)
+- `POST /api/config` — raw-JSON merge, validation-only AppConfig, `schema_version` stamp (app.py)
+
+New:
+- `GET /api/pipeline/export/jobs/{job_id}` · `GET /api/pipeline/export/jobs/{job_id}/chunks` (api_export)
+- `GET /api/pipeline/export/chunk/{job_id}/{idx}` — bounded-range WAV serving (api_export)
+- `GET /api/pipeline/export/audio/{job_id}` — whole-book playback (api_export)
+- `POST /api/pipeline/export/m4b` — FFMETADATA1 3-phase export (concat → metadata → mux); MP3/Audacity derived (api_export)
+- `GET /api/pipeline/walks/{book_id}/runs` (api_walks)
+- `POST /api/pipeline/projects` · `GET /api/pipeline/projects` · `POST /api/pipeline/projects/load` · `DELETE /api/pipeline/projects/{name}` (api_operations)
+
+### Behavioral contracts
+
+- Rows = truth; `manifest.json` = derived cache rebuilt at startup reconciliation. Reconciliation is STARTUP-ONLY (single-process ⇒ race-free).
+- `transaction()` owner-thread guard: writes from non-owner thread while txn open raise `ConcurrentTransactionError` → API 503 + Retry-After; walk-side retry (50–100 ms backoff ×3) on the idempotent write phase.
+- SQLite: `isolation_level=None` explicit, BEGIN IMMEDIATE, explicit COMMIT/ROLLBACK, `PRAGMA busy_timeout=5000`, INTEGER unix ms.
+- Cancel: single `is_cancel_requested(run_id)` dispatcher (DB row + stop-file + event). Batch renders: job-level cancel only; individual renders: per-chunk cancel.
+- Review thresholds: ≥0.7 accept / <0.5 reject / 0.5–0.7 review (unchanged); no ×0.8 multiplier.
+- GC: retention ≥7 days post-completion (env-tunable), hourly sweep, never on hot request path; eligibility union includes `project_snapshot` artifact refs; rows tombstoned (`evicted`/`expired`) in the same sweep as file deletion.
+- Frontend: committed dist/ + CI `git diff --exit-code app/static/dist/`; starlette>=0.49.1 CI pin (Range DoS GHSA-7f5h-v6xp-fcq8).
+- New endpoints must land in the correct `api_*` module and be registered here (this section) — future DD updates append, never rewrite.

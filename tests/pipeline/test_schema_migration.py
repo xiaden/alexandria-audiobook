@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
+from app.pipeline.schema import create_schema
 from scripts.migrate_voice_config_schema import (
     VOICE_CONFIG_COLUMNS,
     get_existing_columns,
@@ -231,3 +232,70 @@ class TestIntegrationWithInMemoryAdapter:
         assert after_cols == expected_cols
 
         adapter.close()
+
+
+class TestCreateSchemaMigrationForUniversalUpgrade:
+    """create_schema must evolve legacy DBs and stay idempotent (Plan A).
+
+    The Universal Upgrade adds ``book.single_speaker`` via a guarded
+    ALTER TABLE, so an existing (pre-upgrade) database gains the column
+    without data loss and a second create_schema run adds nothing twice.
+    """
+
+    def test_create_schema_adds_single_speaker_to_legacy_book(
+        self, tmp_path: Path
+    ) -> None:
+        """A legacy book table (5 columns) gains single_speaker, data intact."""
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE book (
+                id TEXT PRIMARY KEY,
+                series_id TEXT NOT NULL REFERENCES series(id),
+                book_number INTEGER,
+                version INTEGER DEFAULT 1,
+                position INTEGER
+            )
+        """)
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position) "
+            "VALUES ('b1', 's1', 1, 1, 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Run create_schema — should add single_speaker without touching data
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(book)").fetchall()}
+        assert "single_speaker" in cols
+        row = conn.execute(
+            "SELECT series_id, book_number, single_speaker FROM book WHERE id='b1'"
+        ).fetchone()
+        assert row == ("s1", 1, 0)
+        conn.close()
+
+    def test_create_schema_idempotent_on_file_db(self, tmp_path: Path) -> None:
+        """Running create_schema twice on a file-backed DB adds nothing twice."""
+        db_path = tmp_path / "schema.db"
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        conn.close()
+
+        # Second run against the same file — no error, no duplicates
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        dup_tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "GROUP BY name HAVING COUNT(*) > 1"
+        ).fetchall()
+        assert dup_tables == []
+        dup_indices = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name NOT LIKE 'sqlite_%' GROUP BY name HAVING COUNT(*) > 1"
+        ).fetchall()
+        assert dup_indices == []
+        # book has exactly one single_speaker column
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(book)").fetchall()]
+        assert cols.count("single_speaker") == 1
+        conn.close()

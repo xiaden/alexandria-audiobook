@@ -15,10 +15,13 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 
 import pytest
 
 from app.pipeline.adapter import (
+    ConcurrentTransactionError,
     InMemorySQLiteAdapter,
     PipelineStorage,
     SQLiteAdapter,
@@ -597,3 +600,355 @@ class TestSQLiteAdapterPersistence:
             assert len(book_rows) == 0
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P1-S1: transaction() context manager — concurrency-safe BEGIN IMMEDIATE
+# ---------------------------------------------------------------------------
+
+_ADAPTER_FIXTURES = ["sqlite_adapter", "memory_adapter"]
+
+
+class TestConcurrentTransactionError:
+    """ConcurrentTransactionError must be a RuntimeError subclass."""
+
+    def test_is_runtime_error_subclass(self):
+        assert issubclass(ConcurrentTransactionError, RuntimeError)
+
+
+class TestTransactionContextManager:
+    """SQLiteAdapter.transaction() must provide guarded, atomic transactions."""
+
+    # -- (a) begins a transaction -------------------------------------------
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_begins_a_transaction(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction():
+            assert adapter.get_connection().in_transaction is True
+
+    # -- (b) commits on clean exit ------------------------------------------
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_commits_on_clean_exit(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction():
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+        # No transaction may be left open after the block exits.
+        assert adapter.get_connection().in_transaction is False
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert [r["id"] for r in rows] == ["s1"]
+
+    # -- (c) rolls back on exception ----------------------------------------
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_rolls_back_on_exception(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with pytest.raises(RuntimeError, match="boom"):
+            with adapter.transaction():
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+                raise RuntimeError("boom")
+        # Rollback must close the transaction and discard the write.
+        assert adapter.get_connection().in_transaction is False
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert rows == []
+
+    # -- (d) cross-thread write raises ConcurrentTransactionError ------------
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_cross_thread_write_raises_concurrent_transaction_error(
+        self, adapter_name, request
+    ):
+        adapter = request.getfixturevalue(adapter_name)
+        captured: dict[str, ConcurrentTransactionError] = {}
+
+        def write_from_other_thread() -> None:
+            try:
+                adapter.execute_insert(
+                    "INSERT INTO series (id) VALUES (?)", ("s2",)
+                )
+            except ConcurrentTransactionError as exc:
+                captured["error"] = exc
+
+        with adapter.transaction():
+            thread = threading.Thread(target=write_from_other_thread)
+            thread.start()
+            thread.join()
+            assert isinstance(captured.get("error"), ConcurrentTransactionError)
+            # The owner thread can still write while the guard is armed.
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+        # The rejected write must not appear; the owner's write commits.
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert {r["id"] for r in rows} == {"s1"}
+
+    # -- (e) nested re-entry joins the outer transaction ---------------------
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_nested_reentry_joins_outer_transaction(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction():
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+            with adapter.transaction():
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s2",))
+                # Inner exit must NOT commit — still inside a transaction.
+                assert adapter.get_connection().in_transaction is True
+            # Still inside the outer transaction after the inner block.
+            assert adapter.get_connection().in_transaction is True
+        # The outer exit commits both writes atomically.
+        assert adapter.get_connection().in_transaction is False
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert {r["id"] for r in rows} == {"s1", "s2"}
+
+    # -- exception in a nested block rolls back the whole outer transaction --
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_exception_in_nested_block_rolls_back_outer(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with pytest.raises(RuntimeError, match="inner"):
+            with adapter.transaction():
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+                with adapter.transaction():
+                    raise RuntimeError("inner")
+        # The uncaught inner exception must roll back the entire transaction.
+        assert adapter.get_connection().in_transaction is False
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert rows == []
+
+
+class TestIsolationLevelAutocommit:
+    """Both adapters must run in explicit autocommit mode (isolation_level=None)."""
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_isolation_level_is_none(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        assert adapter.get_connection().isolation_level is None
+
+
+# ---------------------------------------------------------------------------
+# P2-S1: busy_timeout — init_db() must arm the busy handler at startup
+# ---------------------------------------------------------------------------
+
+
+class TestBusyTimeout:
+    """init_db() must set PRAGMA busy_timeout=5000 so a second writer blocks
+    up to the timeout instead of failing with "database is locked" instantly.
+
+    The blocking test is file-backed only: :memory: databases are per
+    connection and can never contend on a shared lock.
+    """
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_init_db_sets_busy_timeout_5000(self, adapter_name, request):
+        """After init_db(), the connection must report busy_timeout=5000.
+
+        Not a tautology: sqlite3's driver default already reports 5000, so
+        zero the timeout first and require init_db() to re-arm it.  If the
+        PRAGMA line in init_db() is removed, the readback stays 0 and this
+        fails.
+        """
+        adapter = request.getfixturevalue(adapter_name)
+        conn = adapter.get_connection()
+        # Precondition: override the driver default (5000) so the readback
+        # can only reach 5000 again if init_db() re-arms the busy handler.
+        conn.execute("PRAGMA busy_timeout = 0")
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == 0
+        # init_db() is idempotent (create_schema uses executescript).
+        adapter.init_db()
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == 5000
+
+    def test_second_connection_blocks_until_write_lock_released(self, tmp_path):
+        """While the adapter holds the write lock, a second connection's
+        BEGIN IMMEDIATE must wait (busy_timeout) rather than raising
+        'database is locked' immediately."""
+        db_path = str(tmp_path / "busy_timeout.db")
+        adapter = SQLiteAdapter(db_path=db_path)
+        adapter.init_db()
+        result: dict = {}
+        contending = threading.Event()
+
+        def acquire_from_second_connection() -> None:
+            # Note: this connection relies on the sqlite3 driver default
+            # busy timeout; the assertion below only validates SQLite
+            # contention behavior, NOT that init_db() armed the timeout
+            # (test_init_db_sets_busy_timeout_5000 is the contract test).
+            conn = sqlite3.connect(db_path, isolation_level=None)
+            try:
+                contending.set()
+                start = time.monotonic()
+                conn.execute("BEGIN IMMEDIATE")
+                result["elapsed"] = time.monotonic() - start
+                result["ok"] = True
+            except sqlite3.OperationalError as exc:
+                result["ok"] = False
+                result["error"] = exc
+            finally:
+                conn.close()
+
+        try:
+            with adapter.transaction():
+                adapter.execute_insert(
+                    "INSERT INTO series (id) VALUES (?)", ("s1",)
+                )
+                thread = threading.Thread(target=acquire_from_second_connection)
+                thread.start()
+                # The second connection is now contending on the write lock;
+                # give it time to actually hit the busy handler.
+                assert contending.wait(timeout=5)
+                time.sleep(0.3)
+            # Exiting the with-block commits and releases the write lock.
+            thread.join(timeout=10)
+            # The second connection waited for the lock instead of failing.
+            assert result.get("ok") is True, result
+            assert result["elapsed"] >= 0.25
+        finally:
+            adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# QA Round 1: BEGIN-failure guard state — stale-owner fix + contract
+# translation (contended BEGIN IMMEDIATE raises ConcurrentTransactionError)
+# ---------------------------------------------------------------------------
+
+
+class _FailingBeginConnection:
+    """Proxy around a real ``sqlite3.Connection`` whose ``BEGIN IMMEDIATE``
+    fails.  Every other call delegates to the wrapped connection.
+
+    ``sqlite3.Connection.execute`` is a read-only attribute, so the failure
+    has to be injected through a wrapper instead of a monkeypatch.
+    """
+
+    def __init__(
+        self, real: sqlite3.Connection, error: Exception
+    ) -> None:
+        self._real = real
+        self._error = error
+
+    def execute(self, sql, *args, **kwargs):
+        if isinstance(sql, str) and sql.strip().upper() == "BEGIN IMMEDIATE":
+            raise self._error
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestTransactionBeginFailure:
+    """A ``BEGIN IMMEDIATE`` that fails must not corrupt the guard.
+
+    Round-1 QA finding: if BEGIN raised, ``_txn_owner`` stayed set while
+    ``_txn_depth`` remained 0, so every other thread's write spuriously
+    raised ``ConcurrentTransactionError`` until the owner ran another
+    ``transaction()``.  Also, a contended BEGIN must surface as
+    ``ConcurrentTransactionError`` (the registered contract) rather than a
+    bare ``sqlite3.OperationalError``.
+    """
+
+    @staticmethod
+    def _arm_failing_begin(adapter, error: Exception, monkeypatch) -> None:
+        monkeypatch.setattr(
+            adapter,
+            "_conn",
+            _FailingBeginConnection(adapter.get_connection(), error),
+        )
+
+    def test_contended_begin_raises_concurrent_transaction_error(self, tmp_path):
+        """Real contention: while a second connection holds the write lock,
+        ``transaction()`` must raise ``ConcurrentTransactionError`` and leave
+        the adapter fully usable afterwards."""
+        db_path = str(tmp_path / "begin_timeout.db")
+        adapter = SQLiteAdapter(db_path=db_path)
+        try:
+            adapter.init_db()
+            # Shorten the busy timeout so the contended BEGIN fails fast
+            # instead of waiting out the full 5s startup value.
+            adapter.get_connection().execute("PRAGMA busy_timeout = 200")
+            holder = sqlite3.connect(db_path, isolation_level=None)
+            holder.execute("BEGIN IMMEDIATE")
+            try:
+                with pytest.raises(
+                    ConcurrentTransactionError, match="BEGIN IMMEDIATE timed out"
+                ):
+                    with adapter.transaction():
+                        pass
+                # No transaction may be left half-open.
+                assert adapter.get_connection().in_transaction is False
+            finally:
+                holder.rollback()
+                holder.close()
+            # The adapter must be usable again (guard state reset).
+            with adapter.transaction():
+                adapter.execute_insert(
+                    "INSERT INTO series (id) VALUES (?)", ("s1",)
+                )
+            rows = adapter.execute_query("SELECT id FROM series")
+            assert [r["id"] for r in rows] == ["s1"]
+        finally:
+            adapter.close()
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_begin_failure_resets_owner_for_other_threads(
+        self, adapter_name, request, monkeypatch
+    ):
+        """After a failed BEGIN, the guard must be disarmed: a write from a
+        different thread must NOT raise ``ConcurrentTransactionError``."""
+        adapter = request.getfixturevalue(adapter_name)
+        self._arm_failing_begin(
+            adapter, sqlite3.OperationalError("database is locked"), monkeypatch
+        )
+
+        with pytest.raises(
+            ConcurrentTransactionError, match="BEGIN IMMEDIATE timed out"
+        ):
+            with adapter.transaction():
+                pass
+
+        captured: dict[str, bool] = {}
+
+        def write_from_other_thread() -> None:
+            try:
+                adapter.execute_insert(
+                    "INSERT INTO series (id) VALUES (?)", ("s2",)
+                )
+                captured["ok"] = True
+            except ConcurrentTransactionError:
+                captured["ok"] = False
+
+        thread = threading.Thread(target=write_from_other_thread)
+        thread.start()
+        thread.join()
+        assert captured.get("ok") is True
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_non_operational_begin_failure_re_raises_and_resets_owner(
+        self, adapter_name, request, monkeypatch
+    ):
+        """A non-OperationalError BEGIN failure propagates unchanged, but the
+        owner guard is still cleared."""
+        adapter = request.getfixturevalue(adapter_name)
+        self._arm_failing_begin(
+            adapter, RuntimeError("begin exploded"), monkeypatch
+        )
+
+        with pytest.raises(RuntimeError, match="begin exploded"):
+            with adapter.transaction():
+                pass
+
+        # Guard disarmed: a write from another thread must not be rejected.
+        captured: dict[str, bool] = {}
+
+        def write_from_other_thread() -> None:
+            try:
+                adapter.execute_insert(
+                    "INSERT INTO series (id) VALUES (?)", ("s2",)
+                )
+                captured["ok"] = True
+            except ConcurrentTransactionError:
+                captured["ok"] = False
+
+        thread = threading.Thread(target=write_from_other_thread)
+        thread.start()
+        thread.join()
+        assert captured.get("ok") is True

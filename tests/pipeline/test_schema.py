@@ -84,6 +84,13 @@ EXPECTED_TABLES = {
     "character_book",
     "character_scene",
     "character_span",
+    # Universal Upgrade (Plan A)
+    "render_job",
+    "render_chunk",
+    "walk_run",
+    "walk_review_item",
+    "walk_override",
+    "project_snapshot",
 }
 
 
@@ -113,9 +120,15 @@ class TestGraph1TreeColumns:
 
     def test_book_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "book")}
-        assert set(cols.keys()) == {"id", "series_id", "book_number", "version", "position"}
+        assert set(cols.keys()) == {
+            "id", "series_id", "book_number", "version", "position", "single_speaker"
+        }
         # version DEFAULT 1
         assert cols["version"][4] == '1'  # dflt_value (returned as string)
+        # single_speaker INTEGER NOT NULL DEFAULT 0 (guarded ALTER)
+        assert cols["single_speaker"][2] == "INTEGER"
+        assert cols["single_speaker"][3] == 1  # notnull
+        assert cols["single_speaker"][4] == "0"  # dflt_value
 
     def test_chapter_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "chapter")}
@@ -186,8 +199,8 @@ class TestEdgeUniqueConstraints:
     def test_child_id_unique_book_chapter(self, conn):
         """Each child can only appear once (UNIQUE on child_id)."""
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
-        conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2)")
+        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
 
         # Insert first edge
@@ -199,7 +212,7 @@ class TestEdgeUniqueConstraints:
 
     def test_child_id_unique_chapter_scene(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
+        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
@@ -211,7 +224,7 @@ class TestEdgeUniqueConstraints:
 
     def test_child_id_unique_scene_paragraph(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
+        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
         conn.execute("INSERT INTO scene VALUES ('sc2')")
@@ -235,7 +248,7 @@ class TestEdgeUniqueConstraints:
     def test_parent_position_unique_book_chapter(self, conn):
         """Same parent cannot have two children at the same position."""
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
+        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
 
@@ -246,7 +259,7 @@ class TestEdgeUniqueConstraints:
 
     def test_parent_position_unique_chapter_scene(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
+        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
         conn.execute("INSERT INTO scene VALUES ('sc2')")
@@ -476,7 +489,7 @@ class TestForeignKeyConstraints:
     def test_book_series_fk(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO book VALUES ('b1', 'nonexistent', 1, 1, 1)"
+                "INSERT INTO book VALUES ('b1', 'nonexistent', 1, 1, 1, 0)"
             )
 
     def test_chapter_book_fk(self, conn):
@@ -485,7 +498,7 @@ class TestForeignKeyConstraints:
 
     def test_book_chapter_child_fk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
+        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO book_chapter VALUES ('nonexistent', 'b1', 1)"
@@ -493,7 +506,7 @@ class TestForeignKeyConstraints:
 
     def test_book_chapter_parent_fk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
+        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
@@ -602,8 +615,8 @@ def _populate_spine(conn: sqlite3.Connection):
                 span sp5 (position=1, quotation)
     """
     conn.execute("INSERT INTO series VALUES ('s1')")
-    conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
-    conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2)")
+    conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+    conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2, 0)")
     conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
     conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
     conn.execute("INSERT INTO chapter VALUES ('c3', 'b2')")
@@ -770,3 +783,263 @@ class TestNoForbiddenFields:
         """scene table should not have chapter_id FK (uses chapter_scene edge)."""
         cols = {row[1] for row in _column_info(conn, "scene")}
         assert "chapter_id" not in cols
+
+# ---------------------------------------------------------------------------
+# Universal Upgrade schema (Plan A) — 6 tables, 3 indices, book.single_speaker
+# ---------------------------------------------------------------------------
+
+
+class TestUniversalUpgradeColumns:
+    """Column sets for the Universal Upgrade tables (per contracts ledger)."""
+
+    def test_render_job_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "render_job")}
+        assert set(cols.keys()) == {
+            "job_id", "book_id", "mode", "status",
+            "error", "output_dir", "output_artifact_path",
+            "created_ms", "started_ms", "finished_ms",
+        }
+        # job_id TEXT PK; unix-ms timestamps are INTEGER (new tables only)
+        assert cols["job_id"][2] == "TEXT"
+        assert cols["created_ms"][2] == "INTEGER"
+        assert cols["started_ms"][2] == "INTEGER"
+        assert cols["finished_ms"][2] == "INTEGER"
+
+    def test_render_chunk_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "render_chunk")}
+        assert set(cols.keys()) == {"job_id", "idx", "status", "wav_path", "error"}
+
+    def test_walk_run_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "walk_run")}
+        assert set(cols.keys()) == {
+            "run_id", "book_id", "walk_name", "status", "cancel_requested",
+            "heartbeat_ms", "result_json", "error", "created_ms", "finished_ms",
+        }
+        assert cols["run_id"][2] == "TEXT"
+        assert cols["cancel_requested"][2] == "INTEGER"
+        assert cols["heartbeat_ms"][2] == "INTEGER"
+        assert cols["created_ms"][2] == "INTEGER"
+        assert cols["finished_ms"][2] == "INTEGER"
+
+    def test_walk_review_item_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "walk_review_item")}
+        assert set(cols.keys()) == {
+            "id", "book_id", "run_id", "kind", "target_table",
+            "target_id", "prior_value", "status", "created_ms",
+        }
+        assert cols["id"][2] == "TEXT"
+        assert cols["created_ms"][2] == "INTEGER"
+
+    def test_walk_override_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "walk_override")}
+        assert set(cols.keys()) == {"book_id", "walk_name", "key", "value_json"}
+
+    def test_project_snapshot_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "project_snapshot")}
+        assert set(cols.keys()) == {"name", "book_id", "snapshot_json", "created_ms"}
+        assert cols["name"][2] == "TEXT"
+        assert cols["created_ms"][2] == "INTEGER"
+
+
+class TestUniversalUpgradeCheckConstraints:
+    """CHECK enum values registered in the contracts ledger."""
+
+    def test_render_job_mode_batch(self, conn):
+        conn.execute(
+            "INSERT INTO render_job (job_id, mode, status) "
+            "VALUES ('j1', 'batch', 'pending')"
+        )
+
+    def test_render_job_mode_individual(self, conn):
+        conn.execute(
+            "INSERT INTO render_job (job_id, mode, status) "
+            "VALUES ('j1', 'individual', 'pending')"
+        )
+
+    def test_render_job_mode_invalid(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO render_job (job_id, mode, status) "
+                "VALUES ('j1', 'invalid', 'pending')"
+            )
+
+    @pytest.mark.parametrize(
+        "status",
+        ["pending", "running", "completed", "failed", "cancelled", "interrupted", "expired"],
+    )
+    def test_render_job_status_valid(self, conn, status):
+        conn.execute(
+            "INSERT INTO render_job (job_id, mode, status) VALUES ('j1', 'batch', ?)",
+            (status,),
+        )
+
+    def test_render_job_status_invalid(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO render_job (job_id, mode, status) "
+                "VALUES ('j1', 'batch', 'queued')"
+            )
+
+    @pytest.mark.parametrize("status", ["pending", "done", "failed", "evicted"])
+    def test_render_chunk_status_valid(self, conn, status):
+        conn.execute(
+            "INSERT INTO render_job (job_id, mode, status) VALUES ('j1', 'batch', 'pending')"
+        )
+        conn.execute(
+            "INSERT INTO render_chunk (job_id, idx, status) VALUES ('j1', 0, ?)",
+            (status,),
+        )
+
+    def test_render_chunk_status_invalid(self, conn):
+        conn.execute(
+            "INSERT INTO render_job (job_id, mode, status) VALUES ('j1', 'batch', 'pending')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO render_chunk (job_id, idx, status) VALUES ('j1', 0, 'invalid')"
+            )
+
+    @pytest.mark.parametrize(
+        "status",
+        ["pending", "running", "completed", "failed", "interrupted", "cancelled"],
+    )
+    def test_walk_run_status_valid(self, conn, status):
+        conn.execute(
+            "INSERT INTO walk_run (run_id, status) VALUES ('r1', ?)",
+            (status,),
+        )
+
+    def test_walk_run_status_invalid(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO walk_run (run_id, status) VALUES ('r1', 'queued')"
+            )
+
+    @pytest.mark.parametrize(
+        "kind", ["voice_profile", "voice_assignment", "instruction"]
+    )
+    def test_walk_review_item_kind_valid(self, conn, kind):
+        conn.execute(
+            "INSERT INTO walk_review_item (id, kind, status) VALUES ('w1', ?, 'pending')",
+            (kind,),
+        )
+
+    def test_walk_review_item_kind_invalid(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO walk_review_item (id, kind, status) "
+                "VALUES ('w1', 'pronunciation', 'pending')"
+            )
+
+    @pytest.mark.parametrize("status", ["pending", "resolved", "superseded", "stale"])
+    def test_walk_review_item_status_valid(self, conn, status):
+        conn.execute(
+            "INSERT INTO walk_review_item (id, kind, status) VALUES ('w1', 'instruction', ?)",
+            (status,),
+        )
+
+    def test_walk_review_item_status_invalid(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO walk_review_item (id, kind, status) "
+                "VALUES ('w1', 'instruction', 'closed')"
+            )
+
+
+class TestUniversalUpgradeIndices:
+    """Composite (book_id, status) indices from the contracts ledger."""
+
+    def test_render_job_book_status_index(self, conn):
+        names = {r[1] for r in _index_list(conn, "render_job")}
+        assert "idx_render_job_book_status" in names
+        cols = [r[2] for r in _index_info(conn, "idx_render_job_book_status")]
+        assert cols == ["book_id", "status"]
+
+    def test_walk_run_book_status_index(self, conn):
+        names = {r[1] for r in _index_list(conn, "walk_run")}
+        assert "idx_walk_run_book_status" in names
+        cols = [r[2] for r in _index_info(conn, "idx_walk_run_book_status")]
+        assert cols == ["book_id", "status"]
+
+    def test_walk_review_item_book_status_index(self, conn):
+        names = {r[1] for r in _index_list(conn, "walk_review_item")}
+        assert "idx_walk_review_item_book_status" in names
+        cols = [r[2] for r in _index_info(conn, "idx_walk_review_item_book_status")]
+        assert cols == ["book_id", "status"]
+
+
+class TestUniversalUpgradeConstraints:
+    """PK / FK constraints from the contracts ledger."""
+
+    def test_render_chunk_composite_pk(self, conn):
+        conn.execute(
+            "INSERT INTO render_job (job_id, mode, status) VALUES ('j1', 'batch', 'pending')"
+        )
+        conn.execute(
+            "INSERT INTO render_chunk (job_id, idx, status) VALUES ('j1', 0, 'pending')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO render_chunk (job_id, idx, status) VALUES ('j1', 0, 'done')"
+            )
+
+    def test_render_chunk_job_fk(self, conn):
+        """render_chunk.job_id references render_job(job_id)."""
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO render_chunk (job_id, idx, status) VALUES ('missing', 0, 'pending')"
+            )
+
+    def test_walk_override_composite_pk(self, conn):
+        conn.execute(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json) "
+            "VALUES ('b1', 'w1', 'k1', '{}')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO walk_override (book_id, walk_name, key, value_json) "
+                "VALUES ('b1', 'w1', 'k1', '{}')"
+            )
+
+    def test_render_job_job_id_pk(self, conn):
+        conn.execute(
+            "INSERT INTO render_job (job_id, mode, status) VALUES ('j1', 'batch', 'pending')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO render_job (job_id, mode, status) VALUES ('j1', 'individual', 'pending')"
+            )
+
+    def test_project_snapshot_name_pk(self, conn):
+        conn.execute(
+            "INSERT INTO project_snapshot (name, book_id, snapshot_json) "
+            "VALUES ('snap1', 'b1', '{}')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO project_snapshot (name, book_id, snapshot_json) "
+                "VALUES ('snap1', 'b2', '{}')"
+            )
+
+
+class TestBookSingleSpeaker:
+    """book.single_speaker INTEGER NOT NULL DEFAULT 0 (render-boundary only)."""
+
+    def test_single_speaker_default_zero(self, conn):
+        conn.execute("INSERT INTO series VALUES ('s1')")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, position) "
+            "VALUES ('b1', 's1', 1, 1)"
+        )
+        row = conn.execute(
+            "SELECT single_speaker FROM book WHERE id='b1'"
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_single_speaker_not_null(self, conn):
+        conn.execute("INSERT INTO series VALUES ('s1')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO book (id, series_id, book_number, position, single_speaker) "
+                "VALUES ('b1', 's1', 1, 1, NULL)"
+            )

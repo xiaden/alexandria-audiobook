@@ -58,7 +58,7 @@ def _populate_test_spine(conn: sqlite3.Connection) -> dict:
     Returns dict with span IDs for reference.
     """
     conn.execute("INSERT INTO series VALUES ('s1')")
-    conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1)")
+    conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
     conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
     conn.execute("INSERT INTO scene VALUES ('sc1')")
     conn.execute("INSERT INTO paragraph VALUES ('p1')")
@@ -130,7 +130,7 @@ def _add_second_book(conn: sqlite3.Connection) -> None:
               paragraph p2b (position=1)
                 span sp2_1 (position=1, sentence) - b2 global_index=1
     """
-    conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2)")
+    conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2, 0)")
     conn.execute("INSERT INTO chapter VALUES ('c2', 'b2')")
     conn.execute("INSERT INTO scene VALUES ('sc2')")
     conn.execute("INSERT INTO paragraph VALUES ('p2b')")
