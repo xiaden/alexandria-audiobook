@@ -113,6 +113,47 @@ class PipelineStorage(ABC):
     def delete_walk_override(self, book_id: str, walk_name: str, key: str) -> None:
         """Delete the ``walk_override`` row (no-op if absent)."""
 
+    @abstractmethod
+    def list_project_snapshots(self, book_id: str | None = None) -> list[dict]:
+        """Return ``project_snapshot`` rows, newest first.
+
+        Each dict is ``{"name", "book_id", "snapshot_json", "created_ms"}``
+        with ``snapshot_json`` as the raw TEXT string — callers decide
+        whether to ``json.loads``.  When *book_id* is given, only that
+        book's snapshots are returned.  Ordering is ``created_ms DESC``
+        with ``name ASC`` as a deterministic tiebreak.
+        """
+
+    @abstractmethod
+    def get_project_snapshot(self, name: str) -> dict | None:
+        """Return the ``project_snapshot`` row for *name*, or ``None``."""
+
+    @abstractmethod
+    def create_project_snapshot(
+        self, name: str, book_id: str, snapshot_json: str, created_ms: int
+    ) -> None:
+        """Insert a new ``project_snapshot`` row.
+
+        Raises ``sqlite3.IntegrityError`` when *name* already exists (PK).
+        """
+
+    @abstractmethod
+    def delete_project_snapshot(self, name: str) -> bool:
+        """Delete the ``project_snapshot`` row for *name*.
+
+        Returns ``True`` when a row was removed, ``False`` for an unknown
+        name.
+        """
+
+    @abstractmethod
+    def rename_project_snapshot(self, name: str, new_name: str) -> bool:
+        """Rename a ``project_snapshot`` row from *name* to *new_name*.
+
+        Returns whether a row was updated.  Raises
+        ``sqlite3.IntegrityError`` when *new_name* collides with an
+        existing name (PK UNIQUE constraint).
+        """
+
 
 # ---------------------------------------------------------------------------
 # Startup reconciliation (contract rule #5)
@@ -796,6 +837,79 @@ class SQLiteAdapter(PipelineStorage):
             (book_id, walk_name, key),
         )
 
+    def list_project_snapshots(self, book_id: str | None = None) -> list[dict]:
+        """Return ``project_snapshot`` rows for the adapter, newest first.
+
+        Each dict is ``{"name", "book_id", "snapshot_json", "created_ms"}``
+        with ``snapshot_json`` as the raw TEXT string — callers decide
+        whether to ``json.loads``.  An optional *book_id* restricts the
+        result to one book.  Ordering is ``created_ms DESC`` with ``name
+        ASC`` as a deterministic tiebreak (Plan I contract: newest-first).
+        """
+        if book_id is None:
+            return self.execute_query(
+                "SELECT name, book_id, snapshot_json, created_ms"
+                " FROM project_snapshot ORDER BY created_ms DESC, name ASC"
+            )
+        return self.execute_query(
+            "SELECT name, book_id, snapshot_json, created_ms"
+            " FROM project_snapshot WHERE book_id = ?"
+            " ORDER BY created_ms DESC, name ASC",
+            (book_id,),
+        )
+
+    def get_project_snapshot(self, name: str) -> dict | None:
+        """Return the ``project_snapshot`` row for *name*, or ``None``."""
+        rows = self.execute_query(
+            "SELECT name, book_id, snapshot_json, created_ms"
+            " FROM project_snapshot WHERE name = ?",
+            (name,),
+        )
+        return rows[0] if rows else None
+
+    def create_project_snapshot(
+        self, name: str, book_id: str, snapshot_json: str, created_ms: int
+    ) -> None:
+        """Insert a new ``project_snapshot`` row.
+
+        Raises ``sqlite3.IntegrityError`` when *name* already exists (PK).
+        Composes ``execute_insert`` so it joins an open ``transaction()``
+        when one is active and auto-commits otherwise.
+        """
+        self.execute_insert(
+            "INSERT INTO project_snapshot (name, book_id, snapshot_json, created_ms)"
+            " VALUES (?, ?, ?, ?)",
+            (name, book_id, snapshot_json, created_ms),
+        )
+
+    def delete_project_snapshot(self, name: str) -> bool:
+        """Delete the ``project_snapshot`` row for *name*.
+
+        Returns ``True`` when a row was removed, ``False`` for an unknown
+        name.
+        """
+        return (
+            self.execute_delete(
+                "DELETE FROM project_snapshot WHERE name = ?", (name,)
+            )
+            > 0
+        )
+
+    def rename_project_snapshot(self, name: str, new_name: str) -> bool:
+        """Rename a ``project_snapshot`` row from *name* to *new_name*.
+
+        Returns whether a row was updated.  Raises
+        ``sqlite3.IntegrityError`` when *new_name* collides with an
+        existing name (PK UNIQUE constraint).
+        """
+        return (
+            self.execute_update(
+                "UPDATE project_snapshot SET name = ? WHERE name = ?",
+                (new_name, name),
+            )
+            > 0
+        )
+
     def reconcile_stale_runs(self) -> dict[str, int]:
         """Startup-only: flip stale running rows to ``interrupted`` (one pass).
 
@@ -1012,6 +1126,79 @@ class InMemorySQLiteAdapter(PipelineStorage):
             "DELETE FROM walk_override"
             " WHERE book_id = ? AND walk_name = ? AND key = ?",
             (book_id, walk_name, key),
+        )
+
+    def list_project_snapshots(self, book_id: str | None = None) -> list[dict]:
+        """Return ``project_snapshot`` rows, newest first.
+
+        Mirror of ``SQLiteAdapter.list_project_snapshots`` (same schema and
+        interface).  Optional *book_id* restricts the result to one book.
+        """
+        if book_id is None:
+            return self.execute_query(
+                "SELECT name, book_id, snapshot_json, created_ms"
+                " FROM project_snapshot ORDER BY created_ms DESC, name ASC"
+            )
+        return self.execute_query(
+            "SELECT name, book_id, snapshot_json, created_ms"
+            " FROM project_snapshot WHERE book_id = ?"
+            " ORDER BY created_ms DESC, name ASC",
+            (book_id,),
+        )
+
+    def get_project_snapshot(self, name: str) -> dict | None:
+        """Return the ``project_snapshot`` row for *name*, or ``None``.
+
+        Mirror of ``SQLiteAdapter.get_project_snapshot``.
+        """
+        rows = self.execute_query(
+            "SELECT name, book_id, snapshot_json, created_ms"
+            " FROM project_snapshot WHERE name = ?",
+            (name,),
+        )
+        return rows[0] if rows else None
+
+    def create_project_snapshot(
+        self, name: str, book_id: str, snapshot_json: str, created_ms: int
+    ) -> None:
+        """Insert a new ``project_snapshot`` row.
+
+        Mirror of ``SQLiteAdapter.create_project_snapshot`` (same schema
+        and interface).  Raises ``sqlite3.IntegrityError`` when *name*
+        already exists (PK).
+        """
+        self.execute_insert(
+            "INSERT INTO project_snapshot (name, book_id, snapshot_json, created_ms)"
+            " VALUES (?, ?, ?, ?)",
+            (name, book_id, snapshot_json, created_ms),
+        )
+
+    def delete_project_snapshot(self, name: str) -> bool:
+        """Delete the ``project_snapshot`` row for *name*.
+
+        Mirror of ``SQLiteAdapter.delete_project_snapshot``.  Returns
+        ``True`` when a row was removed, ``False`` for an unknown name.
+        """
+        return (
+            self.execute_delete(
+                "DELETE FROM project_snapshot WHERE name = ?", (name,)
+            )
+            > 0
+        )
+
+    def rename_project_snapshot(self, name: str, new_name: str) -> bool:
+        """Rename a ``project_snapshot`` row from *name* to *new_name*.
+
+        Mirror of ``SQLiteAdapter.rename_project_snapshot``.  Returns
+        whether a row was updated; raises ``sqlite3.IntegrityError`` when
+        *new_name* collides (PK UNIQUE constraint).
+        """
+        return (
+            self.execute_update(
+                "UPDATE project_snapshot SET name = ? WHERE name = ?",
+                (new_name, name),
+            )
+            > 0
         )
 
     def reconcile_stale_runs(self) -> dict[str, int]:

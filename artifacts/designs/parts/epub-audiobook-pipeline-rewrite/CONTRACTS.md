@@ -934,7 +934,9 @@ New:
 - `GET /api/pipeline/export/audio/{job_id}` — whole-book playback (api_export)
 - `POST /api/pipeline/export/m4b` — FFMETADATA1 3-phase export (concat → metadata → mux); MP3/Audacity derived (api_export)
 - `GET /api/pipeline/walks/{book_id}/runs` (api_walks)
-- `POST /api/pipeline/projects` · `GET /api/pipeline/projects` · `POST /api/pipeline/projects/load` · `DELETE /api/pipeline/projects/{name}` (api_operations)
+- `POST /api/pipeline/projects` · `GET /api/pipeline/projects` · `POST /api/pipeline/projects/load` · `DELETE /api/pipeline/projects/{name}` · `PATCH /api/pipeline/projects/{name}` (api_operations)
+
+> 2026-08-07: PATCH /api/pipeline/projects/{name} appended (rename; 409 duplicate, 404 unknown) per DD design decision — rename PATCH.
 
 ### Behavioral contracts
 

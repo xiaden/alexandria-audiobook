@@ -2410,3 +2410,159 @@ class TestGCScheduler:
         finally:
             stop.set()
             thread.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot methods on the file-backed adapter (project_snapshot CRUD parity)
+# ---------------------------------------------------------------------------
+
+
+class TestSQLiteAdapterSnapshotMethods:
+    """File-backed ``SQLiteAdapter`` snapshot methods (project_snapshot CRUD).
+
+    ``test_snapshots.py`` exercises the endpoints and methods against the
+    in-memory adapter only; this class covers the same methods on the
+    file-backed ``SQLiteAdapter`` path (WAL, FK=ON, durable on disk).
+    """
+
+    # -- helpers ------------------------------------------------------------
+
+    @staticmethod
+    def _seed_series(adapter, series_id="s1") -> None:
+        """Insert a series row (book.series_id references it)."""
+        adapter.execute_insert("INSERT INTO series (id) VALUES (?)", (series_id,))
+
+    @staticmethod
+    def _seed_book(adapter, book_id="b1", series_id="s1") -> None:
+        """Insert a book row for a snapshot to reference."""
+        adapter.execute_insert(
+            "INSERT INTO book (id, series_id, position, version)"
+            " VALUES (?, ?, 1, 1)",
+            (book_id, series_id),
+        )
+
+    # -- create / get -------------------------------------------------------
+
+    def test_create_then_get_roundtrip(self, sqlite_adapter):
+        """create_project_snapshot inserts a row readable via
+        get_project_snapshot with all columns intact."""
+        self._seed_series(sqlite_adapter)
+        self._seed_book(sqlite_adapter)
+        sqlite_adapter.create_project_snapshot(
+            "snap", "b1", '{"schema_version": 1}', 1000
+        )
+
+        row = sqlite_adapter.get_project_snapshot("snap")
+        assert row is not None
+        assert row["name"] == "snap"
+        assert row["book_id"] == "b1"
+        assert row["snapshot_json"] == '{"schema_version": 1}'
+        assert row["created_ms"] == 1000
+
+    def test_create_duplicate_name_raises_integrity_error(self, sqlite_adapter):
+        """The name is the PK: inserting the same name twice raises."""
+        self._seed_series(sqlite_adapter)
+        self._seed_book(sqlite_adapter)
+        sqlite_adapter.create_project_snapshot("snap", "b1", "{}", 1000)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            sqlite_adapter.create_project_snapshot("snap", "b1", "{}", 2000)
+
+    # -- list ---------------------------------------------------------------
+
+    def test_list_orders_newest_first_with_name_tiebreak(self, sqlite_adapter):
+        """No-filter listing orders by created_ms DESC with name ASC as the
+        deterministic tiebreak."""
+        self._seed_series(sqlite_adapter)
+        self._seed_book(sqlite_adapter, "b1")
+        self._seed_book(sqlite_adapter, "b2")
+        for name, book_id, ms in (
+            ("z", "b1", 1000),
+            ("a", "b1", 1000),
+            ("m", "b2", 2000),
+        ):
+            sqlite_adapter.create_project_snapshot(name, book_id, "{}", ms)
+
+        rows = sqlite_adapter.list_project_snapshots()
+        assert [r["name"] for r in rows] == ["m", "a", "z"]
+
+    def test_list_filters_by_book_id(self, sqlite_adapter):
+        """book_id restricts the listing to one book."""
+        self._seed_series(sqlite_adapter)
+        self._seed_book(sqlite_adapter, "b1")
+        self._seed_book(sqlite_adapter, "b2")
+        sqlite_adapter.create_project_snapshot("a", "b1", "{}", 1000)
+        sqlite_adapter.create_project_snapshot("b", "b2", "{}", 2000)
+
+        rows = sqlite_adapter.list_project_snapshots(book_id="b1")
+        assert [r["name"] for r in rows] == ["a"]
+
+    # -- get unknown --------------------------------------------------------
+
+    def test_get_unknown_name_returns_none(self, sqlite_adapter):
+        assert sqlite_adapter.get_project_snapshot("missing") is None
+
+    # -- delete -------------------------------------------------------------
+
+    def test_delete_existing_returns_true_and_removes_row(self, sqlite_adapter):
+        self._seed_series(sqlite_adapter)
+        self._seed_book(sqlite_adapter)
+        sqlite_adapter.create_project_snapshot("snap", "b1", "{}", 1000)
+
+        assert sqlite_adapter.delete_project_snapshot("snap") is True
+        assert sqlite_adapter.get_project_snapshot("snap") is None
+
+    def test_delete_unknown_name_returns_false(self, sqlite_adapter):
+        assert sqlite_adapter.delete_project_snapshot("missing") is False
+
+    # -- rename -------------------------------------------------------------
+
+    def test_rename_moves_row_and_preserves_data(self, sqlite_adapter):
+        self._seed_series(sqlite_adapter)
+        self._seed_book(sqlite_adapter)
+        sqlite_adapter.create_project_snapshot("old", "b1", '{"kept": true}', 1000)
+
+        assert sqlite_adapter.rename_project_snapshot("old", "new") is True
+        assert sqlite_adapter.get_project_snapshot("old") is None
+        row = sqlite_adapter.get_project_snapshot("new")
+        assert row is not None
+        assert row["book_id"] == "b1"
+        assert row["snapshot_json"] == '{"kept": true}'
+        assert row["created_ms"] == 1000
+
+    def test_rename_unknown_name_returns_false(self, sqlite_adapter):
+        assert sqlite_adapter.rename_project_snapshot("missing", "new") is False
+
+    def test_rename_collision_raises_integrity_error(self, sqlite_adapter):
+        self._seed_series(sqlite_adapter)
+        self._seed_book(sqlite_adapter)
+        sqlite_adapter.create_project_snapshot("a", "b1", "{}", 1000)
+        sqlite_adapter.create_project_snapshot("b", "b1", "{}", 2000)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            sqlite_adapter.rename_project_snapshot("a", "b")
+
+    # -- persistence across adapter instances -------------------------------
+
+    def test_snapshot_survives_using_adapter(self, tmp_path):
+        """A snapshot committed through one adapter is visible through a
+        second SQLiteAdapter instance on the same file."""
+        db_path = str(tmp_path / "snapshot_persist.db")
+
+        adapter1 = SQLiteAdapter(db_path=db_path)
+        adapter1.init_db()
+        self._seed_series(adapter1)
+        self._seed_book(adapter1)
+        adapter1.create_project_snapshot("snap", "b1", '{"persist": true}', 1000)
+        adapter1.close()
+
+        adapter2 = SQLiteAdapter(db_path=db_path)
+        try:
+            adapter2.init_db()
+            row = adapter2.get_project_snapshot("snap")
+            assert row is not None
+            assert row["book_id"] == "b1"
+            assert row["snapshot_json"] == '{"persist": true}'
+            assert row["created_ms"] == 1000
+        finally:
+            adapter2.close()

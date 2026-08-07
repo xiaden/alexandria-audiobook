@@ -47,26 +47,40 @@ export async function post<T = unknown>(endpoint: string, body: unknown): Promis
 
 /**
  * POST a JSON body with exactly ONE automatic retry when the server
- * responds HTTP 503 with a Retry-After header (the transaction()
- * owner-thread contention contract: ``ConcurrentTransactionError`` is
- * mapped to 503 + Retry-After in the API layer).
+ * responds with a retryable status + Retry-After header.
  *
- * The Retry-After delay (integer seconds; the backend sends "1") is
+ * The live retryable contract is:
+ *  - 409 (Plan I): snapshot restore is blocked while a walk/render is
+ *    active (rule #10) — POST /api/pipeline/projects/load replies
+ *    409 + Retry-After: 5 and the frontend retries once. Pass
+ *    ``retryStatus=409`` for that contract.
+ *
+ * ``retryStatus`` defaults to 503 for backward compatibility with the
+ * legacy two-argument callers (cancel_render/cancel_walks). No endpoint
+ * currently produces 503 + Retry-After — the ConcurrentTransactionError
+ * 503 mapping in the API layer is a known follow-up, not a live contract.
+ *
+ * The Retry-After delay (integer seconds; the load endpoint sends "5") is
  * honored before the single retry. Any non-retryable response — or a
- * second 503 — surfaces via ``handleError`` exactly as the plain
- * ``post()`` wrapper would. Never loops: at most 2 total POST attempts.
+ * second retryable response — surfaces via ``handleError`` exactly as the
+ * plain ``post()`` wrapper would. Never loops: at most 2 total POST
+ * attempts.
  */
-export async function postWithRetryOnce<T = unknown>(endpoint: string, body: unknown): Promise<T> {
+export async function postWithRetryOnce<T = unknown>(
+  endpoint: string,
+  body: unknown,
+  retryStatus: number = 503,
+): Promise<T> {
   let res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
-  if (res.status === 503 && res.headers.get('Retry-After') != null) {
-    // Honor the retry delay. The backend sends integer seconds ("1");
-    // the HTTP-date form is not produced here, so any unparseable value
-    // falls back to a fixed 1s delay.
+  if (res.status === retryStatus && res.headers.get('Retry-After') != null) {
+    // Honor the retry delay. The backend sends integer seconds (currently
+    // always "5" from the load 409); the HTTP-date form is not produced
+    // here, so any unparseable value falls back to a fixed 1s delay.
     const seconds = parseInt(res.headers.get('Retry-After') as string, 10);
     const delayMs = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000;
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
@@ -78,6 +92,35 @@ export async function postWithRetryOnce<T = unknown>(endpoint: string, body: unk
     });
   }
 
+  await handleError(res);
+  return res.json();
+}
+
+/**
+ * Perform a PATCH request to the API
+ * @param endpoint - API endpoint (e.g., '/api/pipeline/projects/{name}')
+ * @param body - Request body (will be JSON.stringify'd)
+ * @returns Parsed JSON response
+ */
+export async function patch<T = unknown>(endpoint: string, body: unknown): Promise<T> {
+  const res = await fetch(endpoint, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  await handleError(res);
+  return res.json();
+}
+
+/**
+ * Perform a DELETE request to the API
+ * @param endpoint - API endpoint (e.g., '/api/pipeline/projects/{name}')
+ * @returns Parsed JSON response
+ */
+export async function del<T = unknown>(endpoint: string): Promise<T> {
+  const res = await fetch(endpoint, {
+    method: 'DELETE'
+  });
   await handleError(res);
   return res.json();
 }

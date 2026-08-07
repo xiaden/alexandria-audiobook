@@ -105,6 +105,7 @@
                     <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="script">2. Script</a></li>
                     <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="voices">3. Voices</a></li>
                     <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="editor">4. Editor</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="projects">5. Projects</a></li>
                     <li class="nav-item ms-3 border-start border-secondary ps-3"><a class="nav-link nav-advanced" href="#" role="button" data-tab="designer">Designer</a></li>
                     <li class="nav-item"><a class="nav-link nav-advanced" href="#" role="button" data-tab="preparer">Preparer</a></li>
                     <li class="nav-item"><a class="nav-link nav-advanced" href="#" role="button" data-tab="dataset-builder">Dataset</a></li>
@@ -1160,6 +1161,27 @@
                         <div id="review-items-container">
                             <p class="text-muted mb-0">Loading review items...</p>
                         </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Projects Tab (Plan I, Phase 3): snapshot projects — Save
+             (auto-named) / Load / Delete / Rename against
+             /api/pipeline/projects/*. The snapshot name is always generated
+             server-side; the frontend never proposes a name. -->
+        <div id="projects-tab" class="tab-content" style="display:none;">
+            <div class="card mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h4 class="m-0"><span class="step-indicator step-active">5</span>Projects</h4>
+                    <button type="button" class="btn btn-success btn-sm" id="btn-project-save" title="Save the current book as an auto-named snapshot">
+                        <i class="fas fa-save me-1"></i>Save
+                    </button>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted">Save the current book as a snapshot. Snapshots are auto-named; load restores a snapshot into the current book (merge — characters are never deleted). If the snapshot's audio is missing, you will be prompted to re-render.</p>
+                    <div id="projects-list">
+                        <!-- ProjectSnapshot rows injected here -->
                     </div>
                 </div>
             </div>
