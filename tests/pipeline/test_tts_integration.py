@@ -1430,3 +1430,281 @@ class TestManifest:
         assert not os.path.exists(
             os.path.join(_render_root, "book-b1", "job-mff", "manifest.json")
         )
+
+
+# ---------------------------------------------------------------------------
+# P1-S1: book.single_speaker render-boundary enforcement (Plan J)
+# ---------------------------------------------------------------------------
+
+
+class TestSingleSpeakerRenderBoundary:
+    """P1-S1: book.single_speaker=1 forces the NARRATOR voice config at the
+    render boundary only — export_annotated_script stays faithful."""
+
+    @staticmethod
+    def _set_single_speaker(
+        storage: InMemorySQLiteAdapter, book_id: str = "b1", value: int = 1
+    ) -> None:
+        storage.execute_update(
+            "UPDATE book SET single_speaker = ? WHERE id = ?", (value, book_id)
+        )
+
+    @staticmethod
+    def _populate_character_only_storage(
+        storage: InMemorySQLiteAdapter,
+    ) -> None:
+        """Insert a book whose spans all have character speakers (no NARRATOR)."""
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, description) VALUES ('vc1', 'Warm Female', 'A warm female voice')"
+        )
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, description) VALUES ('vc2', 'Deep Male', 'A deep male voice')"
+        )
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert(
+            "INSERT INTO book (id, series_id, position) VALUES ('b1', 's1', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
+        )
+        storage.execute_insert(
+            "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
+        )
+        storage.execute_insert("INSERT INTO scene (id) VALUES ('sc1')")
+        storage.execute_insert(
+            "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES ('sc1', 'ch1', 1)"
+        )
+        storage.execute_insert("INSERT INTO paragraph (id) VALUES ('p1')")
+        storage.execute_insert("INSERT INTO paragraph (id) VALUES ('p2')")
+        storage.execute_insert(
+            "INSERT INTO scene_paragraph (child_id, parent_id, position) VALUES ('p1', 'sc1', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO scene_paragraph (child_id, parent_id, position) VALUES ('p2', 'sc1', 2)"
+        )
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp1', 'quotation', 'Hello there!', 'cheerfully')"
+        )
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) "
+            "VALUES ('sp2', 'quotation', 'Goodbye.', 'sadly')"
+        )
+        storage.execute_insert(
+            "INSERT INTO paragraph_span (child_id, parent_id, position) VALUES ('sp1', 'p1', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO paragraph_span (child_id, parent_id, position) VALUES ('sp2', 'p2', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+            "VALUES ('c1', 'Alice', '[]', 'vc1')"
+        )
+        storage.execute_insert(
+            "INSERT INTO character (id, name, aliases, voice_assignment_id) "
+            "VALUES ('c2', 'Bob', '[]', 'vc2')"
+        )
+        storage.execute_insert(
+            "INSERT INTO character_span (character_id, span_id, relation_type, source, confidence) "
+            "VALUES ('c1', 'sp1', 'speaker', 'walk', 0.95)"
+        )
+        storage.execute_insert(
+            "INSERT INTO character_span (character_id, span_id, relation_type, source, confidence) "
+            "VALUES ('c2', 'sp2', 'speaker', 'walk', 0.9)"
+        )
+
+    def test_single_speaker_forces_narrator_config_batch(self, storage, fake_engine):
+        """single_speaker=1: every entry in the batch voice_config is NARRATOR_VOICE."""
+        self._set_single_speaker(storage, "b1", 1)
+        render_audiobook("b1", storage, fake_engine)
+
+        assert len(fake_engine.batch_calls) == 1
+        voice_config = fake_engine.batch_calls[0]["voice_config"]
+        assert set(voice_config) == {"NARRATOR", "Alice", "Bob"}
+        for speaker, config in voice_config.items():
+            assert config == NARRATOR_VOICE, (
+                f"{speaker} not forced to NARRATOR_VOICE: {config!r}"
+            )
+
+    def test_single_speaker_forces_narrator_config_individual(
+        self, storage, fake_engine
+    ):
+        """single_speaker=1: each generate_voice call's voice_config is all-NARRATOR."""
+        self._set_single_speaker(storage, "b1", 1)
+        render_audiobook("b1", storage, fake_engine, use_batch=False)
+
+        assert len(fake_engine.voice_calls) == 3
+        for call in fake_engine.voice_calls:
+            voice_config = call["voice_config"]
+            assert set(voice_config) == {"NARRATOR", "Alice", "Bob"}
+            for speaker, config in voice_config.items():
+                assert config == NARRATOR_VOICE, (
+                    f"{speaker} not forced to NARRATOR_VOICE: {config!r}"
+                )
+
+    def test_single_speaker_uses_db_narrator_row_when_present(
+        self, storage, fake_engine
+    ):
+        """single_speaker=1: a NARRATOR voice_config row wins over the constant."""
+        storage.execute_insert(
+            "INSERT INTO voice_config "
+            "(id, name, description, type, voice, character_style, seed, "
+            "ref_audio, ref_text, adapter_id, adapter_path, alias_of) "
+            "VALUES ('NARRATOR', 'NARRATOR', 'Default narrator', 'clone', "
+            "'CustomNarrator', 'neutral', '42', 'refs/narrator.wav', "
+            "'Narrator reference text', NULL, NULL, NULL)"
+        )
+        self._set_single_speaker(storage, "b1", 1)
+        render_audiobook("b1", storage, fake_engine)
+
+        voice_config = fake_engine.batch_calls[0]["voice_config"]
+        expected = voice_config["NARRATOR"]
+        assert expected["type"] == "clone"
+        assert expected["voice"] == "CustomNarrator"
+        assert expected["description"] == "Default narrator"
+        for speaker, config in voice_config.items():
+            assert config == expected, (
+                f"{speaker} not forced to DB NARRATOR config: {config!r}"
+            )
+
+    def test_single_speaker_without_narrator_span_still_forces_narrator(
+        self, fake_engine
+    ):
+        """single_speaker=1 with no NARRATOR span: a NARRATOR config is still forced."""
+        s = InMemorySQLiteAdapter()
+        s.init_db()
+        self._populate_character_only_storage(s)
+        self._set_single_speaker(s, "b1", 1)
+
+        render_audiobook("b1", s, fake_engine)
+
+        assert len(fake_engine.batch_calls) == 1
+        voice_config = fake_engine.batch_calls[0]["voice_config"]
+        # No NARRATOR span exists in the script — the boundary still provides one
+        assert "NARRATOR" in voice_config
+        for speaker, config in voice_config.items():
+            assert config == NARRATOR_VOICE, (
+                f"{speaker} not forced to NARRATOR_VOICE: {config!r}"
+            )
+
+    def test_single_speaker_export_stays_faithful(self, storage, fake_engine):
+        """export_annotated_script is untouched by single_speaker=1 (editor contract)."""
+        from app.pipeline.assembly import export_annotated_script
+
+        self._set_single_speaker(storage, "b1", 1)
+
+        script = export_annotated_script("b1", storage)
+        assert [e["speaker"] for e in script] == ["Alice", "NARRATOR", "Bob"]
+
+        render_audiobook("b1", storage, fake_engine)
+        # Chunks still carry the faithful speaker names — forcing happens via the
+        # voice_config mapping, never by rewriting the script/chunks.
+        chunks = fake_engine.batch_calls[0]["chunks"]
+        assert [c["speaker"] for c in chunks] == ["Alice", "NARRATOR", "Bob"]
+
+    def test_single_speaker_zero_keeps_per_speaker_configs(self, storage, fake_engine):
+        """single_speaker=0: each speaker keeps its own voice config (unchanged)."""
+        self._set_single_speaker(storage, "b1", 0)
+        render_audiobook("b1", storage, fake_engine)
+
+        voice_config = fake_engine.batch_calls[0]["voice_config"]
+        assert voice_config["Alice"]["voice"] == "Warm Female"
+        assert voice_config["Bob"]["voice"] == "Deep Male"
+        assert voice_config["NARRATOR"] == NARRATOR_VOICE
+        assert len(voice_config) == 3
+
+
+# ---------------------------------------------------------------------------
+# Tests: global pause config passthrough (Plan J Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class TestPauseConfigBoundary:
+    """Global pause config must flow into the render boundary (batch chunks).
+
+    ``pause_between_speakers_ms`` / ``pause_same_speaker_ms`` are carried
+    through ``render_audiobook`` into the engine dispatch unchanged, with the
+    ``TTSConfig`` defaults (500 / 250 ms) applied when a value is omitted.
+    The per-span ``pause_after`` variant is NOT restorable (DD cannot-restore
+    #5) — these tests pin the global variant only.
+    """
+
+    def test_batch_chunks_carry_default_pause_values(self, storage, fake_engine):
+        """Without a TTSConfig the 500/250 ms defaults reach every chunk."""
+        render_audiobook("b1", storage, fake_engine)
+        chunks = fake_engine.batch_calls[0]["chunks"]
+        assert len(chunks) == 3
+        for chunk in chunks:
+            assert chunk["pause_between_speakers_ms"] == 500
+            assert chunk["pause_same_speaker_ms"] == 250
+
+    def test_configured_pause_values_flow_unchanged(self, storage, fake_engine):
+        """Custom TTSConfig pause values reach the engine unchanged."""
+        render_audiobook(
+            "b1",
+            storage,
+            fake_engine,
+            tts_config={
+                "pause_between_speakers_ms": 750,
+                "pause_same_speaker_ms": 350,
+            },
+        )
+        chunks = fake_engine.batch_calls[0]["chunks"]
+        for chunk in chunks:
+            assert chunk["pause_between_speakers_ms"] == 750
+            assert chunk["pause_same_speaker_ms"] == 350
+
+    def test_partial_tts_config_falls_back_per_field(self, storage, fake_engine):
+        """A TTSConfig missing one pause field keeps that field's default."""
+        render_audiobook(
+            "b1",
+            storage,
+            fake_engine,
+            tts_config={"pause_between_speakers_ms": 1000},
+        )
+        chunks = fake_engine.batch_calls[0]["chunks"]
+        for chunk in chunks:
+            assert chunk["pause_between_speakers_ms"] == 1000
+            assert chunk["pause_same_speaker_ms"] == 250  # default retained
+
+    def test_config_json_pause_values_reach_render_boundary(
+        self, storage, fake_engine, tmp_path, monkeypatch
+    ):
+        """End-to-end: config.json pause values → load_tts_config → render."""
+        from app.utils import load_tts_config
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "tts": {
+                        "mode": "external",
+                        "pause_between_speakers_ms": 900,
+                        "pause_same_speaker_ms": 400,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(config_path))
+
+        tts_config = load_tts_config()
+        assert tts_config["pause_between_speakers_ms"] == 900
+
+        render_audiobook("b1", storage, fake_engine, tts_config=tts_config)
+        chunks = fake_engine.batch_calls[0]["chunks"]
+        for chunk in chunks:
+            assert chunk["pause_between_speakers_ms"] == 900
+            assert chunk["pause_same_speaker_ms"] == 400
+
+    def test_individual_mode_accepts_tts_config(self, storage, fake_engine):
+        """Individual mode renders with a TTSConfig present (no regression)."""
+        render_audiobook(
+            "b1",
+            storage,
+            fake_engine,
+            use_batch=False,
+            job_id="job-iv-pause",
+            tts_config={"pause_between_speakers_ms": 600},
+        )
+        assert len(fake_engine.voice_calls) == 3

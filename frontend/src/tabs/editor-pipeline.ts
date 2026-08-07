@@ -56,6 +56,10 @@ export interface ReviewItem {
   related_entity_id: string;
   reason?: string;
   walk_name?: string;
+  /** Contextual review (Plan J, Phase 6 / DD UX workflow #5): up to 2
+   * neighboring span texts in presentation order around the item's target
+   * span. Optional — absent on pre-upgrade payloads. */
+  neighbors?: { before: string[]; after: string[] };
 }
 
 /** A render_chunk row from GET /api/pipeline/export/jobs/{job_id}/chunks */
@@ -193,6 +197,142 @@ export async function pipelineUpdateSpanText(
   return API.put(`/api/pipeline/span/${spanId}/text`, { text });
 }
 
+// ---------------------------------------------------------------------------
+// Single-speaker render flag (Plan J, Phase 2)
+// ---------------------------------------------------------------------------
+// book.single_speaker is a UI write of the flag: enforcement happens ONLY at
+// the render boundary (tts_integration._enforce_single_speaker) — the script
+// stays faithful and the annotated export is untouched (CONTRACTS decision
+// #9). The backend surface is GET/PUT /api/pipeline/book/{book_id}/single_speaker.
+
+/** GET /api/pipeline/book/{bookId}/single_speaker → whether the book renders single-speaker. */
+export async function pipelineGetSingleSpeaker(bookId: string): Promise<boolean> {
+  const data = await API.get<{ single_speaker: number }>(
+    `/api/pipeline/book/${bookId}/single_speaker`,
+  );
+  return data.single_speaker === 1;
+}
+
+/** PUT /api/pipeline/book/{bookId}/single_speaker — persist the flag. */
+export async function pipelineSetSingleSpeaker(bookId: string, enabled: boolean): Promise<void> {
+  await API.put(`/api/pipeline/book/${bookId}/single_speaker`, { single_speaker: enabled });
+}
+
+/**
+ * Reflect the book's saved single-speaker flag into the editor toggle.
+ * No-ops when the toggle element is absent; defaults to off when no book is
+ * onboarded or the read fails (column default is 0).
+ */
+export async function loadSingleSpeakerToggle(): Promise<void> {
+  const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement | null;
+  if (!toggle) return;
+  if (!state.pipelineBookId) {
+    toggle.checked = false;
+    return;
+  }
+  try {
+    toggle.checked = await pipelineGetSingleSpeaker(state.pipelineBookId);
+  } catch (err) {
+    console.error('Failed to load single-speaker flag:', err);
+    toggle.checked = false;
+    showToast('Failed to load single-speaker setting', 'error');
+  }
+}
+
+/**
+ * Toggle change handler: persist book.single_speaker through the backend
+ * path; revert the toggle and surface an error when the write fails.
+ */
+export async function handleSingleSpeakerToggleChange(): Promise<void> {
+  const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement | null;
+  if (!toggle) return;
+  if (!state.pipelineBookId) {
+    toggle.checked = false;
+    return;
+  }
+  const previous = !toggle.checked;
+  try {
+    await pipelineSetSingleSpeaker(state.pipelineBookId, toggle.checked);
+  } catch (err) {
+    console.error('Failed to save single-speaker flag:', err);
+    toggle.checked = previous;
+    showToast('Failed to save single-speaker setting', 'error');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Span-text undo (Plan J, Phase 3)
+// ---------------------------------------------------------------------------
+// Undo = transactional value-restore through the SAME server-validated
+// pipelineUpdateSpanText path (PUT /span/{id}/text) — the DD UX workflow #7
+// primitive. The audit-journal/replay mechanism was explicitly REJECTED in the
+// DD evidence trail, so no new backend surface is needed: the existing
+// update_span_text endpoint is the revert primitive. The stack lives next to
+// the span cache so it can be cleared whenever the cache is replaced.
+
+/** One undoable span-text edit: the span id + the text value BEFORE the edit. */
+export interface UndoEntry {
+  spanId: string;
+  priorValue: string;
+}
+
+/** Push a {spanId, priorValue} entry onto the undo stack (most recent last). */
+export function pushUndoEntry(spanId: string, priorValue: string): void {
+  _undoStack.push({ spanId, priorValue });
+  syncUndoButton();
+}
+
+/** Drop every undo entry (snapshot load / render start / spans reload). */
+export function clearUndoStack(): void {
+  _undoStack = [];
+  syncUndoButton();
+}
+
+/** Read-only view of the undo stack (testability). */
+export function getUndoStack(): UndoEntry[] {
+  return _undoStack;
+}
+
+/**
+ * Revert the most recent span-text edit through the pipeline PUT path. On
+ * success the cached span + visible row are restored so the UI matches the
+ * server (the focusout edit flow keeps the cache authoritative). On failure
+ * the entry is re-pushed so a later retry can still revert it.
+ */
+export async function undoLastSpanEdit(): Promise<void> {
+  const entry = _undoStack.pop();
+  if (!entry) {
+    syncUndoButton();
+    return;
+  }
+  try {
+    await pipelineUpdateSpanText(entry.spanId, entry.priorValue);
+    // Restore the cached span text + the visible row (matched by data-index,
+    // the same key the focusout handler uses).
+    const span = _cachedSpans.find(s => s.id === entry.spanId);
+    if (span) {
+      span.text = entry.priorValue;
+      const cell = document.querySelector(
+        `div.span-text[data-index="${span.global_index}"]`,
+      ) as HTMLElement | null;
+      if (cell) cell.textContent = entry.priorValue;
+    }
+    showToast('Undo: span text reverted', 'success');
+  } catch (err) {
+    console.error('Failed to undo span text edit:', err);
+    // Re-push so the failed revert is not lost; the button stays enabled.
+    _undoStack.push(entry);
+    showToast('Failed to undo span text edit', 'error');
+  }
+  syncUndoButton();
+}
+
+/** Reflect stack emptiness in the Undo button's disabled state. */
+function syncUndoButton(): void {
+  const btn = document.getElementById('btn-pipeline-undo') as HTMLButtonElement | null;
+  if (btn) btn.disabled = _undoStack.length === 0;
+}
+
 /**
  * Build the download URL for a rendered audiobook
  */
@@ -282,6 +422,15 @@ let _cachedReviewItems: ReviewItem[] = [];
 let _selectedIndices: Set<number> = new Set();
 
 /**
+ * Undo stack for span-text edits (Plan J, Phase 3): most-recent-last entries
+ * of {spanId, priorValue}. Pushed only AFTER a PUT succeeds (a failed edit
+ * restores the cached original, so an entry would be a no-op revert) and never
+ * for empty-text edits. Cleared on snapshot load, render start, and spans
+ * (re)load — the stack must not outlive the span set it refers to.
+ */
+let _undoStack: UndoEntry[] = [];
+
+/**
  * Contract tooltip for batch-mode per-span preview (DD-universal-upgrade
  * decision #2): batch renders drift per-chunk (unset seed) so per-span preview
  * differs from the final whole-book output. Shown verbatim when the user
@@ -330,6 +479,9 @@ export async function loadSpans(): Promise<void> {
   if (!state.pipelineBookId) {
     tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No book onboarded. Go to the Script tab to onboard an EPUB first.</td></tr>';
     _cachedSpans = [];
+    // No book → no spans → nothing to undo; drop stale entries referencing the
+    // previous book (Plan J, Phase 3).
+    clearUndoStack();
     return;
   }
 
@@ -341,6 +493,9 @@ export async function loadSpans(): Promise<void> {
     const raw = await pipelineExportSpans();
     const spans = toPipelineSpans(raw);
     _cachedSpans = spans;
+    // The cache was replaced — any undo entry references a stale span set
+    // (book switch / tab re-load / snapshot load); clear it (Plan J, Phase 3).
+    clearUndoStack();
 
     if (spans.length === 0) {
       tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No spans found. Run all walks in the Script tab first.</td></tr>';
@@ -692,6 +847,22 @@ export function renderReviewItem(item: ReviewItem): string {
   const confPercent = Math.round(item.confidence * 100);
   const confBadgeClass = confPercent >= 60 ? 'bg-warning' : 'bg-danger';
 
+  // Contextual review (Plan J, Phase 6 / DD UX workflow #5): a muted,
+  // collapsible block listing up to 2 neighboring span texts (before/after)
+  // when the payload carries any. No block when neighbors is empty/absent.
+  const neighbors = item.neighbors;
+  let neighborsBlock = '';
+  if (neighbors && (neighbors.before.length > 0 || neighbors.after.length > 0)) {
+    neighborsBlock = `
+        <details class="review-neighbors mt-2">
+          <summary class="text-muted small">Context — neighboring spans</summary>
+          <div class="text-muted small mt-1">
+            ${neighbors.before.map(t => `<div class="review-neighbor-before"><span class="text-secondary">↑ before</span> ${escapeHtml(t)}</div>`).join('')}
+            ${neighbors.after.map(t => `<div class="review-neighbor-after"><span class="text-secondary">↓ after</span> ${escapeHtml(t)}</div>`).join('')}
+          </div>
+        </details>`;
+  }
+
   return `
     <div class="card mb-2 review-item-card" data-item-id="${escapeHtml(item.item_id)}">
       <div class="card-body py-2 px-3">
@@ -714,6 +885,7 @@ export function renderReviewItem(item: ReviewItem): string {
             </button>
           </div>
         </div>
+        ${neighborsBlock}
       </div>
     </div>
   `;
@@ -879,6 +1051,10 @@ export async function pipelineRenderAll(): Promise<void> {
   if (btnRender) btnRender.style.display = 'none';
   if (btnRegen) btnRegen.style.display = 'none';
   if (btnCancel) btnCancel.style.display = 'inline-block';
+
+  // A fresh render invalidates any pending span-text undo — the stack must not
+  // outlive the span set it would revert against (Plan J, Phase 3).
+  clearUndoStack();
 
   // Fresh render → the bar starts neutral (0%, Ready) until the first tick.
   resetRenderProgress();

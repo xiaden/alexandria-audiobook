@@ -37,7 +37,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Batch Processing** - Generate dozens of spans simultaneously with 3-6x real-time throughput
 - **Codec Compilation** - Optional `torch.compile` optimization for 3-4x faster batch decoding
 - **Non-verbal Sounds** - LLM writes natural vocalizations ("Ahh!", "Mmm...", "Haha!") with context-aware instruct directions
-- **Natural Pauses** - Configurable silence between speakers (default 500ms) and same-speaker segments (default 250ms)
+- **Natural Pauses** - Configurable pause between speakers (default 500 ms) and same-speaker segments (default 250 ms), carried through the render boundary for merge
 
 ### Web UI Editor
 - **Streamlined Interface** - Core pipeline tabs (Setup, Script, Voices, Editor) plus advanced tools (Designer, Preparer, Dataset, Training)
@@ -241,8 +241,8 @@ Configure connections to your LLM and TTS engine.
 - **Min Sub-batch Size** - Minimum chunks per sub-batch before allowing a split (default: 4)
 - **Length Ratio** - Maximum longest/shortest text length ratio before forcing a sub-batch split (default: 5)
 - **Max Sub-batch Items** - Upper bound on chunks per sub-batch
-- **Speaker Change Pause** - Silence in milliseconds between different speakers during merge (default: 500)
-- **Same Speaker Pause** - Silence in milliseconds when the same speaker continues during merge (default: 250)
+- **Speaker Change Pause** - Pause between different speakers (carried through the render boundary for merge; default: 500 ms)
+- **Same Speaker Pause** - Pause when the same speaker continues (carried through the render boundary for merge; default: 250 ms)
 
 ### Script Tab
 Upload an EPUB file and run the annotation walks. Onboarding is EPUB-only — the file is converted to plain text server-side on upload. The pipeline runs 9 serial LLM walks that convert your book into a structured span graph with:
@@ -271,7 +271,6 @@ Speaker-name variants are resolved automatically during annotation (walk 2c) int
 **Custom Voice Mode:**
 - Select from 9 pre-trained voices: Aiden, Dylan, Eric, Ono_anna, Ryan, Serena, Sohee, Uncle_fu, Vivian
 - Set a character style that appends persistent traits to every TTS instruct (e.g., "Heavy Scottish accent", "Refined aristocratic tone")
-- Optionally set a seed for reproducible output
 
 **Clone Voice Mode:**
 - Select a designed voice or enter a custom reference audio path

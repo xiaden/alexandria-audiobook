@@ -21,7 +21,7 @@
 import * as API from '../api';
 import { state } from '../state';
 import { showToast, showConfirm, escapeHtml } from '../utils';
-import { loadSpans } from './editor-pipeline';
+import { clearUndoStack, loadSpans, loadSingleSpeakerToggle } from './editor-pipeline';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -177,6 +177,11 @@ export async function loadProject(name: string): Promise<void> {
     // Cross-tab refresh: reload the editor span table so the restored
     // snapshot's script is immediately visible on the Editor tab.
     await loadSpans();
+    // ...and reflect the book's single-speaker flag in the editor toggle.
+    await loadSingleSpeakerToggle();
+    // ...and clear the editor's span-text undo stack: snapshot load replaces
+    // the span set, so stale undo entries must not survive (Plan J, Phase 3).
+    clearUndoStack();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     showToast('Failed to load snapshot: ' + msg, 'error');

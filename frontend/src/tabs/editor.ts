@@ -12,6 +12,8 @@
  *   - Operations via POST /api/pipeline/operation (split/merge/move/delete)
  *   - Confidence review via GET /api/pipeline/review/{book_id}
  *   - Render via POST /api/pipeline/render
+ *   - Single-speaker toggle via GET/PUT /api/pipeline/book/{book_id}/single_speaker
+ *     (Plan J, Phase 2 — a UI write; enforced at the render boundary only)
  */
 
 import { showToast } from '../utils';
@@ -38,6 +40,16 @@ import {
   toPipelineSpans,
   loadSpans,
   renderSpanRow,
+  // Single-speaker render toggle (Plan J, Phase 2)
+  pipelineGetSingleSpeaker,
+  pipelineSetSingleSpeaker,
+  loadSingleSpeakerToggle,
+  handleSingleSpeakerToggleChange,
+  // Span-text undo (Plan J, Phase 3)
+  pushUndoEntry,
+  undoLastSpanEdit,
+  clearUndoStack,
+  getUndoStack,
   // Operations
   handleSplit,
   handleMerge,
@@ -101,6 +113,23 @@ export {
   loadSpans,
   renderSpanRow,
 };
+
+// Re-export single-speaker render toggle (Plan J, Phase 2)
+export {
+  pipelineGetSingleSpeaker,
+  pipelineSetSingleSpeaker,
+  loadSingleSpeakerToggle,
+  handleSingleSpeakerToggleChange,
+};
+
+// Re-export span-text undo (Plan J, Phase 3)
+export {
+  pushUndoEntry,
+  undoLastSpanEdit,
+  clearUndoStack,
+  getUndoStack,
+};
+export type { UndoEntry } from './editor-pipeline';
 
 // Re-export pipeline operations
 export {
@@ -221,12 +250,33 @@ export function initEditor(): void {
       btnPipelineMerge.addEventListener('click', () => handleMerge());
     }
 
+    // Single-speaker render toggle (Plan J, Phase 2): persist book.single_speaker
+    // on change. The flag is a UI write — enforcement happens at the render
+    // boundary only (tts_integration._enforce_single_speaker), never in the script.
+    const singleSpeakerToggle = document.getElementById('single-speaker-toggle');
+    if (singleSpeakerToggle) {
+      singleSpeakerToggle.addEventListener('change', () => {
+        handleSingleSpeakerToggleChange();
+      });
+    }
+
+    // Undo button (Plan J, Phase 3): revert the last span-text edit through
+    // the pipeline PUT path. Disabled state is driven by the undo stack.
+    const btnUndo = document.getElementById('btn-pipeline-undo');
+    if (btnUndo) {
+      btnUndo.addEventListener('click', () => {
+        undoLastSpanEdit();
+      });
+    }
+
     // Tab-switch handler: load spans when editor tab is activated
     const editorTabBtn = document.querySelector('[data-tab="editor"]');
     if (editorTabBtn) {
       editorTabBtn.addEventListener('click', () => {
         loadSpans();
         loadReviewItems();
+        // Reflect the book's saved single-speaker flag into the toggle.
+        loadSingleSpeakerToggle();
       });
     }
 
@@ -288,13 +338,25 @@ export function initEditor(): void {
         }
 
         try {
-          await pipelineUpdateSpanText(spanId, newText);
-          // Update local cache
+          // Capture the PRIOR value BEFORE the mutation so a successful edit
+          // can be pushed onto the undo stack (Plan J, Phase 3). Undo =
+          // transactional value-restore through the same server-validated PUT
+          // path (DD UX workflow #7; audit-journal replay rejected in the DD
+          // evidence trail).
           const cachedSpans = getCachedSpans();
           const idx = parseInt(target.dataset.index || '0', 10);
           const span = cachedSpans.find(s => s.global_index === idx);
+          const priorValue = span ? span.text : null;
+
+          await pipelineUpdateSpanText(spanId, newText);
+          // Update local cache
           if (span) {
             span.text = newText;
+          }
+          // Push ONLY after the PUT succeeds and only when something actually
+          // changed — a no-op edit (prior === new) has nothing to revert.
+          if (span && priorValue !== null && priorValue !== newText) {
+            pushUndoEntry(spanId, priorValue);
           }
           showToast('Span text updated', 'success');
         } catch (err) {

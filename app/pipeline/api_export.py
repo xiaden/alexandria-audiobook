@@ -54,6 +54,7 @@ from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
 from app.pipeline.assembly import export_annotated_script
 from app.pipeline.tts_integration import CancelledError, get_render_root, render_audiobook
+from app.utils import load_tts_config
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,7 @@ def _run_render_job(
     use_batch: bool,
     output_dir: Optional[str],
     batch_seed: int,
+    tts_config: dict | None = None,
 ) -> None:
     """Background task: execute render_audiobook and update job state.
 
@@ -170,6 +172,11 @@ def _run_render_job(
     download is row-backed and never consults the dict — and mirrors
     failures that escaped the row handling (e.g. patched callers) back
     into the row.
+
+    ``tts_config`` is the ``tts`` section of config.json resolved by the
+    endpoint at request time; it is passed through to ``render_audiobook``
+    so the global pause values survive the production chain (the background
+    task executes with the config the user saw when starting the render).
     """
     job = _render_jobs[job_id]
     cancel_event: threading.Event = job["cancel_event"]
@@ -183,6 +190,7 @@ def _run_render_job(
             batch_seed=batch_seed,
             job_id=job_id,
             cancel_check=cancel_event.is_set,
+            tts_config=tts_config,
         )
         job["output_dir"] = resolved_dir
         job["status"] = "completed"
@@ -251,6 +259,11 @@ async def render(
 
     batch_seed = request.batch_seed if request.batch_seed is not None else -1
 
+    # TTS config snapshot at request time: the ``tts`` section of config.json
+    # (the same source the TTS engine reads), carrying the global pause values
+    # (pause_between_speakers_ms / pause_same_speaker_ms) into the render.
+    tts_config = load_tts_config()
+
     background_tasks.add_task(
         _run_render_job,
         job_id,
@@ -260,6 +273,7 @@ async def render(
         request.use_batch,
         request.output_dir,
         batch_seed,
+        tts_config=tts_config,
     )
 
     return {"job_id": job_id, "status": "started"}

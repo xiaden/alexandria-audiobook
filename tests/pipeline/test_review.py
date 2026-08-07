@@ -961,7 +961,9 @@ class TestWalkItemsInQueue:
 
     def test_walk_item_shape_is_table_columns_only(self, union_manager):
         """Walk items carry exactly the walk_review_item columns — no
-        confidence/human_override (those do not exist on walk items)."""
+        confidence/human_override (those do not exist on walk items) — plus
+        the Phase 6 contextual-review ``neighbors`` enrichment that every
+        queue item now carries."""
         walk = self._walk_items(union_manager.get_review_items("b1"))
         assert len(walk) == 3
         expected = {
@@ -971,9 +973,11 @@ class TestWalkItemsInQueue:
             "target_id",
             "prior_value",
             "created_ms",
+            "neighbors",
         }
         for item in walk:
             assert set(item) == expected
+            assert set(item["neighbors"]) == {"before", "after"}
 
     def test_non_pending_walk_items_excluded(self, union_manager):
         """resolved/superseded/stale rows never surface in the queue."""
@@ -1413,3 +1417,195 @@ class TestWalkItemValueRestore:
             "WHERE character_id = 'c1' AND key = 'voice_profile'"
         )
         assert rows[0]["value"] == '{"voice":"old"}'
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — contextual review: ±2 neighboring spans (DD UX workflow #5)
+# ---------------------------------------------------------------------------
+
+
+def _populate_neighbor_storage(storage: InMemorySQLiteAdapter) -> None:
+    """Insert a book with 5 spans in a DEFINED presentation order plus review
+    items whose span references exercise the full ±2 window and its edges.
+
+    Presentation order (via span_presentation VIEW, book-scoped by
+    ``bc.parent_id``): ``sp-nb1`` (global 1) .. ``sp-nb5`` (global 5) — one
+    span per paragraph, paragraphs in order in a single scene.
+
+    Review items seeded:
+      - character_span junctions: c-nb speaker of sp-nb1 (FIRST span),
+        sp-nb3 (middle — full ±2 window) and sp-nb5 (LAST span);
+      - character_book junction c-nb → b-nb (no span reference);
+      - walk items: kind ``instruction`` targeting span sp-nb2 (resolves via
+        target_id), plus kinds ``voice_profile`` and ``voice_assignment``
+        (no span reference → empty lists).
+    """
+    storage.execute_insert("INSERT INTO series (id) VALUES ('s-nb')")
+    storage.execute_insert(
+        "INSERT INTO book (id, series_id, position) VALUES ('b-nb', 's-nb', 1)"
+    )
+    storage.execute_insert(
+        "INSERT INTO chapter (id, book_id) VALUES ('ch-nb', 'b-nb')"
+    )
+    storage.execute_insert(
+        "INSERT INTO book_chapter (child_id, parent_id, position) "
+        "VALUES ('ch-nb', 'b-nb', 1)"
+    )
+    storage.execute_insert("INSERT INTO scene (id) VALUES ('sc-nb')")
+    storage.execute_insert(
+        "INSERT INTO chapter_scene (child_id, parent_id, position) "
+        "VALUES ('sc-nb', 'ch-nb', 1)"
+    )
+    for i in range(1, 6):
+        storage.execute_insert(
+            f"INSERT INTO paragraph (id) VALUES ('p-nb{i}')"
+        )
+        storage.execute_insert(
+            f"INSERT INTO scene_paragraph (child_id, parent_id, position) "
+            f"VALUES ('p-nb{i}', 'sc-nb', {i})"
+        )
+        storage.execute_insert(
+            f"INSERT INTO span (id, span_type, text) "
+            f"VALUES ('sp-nb{i}', 'sentence', 'Span {i} text')"
+        )
+        storage.execute_insert(
+            f"INSERT INTO paragraph_span (child_id, parent_id, position) "
+            f"VALUES ('sp-nb{i}', 'p-nb{i}', 1)"
+        )
+    storage.execute_insert(
+        "INSERT INTO character (id, name, aliases) VALUES ('c-nb', 'Narrator', '[]')"
+    )
+    # character_span junctions in the review band [0.5, 0.7)
+    for span_id, conf in (("sp-nb1", 0.6), ("sp-nb3", 0.55), ("sp-nb5", 0.52)):
+        storage.execute_insert(
+            "INSERT INTO character_span "
+            "(character_id, span_id, relation_type, source, confidence) "
+            f"VALUES ('c-nb', '{span_id}', 'speaker', 'walk', {conf})"
+        )
+    # character_book junction (no span reference)
+    storage.execute_insert(
+        "INSERT INTO character_book (character_id, book_id, source, confidence) "
+        "VALUES ('c-nb', 'b-nb', 'walk', 0.58)"
+    )
+    # walk items: instruction targets a span; voice_profile/voice_assignment don't
+    storage.execute_insert(
+        "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+        "VALUES ('run-nb', 'b-nb', 'walk_2i_delivery', 'completed', 1)"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('w-nb1', 'b-nb', 'run-nb', 'instruction', 'span', 'sp-nb2', "
+        "'slow', 'pending', 100)"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('w-nb2', 'b-nb', 'run-nb', 'voice_profile', 'character_metadata', "
+        "'c-nb', '{}', 'pending', 200)"
+    )
+    storage.execute_insert(
+        "INSERT INTO walk_review_item "
+        "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+        "VALUES ('w-nb3', 'b-nb', 'run-nb', 'voice_assignment', 'character', "
+        "'c-nb', NULL, 'pending', 300)"
+    )
+
+
+@pytest.fixture
+def neighbor_manager():
+    """ReviewManager over the 5-span contextual-review fixture."""
+    storage = InMemorySQLiteAdapter()
+    storage.init_db()
+    _populate_neighbor_storage(storage)
+    return ReviewManager(storage)
+
+
+class TestReviewItemNeighborContext:
+    """Phase 6 — get_review_items enriches EVERY item with
+    ``neighbors: {before: [...], after: [...]}`` — up to 2 span TEXTS in
+    presentation order around the item's span reference (DD UX workflow #5).
+
+    Resolution rules:
+      - character_span junction items → ``related_entity_id`` (the span_id);
+      - walk items of kind ``instruction`` → ``target_id``;
+      - every other kind (character_book, character_scene, voice_profile,
+        voice_assignment) → empty before/after lists.
+    """
+
+    @staticmethod
+    def _by_id(manager) -> dict:
+        return {i["item_id"]: i for i in manager.get_review_items("b-nb")}
+
+    def test_every_item_carries_neighbors_key(self, neighbor_manager):
+        """Every item — junction AND walk — carries the neighbors dict."""
+        items = neighbor_manager.get_review_items("b-nb")
+        assert len(items) == 7
+        for item in items:
+            assert "neighbors" in item
+            assert set(item["neighbors"]) == {"before", "after"}
+            assert isinstance(item["neighbors"]["before"], list)
+            assert isinstance(item["neighbors"]["after"], list)
+
+    def test_character_span_middle_span_full_window(self, neighbor_manager):
+        """A span in the middle gets the full ±2 window, in presentation order."""
+        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb3"]
+        assert item["neighbors"] == {
+            "before": ["Span 1 text", "Span 2 text"],
+            "after": ["Span 4 text", "Span 5 text"],
+        }
+
+    def test_first_span_empty_before(self, neighbor_manager):
+        """Item targeting the book's FIRST span → empty before."""
+        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb1"]
+        assert item["neighbors"]["before"] == []
+        assert item["neighbors"]["after"] == ["Span 2 text", "Span 3 text"]
+
+    def test_last_span_empty_after(self, neighbor_manager):
+        """Item targeting the book's LAST span → empty after."""
+        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb5"]
+        assert item["neighbors"]["before"] == ["Span 3 text", "Span 4 text"]
+        assert item["neighbors"]["after"] == []
+
+    def test_instruction_walk_item_resolves_via_target_id(self, neighbor_manager):
+        """Walk items of kind 'instruction' resolve their span via target_id."""
+        item = self._by_id(neighbor_manager)["walkitem:w-nb1"]
+        assert item["neighbors"] == {
+            "before": ["Span 1 text"],
+            "after": ["Span 3 text", "Span 4 text"],
+        }
+
+    def test_no_span_reference_kinds_get_empty_lists(self, neighbor_manager):
+        """character_book junction + voice_profile/voice_assignment walk items
+        carry no span reference → empty before/after."""
+        by_id = self._by_id(neighbor_manager)
+        assert by_id["character_book:c-nb:b-nb"]["neighbors"] == {
+            "before": [],
+            "after": [],
+        }
+        assert by_id["walkitem:w-nb2"]["neighbors"] == {"before": [], "after": []}
+        assert by_id["walkitem:w-nb3"]["neighbors"] == {"before": [], "after": []}
+
+    def test_character_scene_junction_gets_empty_lists(self, neighbor_manager):
+        """character_scene junction items have no span reference (scene id)."""
+        storage = neighbor_manager._storage
+        storage.execute_insert(
+            "INSERT INTO character_scene "
+            "(character_id, scene_id, relation_type, source, confidence) "
+            "VALUES ('c-nb', 'sc-nb', 'present', 'walk', 0.57)"
+        )
+        item = self._by_id(neighbor_manager)["character_scene:c-nb:sc-nb"]
+        assert item["neighbors"] == {"before": [], "after": []}
+
+    def test_walk_item_targeting_span_outside_book_gets_empty_lists(self, neighbor_manager):
+        """An instruction walk item whose target_id is not in the book's
+        presentation order (e.g. a span of another book) → empty lists."""
+        storage = neighbor_manager._storage
+        storage.execute_insert(
+            "INSERT INTO walk_review_item "
+            "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+            "VALUES ('w-nb4', 'b-nb', 'run-nb', 'instruction', 'span', 'sp-other', "
+            "'slow', 'pending', 400)"
+        )
+        item = self._by_id(neighbor_manager)["walkitem:w-nb4"]
+        assert item["neighbors"] == {"before": [], "after": []}

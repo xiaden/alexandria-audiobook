@@ -160,6 +160,92 @@ _WALK_TARGET_WRITES: dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Contextual review - +/-2 neighboring spans (Plan J, Phase 6 / DD UX #5)
+# ---------------------------------------------------------------------------
+
+#: Maximum number of neighboring span texts to include per side.
+NEIGHBOR_WINDOW = 2
+
+
+def _load_spans_in_presentation_order(
+    book_id: str, storage: PipelineStorage
+) -> list[dict[str, Any]]:
+    """Load a book's spans in presentation order via the span_presentation VIEW.
+
+    Identical join chain to walk_2i's ``_load_spans_in_presentation_order``
+    (the VIEW is global; the book scope comes from ``bc.parent_id = ?``) -
+    returns ``[{id, text}]`` ordered by ``sp.global_index``.  Called ONCE per
+    ``get_review_items`` invocation and shared across every item, so the
+    contextual-review enrichment costs exactly one query regardless of how
+    many items the queue holds.
+    """
+    rows = storage.execute_query(
+        """
+        SELECT sp.id, s.text
+        FROM span_presentation sp
+        JOIN span s ON sp.id = s.id
+        JOIN paragraph_span ps ON ps.child_id = sp.id
+        JOIN scene_paragraph sp_edge ON sp_edge.child_id = ps.parent_id
+        JOIN chapter_scene cs ON cs.child_id = sp_edge.parent_id
+        JOIN book_chapter bc ON bc.child_id = cs.parent_id
+        WHERE bc.parent_id = ?
+        ORDER BY sp.global_index
+        """,
+        (book_id,),
+    )
+    return [{"id": row["id"], "text": row["text"] or ""} for row in rows]
+
+
+def _resolve_span_reference(item: dict[str, Any]) -> str | None:
+    """Return the span id an item references, or ``None`` when it has none.
+
+    Phase 6 resolution rules:
+      - ``character_span`` junction items use ``related_entity_id`` (the
+        span_id - set by ``_get_span_review_items`` as ``csp.span_id``);
+      - walk items of kind ``instruction`` use ``target_id`` (walk 2i
+        records instruction items whose target row is the span, so
+        target_id IS the span reference);
+      - every other kind (character_book, character_scene, voice_profile,
+        voice_assignment) returns ``None`` - empty before/after lists.
+    """
+    if item.get("junction_table") == "character_span":
+        return item.get("related_entity_id")
+    if item.get("kind") == "instruction":
+        return item.get("target_id")
+    return None
+
+
+def _build_neighbors(
+    span_ref: str | None,
+    ordered_spans: list[dict[str, Any]],
+    *,
+    window: int = NEIGHBOR_WINDOW,
+) -> dict[str, list[str]]:
+    """Build ``{before, after}`` neighbor-span-TEXT lists for *span_ref*.
+
+    *ordered_spans* is the book's spans in presentation order (the
+    span_presentation VIEW chain).  When *span_ref* is ``None`` or not
+    present in the order, both lists are empty.  Otherwise *before* holds up
+    to *window* span texts immediately preceding the span and *after* up to
+    *window* immediately following, preserving presentation order - the
+    FIRST span yields empty before, the LAST span empty after.
+    """
+    if span_ref is None:
+        return {"before": [], "after": []}
+    for idx, span in enumerate(ordered_spans):
+        if span["id"] == span_ref:
+            return {
+                "before": [
+                    s["text"] for s in ordered_spans[max(0, idx - window):idx]
+                ],
+                "after": [
+                    s["text"] for s in ordered_spans[idx + 1:idx + 1 + window]
+                ],
+            }
+    return {"before": [], "after": []}
+
+
 class ReviewManager:
     """Manage the unified review queue for a book.
 
@@ -237,6 +323,21 @@ class ReviewManager:
 
         # 4) walk_review_item — pending walk items (union tail)
         items.extend(self._get_walk_review_items(book_id, walk_name))
+
+        # 5) Contextual review (Plan J, Phase 6 / DD UX workflow #5): every
+        #    item gains ``neighbors = {before, after}`` — up to 2 span TEXTS
+        #    in presentation order around the item's span reference.  The
+        #    spans are loaded ONCE per call and shared across all items; the
+        #    enrichment rides through the GET /review/{book_id} response
+        #    unchanged (api_review.py returns the manager output verbatim).
+        if items:
+            ordered_spans = _load_spans_in_presentation_order(
+                book_id, self._storage
+            )
+            for item in items:
+                item["neighbors"] = _build_neighbors(
+                    _resolve_span_reference(item), ordered_spans
+                )
 
         return items
 

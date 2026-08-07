@@ -1,7 +1,10 @@
 /**
  * Spec-first tests for Editor tab (frontend/src/tabs/editor.ts).
  * Tests cover: pipeline operations (split/merge/move/delete), span display,
- * confidence review UI, TTS rendering.
+ * confidence review UI, TTS rendering, and the single-speaker render toggle
+ * (Plan J, Phase 2): the toggle writes book.single_speaker via
+ * GET/PUT /api/pipeline/book/{book_id}/single_speaker, reflects the saved
+ * value on load, and reverts + surfaces an error when a write fails.
  *
  * NOTE: Run `npm test` from frontend/ to execute this suite with vitest
  * (^4.1.10) + jsdom (^30.0.1) — both are devDependencies in
@@ -22,6 +25,8 @@ import {
   pipelineReviewOverride,
   pipelineRenderAudiobook,
   pipelineExportSpans,
+  pipelineGetSingleSpeaker,
+  pipelineSetSingleSpeaker,
   pipelineExportM4b,
   handleExportM4bSubmit,
   initExportM4bForm,
@@ -49,6 +54,12 @@ import {
   playPipelineAudiobook,
   playSpanSequence,
   initEditor,
+  loadSingleSpeakerToggle,
+  handleSingleSpeakerToggleChange,
+  pushUndoEntry,
+  undoLastSpanEdit,
+  clearUndoStack,
+  getUndoStack,
 } from '../../src/tabs/editor';
 import { state } from '../../src/state';
 import { getPreviewPlayer } from '../../src/player';
@@ -62,6 +73,7 @@ vi.mock('../../src/api', async () => {
   return {
     get: vi.fn(),
     post: vi.fn(),
+    put: vi.fn(),
     handleError: vi.fn(),
     postWithRetryOnce: actual.postWithRetryOnce,
   };
@@ -806,6 +818,95 @@ describe('Editor Tab — Confidence Review UI', () => {
       const html = renderReviewItem(item);
 
       expect(html).toContain('bg-danger');
+    });
+  });
+
+  describe('Editor Tab - Review Context Neighbors (Plan J, Phase 6)', () => {
+    it('should render a muted context block with before/after neighbor texts when present', () => {
+      const item: ReviewItem = {
+        item_id: 'review-001',
+        character_id: 'char-001',
+        character_name: 'Elizabeth',
+        confidence: 0.65,
+        junction_table: 'speaker',
+        related_entity_id: 'span-003',
+        neighbors: {
+          before: ['Prior line one.', 'Prior line two.'],
+          after: ['Next line one.', 'Next line two.'],
+        },
+      };
+
+      const html = renderReviewItem(item);
+
+      expect(html).toContain('review-neighbors');
+      expect(html).toContain('Prior line one.');
+      expect(html).toContain('Prior line two.');
+      expect(html).toContain('Next line one.');
+      expect(html).toContain('Next line two.');
+      // Existing card markup must be preserved alongside the context block.
+      expect(html).toContain('65% confidence');
+      expect(html).toContain('btn-review-accept');
+      expect(html).toContain('btn-review-reject');
+      expect(html).toContain('btn-review-override');
+      expect(html).toContain('data-item-id="review-001"');
+    });
+
+    it('should render no context block when neighbors is empty', () => {
+      const item: ReviewItem = {
+        item_id: 'review-002',
+        character_id: 'char-003',
+        character_name: 'Unknown Speaker',
+        confidence: 0.52,
+        junction_table: 'narrator',
+        related_entity_id: 'span-002',
+        neighbors: { before: [], after: [] },
+      };
+
+      const html = renderReviewItem(item);
+
+      expect(html).not.toContain('review-neighbors');
+    });
+
+    it('should render no context block when neighbors is undefined (existing fixtures stay valid)', () => {
+      // MOCK_REVIEW_ITEMS has no neighbors field - the field is optional.
+      const html = renderReviewItem(MOCK_REVIEW_ITEMS[0]);
+
+      expect(html).not.toContain('review-neighbors');
+      expect(html).toContain('btn-review-accept');
+    });
+
+    it('should render the block when only one side is non-empty', () => {
+      const item: ReviewItem = {
+        item_id: 'review-003',
+        character_id: 'char-001',
+        character_name: 'Elizabeth',
+        confidence: 0.6,
+        junction_table: 'speaker',
+        related_entity_id: 'span-001',
+        neighbors: { before: ['Only prior line.'], after: [] },
+      };
+
+      const html = renderReviewItem(item);
+
+      expect(html).toContain('review-neighbors');
+      expect(html).toContain('Only prior line.');
+    });
+
+    it('should escape neighbor span text', () => {
+      const item: ReviewItem = {
+        item_id: 'review-004',
+        character_id: 'char-001',
+        character_name: 'Elizabeth',
+        confidence: 0.6,
+        junction_table: 'speaker',
+        related_entity_id: 'span-001',
+        neighbors: { before: ['<script>alert(1)</script>'], after: [] },
+      };
+
+      const html = renderReviewItem(item);
+
+      expect(html).not.toContain('<script>alert(1)</script>');
+      expect(html).toContain('&lt;script&gt;');
     });
   });
 
@@ -2615,5 +2716,433 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       await vi.advanceTimersByTimeAsync(2000);
       await promise;
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Editor Tab — Single-Speaker Toggle (Plan J, Phase 2)
+// ---------------------------------------------------------------------------
+// The toggle is a UI write of book.single_speaker (CONTRACTS decision #9):
+// enforcement happens ONLY at the render boundary (tts_integration
+// _enforce_single_speaker); the script stays faithful. The toggle must write
+// the flag through the backend path, reflect the saved value on load, and
+// revert + surface an error when a write fails.
+
+describe('Editor Tab — Single-Speaker Toggle (Plan J, Phase 2)', () => {
+  beforeEach(() => {
+    // mockReset (not clearAllMocks): clears any unconsumed mockResolvedValueOnce
+    // queue that an earlier test in this file may have left on API.get/API.put,
+    // so each test here is hermetic (see exec-worker log L139 convention).
+    vi.mocked(API.get).mockReset();
+    vi.mocked(API.put).mockReset();
+    state.pipelineBookId = 'book-123';
+  });
+
+  afterEach(() => {
+    state.pipelineBookId = null;
+  });
+
+  it('pipelineSetSingleSpeaker writes the flag through the backend path', async () => {
+    await pipelineSetSingleSpeaker('book-123', true);
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/book/book-123/single_speaker', {
+      single_speaker: true,
+    });
+  });
+
+  it('pipelineSetSingleSpeaker persists the off state', async () => {
+    await pipelineSetSingleSpeaker('book-123', false);
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/book/book-123/single_speaker', {
+      single_speaker: false,
+    });
+  });
+
+  it('pipelineGetSingleSpeaker reads the saved flag via GET', async () => {
+    vi.mocked(API.get).mockResolvedValue({ single_speaker: 1 });
+
+    const enabled = await pipelineGetSingleSpeaker('book-123');
+
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/book/book-123/single_speaker');
+    expect(enabled).toBe(true);
+  });
+
+  it('pipelineGetSingleSpeaker maps the off column value to false', async () => {
+    vi.mocked(API.get).mockResolvedValue({ single_speaker: 0 });
+
+    await expect(pipelineGetSingleSpeaker('book-123')).resolves.toBe(false);
+  });
+
+  it('loadSingleSpeakerToggle reflects the saved value on load', async () => {
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle">`;
+    vi.mocked(API.get).mockResolvedValue({ single_speaker: 1 });
+
+    await loadSingleSpeakerToggle();
+
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+  });
+
+  it('loadSingleSpeakerToggle defaults off when the saved value is 0', async () => {
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle">`;
+    vi.mocked(API.get).mockResolvedValue({ single_speaker: 0 });
+
+    await loadSingleSpeakerToggle();
+
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+  });
+
+  it('loadSingleSpeakerToggle defaults off and surfaces an error when the read fails', async () => {
+    const { showToast } = await import('../../src/utils');
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle">`;
+    vi.mocked(API.get).mockRejectedValue(new Error('boom'));
+
+    await loadSingleSpeakerToggle();
+
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    expect(showToast).toHaveBeenCalledWith('Failed to load single-speaker setting', 'error');
+  });
+
+  it('loadSingleSpeakerToggle stays off and does not fetch without a book', async () => {
+    state.pipelineBookId = null;
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle" checked>`;
+
+    await loadSingleSpeakerToggle();
+
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    expect(API.get).not.toHaveBeenCalled();
+  });
+
+  it('handleSingleSpeakerToggleChange writes the new value and keeps the toggle', async () => {
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle">`;
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+    toggle.checked = true;
+
+    await handleSingleSpeakerToggleChange();
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/book/book-123/single_speaker', {
+      single_speaker: true,
+    });
+    expect(toggle.checked).toBe(true);
+  });
+
+  it('handleSingleSpeakerToggleChange reverts the toggle and surfaces an error on write failure', async () => {
+    const { showToast } = await import('../../src/utils');
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle">`;
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+    toggle.checked = true;
+    vi.mocked(API.put).mockRejectedValueOnce(new Error('server down'));
+
+    await handleSingleSpeakerToggleChange();
+
+    expect(toggle.checked).toBe(false);
+    expect(showToast).toHaveBeenCalledWith('Failed to save single-speaker setting', 'error');
+  });
+
+  it('wires the toggle change event to the backend write via initEditor', async () => {
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle">`;
+    initEditor();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change'));
+
+    await vi.waitFor(() => {
+      expect(API.put).toHaveBeenCalledWith('/api/pipeline/book/book-123/single_speaker', {
+        single_speaker: true,
+      });
+    });
+  });
+
+  it('wires the toggle load into the editor tab-switch handler via initEditor', async () => {
+    // Full editor fixture: the tab-switch handler calls loadSpans + loadReviewItems
+    // + loadSingleSpeakerToggle; all three DOM surfaces must exist so each makes
+    // its own API.get call.
+    document.body.innerHTML = `
+      <a class="nav-link" data-tab="editor"></a>
+      <div id="spans-table-body"></div>
+      <div id="review-items-container"></div>
+      <input type="checkbox" id="single-speaker-toggle">
+    `;
+    initEditor();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    // URL-dispatch mock: order/count-agnostic so the handler's exact call
+    // sequence can never leak a mockResolvedValueOnce into a later test.
+    vi.mocked(API.get).mockImplementation(async (endpoint: string) => {
+      if (endpoint === '/api/pipeline/book/book-123/single_speaker') {
+        return { single_speaker: 1 };
+      }
+      if (endpoint === '/api/pipeline/export/book-123') {
+        return MOCK_SPANS_RAW;
+      }
+      if (endpoint === '/api/pipeline/review/book-123') {
+        return MOCK_REVIEW_ITEMS;
+      }
+      return { single_speaker: 0 };
+    });
+
+    const editorLink = document.querySelector('[data-tab="editor"]') as HTMLElement;
+    editorLink.click();
+
+    await vi.waitFor(() => {
+      const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+      expect(toggle.checked).toBe(true);
+    });
+  });
+
+  it('round-trips: a saved value reflects on the next load', async () => {
+    document.body.innerHTML = `<input type="checkbox" id="single-speaker-toggle">`;
+    const toggle = document.getElementById('single-speaker-toggle') as HTMLInputElement;
+
+    // Save: toggle on → backend write
+    toggle.checked = true;
+    await handleSingleSpeakerToggleChange();
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/book/book-123/single_speaker', {
+      single_speaker: true,
+    });
+
+    // Reload: backend returns the persisted flag → toggle reflects it
+    vi.mocked(API.get).mockResolvedValue({ single_speaker: 1 });
+    toggle.checked = false;
+    await loadSingleSpeakerToggle();
+    expect(toggle.checked).toBe(true);
+  });
+
+  it('index.html exposes the toggle with the contract label and tooltip inside the editor tab', () => {
+    const html = readIndexHtml();
+
+    expect(html).toContain('id="single-speaker-toggle"');
+    expect(html).toContain('>Single-speaker render</label>');
+    expect(html).toContain('forces NARRATOR at render; script stays faithful');
+    const editorTabStart = html.indexOf('id="editor-tab"');
+    const toggleIdx = html.indexOf('id="single-speaker-toggle"');
+    expect(editorTabStart).toBeGreaterThan(-1);
+    expect(toggleIdx).toBeGreaterThan(editorTabStart);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Span-text Undo (Plan J, Phase 3)
+//
+// Design (DD UX workflow #7 + evidence trail): undo = in-memory stack of
+// {spanId, priorValue} pushed on each SUCCESSFUL span-text edit (focusout →
+// PUT /span/{id}/text). The Undo button pops the most recent entry and reverts
+// through the SAME server-validated pipelineUpdateSpanText path — no
+// audit-journal/replay mechanism (explicitly rejected in the DD evidence
+// trail). The stack clears on snapshot load (projects.ts loadProject), at
+// render start (pipelineRenderAll), and whenever spans (re)load — the
+// book-switch/tab-switch choke point.
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Span-Text Undo (Plan J, Phase 3)', () => {
+  // Spans MUST carry server ids for the focusout handler to act on them
+  // (data-span-id); the file-level MOCK_SPANS_RAW omits ids.
+  const MOCK_SPANS_WITH_IDS_RAW = [
+    { id: 'span-1', speaker: 'Narrator', text: 'It was a dark and stormy night.', instruct: 'dramatic' },
+    { id: 'span-2', speaker: 'Elizabeth', text: 'I cannot believe it!', instruct: 'surprised' },
+  ];
+
+  beforeEach(() => {
+    // mockReset (not clearAllMocks): clears any unconsumed mockResolvedValueOnce
+    // queue left on API.get/API.put/API.post by an earlier test in this file,
+    // so each test here is hermetic (exec-worker log L180 convention).
+    vi.mocked(API.get).mockReset();
+    vi.mocked(API.put).mockReset();
+    vi.mocked(API.post).mockReset();
+    state.pipelineBookId = 'book-123';
+  });
+
+  afterEach(() => {
+    state.pipelineBookId = null;
+  });
+
+  it('editing a span then clicking Undo reverts to the prior text via PUT', async () => {
+    document.body.innerHTML = `
+      <div id="spans-table-body"></div>
+      <button id="btn-pipeline-undo" disabled></button>
+    `;
+    initEditor();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_WITH_IDS_RAW);
+    vi.mocked(API.put).mockResolvedValue({ status: 'ok', span_id: 'span-1' });
+
+    await loadSpans();
+
+    // Edit the first span through the delegated focusout handler.
+    const cell = document.querySelector('.span-text') as HTMLElement;
+    cell.textContent = 'Edited line.';
+    cell.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    // Wait for BOTH the PUT and the undo push to land (the push runs in the
+    // microtask after the PUT resolves) before clicking — a disabled button
+    // swallows clicks in jsdom.
+    await vi.waitFor(() => {
+      expect(API.put).toHaveBeenCalledWith('/api/pipeline/span/span-1/text', { text: 'Edited line.' });
+      expect((document.getElementById('btn-pipeline-undo') as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    // Undo → the SAME PUT path reverts to the PRIOR value. Wait for BOTH the
+    // PUT and the visible-row restore (the restore runs in the microtask after
+    // the PUT resolves — poll the DOM state, the P2 convention).
+    const btnUndo = document.getElementById('btn-pipeline-undo') as HTMLButtonElement;
+    btnUndo.click();
+    await vi.waitFor(() => {
+      expect(API.put).toHaveBeenLastCalledWith('/api/pipeline/span/span-1/text', {
+        text: 'It was a dark and stormy night.',
+      });
+      expect(document.querySelector('.span-text')?.textContent).toBe('It was a dark and stormy night.');
+    });
+  });
+
+  it('shows a success toast when an undo succeeds', async () => {
+    const { showToast } = await import('../../src/utils');
+    document.body.innerHTML = `<button id="btn-pipeline-undo" disabled></button>`;
+    vi.mocked(API.put).mockResolvedValue({ status: 'ok', span_id: 'span-1' });
+
+    pushUndoEntry('span-1', 'It was a dark and stormy night.');
+    await undoLastSpanEdit();
+
+    expect(showToast).toHaveBeenCalledWith('Undo: span text reverted', 'success');
+  });
+
+  it('keeps the Undo button disabled until an edit pushes, then disabled again after undo', async () => {
+    document.body.innerHTML = `
+      <div id="spans-table-body"></div>
+      <button id="btn-pipeline-undo" disabled></button>
+    `;
+    initEditor();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_WITH_IDS_RAW);
+    vi.mocked(API.put).mockResolvedValue({ status: 'ok', span_id: 'span-1' });
+    await loadSpans();
+
+    const btnUndo = document.getElementById('btn-pipeline-undo') as HTMLButtonElement;
+    expect(btnUndo.disabled).toBe(true);
+
+    // A successful span-text edit enables the button.
+    const cell = document.querySelector('.span-text') as HTMLElement;
+    cell.textContent = 'Edited line.';
+    cell.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(btnUndo.disabled).toBe(false);
+    });
+
+    // Undoing the only entry disables it again (stack empty).
+    btnUndo.click();
+    await vi.waitFor(() => {
+      expect(btnUndo.disabled).toBe(true);
+    });
+  });
+
+  it('pushUndoEntry/clearUndoStack maintain the stack and the button state', async () => {
+    document.body.innerHTML = `<button id="btn-pipeline-undo" disabled></button>`;
+    const btn = document.getElementById('btn-pipeline-undo') as HTMLButtonElement;
+
+    expect(getUndoStack()).toEqual([]);
+    expect(btn.disabled).toBe(true);
+
+    pushUndoEntry('span-1', 'old one');
+    pushUndoEntry('span-2', 'old two');
+    expect(getUndoStack()).toEqual([
+      { spanId: 'span-1', priorValue: 'old one' },
+      { spanId: 'span-2', priorValue: 'old two' },
+    ]);
+    expect(btn.disabled).toBe(false);
+
+    clearUndoStack();
+    expect(getUndoStack()).toEqual([]);
+    expect(btn.disabled).toBe(true);
+  });
+
+  it('clears the undo stack when a render starts (pipelineRenderAll)', async () => {
+    vi.mocked(API.post).mockResolvedValue({ job_id: 'job-abc-123' });
+    vi.mocked(API.get).mockResolvedValue({ job_id: 'job-abc-123', status: 'completed', output_dir: null, error: null });
+
+    pushUndoEntry('span-1', 'old');
+    expect(getUndoStack()).toHaveLength(1);
+
+    vi.useFakeTimers();
+    try {
+      const promise = pipelineRenderAll();
+      // The stack clears synchronously at render start, before any await.
+      expect(getUndoStack()).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+    } finally {
+      await cancelPipelineRender(true);
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the undo stack when spans (re)load (book-switch choke point)', async () => {
+    document.body.innerHTML = `
+      <div id="spans-table-body"></div>
+      <button id="btn-pipeline-undo" disabled></button>
+    `;
+    vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_WITH_IDS_RAW);
+
+    pushUndoEntry('span-1', 'old');
+    expect(getUndoStack()).toHaveLength(1);
+
+    await loadSpans();
+
+    expect(getUndoStack()).toEqual([]);
+    const btn = document.getElementById('btn-pipeline-undo') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it('does not push an undo entry for an empty-text edit', async () => {
+    const { showToast } = await import('../../src/utils');
+    document.body.innerHTML = `
+      <div id="spans-table-body"></div>
+      <button id="btn-pipeline-undo" disabled></button>
+    `;
+    initEditor();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_WITH_IDS_RAW);
+    await loadSpans();
+
+    const cell = document.querySelector('.span-text') as HTMLElement;
+    cell.textContent = '   ';
+    cell.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+
+    expect(showToast).toHaveBeenCalledWith('Span text cannot be empty', 'error');
+    expect(API.put).not.toHaveBeenCalled();
+    expect(getUndoStack()).toEqual([]);
+    const btn = document.getElementById('btn-pipeline-undo') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it('re-pushes the entry and surfaces an error when the undo PUT fails', async () => {
+    const { showToast } = await import('../../src/utils');
+    document.body.innerHTML = `<button id="btn-pipeline-undo" disabled></button>`;
+    const btn = document.getElementById('btn-pipeline-undo') as HTMLButtonElement;
+    vi.mocked(API.put).mockRejectedValue(new Error('server down'));
+
+    pushUndoEntry('span-1', 'prior text');
+    expect(btn.disabled).toBe(false);
+
+    await undoLastSpanEdit();
+
+    // The entry is re-pushed so a later retry can still revert it.
+    expect(getUndoStack()).toEqual([{ spanId: 'span-1', priorValue: 'prior text' }]);
+    expect(btn.disabled).toBe(false);
+    expect(showToast).toHaveBeenCalledWith('Failed to undo span text edit', 'error');
+  });
+
+  it('index.html declares the Undo button in the editor toolbar, disabled initially', () => {
+    const html = readIndexHtml();
+
+    expect(html).toContain('id="btn-pipeline-undo"');
+    expect(html).toMatch(/id="btn-pipeline-undo"[^>]*disabled/);
+    expect(html).toContain('>Undo</button>');
+    const editorTabStart = html.indexOf('id="editor-tab"');
+    const undoIdx = html.indexOf('id="btn-pipeline-undo"');
+    expect(editorTabStart).toBeGreaterThan(-1);
+    expect(undoIdx).toBeGreaterThan(editorTabStart);
   });
 });

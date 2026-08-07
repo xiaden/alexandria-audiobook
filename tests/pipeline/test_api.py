@@ -472,6 +472,27 @@ class TestReviewEndpoint:
             assert "confidence" in item
             assert 0.5 <= item["confidence"] < 0.7
 
+    def test_review_items_carry_neighbors(self, client):
+        """Every review item carries the contextual-review ``neighbors``
+        enrichment (DD UX workflow #5): {before: [...], after: [...]}.
+
+        The api fixture has one review-band item (character_book:c2:b1) which
+        has no span reference, so the lists are empty — the resolution rules
+        themselves are covered at the manager level (TestReviewItemNeighborContext
+        in test_review.py).
+        """
+        response = client.get("/api/pipeline/review/b1")
+        assert response.status_code == 200
+        result = response.json()
+        assert len(result) > 0
+        for item in result:
+            assert "neighbors" in item
+            assert set(item["neighbors"]) == {"before", "after"}
+            assert isinstance(item["neighbors"]["before"], list)
+            assert isinstance(item["neighbors"]["after"], list)
+            assert item["neighbors"]["before"] == []
+            assert item["neighbors"]["after"] == []
+
 
 # ---------------------------------------------------------------------------
 # P1-S8: POST /api/pipeline/review/accept
@@ -1140,6 +1161,75 @@ class TestSpanTextEditEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Plan J — GET/PUT /api/pipeline/book/{book_id}/single_speaker
+# ---------------------------------------------------------------------------
+
+
+class TestSingleSpeakerFlagEndpoint:
+    def test_get_defaults_to_off(self, client):
+        """GET returns 0 (multi-speaker) when the flag was never set."""
+        response = client.get("/api/pipeline/book/b1/single_speaker")
+        assert response.status_code == 200
+        assert response.json() == {"book_id": "b1", "single_speaker": 0}
+
+    def test_put_enables_and_round_trips(self, client, storage):
+        """PUT true persists 1; a subsequent GET reads it back."""
+        response = client.put(
+            "/api/pipeline/book/b1/single_speaker", json={"single_speaker": True}
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "book_id": "b1",
+            "single_speaker": 1,
+        }
+
+        # Persisted in the DB
+        rows = storage.execute_query(
+            "SELECT single_speaker FROM book WHERE id = 'b1'"
+        )
+        assert rows[0]["single_speaker"] == 1
+
+        # Round trip via the API
+        read = client.get("/api/pipeline/book/b1/single_speaker")
+        assert read.json()["single_speaker"] == 1
+
+    def test_put_disables(self, client, storage):
+        """PUT false writes 0 after a prior true."""
+        client.put(
+            "/api/pipeline/book/b1/single_speaker", json={"single_speaker": True}
+        )
+        response = client.put(
+            "/api/pipeline/book/b1/single_speaker", json={"single_speaker": False}
+        )
+        assert response.status_code == 200
+        assert response.json()["single_speaker"] == 0
+        rows = storage.execute_query(
+            "SELECT single_speaker FROM book WHERE id = 'b1'"
+        )
+        assert rows[0]["single_speaker"] == 0
+
+    def test_get_unknown_book_404(self, client):
+        """GET for a nonexistent book returns 404."""
+        response = client.get("/api/pipeline/book/nope/single_speaker")
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    def test_put_unknown_book_404(self, client):
+        """PUT for a nonexistent book returns 404 and writes nothing."""
+        response = client.put(
+            "/api/pipeline/book/nope/single_speaker", json={"single_speaker": True}
+        )
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    def test_put_missing_body_422(self, client):
+        """PUT without a single_speaker field is rejected by pydantic (422)."""
+        response = client.put("/api/pipeline/book/b1/single_speaker", json={})
+        assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # P1-S12: GET /api/pipeline/export/{book_id}
 # ---------------------------------------------------------------------------
 
@@ -1286,6 +1376,83 @@ class TestBackgroundRender:
         response = client.get("/api/pipeline/render_status/nonexistent-job-id")
         assert response.status_code == 404
         assert "Unknown job_id" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Plan J Phase 4: tts_config passthrough through the production render chain
+# ---------------------------------------------------------------------------
+
+
+class TestRenderTTSConfigPassthrough:
+    """POST /render resolves the TTS config and passes it to render_audiobook.
+
+    P4-S2 wired the passthrough at the ``tts_integration`` boundary; these
+    tests assert the PRODUCTION call chain (endpoint → background task →
+    ``_run_render_job`` → ``render_audiobook``) so the config.json pause
+    values are not dead code.  Starlette runs ``BackgroundTasks`` before the
+    response call returns (``Response.__call__`` awaits ``self.background``),
+    so the background render has completed by the time ``client.post`` returns.
+    """
+
+    def test_configured_pause_values_reach_render_audiobook(
+        self, client, tts_engine
+    ):
+        """Configured config.json pause values flow through the whole chain."""
+        from app.pipeline import api_export
+
+        tts_config = {
+            "mode": "external",
+            "pause_between_speakers_ms": 900,
+            "pause_same_speaker_ms": 400,
+        }
+        with (
+            patch.object(api_export, "load_tts_config", return_value=tts_config),
+            patch.object(api_export, "render_audiobook") as mock_render,
+        ):
+            mock_render.return_value = "/tmp/render-out"
+
+            response = client.post(
+                "/api/pipeline/render",
+                json={"book_id": "b1", "use_batch": True},
+            )
+            assert response.status_code == 200
+
+            # The endpoint resolved the config and the background task passed
+            # it through to render_audiobook (test_render_failure convention:
+            # patch api_export.render_audiobook and inspect the call).
+            mock_render.assert_called_once()
+            assert mock_render.call_args.kwargs["tts_config"] == tts_config
+
+    def test_default_pause_values_apply_when_config_omits_them(
+        self, client, tts_engine
+    ):
+        """A config without pause fields still yields the 500/250 ms defaults.
+
+        Runs the REAL render_audiobook end-to-end (only ``load_tts_config``
+        and the engine boundary are patched) so the assertion covers the
+        full production chain: empty ``tts`` section → ``_resolve_pause_ms``
+        per-field defaults → batch chunk dicts.
+        """
+        from app.pipeline import api_export
+
+        with patch.object(api_export, "load_tts_config", return_value={}) as mock_load:
+            response = client.post(
+                "/api/pipeline/render",
+                json={"book_id": "b1", "use_batch": True},
+            )
+            assert response.status_code == 200
+
+            # The endpoint resolves the config on every render — proves the
+            # production passthrough is wired (not dead code).
+            mock_load.assert_called_once()
+            # Real chain ran: the default pause values landed on the batch
+            # chunks (book b1 has exactly one span → one chunk).
+            tts_engine.generate_batch.assert_called_once()
+            chunks = tts_engine.generate_batch.call_args.args[0]
+            assert chunks
+            for chunk in chunks:
+                assert chunk["pause_between_speakers_ms"] == 500
+                assert chunk["pause_same_speaker_ms"] == 250
 
 
 # ---------------------------------------------------------------------------

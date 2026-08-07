@@ -186,6 +186,67 @@ async def update_span_text(
 
 
 # ---------------------------------------------------------------------------
+# Plan J — Book single-speaker flag
+# GET/PUT /api/pipeline/book/{book_id}/single_speaker
+#
+# The flag is a UI write of book.single_speaker (CONTRACTS decision #9):
+# enforcement happens ONLY at the render boundary (tts_integration
+# ``_enforce_single_speaker``), so toggling it never mutates the script and
+# the annotated export stays faithful. Column default is 0 (multi-speaker).
+# ---------------------------------------------------------------------------
+
+
+class SingleSpeakerUpdateRequest(BaseModel):
+    """Request body for PUT /api/pipeline/book/{book_id}/single_speaker."""
+
+    single_speaker: bool = Field(
+        ...,
+        description="Force NARRATOR for every span at render time",
+    )
+
+
+@router.get("/book/{book_id}/single_speaker")
+async def get_book_single_speaker(
+    book_id: str,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Return the book's single-speaker render flag as ``0`` or ``1``.
+
+    Raises 404 if no book with *book_id* exists. An unset flag reads back as
+    off (column default 0).
+    """
+    rows = storage.execute_query(
+        "SELECT single_speaker FROM book WHERE id = ?", (book_id,)
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Book '{book_id}' not found")
+
+    return {"book_id": book_id, "single_speaker": 1 if rows[0]["single_speaker"] else 0}
+
+
+@router.put("/book/{book_id}/single_speaker")
+async def update_book_single_speaker(
+    book_id: str,
+    request: SingleSpeakerUpdateRequest,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Persist the book's single-speaker render flag (``0`` or ``1``).
+
+    Raises 404 if no book with *book_id* exists. Parameterized SQL only —
+    *book_id* is user-supplied.
+    """
+    rows = storage.execute_query("SELECT id FROM book WHERE id = ?", (book_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Book '{book_id}' not found")
+
+    value = 1 if request.single_speaker else 0
+    storage.execute_update(
+        "UPDATE book SET single_speaker = ? WHERE id = ?", (value, book_id)
+    )
+    return {"status": "ok", "book_id": book_id, "single_speaker": value}
+
+
+# ---------------------------------------------------------------------------
 # Plan I — Snapshot projects (auto-named; no free-form name input)
 # ---------------------------------------------------------------------------
 

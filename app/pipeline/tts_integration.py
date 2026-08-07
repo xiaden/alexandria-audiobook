@@ -51,6 +51,15 @@ NARRATOR_VOICE: dict = {
 #: batch_seed value indicating random (non-reproducible) generation.
 BATCH_SEED_RANDOM: int = -1
 
+#: Global pause defaults — mirror the ``TTSConfig`` pydantic defaults
+#: (app/app.py) and the legacy ``combine_audio_with_pauses`` defaults
+#: (app/tts.py).  Carried through the render boundary (Plan J Phase 4) so
+#: the values the Setup tab submits are the values a merge step can apply.
+#: The per-span ``pause_after`` variant is NOT restorable (DD cannot-restore
+#: #5) — only the global pair exists here.
+PAUSE_BETWEEN_SPEAKERS_MS: int = 500
+PAUSE_SAME_SPEAKER_MS: int = 250
+
 
 # ---------------------------------------------------------------------------
 # Voice config resolution
@@ -97,29 +106,7 @@ def _build_voice_config(
     # Add NARRATOR if present in script
     has_narrator = any(e["speaker"] == "NARRATOR" for e in script)
     if has_narrator:
-        # Try to resolve NARRATOR from voice_config table first
-        narrator_rows = storage.execute_query(
-            "SELECT type, voice, description, character_style, seed, "
-            "ref_audio, ref_text, adapter_id, adapter_path, alias_of "
-            "FROM voice_config WHERE id = 'NARRATOR'",
-        )
-        if narrator_rows:
-            row = narrator_rows[0]
-            voice_config["NARRATOR"] = {
-                "type": row.get("type") or "custom",
-                "voice": row.get("voice") or "",
-                "character_style": row.get("character_style") or "",
-                "seed": row.get("seed") or "-1",
-                "ref_audio": row.get("ref_audio"),
-                "ref_text": row.get("ref_text"),
-                "adapter_id": row.get("adapter_id"),
-                "adapter_path": row.get("adapter_path"),
-                "description": row.get("description") or "",
-                "alias_of": row.get("alias_of"),
-            }
-        else:
-            # Fallback to hardcoded constant
-            voice_config["NARRATOR"] = dict(NARRATOR_VOICE)
+        voice_config["NARRATOR"] = _resolve_narrator_config(storage)
 
     # Resolve character speakers via character → voice_config tables
     if speaker_names:
@@ -177,21 +164,101 @@ def _build_voice_config(
     return voice_config
 
 
+def _resolve_narrator_config(storage: PipelineStorage) -> dict:
+    """Resolve the NARRATOR voice config: DB row wins, constant fallback.
+
+    Queries the ``voice_config`` table for the ``'NARRATOR'`` row; when found,
+    all columns are mapped into the voice-config shape.  When no row exists
+    the module-level ``NARRATOR_VOICE`` constant is used (the same fallback
+    ``_build_voice_config`` has always applied).
+
+    Shared by ``_build_voice_config`` (NARRATOR spans in the script) and
+    ``_enforce_single_speaker`` (books rendered single-speaker even when no
+    NARRATOR span exists) so both paths resolve the narrator identically.
+    """
+    narrator_rows = storage.execute_query(
+        "SELECT type, voice, description, character_style, seed, "
+        "ref_audio, ref_text, adapter_id, adapter_path, alias_of "
+        "FROM voice_config WHERE id = 'NARRATOR'",
+    )
+    if narrator_rows:
+        row = narrator_rows[0]
+        return {
+            "type": row.get("type") or "custom",
+            "voice": row.get("voice") or "",
+            "character_style": row.get("character_style") or "",
+            "seed": row.get("seed") or "-1",
+            "ref_audio": row.get("ref_audio"),
+            "ref_text": row.get("ref_text"),
+            "adapter_id": row.get("adapter_id"),
+            "adapter_path": row.get("adapter_path"),
+            "description": row.get("description") or "",
+            "alias_of": row.get("alias_of"),
+        }
+    return dict(NARRATOR_VOICE)
+
+
+def _enforce_single_speaker(
+    voice_config: dict[str, dict],
+    storage: PipelineStorage,
+    book_id: str,
+) -> dict[str, dict]:
+    """Force every speaker to the NARRATOR voice config when single-speaker.
+
+    Render-boundary-only normalization (DD decision #9, open item #7): reads
+    ``book.single_speaker`` and, when set, replaces every entry in
+    *voice_config* — including the ``NARRATOR`` entry itself, which may be
+    absent when the script has no NARRATOR spans — with a copy of the
+    resolved NARRATOR config.  The annotated-script export is untouched:
+    the editor keeps real multi-speaker data, only the render forces a
+    single voice (audition-multi-voice-then-ship-single workflow).
+
+    When ``single_speaker`` is 0 (or the book row is missing) the mapping
+    is returned unchanged.  The same dict is passed to both the batch
+    (``generate_batch``) and individual (``generate_voice`` per chunk)
+    dispatch paths, so overriding it here covers both modes.
+    """
+    rows = storage.execute_query(
+        "SELECT single_speaker FROM book WHERE id = ?", (book_id,)
+    )
+    if not rows or not rows[0].get("single_speaker"):
+        return voice_config
+    narrator_config = _resolve_narrator_config(storage)
+    voice_config["NARRATOR"] = dict(narrator_config)
+    for speaker in list(voice_config):
+        voice_config[speaker] = dict(narrator_config)
+    return voice_config
+
+
 # ---------------------------------------------------------------------------
 # Chunk construction
 # ---------------------------------------------------------------------------
 
 
-def _build_chunks(script: list[dict]) -> list[dict]:
+def _build_chunks(
+    script: list[dict],
+    *,
+    pause_between_speakers_ms: int = PAUSE_BETWEEN_SPEAKERS_MS,
+    pause_same_speaker_ms: int = PAUSE_SAME_SPEAKER_MS,
+) -> list[dict]:
     """Convert annotated script entries to TTSEngine chunk format.
 
     Each chunk has the keys required by ``TTSEngine.generate_batch``:
-    ``index`` (0-based), ``text``, ``instruct``, and ``speaker``.
+    ``index`` (0-based), ``text``, ``instruct``, and ``speaker``.  The
+    global pause values (``pause_between_speakers_ms`` /
+    ``pause_same_speaker_ms``) are carried on every chunk so the values
+    configured in the Setup tab survive the render boundary and are
+    available to a merge step (the engine ignores unknown chunk keys).
+    The per-span ``pause_after`` variant is not restorable.
 
     Parameters
     ----------
     script:
         Annotated script entries from ``export_annotated_script``.
+    pause_between_speakers_ms:
+        Global silence (ms) between different speakers (default 500).
+    pause_same_speaker_ms:
+        Global silence (ms) when the same speaker continues (default 250).
 
     Returns
     -------
@@ -206,9 +273,29 @@ def _build_chunks(script: list[dict]) -> list[dict]:
                 "text": entry["text"],
                 "instruct": entry.get("instruct", ""),
                 "speaker": entry["speaker"],
+                "pause_between_speakers_ms": pause_between_speakers_ms,
+                "pause_same_speaker_ms": pause_same_speaker_ms,
             }
         )
     return chunks
+
+
+def _resolve_pause_ms(tts_config: dict | None) -> tuple[int, int]:
+    """Resolve the global pause values from a TTSConfig dict.
+
+    ``pause_between_speakers_ms`` / ``pause_same_speaker_ms`` fall back to
+    ``PAUSE_BETWEEN_SPEAKERS_MS`` / ``PAUSE_SAME_SPEAKER_MS`` (500 / 250 ms
+    — the ``TTSConfig`` pydantic defaults) per field, so a partial config
+    keeps the untouched field's default.  ``None`` (no config) returns both
+    defaults.
+    """
+    if not tts_config:
+        return PAUSE_BETWEEN_SPEAKERS_MS, PAUSE_SAME_SPEAKER_MS
+    between = tts_config.get(
+        "pause_between_speakers_ms", PAUSE_BETWEEN_SPEAKERS_MS
+    )
+    same = tts_config.get("pause_same_speaker_ms", PAUSE_SAME_SPEAKER_MS)
+    return between, same
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +585,7 @@ def render_audiobook(
     batch_seed: int = BATCH_SEED_RANDOM,
     job_id: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    tts_config: dict | None = None,
 ) -> str:
     """Render an audiobook from the pipeline's annotated script.
 
@@ -544,6 +632,14 @@ def render_audiobook(
         should abort.  Invoked before each chunk (individual mode) or once
         before the batch dispatch (batch mode).  When triggered, raises
         :class:`CancelledError`.
+    tts_config:
+        Optional TTS config dict (the ``tts`` section of ``config.json``,
+        e.g. from ``load_tts_config``).  Its global pause values
+        (``pause_between_speakers_ms`` / ``pause_same_speaker_ms``) are
+        carried through the boundary onto the batch chunk dicts so a merge
+        step can apply them; absent fields keep the 500 / 250 ms defaults.
+        Individual mode has no chunk channel (per-span preview clips are
+        generated standalone) so it accepts the config without carrying it.
 
     Returns
     -------
@@ -591,12 +687,28 @@ def render_audiobook(
             )
             return resolved_job_id
 
+        # Step 4b: Single-speaker render boundary — when book.single_speaker is
+        # set, force every speaker's voice config to the NARRATOR config.  This
+        # is render-only normalization: the script from export_annotated_script
+        # (Step 1) and the chunk ``speaker`` fields below stay faithful.
+        voice_config = _enforce_single_speaker(voice_config, storage, book_id)
+
+        # Step 4c: Global pause passthrough — resolve the TTSConfig pause
+        # values (500/250 ms defaults) and ride them through the boundary on
+        # the chunk dicts.  The per-span ``pause_after`` variant is NOT
+        # restorable (DD cannot-restore #5).
+        pause_between_ms, pause_same_ms = _resolve_pause_ms(tts_config)
+
         # Step 5: Build chunks and dispatch
         if use_batch:
             # Check cancellation once before the batch dispatch
             if cancel_check is not None and cancel_check():
                 raise CancelledError("Render cancelled before batch dispatch")
-            chunks = _build_chunks(script)
+            chunks = _build_chunks(
+                script,
+                pause_between_speakers_ms=pause_between_ms,
+                pause_same_speaker_ms=pause_same_ms,
+            )
             result = tts_engine.generate_batch(
                 chunks, voice_config, resolved_dir, batch_seed
             )

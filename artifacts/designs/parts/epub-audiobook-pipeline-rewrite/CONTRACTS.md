@@ -935,8 +935,11 @@ New:
 - `POST /api/pipeline/export/m4b` — FFMETADATA1 3-phase export (concat → metadata → mux); MP3/Audacity derived (api_export)
 - `GET /api/pipeline/walks/{book_id}/runs` (api_walks)
 - `POST /api/pipeline/projects` · `GET /api/pipeline/projects` · `POST /api/pipeline/projects/load` · `DELETE /api/pipeline/projects/{name}` · `PATCH /api/pipeline/projects/{name}` (api_operations)
+- `GET /api/pipeline/book/{book_id}/single_speaker` · `PUT /api/pipeline/book/{book_id}/single_speaker` (api_operations)
 
 > 2026-08-07: PATCH /api/pipeline/projects/{name} appended (rename; 409 duplicate, 404 unknown) per DD design decision — rename PATCH.
+
+> 2026-08-07: GET+PUT /api/pipeline/book/{book_id}/single_speaker appended (single-speaker render toggle; 404 unknown book, 422 invalid body, parameterized SQL, 0/1 normalization) per DD decision #9 — render-boundary enforcement only.
 
 ### Behavioral contracts
 

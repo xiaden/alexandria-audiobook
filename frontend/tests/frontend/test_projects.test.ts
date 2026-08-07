@@ -42,7 +42,7 @@ import {
 import { state } from '../../src/state';
 import * as API from '../../src/api';
 import { showToast, showConfirm } from '../../src/utils';
-import { loadSpans } from '../../src/tabs/editor-pipeline';
+import { clearUndoStack, loadSingleSpeakerToggle, loadSpans } from '../../src/tabs/editor-pipeline';
 
 // Mock the API module. postWithRetryOnce is a vi.fn by default (resolves a
 // successful load); the 409-retry integration test re-implements it with the
@@ -77,6 +77,8 @@ vi.mock('../../src/utils', () => ({
 // observable without pulling in the real editor module.
 vi.mock('../../src/tabs/editor-pipeline', () => ({
   loadSpans: vi.fn(() => Promise.resolve()),
+  loadSingleSpeakerToggle: vi.fn(() => Promise.resolve()),
+  clearUndoStack: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------
@@ -328,6 +330,14 @@ describe('loadProject', () => {
     );
     expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
     expect(loadSpans).toHaveBeenCalled();
+  });
+
+  it('clears the editor undo stack on snapshot load (cross-tab reset)', async () => {
+    await loadProject('Project 2026-08-07 03:13');
+
+    expect(clearUndoStack).toHaveBeenCalled();
+    expect(loadSpans).toHaveBeenCalled();
+    expect(loadSingleSpeakerToggle).toHaveBeenCalled();
   });
 
   it('shows an error toast when the load fails (e.g. both attempts 409)', async () => {

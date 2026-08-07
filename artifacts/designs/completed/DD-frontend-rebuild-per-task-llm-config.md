@@ -1,6 +1,9 @@
 # Frontend Rebuild (TypeScript + Vite) & Per-Task LLM Configuration — Design Document
 
-**Status:** Completed  
+> **Status:** SUPERSEDED — stale pre-universal-upgrade design. Do NOT use.
+> **Superseded by:** [DD-universal-upgrade](../pending/DD-universal-upgrade.md) (Universal Upgrade decomposition, Plan G) — the per-task LLM configuration it scoped (resolve_task_llm) was replaced by the Plan G overlay config work (resolve_task_config), and the frontend rebuild it scoped was delivered as the pipeline-native frontend (Plans E–I). Archived in place per Plan J P5-S1 (TASK-universal-upgrade-J-single-speaker-undo-iteration); this repo has no designs/archived/ directory and prior stale artifacts (walk-definitions.md, DD-epub-audiobook-pipeline-rewrite-v3) are handled with an in-place SUPERSEDED header, so this file remains in artifacts/designs/completed/.
+
+**Status:** Superseded (originally Completed; see SUPERSEDED header above)  
 **Author:** rnd-dd-author  
 **Created:** 2026-08-02  
 

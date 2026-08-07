@@ -209,6 +209,10 @@ export async function loadConfig(): Promise<void> {
     if (subBatchMaxItemsEl && config.tts.sub_batch_max_items != null) {
       subBatchMaxItemsEl.value = String(config.tts.sub_batch_max_items);
     }
+    // Global pause fields (DD cannot-restore #5: no per-span pause_after):
+    // carried through the render boundary for a merge step to apply —
+    // pause_between_speakers_ms between different speakers (default 500 ms),
+    // pause_same_speaker_ms when the same speaker continues (default 250 ms).
     if (pauseBetweenSpeakersEl && config.tts.pause_between_speakers_ms != null) {
       pauseBetweenSpeakersEl.value = String(config.tts.pause_between_speakers_ms);
     }
@@ -337,6 +341,9 @@ export function buildConfigPayload(): AppConfig {
       sub_batch_min_size: parseInt(subBatchMinSizeEl?.value || '') || 4,
       sub_batch_ratio: parseFloat(subBatchRatioEl?.value || '') || 5,
       sub_batch_max_items: parseInt(subBatchMaxItemsEl?.value || '') || 0,
+      // Global pause fields — carried through the render boundary onto the
+      // batch chunk dicts (tts_integration._build_chunks); fall back to the
+      // TTSConfig defaults (500/250 ms) when the input is empty/invalid.
       pause_between_speakers_ms: parseInt(pauseBetweenSpeakersEl?.value || '') || 500,
       pause_same_speaker_ms: parseInt(pauseSameSpeakerEl?.value || '') || 250,
     },

@@ -416,14 +416,14 @@
                         </div>
                         <div class="row mb-3">
                             <div class="col-md-2">
-                                <label class="form-label">Speaker Change Pause (ms)</label>
-                                <input type="number" class="form-control" id="pause-between-speakers" value="500" min="0" step="50">
-                                <div class="form-text">Silence between different speakers on merge</div>
+                                <label class="form-label" for="pause-between-speakers" title="Pause between different speakers (carried through the render boundary for merge; default 500 ms)">Speaker Change Pause (ms)</label>
+                                <input type="number" class="form-control" id="pause-between-speakers" value="500" min="0" step="50" title="Pause between different speakers (carried through the render boundary for merge; default 500 ms)">
+                                <div class="form-text">Pause between different speakers (carried through the render boundary for merge; default 500 ms)</div>
                             </div>
                             <div class="col-md-2">
-                                <label class="form-label">Same Speaker Pause (ms)</label>
-                                <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" step="50">
-                                <div class="form-text">Silence when same speaker continues on merge</div>
+                                <label class="form-label" for="pause-same-speaker" title="Pause when the same speaker continues (carried through the render boundary for merge; default 250 ms)">Same Speaker Pause (ms)</label>
+                                <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" step="50" title="Pause when the same speaker continues (carried through the render boundary for merge; default 250 ms)">
+                                <div class="form-text">Pause when the same speaker continues (carried through the render boundary for merge; default 250 ms)</div>
                             </div>
                         </div>
 
@@ -1052,6 +1052,7 @@
                             <button class="btn btn-info btn-sm" id="btn-pipeline-merge" disabled title="Select exactly 2 adjacent spans to merge">
                                 <i class="fas fa-compress-alt me-1"></i>Merge Selected
                             </button>
+                            <button class="btn btn-outline-secondary btn-sm" id="btn-pipeline-undo" disabled title="Undo the last span-text edit" aria-label="Undo the last span-text edit"><i class="fas fa-undo me-1"></i>Undo</button>
                             <button class="btn btn-success btn-sm" id="btn-pipeline-render"><i class="fas fa-bolt me-1"></i>Render</button>
                             <button class="btn btn-outline-success btn-sm" id="btn-pipeline-regen"><i class="fas fa-redo me-1"></i>Re-render All</button>
                             <button class="btn btn-danger btn-sm" id="btn-pipeline-cancel" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
@@ -1069,6 +1070,18 @@
                         </div>
                         <!-- Per-chunk failure badge (individual renders; hidden until a chunk fails) -->
                         <span id="render-failures-badge" class="badge bg-danger mb-3" style="display:none;"></span>
+
+                        <!-- Single-speaker render toggle (Plan J, Phase 2) — a UI write of
+                             book.single_speaker; enforcement happens ONLY at the render boundary
+                             (tts_integration _enforce_single_speaker), the script stays faithful. -->
+                        <div class="row mb-3 align-items-center" id="single-speaker-row">
+                            <div class="col-auto">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="single-speaker-toggle" aria-label="Single-speaker render">
+                                    <label class="form-check-label" for="single-speaker-toggle" title="forces NARRATOR at render; script stays faithful">Single-speaker render</label>
+                                </div>
+                            </div>
+                        </div>
 
                         <div class="table-responsive">
                             <table class="table table-bordered table-hover">
