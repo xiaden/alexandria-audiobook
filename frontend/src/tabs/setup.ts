@@ -1,5 +1,7 @@
 /**
- * Setup tab module — Configuration panel with per-task LLM overrides
+ * Setup tab module — Configuration panel with per-task LLM overrides and
+ * per-walk prompt overrides. Save preserves unknown top-level config sections
+ * (generation/prompts/walk_override) verbatim — byte-stable round-trip.
  * Ported from app/static/index.html lines 96-416 (HTML), 1251-1520 (JS)
  */
 
@@ -10,7 +12,7 @@ import { showToast } from '../utils';
  * Canonical walk task names matching WalkRunner.WALK_ORDER in runner.py.
  * These are the data-task attribute values used in the per-task LLM overrides
  * table. The short names (without walk_2x_ prefix) match what the backend
- * walks pass to resolve_task_llm().
+ * walks pass to resolve_task_config().
  */
 export const WALK_TASK_NAMES: readonly string[] = [
   'scene_segmentation',
@@ -60,7 +62,24 @@ interface TTSConfig {
 interface AppConfig {
   llm: LLMConfig;
   tts: TTSConfig;
+  schema_version?: number;
+  walk_override?: Record<string, WalkOverride>;
+  /** Unknown top-level sections (generation, prompts, ...) preserved byte-stable. */
+  [key: string]: unknown;
 }
+
+/** Per-walk override entry carried in the config payload's walk_override section (keyed by task name). */
+interface WalkOverride {
+  temperature?: number | null;
+  prompt?: string | null;
+}
+
+/**
+ * Full raw config from the last GET /api/config — retained so a save payload
+ * can carry unknown top-level sections (generation/prompts/walk_override)
+ * forward verbatim (byte-stable contract, CONTRACTS.md rule #11).
+ */
+let retainedConfig: AppConfig | null = null;
 
 /** Human-readable label for a reasoning_effort value ('' / null = 'Default'). */
 function reasoningLabel(value: string | null | undefined): string {
@@ -96,6 +115,10 @@ function toggleTTSMode(): void {
 export async function loadConfig(): Promise<void> {
   try {
     const config = await API.get<AppConfig>('/api/config');
+
+    // Retain the FULL raw config (unknown top-level sections included) so the
+    // save payload can carry them forward — byte-stable round-trip contract.
+    retainedConfig = config;
 
     // LLM settings
     const llmUrlEl = document.getElementById('llm-url') as HTMLInputElement;
@@ -137,6 +160,14 @@ export async function loadConfig(): Promise<void> {
         temperatureInput.value = (taskConfig && taskConfig.temperature != null) ? String(taskConfig.temperature) : '';
         // Surface the inherited global temperature so per-task inheritance is visible
         temperatureInput.placeholder = `Inherit: ${config.llm.temperature != null ? config.llm.temperature : 0.6}`;
+      }
+      // Per-walk prompt override from the config payload's walk_override section
+      const promptInput = row.querySelector<HTMLInputElement>('[data-field="prompt"]');
+      if (promptInput) {
+        const walkOverride = config.walk_override?.[taskName as string];
+        promptInput.value = (walkOverride && walkOverride.prompt) ? walkOverride.prompt : '';
+        // Surface the inherited global model so per-walk inheritance is visible
+        promptInput.placeholder = `Inherit: ${config.llm.model_name}`;
       }
     });
 
@@ -219,13 +250,38 @@ export function collectTaskOverrides(): Record<string, TaskOverride> {
 }
 
 /**
- * Handle config form submission.
- * Collects all field values including per-task overrides, builds config object
- * (llm + tts only), and POSTs to /api/config.
+ * Collect per-walk prompt overrides from the table rows.
+ * Iterates #per-task-llm-table tbody tr, reads the prompt input per task, and
+ * builds the top-level walk_override section keyed by task name. This section is
+ * an unknown top-level config path — the backend deep-merges it and GET returns
+ * it verbatim, so it round-trips byte-stable (unlike nested keys inside llm,
+ * which pydantic drops on GET). Only collects overrides for known walk task names.
  */
-async function handleConfigSubmit(e: Event): Promise<void> {
-  e.preventDefault();
+export function collectWalkOverrides(): Record<string, WalkOverride> {
+  const walkOverrides: Record<string, WalkOverride> = {};
+  const overrideRows = document.querySelectorAll<HTMLTableRowElement>('#per-task-llm-table tbody tr');
+  overrideRows.forEach(row => {
+    const taskName = row.getAttribute('data-task');
+    if (!taskName || !WALK_TASK_NAMES.includes(taskName)) return;
+    const promptInput = row.querySelector<HTMLInputElement>('[data-field="prompt"]');
+    const override: WalkOverride = {
+      // Explicit null for empty — matches the collectTaskOverrides convention and
+      // lets the backend deep-merge clear a previously-set prompt on disk.
+      prompt: promptInput ? (promptInput.value.trim() || null) : null,
+    };
+    walkOverrides[taskName] = override;
+  });
+  return walkOverrides;
+}
 
+/**
+ * Build the config payload sent to POST /api/config.
+ * Starts from the retained raw config (unknown top-level sections preserved
+ * verbatim — the byte-stable contract), overlays the known llm/tts keys from the
+ * current form values, and adds the per-walk prompt overrides under the
+ * top-level walk_override section (keyed by task name).
+ */
+export function buildConfigPayload(): AppConfig {
   const parallelWorkersEl = document.getElementById('parallel-workers') as HTMLInputElement;
 
   // Validate parallel workers
@@ -235,6 +291,7 @@ async function handleConfigSubmit(e: Event): Promise<void> {
 
   // Collect per-task LLM overrides
   const taskOverrides = collectTaskOverrides();
+  const walkOverrides = collectWalkOverrides();
 
   const llmUrlEl = document.getElementById('llm-url') as HTMLInputElement;
   const llmKeyEl = document.getElementById('llm-key') as HTMLInputElement;
@@ -255,7 +312,10 @@ async function handleConfigSubmit(e: Event): Promise<void> {
   const pauseBetweenSpeakersEl = document.getElementById('pause-between-speakers') as HTMLInputElement;
   const pauseSameSpeakerEl = document.getElementById('pause-same-speaker') as HTMLInputElement;
 
-  const config = {
+  // Start from the retained raw config so unknown top-level sections survive;
+  // known llm/tts keys are rebuilt from the current form values.
+  const config: AppConfig = {
+    ...(retainedConfig ?? {}),
     llm: {
       base_url: llmUrlEl?.value || '',
       api_key: llmKeyEl?.value || '',
@@ -280,13 +340,30 @@ async function handleConfigSubmit(e: Event): Promise<void> {
       pause_between_speakers_ms: parseInt(pauseBetweenSpeakersEl?.value || '') || 500,
       pause_same_speaker_ms: parseInt(pauseSameSpeakerEl?.value || '') || 250,
     },
+    walk_override: {
+      ...(retainedConfig?.walk_override ?? {}),
+      ...walkOverrides,
+    },
   };
+  return config;
+}
+
+/**
+ * Handle config form submission.
+ * Builds the config payload from the retained raw config merged with current
+ * form values (unknown top-level sections preserved — byte-stable round-trip)
+ * and POSTs it to /api/config.
+ */
+async function handleConfigSubmit(e: Event): Promise<void> {
+  e.preventDefault();
+
+  const config = buildConfigPayload();
 
   try {
     await API.post('/api/config', config);
     showToast('Configuration Saved!', 'success');
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     showToast('Error saving config: ' + msg, 'error');
   }
 }

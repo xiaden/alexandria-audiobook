@@ -169,15 +169,16 @@
 
                         <div class="mb-4">
                             <h6 class="fw-bold mb-2"><i class="fas fa-microchip me-2"></i>Per-Task Model Overrides</h6>
-                            <p class="text-muted small mb-2">Override model and reasoning effort for specific LLM tasks. Leave empty to inherit the global default.</p>
+                            <p class="text-muted small mb-2">Override model, reasoning effort, temperature, and prompt for specific LLM tasks. Leave empty to inherit the global default.</p>
                             <div class="table-responsive">
                                 <table id="per-task-llm-table" class="table table-sm table-borderless align-middle mb-0">
                                     <thead class="table-light">
                                         <tr>
-                                            <th style="width: 30%">Task</th>
-                                            <th style="width: 35%">Model Name</th>
-                                            <th style="width: 20%">Reasoning Effort</th>
+                                            <th style="width: 25%">Task</th>
+                                            <th style="width: 25%">Model Name</th>
+                                            <th style="width: 15%">Reasoning Effort</th>
                                             <th style="width: 15%">Temperature</th>
+                                            <th style="width: 20%">Prompt Override</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -194,6 +195,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="character_discovery">
                                             <td class="fw-medium">Character Discovery</td>
@@ -208,6 +210,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="script_alias_resolution">
                                             <td class="fw-medium">Alias Resolution</td>
@@ -222,6 +225,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="scene_presence">
                                             <td class="fw-medium">Scene Presence</td>
@@ -236,6 +240,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="span_attribution">
                                             <td class="fw-medium">Span Attribution</td>
@@ -250,6 +255,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="character_description">
                                             <td class="fw-medium">Character Description</td>
@@ -264,6 +270,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="voice_audition">
                                             <td class="fw-medium">Voice Audition</td>
@@ -278,6 +285,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="voice_assignment">
                                             <td class="fw-medium">Voice Assignment</td>
@@ -292,6 +300,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                         <tr data-task="delivery">
                                             <td class="fw-medium">Delivery</td>
@@ -306,6 +315,7 @@
                                                 </select>
                                             </td>
                                             <td><input type="number" class="form-control form-control-sm" data-field="temperature" placeholder="Inherit" min="0" max="2" step="0.1"></td>
+                                            <td><input type="text" class="form-control form-control-sm" data-field="prompt" placeholder="Inherit global"></td>
                                         </tr>
                                     </tbody>
                                 </table>

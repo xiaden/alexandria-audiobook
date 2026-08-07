@@ -110,13 +110,16 @@ def test_get_config():
     data = r.json()
     assert_key(data, "llm")
     assert_key(data, "tts")
-    # Legacy prompts/generation/current_file surface removed — must be absent
-    if "prompts" in data:
-        raise TestFailure("Legacy prompts key still present in config response")
-    if "generation" in data:
-        raise TestFailure("Legacy generation key still present in config response")
-    if "current_file" in data:
-        raise TestFailure("Legacy current_file key still present in config response")
+    # Byte-stable contract (CONTRACTS.md rule #11): unknown top-level keys
+    # (generation/prompts/...) live in config.json as raw JSON and MUST round-trip
+    # through GET/POST — they are never validated AppConfig fields (DD
+    # cannot-restore #13). We do NOT assert their absence here; the round-trip
+    # test asserts preservation.
+    # Known-key defaults must be materialised (H1 contract): the frontend
+    # per-task table depends on task_overrides being present in the response.
+    llm = data.get("llm", {})
+    if "task_overrides" not in llm:
+        raise TestFailure("task_overrides missing from config response (H1 contract)")
 
 
 def test_save_config_roundtrip():
@@ -126,10 +129,16 @@ def test_save_config_roundtrip():
     original = r.json()
     shared["original_config"] = original
 
-    # Build test config with modified language
+    # Build test config with modified language + unknown top-level sections.
+    # Byte-stable contract: these unknown keys must survive POST+GET with
+    # identical values. Prefixed with _test_ so any residue on a live server's
+    # config.json is clearly test data (raw-JSON merge never deletes unknown
+    # keys, so the restore step below cannot remove them).
     test_config = {
         "llm": original["llm"],
         "tts": {**original.get("tts", {}), "language": "_test_roundtrip_lang"},
+        "_test_generation": {"max_chapters": 3, "nested": {"enabled": True}},
+        "_test_prompts": {"script": "You are a narrator."},
     }
     test_config["tts"].setdefault("mode", "external")
     test_config["tts"].setdefault("url", "http://127.0.0.1:7860")
@@ -146,11 +155,16 @@ def test_save_config_roundtrip():
     if readback.get("tts", {}).get("language") != "_test_roundtrip_lang":
         raise TestFailure("Config round-trip failed: language not persisted")
 
-    # Legacy prompts/generation sections must not reappear in the saved config
-    if "prompts" in readback:
-        raise TestFailure("Config round-trip failed: prompts section still present")
-    if "generation" in readback:
-        raise TestFailure("Config round-trip failed: generation section still present")
+    # Byte-stable contract: unknown top-level sections round-trip unchanged
+    # (the old wipe behavior was the L4 data-loss bug — saving wiped the
+    # generation/prompts sections a user had configured).
+    if readback.get("_test_generation") != {"max_chapters": 3, "nested": {"enabled": True}}:
+        raise TestFailure("Config round-trip failed: unknown _test_generation section lost")
+    if readback.get("_test_prompts") != {"script": "You are a narrator."}:
+        raise TestFailure("Config round-trip failed: unknown _test_prompts section lost")
+    # schema_version must be stamped into the saved config.
+    if readback.get("schema_version") is None:
+        raise TestFailure("Config round-trip failed: schema_version not stamped")
 
     # Restore original
     restore = {

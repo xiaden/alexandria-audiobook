@@ -96,7 +96,7 @@ def _make_mock_response(content):
 
 
 def _patch_llm(monkeypatch, mock_llm_client, response_content):
-    """Patch resolve_task_llm and create_llm_client for testing."""
+    """Patch resolve_task_config and create_llm_client for testing."""
     mock_llm_client.chat.completions.create.return_value = _make_mock_response(
         response_content
     )
@@ -106,8 +106,8 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
         lambda config_path=None: (mock_llm_client, "test-model"),
     )
     monkeypatch.setattr(
-        "app.utils.resolve_task_llm",
-        lambda task_name, config_path=None: {
+        "app.utils.resolve_task_config",
+        lambda task, storage, book_id: {
             "model_name": "test-model",
             "reasoning_effort": None,
             "temperature": 0.1,
@@ -466,8 +466,8 @@ class TestExecute:
             lambda config_path=None: (mock_llm_client, "test-model"),
         )
         monkeypatch.setattr(
-            "app.utils.resolve_task_llm",
-            lambda task_name, config_path=None: {
+            "app.utils.resolve_task_config",
+            lambda task, storage, book_id: {
                 "model_name": "test-model",
                 "reasoning_effort": None,
                 "temperature": 0.1,
@@ -486,6 +486,125 @@ class TestExecute:
         # John comes before Mary alphabetically (J < M)
         assert rows[0]["voice_assignment_id"] == "voice-1"  # John
         assert rows[1]["voice_assignment_id"] == "voice-2"  # Mary
+
+
+    def test_walk_override_drives_llm_config(self, populated_storage, monkeypatch, tmp_path):
+        """A walk_override row for (book, task) overrides the walk's LLM config.
+
+        Phase 3 (Plan G): the walk resolves its LLM config via
+        ``resolve_task_config(task, storage, book_id)`` at unit start, so a
+        walk_override row for this book + task must beat the on-disk
+        fallbacks and flow into the LLM call (temperature + model).
+        """
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_voice_config(populated_storage, "voice-1", "Warm Male")
+        _insert_voice_profile(
+            populated_storage, "char-1",
+            {"age": "middle-aged", "gender": "male", "tone": "warm"},
+        )
+
+        # Point config resolution at a tmp path with no config file -> fallbacks.
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(tmp_path / "config.json"))
+
+        # walk_override rows override temperature AND model for this book+task.
+        populated_storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            ("book-1", "voice_assignment", "temperature", json.dumps(0.9)),
+        )
+        populated_storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            ("book-1", "voice_assignment", "model_name", json.dumps("gpt-4o-mini")),
+        )
+
+        monkeypatch.setattr(
+            "app.utils.create_llm_client", lambda config_path=None: (object(), None)
+        )
+
+        captured = {}
+
+        def mock_call_llm(
+            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+        ):
+            captured["temperature"] = temperature
+            captured["model_name"] = model_name
+            return "[]"
+
+        monkeypatch.setattr(
+            "app.pipeline.walks.walk_2h_voice_assignment.chat_completion",
+            mock_call_llm,
+        )
+
+        execute("book-1", populated_storage, {})
+
+        # Override wins over the 0.6 fallback temperature and default model.
+        assert captured["temperature"] == 0.9
+        assert captured["model_name"] == "gpt-4o-mini"
+
+    def test_prompt_override_drives_system_prompt(
+        self, populated_storage, monkeypatch, tmp_path
+    ):
+        """A walk_override row key='prompt' flows into the LLM system_prompt.
+
+        Phase 3 Amendment (Plan G): ``resolve_task_config`` returns an
+        effective ``prompt``; the walk must pass it as ``system_prompt``.
+        With no override at any tier the built-in system prompt is used;
+        with a walk_override prompt row the row wins.
+        """
+        # Seed a character with a voice profile + an available voice so the
+        # walk reaches the LLM call.
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_voice_config(populated_storage, "voice-1", "Warm Male")
+        _insert_voice_profile(
+            populated_storage,
+            "char-1",
+            {"age": "middle-aged", "gender": "male", "tone": "warm"},
+        )
+
+        # No config file at the pinned path -> no prompt override at any tier.
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(tmp_path / "config.json"))
+
+        monkeypatch.setattr(
+            "app.utils.create_llm_client", lambda config_path=None: (object(), None)
+        )
+
+        captured = {}
+
+        def mock_call_llm(
+            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+        ):
+            captured["system_prompt"] = system_prompt
+            return "[]"
+
+        monkeypatch.setattr(
+            "app.pipeline.walks.walk_2h_voice_assignment.chat_completion",
+            mock_call_llm,
+        )
+
+        execute("book-1", populated_storage, {})
+
+        # Unset at every tier -> the walk's built-in system prompt.
+        assert captured["system_prompt"] == (
+            "You are a voice casting director for audiobook production, "
+            "matching characters to available text-to-speech voices."
+        )
+
+        # walk_override row key="prompt" wins over the built-in.
+        populated_storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                "book-1",
+                "voice_assignment",
+                "prompt",
+                json.dumps("You are a TEST override prompt."),
+            ),
+        )
+
+        execute("book-1", populated_storage, {})
+
+        assert captured["system_prompt"] == "You are a TEST override prompt."
 
 
 class TestWalkReviewItem:

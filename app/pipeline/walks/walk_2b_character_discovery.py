@@ -12,7 +12,7 @@ Confidence filter:
 - <0.5: auto-reject (character is discarded)
 - 0.5–0.7: flagged for user review (character is created but tracked)
 
-LLM configuration is resolved via ``resolve_task_llm('character_discovery')``
+LLM configuration is resolved via ``resolve_task_config('character_discovery', storage, book_id)``
 with temperature=0.1 for format stability.
 """
 
@@ -50,7 +50,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     storage:
         Pipeline storage adapter.
     config:
-        App config dict (passed to ``resolve_task_llm``).
+        App config dict (kept for the runner contract; not consulted by ``resolve_task_config``).
 
     Returns
     -------
@@ -58,7 +58,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
         Summary with keys: ``book_id``, ``scenes_processed``,
         ``characters_created``, ``characters_for_review``, ``errors``.
     """
-    from app.utils import create_llm_client, resolve_task_llm
+    from app.utils import create_llm_client, resolve_task_config
 
     result: dict[str, Any] = {
         "book_id": book_id,
@@ -69,11 +69,12 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     }
 
     # Resolve LLM config for character discovery
-    llm_config = resolve_task_llm("character_discovery", config_path=None)
+    llm_config = resolve_task_config("character_discovery", storage, book_id)
     client, _ = create_llm_client(config_path=None)
     model_name = llm_config["model_name"]
     temperature = llm_config["temperature"]
     reasoning_effort = llm_config.get("reasoning_effort")
+    prompt = llm_config.get("prompt")
 
     # Look up series_id for character_series junctions
     book_rows = storage.execute_query(
@@ -115,6 +116,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 model_name=model_name,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
+                system_prompt_override=prompt,
                 name_to_id=name_to_id,
                 result=result,
             )
@@ -155,6 +157,7 @@ def _process_scene(
     model_name: str,
     temperature: float,
     reasoning_effort: str | None,
+    system_prompt_override: str | None,
     name_to_id: dict[str, str],
     result: dict,
 ) -> None:
@@ -198,7 +201,10 @@ def _process_scene(
         model_name=model_name,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
-        system_prompt="You are a literary analyst specializing in character identification in fiction.",
+        system_prompt=(
+            system_prompt_override
+            or "You are a literary analyst specializing in character identification in fiction."
+        ),
         user_prompt=prompt,
     )
 

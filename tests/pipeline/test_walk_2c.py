@@ -38,15 +38,15 @@ from app.pipeline.walks.walk_2c_alias_resolution import (
 
 
 def _patch_llm(monkeypatch, response_text: str):
-    """Patch resolve_task_llm (in app.utils), create_llm_client (in app.utils),
+    """Patch resolve_task_config (in app.utils), create_llm_client (in app.utils),
     and chat_completion (imported locally in walk_2c) so walk_2c uses our
     mocked response.
 
-    Critical: resolve_task_llm / create_llm_client are imported *inside*
+    Critical: resolve_task_config / create_llm_client are imported *inside*
     execute() from ``app.utils``, so we patch the source module.
     """
 
-    def mock_resolve(task_name, config_path=None):
+    def mock_resolve(task, storage, book_id):
         return {
             "model_name": "test-model",
             "temperature": 0.1,
@@ -57,7 +57,7 @@ def _patch_llm(monkeypatch, response_text: str):
         return object(), None
 
     monkeypatch.setattr(
-        "app.utils.resolve_task_llm",
+        "app.utils.resolve_task_config",
         mock_resolve,
     )
     monkeypatch.setattr(
@@ -156,7 +156,7 @@ class TestExecuteSummary:
 
         llm_called = []
 
-        def mock_resolve(task_name, config_path=None):
+        def mock_resolve(task, storage, book_id):
             return {"model_name": "test", "temperature": 0.1}
 
         def mock_create_client(config_path=None):
@@ -166,7 +166,7 @@ class TestExecuteSummary:
             llm_called.append(True)
             return "[]"
 
-        monkeypatch.setattr("app.utils.resolve_task_llm", mock_resolve)
+        monkeypatch.setattr("app.utils.resolve_task_config", mock_resolve)
         monkeypatch.setattr("app.utils.create_llm_client", mock_create_client)
         monkeypatch.setattr(
             "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
@@ -235,8 +235,8 @@ class TestLLMInteraction:
             return "[]"
 
         monkeypatch.setattr(
-            "app.utils.resolve_task_llm",
-            lambda tn, config_path=None: {
+            "app.utils.resolve_task_config",
+            lambda task, storage, book_id: {
                 "model_name": "test-model",
                 "temperature": 0.1,
             },
@@ -259,7 +259,7 @@ class TestLLMInteraction:
         assert "c2" in prompt
 
     def test_uses_script_alias_resolution_task(self, monkeypatch):
-        """Verify resolve_task_llm is called with 'script_alias_resolution'."""
+        """Verify resolve_task_config is called with 'script_alias_resolution'."""
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
@@ -271,11 +271,11 @@ class TestLLMInteraction:
 
         captured_task = []
 
-        def mock_resolve(task_name, config_path=None):
-            captured_task.append(task_name)
+        def mock_resolve(task, storage, book_id):
+            captured_task.append(task)
             return {"model_name": "t", "temperature": 0.1}
 
-        monkeypatch.setattr("app.utils.resolve_task_llm", mock_resolve)
+        monkeypatch.setattr("app.utils.resolve_task_config", mock_resolve)
         monkeypatch.setattr(
             "app.utils.create_llm_client", lambda config_path=None: (object(), None)
         )
@@ -291,6 +291,163 @@ class TestLLMInteraction:
 # ---------------------------------------------------------------------------
 # Tests: parse_llm_response
 # ---------------------------------------------------------------------------
+
+
+    def test_walk_override_drives_llm_config(self, monkeypatch, tmp_path):
+        """A walk_override row for (book, task) overrides the walk's LLM config.
+
+        Phase 3 (Plan G): the walk resolves its LLM config via
+        ``resolve_task_config(task, storage, book_id)`` at unit start, so a
+        walk_override row for this book + task must beat the on-disk
+        fallbacks and flow into the LLM call (temperature + model).
+        """
+        # Point config resolution at a tmp path with no config file -> fallbacks.
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(tmp_path / "config.json"))
+
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        _insert_character(storage, "c1", "Alice")
+        _insert_char_book(storage, "c1", "b1", 0.9)
+
+        # walk_override rows override temperature AND model for this book+task.
+        storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            ("b1", "script_alias_resolution", "temperature", json.dumps(0.9)),
+        )
+        storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            ("b1", "script_alias_resolution", "model_name", json.dumps("gpt-4o-mini")),
+        )
+
+        monkeypatch.setattr(
+            "app.utils.create_llm_client", lambda config_path=None: (object(), None)
+        )
+
+        captured = {}
+
+        def mock_call_llm(
+            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+        ):
+            captured["temperature"] = temperature
+            captured["model_name"] = model_name
+            return "[]"
+
+        monkeypatch.setattr(
+            "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
+            mock_call_llm,
+        )
+
+        execute("b1", storage, {})
+
+        # Override wins over the 0.6 fallback temperature and default model.
+        assert captured["temperature"] == 0.9
+        assert captured["model_name"] == "gpt-4o-mini"
+
+    def test_prompt_override_drives_system_prompt(self, monkeypatch, tmp_path):
+        """A walk_override row key='prompt' flows into the LLM system_prompt.
+
+        Phase 3 Amendment (Plan G): ``resolve_task_config`` returns an
+        effective ``prompt``; the walk must pass it as ``system_prompt``.
+        With no override at any tier the built-in system prompt is used;
+        with a walk_override prompt row the row wins.
+        """
+        # No config file at the pinned path -> no prompt override at any tier.
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(tmp_path / "config.json"))
+
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        _insert_character(storage, "c1", "Alice")
+        _insert_char_book(storage, "c1", "b1", 0.9)
+
+        monkeypatch.setattr(
+            "app.utils.create_llm_client", lambda config_path=None: (object(), None)
+        )
+
+        captured = {}
+
+        def mock_call_llm(
+            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+        ):
+            captured["system_prompt"] = system_prompt
+            return "[]"
+
+        monkeypatch.setattr(
+            "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
+            mock_call_llm,
+        )
+
+        execute("b1", storage, {})
+
+        # Unset at every tier -> the walk's built-in system prompt.
+        assert captured["system_prompt"] == (
+            "You are a literary analyst specializing in character identity "
+            "resolution across long narratives."
+        )
+
+        # walk_override row key="prompt" wins over the built-in.
+        storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                "b1",
+                "script_alias_resolution",
+                "prompt",
+                json.dumps("You are a TEST override prompt."),
+            ),
+        )
+
+        execute("b1", storage, {})
+
+        assert captured["system_prompt"] == "You are a TEST override prompt."
+
+    def test_prompt_override_config_section_drives_system_prompt(self, monkeypatch, tmp_path):
+        """Top-level config walk_override[task].prompt flows into system_prompt."""
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "walk_override": {
+                        "script_alias_resolution": {
+                            "prompt": "You are a TEST config prompt."
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(tmp_path / "config.json"))
+
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        _insert_character(storage, "c1", "Alice")
+        _insert_char_book(storage, "c1", "b1", 0.9)
+
+        monkeypatch.setattr(
+            "app.utils.create_llm_client", lambda config_path=None: (object(), None)
+        )
+
+        captured = {}
+
+        def mock_call_llm(
+            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+        ):
+            captured["system_prompt"] = system_prompt
+            return "[]"
+
+        monkeypatch.setattr(
+            "app.pipeline.walks.walk_2c_alias_resolution.chat_completion",
+            mock_call_llm,
+        )
+
+        execute("b1", storage, {})
+
+        assert captured["system_prompt"] == "You are a TEST config prompt."
 
 
 class TestParseLLMResponse:
@@ -875,8 +1032,8 @@ class TestLLMErrorHandling:
         _insert_char_book(storage, "c1", "b1", 0.9)
 
         monkeypatch.setattr(
-            "app.utils.resolve_task_llm",
-            lambda tn, config_path=None: {"model_name": "t", "temperature": 0.1},
+            "app.utils.resolve_task_config",
+            lambda task, storage, book_id: {"model_name": "t", "temperature": 0.1},
         )
         monkeypatch.setattr(
             "app.utils.create_llm_client", lambda config_path=None: (object(), None)

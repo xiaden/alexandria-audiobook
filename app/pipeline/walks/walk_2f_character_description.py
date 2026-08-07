@@ -17,7 +17,7 @@ Confidence filter:
 - <0.5: auto-reject (description discarded)
 - 0.5–0.7: flagged for user review (description stored but tracked)
 
-LLM configuration is resolved via ``resolve_task_llm('character_description')``
+LLM configuration is resolved via ``resolve_task_config('character_description', storage, book_id)``
 with temperature=0.1 for format stability.
 """
 
@@ -54,7 +54,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     storage:
         Pipeline storage adapter.
     config:
-        App config dict (passed to ``resolve_task_llm``).
+        App config dict (kept for the runner contract; not consulted by ``resolve_task_config``).
 
     Returns
     -------
@@ -62,7 +62,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
         Summary with keys: ``book_id``, ``characters_processed``,
         ``descriptions_generated``, ``descriptions_for_review``, ``errors``.
     """
-    from app.utils import create_llm_client, resolve_task_llm
+    from app.utils import create_llm_client, resolve_task_config
 
     result: dict[str, Any] = {
         "book_id": book_id,
@@ -73,11 +73,12 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     }
 
     # Resolve LLM config for character description
-    llm_config = resolve_task_llm("character_description", config_path=None)
+    llm_config = resolve_task_config("character_description", storage, book_id)
     client, _ = create_llm_client(config_path=None)
     model_name = llm_config["model_name"]
     temperature = llm_config["temperature"]
     reasoning_effort = llm_config.get("reasoning_effort")
+    prompt = llm_config.get("prompt")
 
     # Look up book existence
     book_rows = storage.execute_query(
@@ -108,6 +109,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 model_name=model_name,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
+                system_prompt_override=prompt,
                 result=result,
             )
         except Exception as e:
@@ -200,6 +202,7 @@ def _process_character(
     model_name: str,
     temperature: float,
     reasoning_effort: str | None,
+    system_prompt_override: str | None,
     result: dict,
 ) -> None:
     """Process a single character: collect spans, call LLM, store description."""
@@ -226,7 +229,10 @@ def _process_character(
         model_name=model_name,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
-        system_prompt="You are a literary analyst specializing in character analysis and description.",
+        system_prompt=(
+            system_prompt_override
+            or "You are a literary analyst specializing in character analysis and description."
+        ),
         user_prompt=prompt,
     )
 

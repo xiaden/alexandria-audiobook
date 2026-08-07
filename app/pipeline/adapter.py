@@ -94,6 +94,25 @@ class PipelineStorage(ABC):
     def execute_delete(self, sql: str, params: tuple = ()) -> int:
         """Execute a DELETE and return ``rowcount``."""
 
+    @abstractmethod
+    def get_walk_overrides(self, book_id: str) -> list[dict]:
+        """Return all ``walk_override`` rows for *book_id* as a list of dicts
+        ``{"book_id", "walk_name", "key", "value_json"}`` (``value_json`` is
+        the raw TEXT string — callers decide whether to ``json.loads``).
+        A missing ``walk_override`` table degrades gracefully to ``[]``.
+        """
+
+    @abstractmethod
+    def upsert_walk_override(
+        self, book_id: str, walk_name: str, key: str, value_json: str
+    ) -> None:
+        """Insert or update the ``walk_override`` row for
+        ``(book_id, walk_name, key)``; ``value_json`` is JSON-encoded."""
+
+    @abstractmethod
+    def delete_walk_override(self, book_id: str, walk_name: str, key: str) -> None:
+        """Delete the ``walk_override`` row (no-op if absent)."""
+
 
 # ---------------------------------------------------------------------------
 # Startup reconciliation (contract rule #5)
@@ -729,6 +748,54 @@ class SQLiteAdapter(PipelineStorage):
             self._conn.commit()
         return cursor.rowcount
 
+    def get_walk_overrides(self, book_id: str) -> list[dict]:
+        """Return all ``walk_override`` rows for *book_id*.
+
+        Each dict is ``{"book_id", "walk_name", "key", "value_json"}`` with
+        ``value_json`` as the raw TEXT string — callers decide whether to
+        ``json.loads``.  A missing ``walk_override`` table (uninitialized
+        database) degrades gracefully to ``[]`` so config resolution never
+        crashes on an older schema.
+        """
+        try:
+            return self.execute_query(
+                "SELECT book_id, walk_name, key, value_json"
+                " FROM walk_override WHERE book_id = ?",
+                (book_id,),
+            )
+        except sqlite3.OperationalError:
+            return []
+
+    def upsert_walk_override(
+        self, book_id: str, walk_name: str, key: str, value_json: str
+    ) -> None:
+        """Insert or update the ``walk_override`` row keyed by the composite
+        PK ``(book_id, walk_name, key)``.
+
+        ``value_json`` is a JSON-encoded string.  ``ON CONFLICT ... DO
+        UPDATE`` keeps the existing row (true upsert semantics — the PK row
+        count never grows).  Composes ``execute_insert`` so it joins an open
+        ``transaction()`` when one is active and auto-commits otherwise.
+        """
+        self.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(book_id, walk_name, key)"
+            " DO UPDATE SET value_json = excluded.value_json",
+            (book_id, walk_name, key, value_json),
+        )
+
+    def delete_walk_override(self, book_id: str, walk_name: str, key: str) -> None:
+        """Delete the ``walk_override`` row for ``(book_id, walk_name, key)``.
+
+        Deleting an absent row is a no-op (``execute_delete`` returns 0).
+        """
+        self.execute_delete(
+            "DELETE FROM walk_override"
+            " WHERE book_id = ? AND walk_name = ? AND key = ?",
+            (book_id, walk_name, key),
+        )
+
     def reconcile_stale_runs(self) -> dict[str, int]:
         """Startup-only: flip stale running rows to ``interrupted`` (one pass).
 
@@ -901,6 +968,51 @@ class InMemorySQLiteAdapter(PipelineStorage):
         if not was_in_transaction:
             self._conn.commit()
         return cursor.rowcount
+
+    def get_walk_overrides(self, book_id: str) -> list[dict]:
+        """Return all ``walk_override`` rows for *book_id*.
+
+        Mirror of ``SQLiteAdapter.get_walk_overrides`` (same schema and
+        interface).  ``value_json`` is returned as the raw TEXT string;
+        a missing table degrades gracefully to ``[]``.
+        """
+        try:
+            return self.execute_query(
+                "SELECT book_id, walk_name, key, value_json"
+                " FROM walk_override WHERE book_id = ?",
+                (book_id,),
+            )
+        except sqlite3.OperationalError:
+            return []
+
+    def upsert_walk_override(
+        self, book_id: str, walk_name: str, key: str, value_json: str
+    ) -> None:
+        """Insert or update the ``walk_override`` row keyed by the composite
+        PK ``(book_id, walk_name, key)``.
+
+        Mirror of ``SQLiteAdapter.upsert_walk_override`` (same schema and
+        interface).  ``value_json`` is a JSON-encoded string.
+        """
+        self.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(book_id, walk_name, key)"
+            " DO UPDATE SET value_json = excluded.value_json",
+            (book_id, walk_name, key, value_json),
+        )
+
+    def delete_walk_override(self, book_id: str, walk_name: str, key: str) -> None:
+        """Delete the ``walk_override`` row for ``(book_id, walk_name, key)``.
+
+        Mirror of ``SQLiteAdapter.delete_walk_override`` (same schema and
+        interface).  Deleting an absent row is a no-op.
+        """
+        self.execute_delete(
+            "DELETE FROM walk_override"
+            " WHERE book_id = ? AND walk_name = ? AND key = ?",
+            (book_id, walk_name, key),
+        )
 
     def reconcile_stale_runs(self) -> dict[str, int]:
         """Startup-only: flip stale running rows to ``interrupted`` (one pass).

@@ -2,6 +2,8 @@ import os
 import json
 import time
 import tempfile
+import re
+import gc
 
 
 # Structure markers for flattened EPUB text (emitted by app.py extract_epub_text /
@@ -45,9 +47,6 @@ def atomic_json_write(data, target_path, max_retries=5):
                 os.remove(tmp_path)
             except OSError:
                 pass
-
-import re
-import gc
 
 # ── JSON Helpers ──
 
@@ -99,29 +98,48 @@ def load_llm_config(config_path=None):
     }
 
 
-def resolve_task_llm(task_name: str, config_path=None) -> dict:
-    """Resolve per-task LLM config.
+def resolve_task_config(task: str, storage, book_id) -> dict:
+    """Resolve the effective LLM config dict for *task* for *book_id*.
 
-    Returns ``{'model_name': str, 'reasoning_effort': str|None, 'temperature': float}``.
+    Returns ``{'model_name': str, 'reasoning_effort': str|None, 'temperature': float,
+    'prompt': str|None}``.
 
-    Resolution order: task-specific override -> global default -> hardcoded fallback.
+    Three-tier precedence (later tiers win):
+      1. on-disk config global ``llm`` defaults (with hardcoded fallbacks);
+      2. ``llm.task_overrides[task]`` — temperature uses ``is not None`` so an
+         explicit ``0.0`` is honored; model/reasoning use truthiness;
+      3. ``walk_override`` rows for ``(book_id, task)`` — each row's ``key``
+         (model_name | reasoning_effort | temperature | prompt) overrides the
+         tier-2 value; ``value_json`` is a JSON-encoded string parsed with
+         ``json.loads`` (corrupt rows are skipped, never fatal).
+
+    ``prompt`` resolves along its own chain (config top-level
+    ``walk_override[task].prompt`` -> ``llm.task_overrides[task].prompt`` ->
+    walk_override row ``key="prompt"``, row wins). A value is honored only
+    when it is a non-empty string; the effective prompt is ``None`` when unset
+    or empty at every tier — walks then fall back to their built-in
+    system prompt.
+
+    The returned dict is an independent value snapshot: later mutations of the
+    on-disk config or the storage never alter an already-resolved dict. The
+    walk resolves once per unit start and keeps the snapshot for the unit.
     """
-    # Hardcoded fallback defaults
+    # Hardcoded fallback defaults.
     _FALLBACK_MODEL = "richardyoung/qwen3-14b-abliterated:Q8_0"
     _FALLBACK_REASONING = None
     _FALLBACK_TEMPERATURE = 0.6
 
-    config = load_app_config(config_path) or {}
+    config = load_app_config() or {}
     llm = config.get("llm", {})
 
-    # Global defaults from config (or fallback)
+    # Tier 1: global defaults from config (or fallback)
     global_model = llm.get("model_name", _FALLBACK_MODEL)
     global_reasoning = llm.get("reasoning_effort", _FALLBACK_REASONING)
     global_temperature = llm.get("temperature", _FALLBACK_TEMPERATURE)
 
-    # Task-specific overrides
+    # Tier 2: task-specific overrides
     task_overrides = llm.get("task_overrides", {})
-    task_override = task_overrides.get(task_name, {}) if isinstance(task_overrides, dict) else {}
+    task_override = task_overrides.get(task, {}) if isinstance(task_overrides, dict) else {}
 
     # Resolve model_name: task override -> global -> hardcoded fallback
     override_model = task_override.get("model_name") if isinstance(task_override, dict) else None
@@ -136,7 +154,63 @@ def resolve_task_llm(task_name: str, config_path=None) -> dict:
     override_temperature = task_override.get("temperature") if isinstance(task_override, dict) else None
     temperature = override_temperature if override_temperature is not None else global_temperature
 
-    return {"model_name": model, "reasoning_effort": reasoning, "temperature": temperature}
+    # Resolve prompt (separate chain): config top-level walk_override section
+    # -> llm.task_overrides -> walk_override row (row wins). A value is honored
+    # only when it is a non-empty string; empty/unset falls through to the next
+    # tier and finally to None (walks then use their built-in system prompt).
+    config_walk_overrides = config.get("walk_override", {})
+    config_walk_task = (
+        config_walk_overrides.get(task, {}) if isinstance(config_walk_overrides, dict) else {}
+    )
+    prompt = None
+    tier1_prompt = config_walk_task.get("prompt") if isinstance(config_walk_task, dict) else None
+    if isinstance(tier1_prompt, str) and tier1_prompt:
+        prompt = tier1_prompt
+    if prompt is None:
+        tier2_prompt = task_override.get("prompt") if isinstance(task_override, dict) else None
+        if isinstance(tier2_prompt, str) and tier2_prompt:
+            prompt = tier2_prompt
+
+    # Tier 3: walk_override rows — walk_override WINS. Guarded so a missing
+    # walk_override table (older databases) or unreadable storage degrades
+    # gracefully to tiers 1-2 instead of crashing the walk at unit start.
+    try:
+        rows = storage.execute_query(
+            "SELECT key, value_json FROM walk_override WHERE book_id = ? AND walk_name = ?",
+            (book_id, task),
+        )
+    except Exception:
+        rows = []
+
+    for row in rows:
+        key = row.get("key")
+        if key not in ("model_name", "reasoning_effort", "temperature", "prompt"):
+            continue
+        try:
+            value = json.loads(row.get("value_json") or "null")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if key == "temperature":
+            # `is not None` so an explicit 0.0 walk override is honored.
+            if value is not None:
+                temperature = value
+        elif key == "prompt":
+            # Only a non-empty string row wins; empty/non-string rows are
+            # treated as unset and leave the config-tier prompt untouched.
+            if isinstance(value, str) and value:
+                prompt = value
+        elif value:
+            if key == "model_name":
+                model = value
+            else:
+                reasoning = value
+
+    return {
+        "model_name": model,
+        "reasoning_effort": reasoning,
+        "temperature": temperature,
+        "prompt": prompt,
+    }
 
 
 def load_generation_config(config_path=None):
@@ -429,7 +503,7 @@ def load_model_from_cache(model_cls, model_id, **load_kwargs):
             import traceback
             print(f"  Warning: Failed to load from local cache: {e}")
             traceback.print_exc()
-            print(f"  Retrying with model ID (may download missing files)...")
+            print("  Retrying with model ID (may download missing files)...")
     else:
         print(f"  Model not cached locally, downloading {model_id}...")
     return model_cls.from_pretrained(model_id, **load_kwargs)

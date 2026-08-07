@@ -82,7 +82,7 @@
 ### Config (Plan G)
 | Method | Notes |
 |--------|-------|
-| `resolve_task_config(task, storage, book_id) -> dict` | Single helper replacing dead `resolve_task_llm(task, config_path=None)` param. Applies on-disk config → llm.task_overrides → walk_override rows, snapshotted per walk-unit start. Called from all 9 walks. |
+| `resolve_task_config(task, storage, book_id) -> dict` | Single helper replacing dead `resolve_task_llm(task, config_path=None)` param. Applies on-disk config → llm.task_overrides → walk_override rows, snapshotted per walk-unit start. Returns `{model_name, reasoning_effort, temperature, prompt}` — `prompt` (str or None) resolves via top-level config `walk_override[task].prompt` → `llm.task_overrides[task].prompt` → walk_override row `key="prompt"` (row wins; None when unset → walk built-in system_prompt fallback). Called from all 9 walks. |
 | raw-JSON merge (app.py POST /api/config) | Parse raw JSON → validate known keys through AppConfig(extra='ignore', output never serialized) → recursive deep-merge unknown paths → stamp schema_version → atomic write. Byte-stable round-trip. |
 
 ## API Contracts

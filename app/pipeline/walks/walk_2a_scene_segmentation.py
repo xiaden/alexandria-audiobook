@@ -9,7 +9,7 @@ Confidence filter:
 - <0.5: auto-reject (scene is discarded)
 - 0.5–0.7: flagged for user review (scene is created but marked)
 
-LLM configuration is resolved via ``resolve_task_llm('scene_segmentation')``
+LLM configuration is resolved via ``resolve_task_config('scene_segmentation', storage, book_id)``
 with temperature=0.1 for format stability.
 """
 
@@ -45,7 +45,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     storage:
         Pipeline storage adapter.
     config:
-        App config dict (passed to ``resolve_task_llm``).
+        App config dict (kept for the runner contract; not consulted by ``resolve_task_config``).
 
     Returns
     -------
@@ -55,7 +55,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
         ``errors``.
     """
     from app.pipeline.populate import insert_scene
-    from app.utils import create_llm_client, resolve_task_llm
+    from app.utils import create_llm_client, resolve_task_config
 
     result = {
         "book_id": book_id,
@@ -67,11 +67,12 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     }
 
     # Resolve LLM config for scene segmentation
-    llm_config = resolve_task_llm("scene_segmentation", config_path=None)
+    llm_config = resolve_task_config("scene_segmentation", storage, book_id)
     client, _ = create_llm_client(config_path=None)
     model_name = llm_config["model_name"]
     temperature = llm_config["temperature"]
     reasoning_effort = llm_config.get("reasoning_effort")
+    prompt = llm_config.get("prompt")
 
     # Query chapters for this book
     chapters = storage.execute_query(
@@ -91,6 +92,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 model_name=model_name,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
+                system_prompt_override=prompt,
                 insert_scene_fn=insert_scene,
                 result=result,
             )
@@ -113,6 +115,7 @@ def _process_chapter(
     model_name: str,
     temperature: float,
     reasoning_effort: str | None,
+    system_prompt_override: str | None,
     insert_scene_fn: Any,
     result: dict,
 ) -> None:
@@ -143,7 +146,10 @@ def _process_chapter(
         model_name=model_name,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
-        system_prompt="You are a literary analyst specializing in narrative structure.",
+        system_prompt=(
+            system_prompt_override
+            or "You are a literary analyst specializing in narrative structure."
+        ),
         user_prompt=prompt,
     )
 

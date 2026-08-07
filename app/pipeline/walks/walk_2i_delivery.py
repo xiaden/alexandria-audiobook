@@ -21,7 +21,7 @@ Confidence filter:
 For narrative/non-speaker spans (no speaker character), the LLM is still
 called with "NARRATOR" as the speaker and a note that the text is narrative.
 
-LLM configuration is resolved via ``resolve_task_llm('delivery')``
+LLM configuration is resolved via ``resolve_task_config('delivery', storage, book_id)``
 with temperature=0.3 for interpretive delivery characterization.
 
 CRITICAL: This walk MUST use the LLM for every span — no rule-based fallback.
@@ -61,7 +61,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     storage:
         Pipeline storage adapter.
     config:
-        App config dict (passed to ``resolve_task_llm``).
+        App config dict (kept for the runner contract; not consulted by ``resolve_task_config``).
 
     Returns
     -------
@@ -69,7 +69,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
         Summary with keys: ``book_id``, ``spans_processed``,
         ``instructs_generated``, ``instructs_for_review``, ``errors``.
     """
-    from app.utils import create_llm_client, resolve_task_llm
+    from app.utils import create_llm_client, resolve_task_config
 
     result: dict[str, Any] = {
         "book_id": book_id,
@@ -84,11 +84,12 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     committed_target_ids: list[str] = []
 
     # Resolve LLM config for delivery
-    llm_config = resolve_task_llm("delivery", config_path=None)
+    llm_config = resolve_task_config("delivery", storage, book_id)
     client, _ = create_llm_client(config_path=None)
     model_name = llm_config["model_name"]
     temperature = llm_config["temperature"]
     reasoning_effort = llm_config.get("reasoning_effort")
+    prompt = llm_config.get("prompt")
 
     # Look up book existence
     book_rows = storage.execute_query(
@@ -120,6 +121,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 model_name=model_name,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
+                system_prompt_override=prompt,
                 result=result,
                 committed_target_ids=committed_target_ids,
             )
@@ -271,6 +273,7 @@ def _process_span(
     model_name: str,
     temperature: float,
     reasoning_effort: str | None,
+    system_prompt_override: str | None,
     result: dict,
     committed_target_ids: list[str],
 ) -> None:
@@ -307,7 +310,11 @@ def _process_span(
         model_name=model_name,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
-        system_prompt="You are a TTS delivery specialist for audiobook production, generating performance instructions for text-to-speech rendering.",
+        system_prompt=(
+            system_prompt_override
+            or "You are a TTS delivery specialist for audiobook production, "
+            "generating performance instructions for text-to-speech rendering."
+        ),
         user_prompt=prompt,
     )
 

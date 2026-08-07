@@ -18,7 +18,7 @@ Confidence filter:
 - <0.5: auto-reject (merge group is skipped)
 - 0.5–0.7: flagged for user review (merge is applied but tracked)
 
-LLM configuration is resolved via ``resolve_task_llm('script_alias_resolution')``
+LLM configuration is resolved via ``resolve_task_config('script_alias_resolution', storage, book_id)``
 with temperature=0.1 for format stability.
 """
 
@@ -55,7 +55,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     storage:
         Pipeline storage adapter.
     config:
-        App config dict (passed to ``resolve_task_llm``).
+        App config dict (kept for the runner contract; not consulted by ``resolve_task_config``).
 
     Returns
     -------
@@ -64,7 +64,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
         ``merge_groups``, ``characters_merged``, ``characters_remaining``,
         ``merges_for_review``, ``merges_rejected``, ``errors``.
     """
-    from app.utils import create_llm_client, resolve_task_llm
+    from app.utils import create_llm_client, resolve_task_config
 
     result: dict[str, Any] = {
         "book_id": book_id,
@@ -78,11 +78,15 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     }
 
     # Resolve LLM config for alias resolution (GLOBAL scope)
-    llm_config = resolve_task_llm("script_alias_resolution", config_path=None)
+    llm_config = resolve_task_config("script_alias_resolution", storage, book_id)
     client, _ = create_llm_client(config_path=None)
     model_name = llm_config["model_name"]
     temperature = llm_config["temperature"]
     reasoning_effort = llm_config.get("reasoning_effort")
+    # Effective prompt override (None when unset) — the GLOBAL alias
+    # resolution chat_completion call is inside execute() itself, so the
+    # capture is consumed directly below (no per-unit threading needed).
+    system_prompt_override = llm_config.get("prompt")
 
     # ------------------------------------------------------------------
     # GLOBAL scope: collect ALL characters for the book in ONE query.
@@ -117,7 +121,8 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             system_prompt=(
-                "You are a literary analyst specializing in character identity "
+                system_prompt_override
+                or "You are a literary analyst specializing in character identity "
                 "resolution across long narratives."
             ),
             user_prompt=prompt,

@@ -130,7 +130,7 @@ def _make_mock_response(content):
 
 
 def _patch_llm(monkeypatch, mock_llm_client, response_content):
-    """Patch resolve_task_llm and create_llm_client for testing."""
+    """Patch resolve_task_config and create_llm_client for testing."""
     mock_llm_client.chat.completions.create.return_value = _make_mock_response(
         response_content
     )
@@ -140,8 +140,8 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
         lambda config_path=None: (mock_llm_client, "test-model"),
     )
     monkeypatch.setattr(
-        "app.utils.resolve_task_llm",
-        lambda task_name, config_path=None: {
+        "app.utils.resolve_task_config",
+        lambda task, storage, book_id: {
             "model_name": "test-model",
             "reasoning_effort": None,
             "temperature": 0.1,
@@ -211,8 +211,8 @@ class TestExecute:
             lambda config_path=None: (mock_llm_client, "test-model"),
         )
         monkeypatch.setattr(
-            "app.utils.resolve_task_llm",
-            lambda task_name, config_path=None: {
+            "app.utils.resolve_task_config",
+            lambda task, storage, book_id: {
                 "model_name": "test-model",
                 "reasoning_effort": None,
                 "temperature": 0.1,
@@ -330,6 +330,107 @@ class TestExecute:
 # ---------------------------------------------------------------------------
 # Tests: _build_prompt()
 # ---------------------------------------------------------------------------
+
+
+    def test_walk_override_drives_llm_config(self, seeded_storage, monkeypatch, tmp_path):
+        """A walk_override row for (book, task) overrides the walk's LLM config.
+
+        Phase 3 (Plan G): the walk resolves its LLM config via
+        ``resolve_task_config(task, storage, book_id)`` at unit start, so a
+        walk_override row for this book + task must beat the on-disk
+        fallbacks and flow into the LLM call (temperature + model).
+        """
+        # Point config resolution at a tmp path with no config file -> fallbacks.
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(tmp_path / "config.json"))
+
+        # walk_override rows override temperature AND model for this book+task.
+        seeded_storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            ("book-1", "scene_presence", "temperature", json.dumps(0.9)),
+        )
+        seeded_storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            ("book-1", "scene_presence", "model_name", json.dumps("gpt-4o-mini")),
+        )
+
+        monkeypatch.setattr(
+            "app.utils.create_llm_client", lambda config_path=None: (object(), None)
+        )
+
+        captured = {}
+
+        def mock_call_llm(
+            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+        ):
+            captured["temperature"] = temperature
+            captured["model_name"] = model_name
+            return "[]"
+
+        monkeypatch.setattr(
+            "app.pipeline.walks.walk_2d_scene_presence.chat_completion",
+            mock_call_llm,
+        )
+
+        execute("book-1", seeded_storage, {})
+
+        # Override wins over the 0.6 fallback temperature and default model.
+        assert captured["temperature"] == 0.9
+        assert captured["model_name"] == "gpt-4o-mini"
+
+    def test_prompt_override_drives_system_prompt(
+        self, seeded_storage, monkeypatch, tmp_path
+    ):
+        """A walk_override row key='prompt' flows into the LLM system_prompt.
+
+        Phase 3 Amendment (Plan G): ``resolve_task_config`` returns an
+        effective ``prompt``; the walk must pass it as ``system_prompt``.
+        With no override at any tier the built-in system prompt is used;
+        with a walk_override prompt row the row wins.
+        """
+        # No config file at the pinned path -> no prompt override at any tier.
+        monkeypatch.setenv("ALEXANDRIA_CONFIG_PATH", str(tmp_path / "config.json"))
+
+        monkeypatch.setattr(
+            "app.utils.create_llm_client", lambda config_path=None: (object(), None)
+        )
+
+        captured = {}
+
+        def mock_call_llm(
+            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+        ):
+            captured["system_prompt"] = system_prompt
+            return "[]"
+
+        monkeypatch.setattr(
+            "app.pipeline.walks.walk_2d_scene_presence.chat_completion",
+            mock_call_llm,
+        )
+
+        execute("book-1", seeded_storage, {})
+
+        # Unset at every tier -> the walk's built-in system prompt.
+        assert captured["system_prompt"] == (
+            "You are a literary analyst specializing in character presence in narrative scenes."
+        )
+
+        # walk_override row key="prompt" wins over the built-in.
+        seeded_storage.execute_insert(
+            "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                "book-1",
+                "scene_presence",
+                "prompt",
+                json.dumps("You are a TEST override prompt."),
+            ),
+        )
+
+        execute("book-1", seeded_storage, {})
+
+        assert captured["system_prompt"] == "You are a TEST override prompt."
 
 
 class TestBuildPrompt:

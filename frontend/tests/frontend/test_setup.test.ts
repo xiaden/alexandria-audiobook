@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { WALK_TASK_NAMES, collectTaskOverrides, loadConfig } from '../../src/tabs/setup';
+import { WALK_TASK_NAMES, collectTaskOverrides, loadConfig, buildConfigPayload } from '../../src/tabs/setup';
 import { state, setPipelineBookId, initState } from '../../src/state';
 import * as API from '../../src/api';
 
@@ -180,11 +180,13 @@ describe('loadConfig', () => {
             <td><input data-field="model_name" /></td>
             <td><select data-field="reasoning_effort"><option value="">Default</option><option value="low">Low</option><option value="high">High</option></select></td>
             <td><input data-field="temperature" /></td>
+            <td><input data-field="prompt" /></td>
           </tr>
           <tr data-task="delivery">
             <td><input data-field="model_name" /></td>
             <td><select data-field="reasoning_effort"><option value="">Default</option><option value="low">Low</option><option value="high">High</option></select></td>
             <td><input data-field="temperature" /></td>
+            <td><input data-field="prompt" /></td>
           </tr>
         </tbody>
       </table>
@@ -293,11 +295,11 @@ describe('loadConfig', () => {
     expect(legacyModel?.value).toBe('should-not-change');
   });
 
-  it('should accept pipeline-only config shape (llm + tts, ignoring legacy prompts/generation keys)', async () => {
-    const pipelineOnlyConfig = {
+  it('should preserve unknown top-level sections (generation/prompts/walk_override) in the save payload', async () => {
+    const configWithUnknowns = {
       llm: {
         base_url: 'http://localhost:1234/v1',
-        api_key: 'legacy-key-present',
+        api_key: 'test-key',
         model_name: 'gpt-4',
         reasoning_effort: 'high',
         temperature: 0.5,
@@ -310,38 +312,217 @@ describe('loadConfig', () => {
         language: 'English',
         parallel_workers: 2,
       },
-      // Legacy pre-pipeline keys — loadConfig must ignore these entirely
+      // Unknown top-level sections (byte-stable contract: backend deep-merges
+      // unknown paths, never deletes them — the save payload must carry them).
+      generation: { max_tokens: 512, seed: 42 },
       prompts: { default_prompt: 'legacy' },
-      generation: { max_tokens: 512 },
+      walk_override: { scene_segmentation: { prompt: 'Seg prompt' } },
     };
 
-    vi.mocked(API.get).mockResolvedValueOnce(pipelineOnlyConfig);
+    vi.mocked(API.get).mockResolvedValueOnce(configWithUnknowns);
 
     await loadConfig();
 
-    const llmUrl = document.getElementById('llm-url') as HTMLInputElement;
-    const llmModel = document.getElementById('llm-model') as HTMLInputElement;
-    const llmReasoning = document.getElementById('llm-reasoning') as HTMLSelectElement;
-    const llmTemp = document.getElementById('llm-temperature') as HTMLInputElement;
-    const ttsMode = document.getElementById('tts-mode') as HTMLSelectElement;
-    const ttsUrl = document.getElementById('tts-url') as HTMLInputElement;
-    const ttsDevice = document.getElementById('tts-device') as HTMLSelectElement;
-    const ttsLang = document.getElementById('tts-language') as HTMLSelectElement;
-    const workers = document.getElementById('parallel-workers') as HTMLInputElement;
+    const payload = buildConfigPayload();
 
-    // llm fields populated
-    expect(llmUrl?.value).toBe('http://localhost:1234/v1');
-    expect(llmModel?.value).toBe('gpt-4');
-    expect(llmReasoning?.value).toBe('high');
-    expect(llmTemp?.value).toBe('0.5');
-    // tts fields populated
-    expect(ttsMode?.value).toBe('external');
-    expect(ttsUrl?.value).toBe('http://localhost:7860');
-    expect(ttsDevice?.value).toBe('auto');
-    expect(ttsLang?.value).toBe('English');
-    expect(workers?.value).toBe('2');
-    // prompts/generation keys are ignored — no elements exist for them
-    expect(document.getElementById('default-prompt')).toBeNull();
-    expect(document.getElementById('max-tokens')?.value).toBe('');
+    // Unknown top-level sections are preserved verbatim in the save payload
+    expect(payload.generation).toEqual({ max_tokens: 512, seed: 42 });
+    expect(payload.prompts).toEqual({ default_prompt: 'legacy' });
+    expect(payload.walk_override).toHaveProperty('scene_segmentation');
+    expect(payload.walk_override?.scene_segmentation?.prompt).toBe('Seg prompt');
+    // Known sections still present
+    expect(payload.llm?.model_name).toBe('gpt-4');
+    expect(payload.tts?.mode).toBe('external');
+  });
+
+  it('should render per-walk override fields (temperature + prompt) from config and include them in the save payload', async () => {
+    const configWithOverrides = {
+      llm: {
+        base_url: 'http://localhost:1234/v1',
+        api_key: 'test-key',
+        model_name: 'gpt-4',
+        reasoning_effort: 'medium',
+        temperature: 0.6,
+        task_overrides: {
+          scene_segmentation: {
+            model_name: 'gpt-4-turbo',
+            reasoning_effort: 'high',
+            temperature: 0.7,
+          },
+          delivery: {
+            model_name: null,
+            reasoning_effort: null,
+            temperature: null,
+          },
+        },
+      },
+      tts: {
+        mode: 'external',
+        url: 'http://localhost:7860',
+        device: 'auto',
+        language: 'English',
+        parallel_workers: 2,
+      },
+      // Per-walk prompt overrides carried in the config payload's walk_override section
+      walk_override: {
+        scene_segmentation: { prompt: 'You are a scene segmentation expert.' },
+        delivery: { prompt: null },
+      },
+    };
+
+    vi.mocked(API.get).mockResolvedValueOnce(configWithOverrides);
+
+    await loadConfig();
+
+    // Temperature override rendered from llm.task_overrides (existing convention)
+    const sceneRow = document.querySelector('[data-task="scene_segmentation"]');
+    const sceneTemp = sceneRow?.querySelector('[data-field="temperature"]') as HTMLInputElement;
+    expect(sceneTemp?.value).toBe('0.7');
+
+    // Prompt override rendered from the walk_override section
+    const scenePrompt = sceneRow?.querySelector('[data-field="prompt"]') as HTMLInputElement;
+    expect(scenePrompt?.value).toBe('You are a scene segmentation expert.');
+    const deliveryRow = document.querySelector('[data-task="delivery"]');
+    const deliveryPrompt = deliveryRow?.querySelector('[data-field="prompt"]') as HTMLInputElement;
+    expect(deliveryPrompt?.value).toBe('');
+
+    // Save payload includes both override kinds
+    const payload = buildConfigPayload();
+    expect(payload.llm?.task_overrides?.scene_segmentation?.temperature).toBe(0.7);
+    expect(payload.walk_override?.scene_segmentation?.prompt).toBe('You are a scene segmentation expert.');
+    expect(payload.walk_override?.delivery?.prompt).toBeNull();
+  });
+});
+
+describe('prompt override contract lock (P5-S5)', () => {
+  // Backend read path (resolve_task_config in app/utils.py): tier-1 prompt source
+  // is config["walk_override"][task]["prompt"] — a TOP-LEVEL section keyed by task
+  // name, string or None. These assertions lock the frontend payload/render to
+  // that exact shape so a prompt set in the Setup tab stays consumable end-to-end.
+
+  const nineTaskRows = WALK_TASK_NAMES.map(
+    (task) => `
+      <tr data-task="${task}">
+        <td><input data-field="model_name" /></td>
+        <td><select data-field="reasoning_effort"><option value="">Default</option><option value="low">Low</option><option value="high">High</option></select></td>
+        <td><input data-field="temperature" /></td>
+        <td><input data-field="prompt" /></td>
+      </tr>
+    `,
+  ).join('');
+
+  const configWithWalkPrompts = {
+    llm: {
+      base_url: 'http://localhost:1234/v1',
+      api_key: 'test-key',
+      model_name: 'gpt-4',
+      reasoning_effort: 'medium',
+      temperature: 0.6,
+      task_overrides: {
+        scene_segmentation: { model_name: 'gpt-4-turbo', reasoning_effort: 'high', temperature: 0.7 },
+      },
+    },
+    tts: {
+      mode: 'external',
+      url: 'http://localhost:7860',
+      device: 'auto',
+      language: 'English',
+      parallel_workers: 2,
+    },
+    // Top-level walk_override section — the exact path resolve_task_config reads
+    // (config["walk_override"][task]["prompt"]). scene_segmentation: string prompt;
+    // delivery + script_alias_resolution: explicit null; voice_audition: absent
+    // entirely (unset -> None -> built-in system_prompt fallback on the backend).
+    walk_override: {
+      scene_segmentation: { prompt: 'You are a scene segmentation expert.' },
+      character_discovery: { prompt: 'You are a character discovery expert.' },
+      script_alias_resolution: { prompt: null },
+      scene_presence: { prompt: 'You are a scene presence expert.' },
+      span_attribution: { prompt: 'You are a span attribution expert.' },
+      character_description: { prompt: 'You are a character description expert.' },
+      voice_assignment: { prompt: 'You are a voice assignment expert.' },
+      delivery: { prompt: null },
+    },
+  };
+
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <input id="llm-url" />
+      <input id="llm-key" />
+      <input id="llm-model" />
+      <select id="llm-reasoning"><option value="">Default</option><option value="low">Low</option><option value="high">High</option></select>
+      <input id="llm-temperature" />
+      <table id="per-task-llm-table"><tbody>${nineTaskRows}</tbody></table>
+      <select id="tts-mode"><option value="external">External</option></select>
+      <input id="tts-url" />
+      <select id="tts-device"><option value="auto">Auto</option></select>
+      <select id="tts-language"><option value="English">English</option></select>
+      <input id="parallel-workers" />
+      <input id="batch-seed" />
+      <input id="compile-codec" type="checkbox" />
+      <input id="batch-group-by-type" type="checkbox" />
+      <input id="sub-batch-enabled" type="checkbox" />
+      <input id="sub-batch-min-size" />
+      <input id="sub-batch-ratio" />
+      <input id="sub-batch-max-items" />
+      <input id="pause-between-speakers" />
+      <input id="pause-same-speaker" />
+    `;
+    vi.clearAllMocks();
+  });
+
+  it('buildConfigPayload emits walk_override[taskName].prompt (string|null) keyed by task name — the resolve_task_config read path', async () => {
+    vi.mocked(API.get).mockResolvedValueOnce(configWithWalkPrompts);
+
+    await loadConfig();
+
+    const payload = buildConfigPayload();
+
+    // (a) Every walk task is keyed in the TOP-LEVEL walk_override section with a
+    // prompt value that is either a non-empty string or explicit null — the exact
+    // shape resolve_task_config consumes via config["walk_override"][task]["prompt"].
+    for (const task of WALK_TASK_NAMES) {
+      const entry = payload.walk_override?.[task];
+      expect(entry, `walk_override entry for ${task}`).toBeDefined();
+      const prompt = entry?.prompt;
+      expect(
+        typeof prompt === 'string' || prompt === null,
+        `prompt for ${task} must be string or null, got ${String(prompt)}`,
+      ).toBe(true);
+    }
+    // Concrete round-trip values: string prompt survives, explicit null survives,
+    // and an absent entry becomes explicit null (backend: unset -> None -> built-in).
+    expect(payload.walk_override?.scene_segmentation?.prompt).toBe('You are a scene segmentation expert.');
+    expect(payload.walk_override?.delivery?.prompt).toBeNull();
+    expect(payload.walk_override?.script_alias_resolution?.prompt).toBeNull();
+    expect(payload.walk_override?.voice_audition?.prompt).toBeNull();
+    // Override entries carry exactly {prompt} — no stray keys (temperature lives
+    // in llm.task_overrides, which is where the backend tier-2 reads it from).
+    expect(payload.walk_override?.scene_segmentation).toEqual({ prompt: 'You are a scene segmentation expert.' });
+
+    // (b) The prompt override is NOT nested inside llm.task_overrides — that path
+    // is stripped by GET /api/config (pydantic model_dump drops nested unknown
+    // keys) and resolve_task_config does not read it. Lock it out of the payload.
+    for (const task of WALK_TASK_NAMES) {
+      const overrideEntry = payload.llm?.task_overrides?.[task];
+      if (overrideEntry) {
+        expect(Object.keys(overrideEntry)).not.toContain('prompt');
+      }
+    }
+  });
+
+  it('loadConfig populates the per-walk prompt input from config.walk_override[taskName].prompt (same path)', async () => {
+    vi.mocked(API.get).mockResolvedValueOnce(configWithWalkPrompts);
+
+    await loadConfig();
+
+    // Every row's prompt input reflects the walk_override section: the override
+    // string when set, '' when null/absent (placeholder shows the inherited model).
+    for (const task of WALK_TASK_NAMES) {
+      const row = document.querySelector(`[data-task="${task}"]`);
+      const input = row?.querySelector('[data-field="prompt"]') as HTMLInputElement | null;
+      const expected = configWithWalkPrompts.walk_override?.[task]?.prompt ?? '';
+      expect(input?.value, `prompt input for ${task}`).toBe(expected);
+    }
   });
 });

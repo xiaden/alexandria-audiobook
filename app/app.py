@@ -4,11 +4,11 @@ import json
 import shutil
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 import re
 import time
@@ -17,7 +17,7 @@ import threading
 import zipfile
 import subprocess
 import aiofiles
-from utils import atomic_json_write
+from utils import atomic_json_write, save_json
 
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
 
@@ -258,6 +258,13 @@ class TTSConfig(BaseModel):
     pause_same_speaker_ms: int = 250  # silence (ms) when same speaker continues during merge
 
 class AppConfig(BaseModel):
+    # Validation-only schema (CONTRACTS.md rule #11): unknown top-level keys
+    # (generation/prompts/...) are IGNORED here — they survive only as raw JSON
+    # in config.json (DD cannot-restore #13) and the validation OUTPUT is never
+    # serialized. Pydantic's default is already 'ignore'; this makes the
+    # contract explicit and guards against a future model_config change.
+    model_config = ConfigDict(extra="ignore")
+
     llm: LLMConfig
     tts: TTSConfig
 
@@ -465,8 +472,11 @@ async def get_config():
     ``task_overrides`` and ``reasoning_effort`` are always present in the
     response — even when absent from the on-disk config.
 
-    Returns:
-        Dict matching the ``AppConfig`` schema.
+    Unknown top-level keys (``generation``, ``prompts``, ``schema_version``,
+    ...) present in the on-disk file are preserved in the response: the
+    raw-JSON merge contract (rule #11) guarantees a byte-stable round-trip, so
+    this endpoint must NOT drop keys the old ``model_validate -> model_dump``
+    path stripped (the L4 data-loss bug).
     """
     default_config = {
         "llm": {
@@ -494,13 +504,66 @@ async def get_config():
     validated = AppConfig.model_validate(config)
     result = validated.model_dump()
 
+    # Preserve unknown top-level keys from the on-disk file (byte-stable
+    # contract, rule #11) — they are not AppConfig fields and must round-trip
+    # unchanged (DD cannot-restore #13).
+    for key, value in config.items():
+        if key not in result:
+            result[key] = value
+
     return result
 
+
+def _deep_merge_unknown(base: dict, overlay: dict, known: set) -> dict:
+    """Deep-merge the unknown keys of ``overlay`` onto ``base`` (raw-JSON merge).
+
+    Known keys (in ``known``, i.e. the AppConfig field names) replace the
+    on-disk value verbatim — they come from the request body which was already
+    validated through ``AppConfig``. Unknown keys are merged recursively:
+    values from ``overlay`` win, but unknown keys already on disk that the body
+    omits survive, and nested dicts merge key-wise. Returns a NEW dict;
+    ``base`` is never mutated.
+    """
+    result = dict(base)
+    for key, value in overlay.items():
+        if key in known:
+            result[key] = value
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_unknown(result[key], value, known)
+        else:
+            result[key] = value
+    return result
+
+
 @app.post("/api/config")
-async def save_config(config: AppConfig):
-    os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config.model_dump(), f, indent=2, ensure_ascii=False)
+async def save_config(request: Request, config: AppConfig):
+    """Save the application configuration with a raw-JSON merge.
+
+    The request body is parsed as raw JSON and deep-merged onto the current
+    on-disk config: unknown top-level keys (``generation``, ``prompts``, ...)
+    survive byte-stable instead of being wiped by ``AppConfig.model_dump()``
+    (the L4 data-loss bug). Known keys are validated through ``AppConfig``
+    (extra='ignore') and replace the on-disk section; the validation OUTPUT is
+    never serialized. ``schema_version`` is stamped and the merged config is
+    written atomically (tmp+rename) so a failure never leaves a partial file.
+    """
+    # Raw request body, including unknown top-level keys. ``config: AppConfig``
+    # above has already parsed+validated the body (422 on malformed JSON or
+    # invalid known values), so request.json() here is safe and returns the
+    # exact bytes the client sent.
+    raw = await request.json()
+
+    # Merge base = current on-disk config (empty when the file is missing).
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            current = json.load(f)
+    else:
+        current = {}
+
+    merged = _deep_merge_unknown(current, raw, known=set(AppConfig.model_fields))
+    merged["schema_version"] = 1  # schema_version stamp (rule #11)
+
+    save_json(CONFIG_PATH, merged)
     # Reset engine so it picks up new TTS settings on next use
     reset_tts_engine()
     return {"status": "saved"}
