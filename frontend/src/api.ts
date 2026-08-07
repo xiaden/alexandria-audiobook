@@ -46,6 +46,43 @@ export async function post<T = unknown>(endpoint: string, body: unknown): Promis
 }
 
 /**
+ * POST a JSON body with exactly ONE automatic retry when the server
+ * responds HTTP 503 with a Retry-After header (the transaction()
+ * owner-thread contention contract: ``ConcurrentTransactionError`` is
+ * mapped to 503 + Retry-After in the API layer).
+ *
+ * The Retry-After delay (integer seconds; the backend sends "1") is
+ * honored before the single retry. Any non-retryable response — or a
+ * second 503 — surfaces via ``handleError`` exactly as the plain
+ * ``post()`` wrapper would. Never loops: at most 2 total POST attempts.
+ */
+export async function postWithRetryOnce<T = unknown>(endpoint: string, body: unknown): Promise<T> {
+  let res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (res.status === 503 && res.headers.get('Retry-After') != null) {
+    // Honor the retry delay. The backend sends integer seconds ("1");
+    // the HTTP-date form is not produced here, so any unparseable value
+    // falls back to a fixed 1s delay.
+    const seconds = parseInt(res.headers.get('Retry-After') as string, 10);
+    const delayMs = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000;
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+
+    res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  await handleError(res);
+  return res.json();
+}
+
+/**
  * Perform a PUT request to the API
  * @param endpoint - API endpoint (e.g., '/api/pipeline/characters/{id}/voice')
  * @param body - Request body (will be JSON.stringify'd)

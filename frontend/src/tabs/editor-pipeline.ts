@@ -23,6 +23,8 @@
  *          sequence playback — player queue of span chunk URLs with
  *          auto-advance on 'ended')
  *   - GET  /api/pipeline/export/audio/{job_id}   (whole-book playback)
+ *   - POST /api/pipeline/export/m4b              (multipart form: metadata
+ *          + optional cover; raw fetch + FormData, NOT JSON)
  */
 
 import * as API from '../api';
@@ -164,7 +166,9 @@ export async function pipelineRenderStatus(
 export async function pipelineCancelRender(
   jobId: string,
 ): Promise<{ status: string; job_id: string }> {
-  return API.post('/api/pipeline/cancel_render', { job_id: jobId });
+  // 503 + Retry-After (transaction() owner-thread contention) is retried
+  // exactly once by the wrapper before the error surfaces (DD UX workflow #2).
+  return API.postWithRetryOnce('/api/pipeline/cancel_render', { job_id: jobId });
 }
 
 /**
@@ -202,6 +206,66 @@ export function pipelineDownloadUrl(jobId: string): string {
 export async function pipelineExportSpans(): Promise<Array<{ id: string; speaker: string; text: string; instruct: string | null }>> {
   if (!state.pipelineBookId) return [];
   return API.get(`/api/pipeline/export/${state.pipelineBookId}`);
+}
+
+/**
+ * Success payload of POST /api/pipeline/export/m4b (backend contract,
+ * api_export.py export_m4b — verified, unchanged).
+ *
+ * ``message`` is present only when libmp3lame is unavailable and the export
+ * degraded to M4B-only (DD open item #8).
+ */
+export interface M4bExportResult {
+  status: string;
+  output_path: string;
+  mp3: boolean;
+  mp3_path: string | null;
+  audacity: boolean;
+  audacity_path: string | null;
+  message?: string;
+}
+
+/** Form values for the Export M4B form (5 metadata fields + optional cover). */
+export interface ExportM4bPayload {
+  jobId: string;
+  title: string;
+  author: string;
+  narrator: string;
+  year: string;
+  description: string;
+  cover?: File | null;
+}
+
+/**
+ * Export the rendered job as an M4B via POST /api/pipeline/export/m4b.
+ *
+ * MULTIPART form (FastAPI Form(...) + File(...) — NOT JSON): job_id + the 5
+ * metadata fields (title/author/narrator/year/description, all default '' on
+ * the backend) + an optional cover UploadFile. Must use raw fetch + FormData
+ * — API.post JSON-stringifies and would break the route (same raw-fetch
+ * pattern as pipelineOnboard in script.ts).
+ *
+ * Errors (404 unknown/non-completed job, 410 expired, 409 format mismatch,
+ * 400 no chunks) surface the backend ``detail`` via a thrown Error.
+ */
+export async function pipelineExportM4b(payload: ExportM4bPayload): Promise<M4bExportResult> {
+  const formData = new FormData();
+  formData.append('job_id', payload.jobId);
+  formData.append('title', payload.title ?? '');
+  formData.append('author', payload.author ?? '');
+  formData.append('narrator', payload.narrator ?? '');
+  formData.append('year', payload.year ?? '');
+  formData.append('description', payload.description ?? '');
+  if (payload.cover) formData.append('cover', payload.cover);
+  const res = await fetch('/api/pipeline/export/m4b', {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || res.statusText);
+  }
+  return res.json();
 }
 
 // ---------------------------------------------------------------------------
@@ -283,13 +347,10 @@ export async function loadSpans(): Promise<void> {
       return;
     }
 
-    // Update progress bar
-    const total = spans.length;
-    const progressBar = document.getElementById('full-progress-bar');
-    if (progressBar) {
-      progressBar.style.width = '100%';
-      progressBar.innerText = `${total} spans loaded`;
-    }
+    // The progress bar is owned by RENDER progress (Plan F) — span loading
+    // must not claim 100% (the static "N spans loaded" overstatement is gone).
+    // Leave the bar in its neutral state until a render starts.
+    resetRenderProgress();
 
     // Full redraw
     tbody.innerHTML = spans.map(span => renderSpanRow(span)).join('');
@@ -719,6 +780,84 @@ let _currentRenderJobId: string | null = null;
 let _renderPollTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * Reset the render progress bar to its neutral state (Plan F).
+ *
+ * The bar is owned by RENDER progress — span loading no longer claims 100%
+ * (the old static "N spans loaded" overstatement is gone). Called when spans
+ * load and when a new render starts so a stale bar from a previous render
+ * never lingers.
+ */
+function resetRenderProgress(): void {
+  const bar = document.getElementById('full-progress-bar');
+  if (bar) {
+    bar.classList.remove('progress-bar-animated');
+    bar.style.width = '0%';
+    bar.innerText = 'Ready';
+  }
+  const badge = document.getElementById('render-failures-badge');
+  if (badge) {
+    badge.style.display = 'none';
+    badge.innerText = '';
+  }
+}
+
+/**
+ * Render the progress bar from a render_status payload (Plan F).
+ *
+ * Individual mode: per-chunk counts derived from render_chunk rows (rows =
+ * truth) — width = completed/total, label `${completed}/${total} chunks`,
+ * and a red failure badge (count + job error text as title) when chunks
+ * failed. Batch mode has NO per-chunk counts — job-level progress only:
+ * running/pending → indeterminate animated striped bar ("Rendering..."),
+ * completed → 100%, failed/cancelled → status label. A mode-less legacy
+ * payload falls back to the job-level branch.
+ */
+function updateRenderProgress(status: RenderStatus): void {
+  const bar = document.getElementById('full-progress-bar');
+  const badge = document.getElementById('render-failures-badge');
+
+  if (status.mode === 'individual' && status.total_chunks && status.total_chunks > 0) {
+    const completed = status.completed_chunks ?? 0;
+    const total = status.total_chunks;
+    const failed = status.failed_chunks ?? 0;
+    const pct = Math.min(100, Math.round((completed / total) * 100));
+    if (bar) {
+      bar.classList.remove('progress-bar-animated');
+      bar.style.width = `${pct}%`;
+      bar.innerText = `${completed}/${total} chunks`;
+    }
+    if (badge) {
+      if (failed > 0) {
+        badge.style.display = 'inline-block';
+        badge.innerText = `${failed} chunk${failed === 1 ? '' : 's'} failed`;
+        badge.title = status.error || `${failed} chunk${failed === 1 ? '' : 's'} failed`;
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+    return;
+  }
+
+  // Batch mode (or a mode-less legacy payload): job-level progress only.
+  if (badge) badge.style.display = 'none';
+  if (bar) {
+    bar.classList.remove('progress-bar-animated');
+    if (status.status === 'completed') {
+      bar.style.width = '100%';
+      bar.innerText = '100%';
+    } else if (status.status === 'failed' || status.status === 'cancelled') {
+      bar.style.width = '100%';
+      bar.innerText = status.status === 'failed' ? 'Failed' : 'Cancelled';
+    } else {
+      // running / pending — indeterminate animated striped bar
+      bar.classList.add('progress-bar-animated');
+      bar.style.width = '100%';
+      bar.innerText = 'Rendering...';
+    }
+  }
+}
+
+/**
  * Render the audiobook using the pipeline render endpoint.
  *
  * The backend executes the render as a background job and returns
@@ -741,6 +880,12 @@ export async function pipelineRenderAll(): Promise<void> {
   if (btnRegen) btnRegen.style.display = 'none';
   if (btnCancel) btnCancel.style.display = 'inline-block';
 
+  // Fresh render → the bar starts neutral (0%, Ready) until the first tick.
+  resetRenderProgress();
+  // A fresh render invalidates the previous export — hide + reset the Export
+  // M4B card until this render completes (Plan F, Phase 4).
+  hideExportM4bForm();
+
   try {
     // Start the render — returns immediately with a job_id
     const result = await pipelineRenderAudiobook(true);
@@ -758,6 +903,7 @@ export async function pipelineRenderAll(): Promise<void> {
         }
         try {
            const status = await pipelineRenderStatus(_currentRenderJobId);
+           updateRenderProgress(status);
            if (status.status === 'completed') {
              if (_renderPollTimer) clearInterval(_renderPollTimer);
              _renderPollTimer = null;
@@ -783,12 +929,9 @@ export async function pipelineRenderAll(): Promise<void> {
       }, 2000);
     });
 
-    // Show download button on success
-    const btnDownload = document.getElementById('btn-pipeline-download');
-    if (btnDownload && _currentRenderJobId) {
-      btnDownload.style.display = 'inline-block';
-      btnDownload.setAttribute('data-job-id', _currentRenderJobId);
-    }
+    // Reveal the full result surface on success (Plan F): download + whole-book
+    // play affordances and the Export M4B card (Phase 4).
+    if (_currentRenderJobId) revealResultSurface(_currentRenderJobId);
 
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -989,6 +1132,188 @@ export async function playSpanSequence(jobId?: string): Promise<void> {
     console.error('Sequence playback failed:', e);
     showToast('Sequence playback failed: ' + (e instanceof Error ? e.message : String(e)), 'error');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Export M4B form (Plan F, Phase 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reveal the result surface for a completed/exported render job: the
+ * Download button (GET /api/pipeline/download/{job_id}), the whole-book Play
+ * affordance (GET /api/pipeline/export/audio/{job_id} — after a successful
+ * export the m4b is the served artifact), and the Export M4B card.
+ */
+function revealResultSurface(jobId: string): void {
+  const btnDownload = document.getElementById('btn-pipeline-download');
+  if (btnDownload) {
+    btnDownload.style.display = 'inline-block';
+    btnDownload.setAttribute('data-job-id', jobId);
+  }
+  const btnPlayBook = document.getElementById('btn-pipeline-play-book');
+  if (btnPlayBook) btnPlayBook.style.display = 'inline-block';
+  const exportCard = document.getElementById('export-m4b-card');
+  if (exportCard) exportCard.style.display = 'block';
+}
+
+/**
+ * Clear the Export M4B form values and hide the M4B-only info alert.
+ * Visibility of the card itself is owned by hideExportM4bForm /
+ * revealResultSurface, not by this helper.
+ */
+function resetExportM4bForm(): void {
+  const form = document.getElementById('export-m4b-form') as HTMLFormElement | null;
+  if (form) form.reset();
+  const infoAlert = document.getElementById('export-m4b-info');
+  if (infoAlert) infoAlert.style.display = 'none';
+}
+
+/**
+ * Render the MP3/Audacity capability affordances from an export response
+ * (Plan F, Phase 5 feature-detect).
+ *
+ * The /export/m4b response IS the capability carrier — there is no separate
+ * capability endpoint. The flags drive the affordances:
+ *   mp3:true      → MP3 download link visible, href = mp3_path
+ *   audacity:true → Audacity bundle link visible, href = audacity_path
+ *   mp3:false     → MP3 link suppressed + the M4B-only degrade message
+ *                   surfaced (response.message, or the frontend default
+ *                   'MP3 export unavailable — M4B-only' when the key is
+ *                   absent), so the degrade is explicit to the user.
+ *
+ * URL scheme: the hrefs are the artifact paths VERBATIM as returned by the
+ * backend. NOTE (backend gap, frontend-only phase): api_export.py serves no
+ * HTTP route for the mp3 / audacity zip — only /download/{job_id} (the m4b
+ * via output_artifact_path) and /export/audio/{job_id} exist; the returned
+ * paths are server-side filesystem locations. The affordances surface the
+ * backend's own path contract; a future phase should add a serving route
+ * (e.g. /api/pipeline/download/{job_id}?format=mp3|audacity).
+ */
+function renderExportCapabilities(result: M4bExportResult): void {
+  const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement | null;
+  if (mp3) {
+    if (result.mp3 && result.mp3_path) {
+      mp3.href = result.mp3_path;
+      mp3.style.display = 'inline-block';
+    } else {
+      mp3.style.display = 'none';
+      mp3.href = '';
+    }
+  }
+  const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement | null;
+  if (audacity) {
+    if (result.audacity && result.audacity_path) {
+      audacity.href = result.audacity_path;
+      audacity.style.display = 'inline-block';
+    } else {
+      audacity.style.display = 'none';
+      audacity.href = '';
+    }
+  }
+  const infoAlert = document.getElementById('export-m4b-info');
+  if (infoAlert) {
+    if (!result.mp3) {
+      infoAlert.textContent = result.message || 'MP3 export unavailable — M4B-only';
+      infoAlert.style.display = 'block';
+    } else {
+      infoAlert.style.display = 'none';
+    }
+  }
+}
+
+/**
+ * Hide + clear the export capability affordances (Plan F, Phase 5): the MP3
+ * and Audacity download links from a previous export never linger. Called on
+ * a new render start (hideExportM4bForm) so a stale capability row cannot
+ * outlive its job.
+ */
+function resetExportCapabilities(): void {
+  const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement | null;
+  if (mp3) {
+    mp3.style.display = 'none';
+    mp3.href = '';
+  }
+  const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement | null;
+  if (audacity) {
+    audacity.style.display = 'none';
+    audacity.href = '';
+  }
+}
+
+/**
+ * Hide + reset the export card — called when a new render starts so a stale
+ * export form from a previous completed render never lingers (idle until the
+ * next completion reveals it again). Also resets the Phase 5 capability row.
+ */
+function hideExportM4bForm(): void {
+  const card = document.getElementById('export-m4b-card');
+  if (card) card.style.display = 'none';
+  resetExportM4bForm();
+  resetExportCapabilities();
+}
+
+/**
+ * Gather the Export M4B form values and submit the multipart export.
+ *
+ * Bound to the form's submit event by initExportM4bForm; also exported for
+ * direct testing. Requires a completed render (state.pipelineRenderJobId —
+ * set when pipelineRenderAll reaches a terminal completed state). On success:
+ * success toast, result surface revealed for the exported job, the M4B-only
+ * degrade message surfaced when present, and the form reset. On error: the
+ * backend ``detail`` is surfaced via an error toast and the form stays usable
+ * (values preserved, nothing disabled, no reset).
+ */
+export async function handleExportM4bSubmit(e?: Event): Promise<void> {
+  e?.preventDefault();
+  const jobId = state.pipelineRenderJobId;
+  if (!jobId) {
+    showToast('No completed render to export. Render the audiobook first.', 'warning');
+    return;
+  }
+  const value = (id: string): string =>
+    (document.getElementById(id) as HTMLInputElement | null)?.value ?? '';
+  const coverInput = document.getElementById('export-m4b-cover') as HTMLInputElement | null;
+  const payload: ExportM4bPayload = {
+    jobId,
+    title: value('export-m4b-title'),
+    author: value('export-m4b-author'),
+    narrator: value('export-m4b-narrator'),
+    year: value('export-m4b-year'),
+    description: value('export-m4b-description'),
+    cover: coverInput?.files?.[0] ?? null,
+  };
+
+  try {
+    const result = await pipelineExportM4b(payload);
+    showToast('M4B export complete', 'success');
+    revealResultSurface(jobId);
+    // Reset the consumed fields FIRST, THEN render the capability row —
+    // resetExportM4bForm hides the info alert, so a fresh M4B-only message
+    // must survive the reset (Plan F Phase 4).
+    resetExportM4bForm();
+    // Render the MP3/Audacity capability affordances from the response flags
+    // (Phase 5 feature-detect: mp3/audacity flags + artifact paths + the
+    // M4B-only degrade message).
+    renderExportCapabilities(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    showToast('Export failed: ' + msg, 'error');
+    // Keep the form usable: values stay, nothing disabled, no reset.
+  }
+}
+
+/**
+ * Wire the Export M4B form submit handler (Plan F, Phase 4).
+ *
+ * Called from initEditor's DOMContentLoaded handler. No-ops when the form is
+ * absent from the current DOM — each DOMContentLoaded dispatch wires whatever
+ * elements are present at that time (same model as the button wiring in
+ * initEditor).
+ */
+export function initExportM4bForm(): void {
+  const form = document.getElementById('export-m4b-form');
+  if (!form) return;
+  form.addEventListener('submit', handleExportM4bSubmit);
 }
 
 // ---------------------------------------------------------------------------

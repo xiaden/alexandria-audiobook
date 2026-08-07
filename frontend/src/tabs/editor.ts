@@ -30,6 +30,10 @@ import {
   pipelineRenderAudiobook,
   pipelineExportSpans,
   pipelineUpdateSpanText,
+  // Export M4B (Plan F, Phase 4)
+  pipelineExportM4b,
+  handleExportM4bSubmit,
+  initExportM4bForm,
   // Span display
   toPipelineSpans,
   loadSpans,
@@ -51,6 +55,7 @@ import {
   handleReviewOverride,
   // TTS rendering
   pipelineRenderAll,
+  pipelineCancelRender,
   cancelPipelineRender,
   downloadPipelineRender,
   mergePipelineAudiobook,
@@ -83,6 +88,13 @@ export {
   pipelineExportSpans,
 };
 
+// Re-export Export M4B (Plan F, Phase 4)
+export {
+  pipelineExportM4b,
+  handleExportM4bSubmit,
+  initExportM4bForm,
+};
+
 // Re-export pipeline span display
 export {
   toPipelineSpans,
@@ -111,6 +123,7 @@ export {
 // Re-export pipeline TTS rendering
 export {
   pipelineRenderAll,
+  pipelineCancelRender,
   cancelPipelineRender,
   downloadPipelineRender,
   mergePipelineAudiobook,
@@ -198,6 +211,9 @@ export function initEditor(): void {
     if (btnPipelinePlaySequence) {
       btnPipelinePlaySequence.addEventListener('click', () => playSpanSequence());
     }
+
+    // Export M4B form submit wiring (Plan F, Phase 4)
+    initExportM4bForm();
 
     // Pipeline merge button (for merging selected spans)
     const btnPipelineMerge = document.getElementById('btn-pipeline-merge');

@@ -34,6 +34,21 @@ interface ReonboardResult {
 /** Walk status map: walk_name → 'pending' | 'running' | 'completed' | 'failed' */
 type WalkStatusMap = Record<string, string>;
 
+/**
+ * Row from GET /api/pipeline/walks/{book_id}/runs (WalkRunRow DTO).
+ * `created_ms`/`finished_ms` are INTEGER unix milliseconds; `finished_ms` is 0
+ * while a run is still in progress; `error` is null unless the run failed.
+ */
+export interface WalkRunRow {
+  run_id: string;
+  walk_name: string;
+  status: string; // 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+  heartbeat_ms: number;
+  created_ms: number;
+  finished_ms: number;
+  error: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
@@ -114,12 +129,24 @@ export async function pipelineWalkStatus(bookId: string): Promise<WalkStatusMap>
 }
 
 /**
+ * Get walk run history for a book, newest-first.
+ * GET /api/pipeline/walks/{book_id}/runs
+ * @param bookId - Book UUID
+ * @returns WalkRunRow rows; empty list when the book has no runs yet
+ */
+export async function pipelineWalkRuns(bookId: string): Promise<WalkRunRow[]> {
+  return API.get<WalkRunRow[]>(`/api/pipeline/walks/${bookId}/runs`);
+}
+
+/**
  * Cancel running walks for a book.
  * POST /api/pipeline/cancel_walks
  * @param bookId - Book UUID
  */
 export async function pipelineCancelWalks(bookId: string): Promise<unknown> {
-  return API.post('/api/pipeline/cancel_walks', {
+  // 503 + Retry-After (transaction() owner-thread contention) is retried
+  // exactly once by the wrapper before the error surfaces (DD UX workflow #2).
+  return API.postWithRetryOnce('/api/pipeline/cancel_walks', {
     book_id: bookId,
   });
 }
@@ -140,6 +167,28 @@ export async function pipelineReonboard(bookId: string): Promise<ReonboardResult
 // ---------------------------------------------------------------------------
 
 /**
+ * Build the status badge span shared by walk statuses and walk runs.
+ * Status → badge classes (identical across both renderers):
+ *   completed → bg-success, running → bg-warning text-dark, failed → bg-danger,
+ *   cancelled → bg-dark, anything else → bg-secondary.
+ */
+function buildStatusBadge(status: string): string {
+  const badgeClass =
+    status === 'completed' ? 'bg-success' :
+    status === 'running' ? 'bg-warning text-dark' :
+    status === 'failed' ? 'bg-danger' :
+    status === 'cancelled' ? 'bg-dark' :
+    'bg-secondary';
+  const icon =
+    status === 'completed' ? '<i class="fas fa-check me-1"></i>' :
+    status === 'running' ? '<i class="fas fa-spinner fa-spin me-1"></i>' :
+    status === 'failed' ? '<i class="fas fa-times me-1"></i>' :
+    status === 'cancelled' ? '<i class="fas fa-stop me-1"></i>' :
+    '<i class="fas fa-clock me-1"></i>';
+  return `<span class="badge ${badgeClass}">${icon}${escapeHtml(status)}</span>`;
+}
+
+/**
  * Render the walk status list into #walk-status-container.
  * Each walk is shown with its human-readable label and a status badge.
  * @param statuses - Map of walk_name → status
@@ -151,23 +200,74 @@ export function renderWalkStatuses(statuses: WalkStatusMap): void {
   container.innerHTML = WALK_ORDER.map(walkName => {
     const status = statuses[walkName] || 'pending';
     const label = WALK_DISPLAY_NAMES[walkName] || walkName;
-    const badgeClass =
-      status === 'completed' ? 'bg-success' :
-      status === 'running' ? 'bg-warning text-dark' :
-      status === 'failed' ? 'bg-danger' :
-      'bg-secondary';
-    const icon =
-      status === 'completed' ? '<i class="fas fa-check me-1"></i>' :
-      status === 'running' ? '<i class="fas fa-spinner fa-spin me-1"></i>' :
-      status === 'failed' ? '<i class="fas fa-times me-1"></i>' :
-      '<i class="fas fa-clock me-1"></i>';
 
     return `
       <div class="d-flex align-items-center justify-content-between py-1 border-bottom" data-walk="${escapeHtml(walkName)}">
         <span class="small">${escapeHtml(label)}</span>
-        <span class="badge ${badgeClass}">${icon}${escapeHtml(status)}</span>
+        ${buildStatusBadge(status)}
       </div>`;
   }).join('');
+}
+
+/**
+ * Format an integer unix-millisecond timestamp as 'YYYY-MM-DD HH:MM' (local time).
+ * Returns '—' for falsy/missing timestamps (e.g. `finished_ms` = 0 while a run
+ * is still in progress).
+ */
+export function formatWalkRunTime(ms: number): string {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/**
+ * Render the walk run history into #walk-runs-container, below the per-walk
+ * status badges. Newest-first, as returned by the backend.
+ * Shows an empty-state message when there are no runs yet.
+ * @param runs - WalkRunRow rows from GET /walks/{book_id}/runs
+ */
+export function renderWalkRuns(runs: WalkRunRow[]): void {
+  const container = document.getElementById('walk-runs-container');
+  if (!container) return;
+
+  if (!runs || runs.length === 0) {
+    container.innerHTML =
+      '<div class="text-muted small"><i class="fas fa-history me-1"></i>No walk runs yet</div>';
+    return;
+  }
+
+  container.innerHTML = runs.map(run => {
+    const label = WALK_DISPLAY_NAMES[run.walk_name] || run.walk_name;
+    const errorHtml = run.error
+      ? `<div class="small text-danger"><i class="fas fa-exclamation-triangle me-1"></i>${escapeHtml(run.error)}</div>`
+      : '';
+    return `
+      <div class="py-1 border-bottom" data-walk-run-row="${escapeHtml(run.run_id)}">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="small">${escapeHtml(label)}</span>
+          ${buildStatusBadge(run.status)}
+        </div>
+        <div class="small text-muted">Created ${formatWalkRunTime(run.created_ms)} · Finished ${formatWalkRunTime(run.finished_ms)}</div>
+        ${errorHtml}
+      </div>`;
+  }).join('');
+}
+
+/**
+ * Fetch and render the walk runs list.
+ * Uses `bookId` when given (restored-session tab load); otherwise the current
+ * book. No-op without a book; failures are logged and leave the list as-is.
+ */
+async function refreshWalkRuns(bookId?: string): Promise<void> {
+  const id = bookId ?? currentBookId;
+  if (!id) return;
+  try {
+    const runs = await pipelineWalkRuns(id);
+    renderWalkRuns(runs);
+  } catch (e) {
+    console.error('Walk runs fetch error', e);
+  }
 }
 
 /**
@@ -186,6 +286,8 @@ export function startWalkPolling(): void {
       const statuses = await pipelineWalkStatus(currentBookId);
       renderWalkStatuses(statuses);
       updateWalkButtons(statuses);
+      // Runs history refreshes alongside walk status on every poll tick.
+      await refreshWalkRuns();
 
       // Detect failed walks and show error toast
       for (const [walkName, status] of Object.entries(statuses)) {
@@ -491,5 +593,12 @@ function initPipelineUI(): void {
   const btnReonboard = document.getElementById('btn-reonboard');
   if (btnReonboard) {
     btnReonboard.addEventListener('click', () => handleReonboard());
+  }
+
+  // Restored session (initState persisted pipelineBookId): load the runs
+  // history for the book without starting walk polling (walk-status behavior
+  // is unchanged — polling only starts from an explicit run/onboard action).
+  if (state.pipelineBookId) {
+    void refreshWalkRuns(state.pipelineBookId ?? undefined);
   }
 }

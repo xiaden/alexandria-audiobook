@@ -9,9 +9,9 @@ The frontend is organized into core pipeline tabs (script, voices, editor, setup
 | Tab | Module | Purpose |
 |-----|--------|---------|
 | Setup | `src/tabs/setup.ts` | LLM endpoint config (base URL / API key / model / reasoning / temperature) and TTS settings (mode, device, language, parallel workers, batch seed, codec compilation, sub-batching, pauses) |
-| Script | `src/tabs/script.ts` | Book onboarding (`POST /api/pipeline/onboard`), run walks (`POST /api/pipeline/run_walk`, `run_all_walks`), walk status polling (`GET /api/pipeline/walk_status/{book_id}`), cancel walks, re-onboard |
-| Voices | `src/tabs/voices.ts` | Character list with voice assignment dropdowns (`GET /api/pipeline/characters/{book_id}`, `PUT /api/pipeline/characters/{id}/voice`) and voice catalog management (`GET/POST/PUT/DELETE /api/pipeline/voices`, preview) |
-| Editor | `src/tabs/editor.ts` + `src/tabs/editor-pipeline.ts` | Span-based editing against `/api/pipeline/*` endpoints: structural operations, inline span text edits, confidence review, render, merge, download |
+| Script | `src/tabs/script.ts` | Book onboarding (`POST /api/pipeline/onboard`), run walks (`POST /api/pipeline/run_walk`, `run_all_walks`), walk status polling (`GET /api/pipeline/walk_status/{book_id}`), walk run history (`GET /api/pipeline/walks/{book_id}/runs`), cancel walks, re-onboard |
+| Voices | `src/tabs/voices.ts` | Character list with voice assignment dropdowns (`GET /api/pipeline/characters/{book_id}`, `PUT /api/pipeline/characters/{id}/voice`), narrator voice selector (`PUT /api/pipeline/voices/NARRATOR`), and voice catalog with preview buttons (`GET /api/pipeline/voices`, `POST /api/pipeline/voices/{id}/preview`) |
+| Editor | `src/tabs/editor.ts` + `src/tabs/editor-pipeline.ts` | Span-based editing against `/api/pipeline/*` endpoints: structural operations, inline span text edits, confidence review, render with real-time progress, cancel, playback/preview, Export M4B form (metadata + cover + MP3/Audacity), merge, download |
 | Designer | `src/tabs/designer.ts` | Voice Designer — describe a voice, generate and preview it, save to the library (`/api/voice_design/*`) |
 | Preparer | `src/tabs/preparer.ts` | Voice Training Dataset Preparer — upload and prepare LoRA training datasets (`/api/preparer/*`) |
 | Dataset Builder | `src/tabs/dataset-builder.ts` | Build LoRA training datasets with per-sample preview (`/api/dataset_builder/*`) |
@@ -53,8 +53,10 @@ Other pipeline endpoints used by the editor:
 | `/api/pipeline/review/reject` | POST | Reject a review item |
 | `/api/pipeline/review/override` | POST | Override a review item |
 | `/api/pipeline/render` | POST | Start a render job (returns `job_id`) |
-| `/api/pipeline/render_status/{job_id}` | GET | Poll render progress |
-| `/api/pipeline/cancel_render` | POST | Cancel a running render job |
+| `/api/pipeline/render_status/{job_id}` | GET | Poll render progress (individual jobs include mode + per-chunk counts; batch is job-level) |
+| `/api/pipeline/cancel_render` | POST | Cancel a running render job (retried once on 503 contention) |
+| `/api/pipeline/export/m4b` | POST | Export a chaptered M4B from the metadata form (multipart: title/author/narrator/year/description + optional cover) |
+| `/api/pipeline/export/audio/{job_id}` | GET | Play the whole rendered book |
 | `/api/pipeline/merge` | POST | Merge rendered chunks into `audiobook.m4b` |
 | `/api/pipeline/download/{job_id}` | GET | Download the merged M4B (or a ZIP of raw chunks) |
 
@@ -74,9 +76,11 @@ Rendering is pipeline-only:
 | Step | Endpoint | Frontend |
 |------|----------|----------|
 | Render | `POST /api/pipeline/render` → `renderPipeline()` | starts a background job, returns `job_id` |
-| Progress | `GET /api/pipeline/render_status/{job_id}` | polls every ~2s, updates progress bar and log |
-| Cancel | `POST /api/pipeline/cancel_render` → `cancelPipelineRender()` | cancels a running render job |
+| Progress | `GET /api/pipeline/render_status/{job_id}` | polls every ~2s; individual renders show per-chunk progress (completed/total) with failure badges, batch renders show job-level progress |
+| Cancel | `POST /api/pipeline/cancel_render` → `cancelPipelineRender()` | cancels a running render job (retried once on 503 contention) |
+| Export M4B | `POST /api/pipeline/export/m4b` → `pipelineExportM4b()` | metadata form (title/author/narrator/year/description + optional cover) → chaptered M4B; MP3 link when the backend reports MP3 support (M4B-only message otherwise), Audacity bundle produced alongside the M4B |
+| Play | `GET /api/pipeline/export/audio/{job_id}` → `playPipelineAudiobook()` | plays the whole rendered book |
 | Merge | `POST /api/pipeline/merge` → `mergePipelineAudiobook()` | combines rendered chunks into `audiobook.m4b` |
 | Download | `GET /api/pipeline/download/{job_id}` → `downloadPipelineRender()` | downloads the merged M4B (or `audiobook.zip` of raw chunks) |
 
-The render request body is `{ book_id, use_batch, output_dir?, batch_seed? }`; batch mode (default) renders all pending spans in a single batched TTS call.
+The render request body is `{ book_id, use_batch, output_dir?, batch_seed? }`; individual mode renders one chunk per span with per-chunk progress, batch mode (default) renders all pending spans in a single batched TTS call with job-level progress.

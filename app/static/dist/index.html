@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-Dx_qAJuB.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-CGCTafV9.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -472,6 +472,17 @@
                                 <div class="card-body p-2">
                                     <div id="walk-status-container">
                                         <!-- Populated by renderWalkStatuses() -->
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="card mb-3">
+                                <div class="card-header py-2">
+                                    <h6 class="m-0">Walk Runs</h6>
+                                </div>
+                                <div class="card-body p-2">
+                                    <div id="walk-runs-container">
+                                        <!-- Populated by renderWalkRuns() -->
                                     </div>
                                 </div>
                             </div>
@@ -988,14 +999,17 @@
                             <button class="btn btn-warning btn-sm" id="btn-pipeline-merge-audiobook"><i class="fas fa-file-audio me-1"></i>Merge Audiobook</button>
                             <button class="btn btn-outline-info btn-sm" id="btn-pipeline-play-book" title="Play whole book" aria-label="Play whole book"><i class="fas fa-play me-1"></i>Play Book</button>
                             <button class="btn btn-outline-primary btn-sm" id="btn-pipeline-play-sequence" title="Play spans in sequence (selected, or all)" aria-label="Play spans in sequence"><i class="fas fa-list-ul me-1"></i>Play Sequence</button>
+                            <button class="btn btn-outline-primary btn-sm" id="btn-pipeline-download" style="display:none;" title="Download rendered audiobook" aria-label="Download audiobook"><i class="fas fa-download me-1"></i>Download</button>
                             <span id="pipeline-render-job" class="badge bg-info d-none"></span>
                         </div>
                     </div>
                     <div class="card-body">
-                        <!-- Full Progress Bar -->
+                        <!-- Full Progress Bar (owned by render progress — per-chunk counts in individual mode, job-level in batch mode) -->
                         <div class="progress mb-3" style="height: 25px;">
                             <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
                         </div>
+                        <!-- Per-chunk failure badge (individual renders; hidden until a chunk fails) -->
+                        <span id="render-failures-badge" class="badge bg-danger mb-3" style="display:none;"></span>
 
                         <div class="table-responsive">
                             <table class="table table-bordered table-hover">
@@ -1012,6 +1026,69 @@
                                     <!-- Pipeline span rows injected here -->
                                 </tbody>
                             </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Export M4B card (Plan F, Phase 4) — result surface; hidden
+                     until a render completes (same moment the download/play
+                     buttons are revealed). Multipart POST /api/pipeline/export/m4b. -->
+                <div class="card mb-3" id="export-m4b-card" style="display:none;">
+                    <div class="card-header">
+                        <h5 class="m-0"><i class="fas fa-book me-2"></i>Export M4B</h5>
+                    </div>
+                    <div class="card-body">
+                        <form id="export-m4b-form" enctype="multipart/form-data">
+                            <div class="row g-2 mb-2">
+                                <div class="col-md-6">
+                                    <label for="export-m4b-title" class="form-label mb-1">Title</label>
+                                    <input type="text" class="form-control form-control-sm" id="export-m4b-title" name="title" placeholder="Book title">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="export-m4b-author" class="form-label mb-1">Author</label>
+                                    <input type="text" class="form-control form-control-sm" id="export-m4b-author" name="author" placeholder="Author name">
+                                </div>
+                            </div>
+                            <div class="row g-2 mb-2">
+                                <div class="col-md-6">
+                                    <label for="export-m4b-narrator" class="form-label mb-1">Narrator</label>
+                                    <input type="text" class="form-control form-control-sm" id="export-m4b-narrator" name="narrator" placeholder="Narrator name">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="export-m4b-year" class="form-label mb-1">Year</label>
+                                    <input type="text" class="form-control form-control-sm" id="export-m4b-year" name="year" placeholder="Publication year">
+                                </div>
+                            </div>
+                            <div class="mb-2">
+                                <label for="export-m4b-description" class="form-label mb-1">Description</label>
+                                <textarea class="form-control form-control-sm" id="export-m4b-description" name="description" rows="2" placeholder="Book description (optional)"></textarea>
+                            </div>
+                            <div class="mb-2">
+                                <label for="export-m4b-cover" class="form-label mb-1">Cover image (optional)</label>
+                                <input type="file" class="form-control form-control-sm" id="export-m4b-cover" name="cover" accept="image/*">
+                            </div>
+                            <div class="d-flex align-items-center gap-2">
+                                <button type="submit" class="btn btn-primary btn-sm" id="btn-export-m4b">
+                                    <i class="fas fa-file-audio me-1"></i>Export M4B
+                                </button>
+                                <div id="export-m4b-info" class="alert alert-warning py-1 px-2 mb-0 small" style="display:none;"></div>
+                            </div>
+                        </form>
+                        <!-- Export capability affordances (Plan F, Phase 5) —
+                             feature-detected from the /export/m4b response:
+                             mp3:true → MP3 link (href = mp3_path);
+                             audacity:true → Audacity ZIP_STORED bundle link
+                             (href = audacity_path); mp3:false → MP3 link
+                             suppressed + M4B-only degrade message in
+                             #export-m4b-info. Hidden by default; reset when a
+                             new render starts. -->
+                        <div class="d-flex align-items-center gap-2 mt-2" id="export-capabilities-row">
+                            <a id="export-mp3-link" class="btn btn-sm btn-outline-success" href="#" download style="display:none;">
+                                <i class="fas fa-file-audio me-1"></i>Download MP3
+                            </a>
+                            <a id="export-audacity-link" class="btn btn-sm btn-outline-warning" href="#" download style="display:none;">
+                                <i class="fas fa-file-archive me-1"></i>Download Audacity bundle
+                            </a>
                         </div>
                     </div>
                 </div>

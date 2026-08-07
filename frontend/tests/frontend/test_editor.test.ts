@@ -22,6 +22,9 @@ import {
   pipelineReviewOverride,
   pipelineRenderAudiobook,
   pipelineExportSpans,
+  pipelineExportM4b,
+  handleExportM4bSubmit,
+  initExportM4bForm,
   toPipelineSpans,
   loadSpans,
   renderSpanRow,
@@ -36,6 +39,7 @@ import {
   handleReviewReject,
   handleReviewOverride,
   pipelineRenderAll,
+  pipelineCancelRender,
   cancelPipelineRender,
   getCachedSpans,
   getCachedReviewItems,
@@ -50,12 +54,18 @@ import { state } from '../../src/state';
 import { getPreviewPlayer } from '../../src/player';
 import * as API from '../../src/api';
 
-// Mock the API module
-vi.mock('../../src/api', () => ({
-  get: vi.fn(),
-  post: vi.fn(),
-  handleError: vi.fn(),
-}));
+// Mock the API module — partial mock: get/post stay mocked, but the REAL
+// postWithRetryOnce is exposed so cancel tests exercise the actual
+// 503+Retry-After retry-once wrapper against a spied global fetch.
+vi.mock('../../src/api', async () => {
+  const actual = await vi.importActual<typeof import('../../src/api')>('../../src/api');
+  return {
+    get: vi.fn(),
+    post: vi.fn(),
+    handleError: vi.fn(),
+    postWithRetryOnce: actual.postWithRetryOnce,
+  };
+});
 
 // Mock utils to avoid DOM side effects
 vi.mock('../../src/utils', () => ({
@@ -942,6 +952,407 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Render progress + result surface (Plan F, Phase 1)
+//
+// Backend contract (app/pipeline/api_export.py render_status — verified,
+// unchanged): GET /api/pipeline/render_status/{job_id} returns
+//   { job_id, status, output_dir, error, mode }
+// where mode ∈ {'individual','batch'}. Individual mode ALSO returns
+// total_chunks/completed_chunks/failed_chunks derived from render_chunk rows
+// (rows = truth); batch mode has NO per-chunk counts — job-level progress
+// only (running → indeterminate animated bar, completed → 100%).
+//
+// The result surface: #btn-pipeline-download (restored in index.html, wired
+// to GET /api/pipeline/download/{job_id} via downloadPipelineRender) and the
+// Plan E #btn-pipeline-play-book affordance (GET /api/pipeline/export/audio/
+// {job_id} via the singleton player) — both exposed when a render completes.
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Render Progress + Result Surface (Plan F)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    state.pipelineBookId = 'book-123';
+    document.body.innerHTML = `
+      <button id="btn-pipeline-render"></button>
+      <button id="btn-pipeline-regen"></button>
+      <button id="btn-pipeline-cancel" style="display:none;"></button>
+      <button id="btn-pipeline-download" style="display:none;"></button>
+      <button id="btn-pipeline-play-book" style="display:none;"></button>
+      <div class="progress" style="height: 25px;">
+        <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+      </div>
+      <span id="render-failures-badge" class="badge bg-danger" style="display:none;"></span>
+      <span id="pipeline-render-job" class="d-none"></span>
+      <div id="spans-table-body"></div>
+    `;
+  });
+
+  afterEach(async () => {
+    state.pipelineRenderJobId = null;
+    await cancelPipelineRender(true);
+    // Drop leftover mock implementations/Once queues so a failing test cannot
+    // leak a render_status payload into later describes: vi.clearAllMocks()
+    // keeps implementations, mockReset() clears them (audio-surface describes
+    // use the same isolation pattern).
+    vi.mocked(API.get).mockReset();
+    vi.mocked(API.post).mockReset();
+    vi.useRealTimers();
+  });
+
+  describe('per-chunk progress (individual mode)', () => {
+    it('renders width = completed/total and a chunk-count label from render_status counts', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-ind-1' });
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-ind-1', status: 'running', mode: 'individual',
+          output_dir: null, error: null,
+          total_chunks: 40, completed_chunks: 12, failed_chunks: 0,
+        })
+        .mockResolvedValueOnce({
+          job_id: 'job-ind-1', status: 'completed', mode: 'individual',
+          output_dir: null, error: null,
+          total_chunks: 40, completed_chunks: 40, failed_chunks: 0,
+        });
+
+      const promise = pipelineRenderAll();
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const bar = document.getElementById('full-progress-bar') as HTMLElement;
+      expect(bar.style.width).toBe('30%');
+      expect(bar.innerText).toBe('12/40 chunks');
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+
+      // Terminal tick: 100% width, full counts label, no animation class.
+      expect(bar.style.width).toBe('100%');
+      expect(bar.innerText).toBe('40/40 chunks');
+      expect(bar.classList.contains('progress-bar-animated')).toBe(false);
+    });
+
+    it('surfaces per-chunk failures as a red count/error badge', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-ind-2' });
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-ind-2', status: 'running', mode: 'individual',
+          output_dir: null, error: 'TTS failed on chunk 7',
+          total_chunks: 40, completed_chunks: 12, failed_chunks: 3,
+        })
+        .mockResolvedValueOnce({
+          job_id: 'job-ind-2', status: 'completed', mode: 'individual',
+          output_dir: null, error: 'TTS failed on chunk 7',
+          total_chunks: 40, completed_chunks: 37, failed_chunks: 3,
+        });
+
+      const promise = pipelineRenderAll();
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const badge = document.getElementById('render-failures-badge') as HTMLElement;
+      expect(badge.style.display).toBe('inline-block');
+      expect(badge.innerText).toContain('3 chunks failed');
+      expect(badge.title).toBe('TTS failed on chunk 7');
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+
+      // Failures persist on the badge through the terminal tick.
+      expect(badge.style.display).toBe('inline-block');
+    });
+
+    it('hides the failure badge when no chunks failed', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-ind-3' });
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-ind-3', status: 'running', mode: 'individual',
+          output_dir: null, error: null,
+          total_chunks: 10, completed_chunks: 4, failed_chunks: 0,
+        })
+        .mockResolvedValueOnce({
+          job_id: 'job-ind-3', status: 'completed', mode: 'individual',
+          output_dir: null, error: null,
+          total_chunks: 10, completed_chunks: 10, failed_chunks: 0,
+        });
+
+      const badge = document.getElementById('render-failures-badge') as HTMLElement;
+      badge.style.display = 'inline-block'; // stale from a prior render
+
+      const promise = pipelineRenderAll();
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(badge.style.display).toBe('none');
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+    });
+  });
+
+  describe('job-level progress (batch mode — no per-chunk counts)', () => {
+    it('shows an indeterminate animated bar while running and 100% when completed', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-batch-1' });
+      vi.mocked(API.get)
+        .mockResolvedValueOnce({
+          job_id: 'job-batch-1', status: 'running', mode: 'batch',
+          output_dir: null, error: null,
+        })
+        .mockResolvedValueOnce({
+          job_id: 'job-batch-1', status: 'completed', mode: 'batch',
+          output_dir: null, error: null,
+        });
+
+      const promise = pipelineRenderAll();
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const bar = document.getElementById('full-progress-bar') as HTMLElement;
+      expect(bar.classList.contains('progress-bar-animated')).toBe(true);
+      expect(bar.style.width).toBe('100%');
+      expect(bar.innerText).toBe('Rendering...');
+      // Batch mode carries no per-chunk counts → no failure badge.
+      const badge = document.getElementById('render-failures-badge') as HTMLElement;
+      expect(badge.style.display).toBe('none');
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+
+      expect(bar.classList.contains('progress-bar-animated')).toBe(false);
+      expect(bar.style.width).toBe('100%');
+      expect(bar.innerText).toBe('100%');
+    });
+  });
+
+  describe('result surface', () => {
+    it('restores a reachable #btn-pipeline-download inside the editor tab in index.html', () => {
+      const html = readIndexHtml();
+
+      expect(html).toContain('id="btn-pipeline-download"');
+      expect(html).toContain('id="render-failures-badge"');
+      // The download affordance must live inside the editor tab (reachable),
+      // not somewhere in another tab.
+      const editorTabStart = html.indexOf('id="editor-tab"');
+      const downloadIdx = html.indexOf('id="btn-pipeline-download"');
+      expect(editorTabStart).toBeGreaterThan(-1);
+      expect(downloadIdx).toBeGreaterThan(editorTabStart);
+    });
+
+    it('wires the Download button to GET /api/pipeline/download/{job_id} via downloadPipelineRender', async () => {
+      state.pipelineRenderJobId = 'job-dl-1';
+      let clickedHref: string | null = null;
+      // Spy on the ANCHOR prototype only: downloadPipelineRender creates a
+      // temporary <a href="/api/pipeline/download/{id}"> and clicks it, while
+      // the button's own click() must still dispatch (buttons share
+      // HTMLElement.prototype.click — spying there would swallow the event).
+      const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+        clickedHref = this.getAttribute('href');
+      });
+      try {
+        document.body.innerHTML = `<button id="btn-pipeline-download" style="display:none;"></button>`;
+        initEditor();
+        document.dispatchEvent(new Event('DOMContentLoaded'));
+
+        const btn = document.getElementById('btn-pipeline-download') as HTMLButtonElement;
+        expect(btn).not.toBeNull();
+        btn.click();
+
+        // downloadPipelineRender runs synchronously up to the anchor click.
+        expect(clickSpy).toHaveBeenCalledTimes(1);
+        expect(clickedHref).toBe('/api/pipeline/download/job-dl-1');
+      } finally {
+        clickSpy.mockRestore();
+      }
+    });
+
+    it('exposes the download button and the Play Book affordance when a render completes', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-done-1' });
+      vi.mocked(API.get).mockResolvedValue({
+        job_id: 'job-done-1', status: 'completed', mode: 'individual',
+        output_dir: null, error: null,
+        total_chunks: 40, completed_chunks: 40, failed_chunks: 0,
+      });
+
+      const btnDownload = document.getElementById('btn-pipeline-download') as HTMLElement;
+      const btnPlayBook = document.getElementById('btn-pipeline-play-book') as HTMLElement;
+      expect(btnDownload.style.display).toBe('none');
+      expect(btnPlayBook.style.display).toBe('none');
+
+      const promise = pipelineRenderAll();
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+
+      expect(btnDownload.style.display).toBe('inline-block');
+      expect(btnDownload.getAttribute('data-job-id')).toBe('job-done-1');
+      expect(btnPlayBook.style.display).toBe('inline-block');
+    });
+
+    it('keeps the progress bar neutral (Ready, 0%) when spans load — no static 100% claim', async () => {
+      vi.mocked(API.get).mockResolvedValue(MOCK_SPANS_RAW);
+      const bar = document.getElementById('full-progress-bar') as HTMLElement;
+      // Simulate a stale render-complete bar; loadSpans must reset it.
+      bar.style.width = '100%';
+      bar.innerText = '40/40 chunks';
+
+      await loadSpans();
+
+      expect(bar.style.width).toBe('0%');
+      expect(bar.innerText).toBe('Ready');
+      expect(bar.innerText).not.toContain('spans loaded');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cancel wiring with retry-once (Plan F, Phase 2)
+//
+// Backend contract (app/pipeline/api_export.py cancel_render — verified,
+// unchanged): POST /api/pipeline/cancel_render {job_id} → dict on success; on
+// transaction() owner-thread contention (ConcurrentTransactionError) → HTTP
+// 503 + Retry-After header. Frontend contract (DD UX workflow #2): the caller
+// retries EXACTLY ONCE before surfacing the error. The retry wrapper
+// (api.postWithRetryOnce) uses raw fetch, and the api module is a partial
+// mock here — so these tests spy on global fetch to count POST attempts and
+// to shape 503-then-200 / 503-then-503 sequences.
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Cancel with Retry-once (Plan F, Phase 2)', () => {
+  const originalFetch = globalThis.fetch;
+
+  const retry503 = {
+    ok: false,
+    status: 503,
+    statusText: 'Service Unavailable',
+    headers: { get: (name: string) => (name === 'Retry-After' ? '1' : null) },
+    json: async () => ({ detail: 'transaction contention' }),
+  };
+  const noHeader503 = {
+    ok: false,
+    status: 503,
+    statusText: 'Service Unavailable',
+    headers: { get: () => null },
+    json: async () => ({ detail: 'transaction contention' }),
+  };
+  const okCancelled = {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: { get: () => null },
+    json: async () => ({ status: 'cancelled', job_id: 'job-cancel-1' }),
+  };
+
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    state.pipelineBookId = 'book-123';
+    document.body.innerHTML = `
+      <button id="btn-pipeline-render"></button>
+      <button id="btn-pipeline-regen"></button>
+      <button id="btn-pipeline-cancel" style="display:none;"></button>
+    `;
+    fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy;
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    await cancelPipelineRender(true);
+    globalThis.fetch = originalFetch;
+    vi.mocked(API.get).mockReset();
+    vi.mocked(API.post).mockReset();
+    vi.useRealTimers();
+  });
+
+  it('pipelineCancelRender posts /api/pipeline/cancel_render with {job_id} and retries exactly once on 503+Retry-After, succeeding when the retry returns 200', async () => {
+    fetchSpy
+      .mockResolvedValueOnce(retry503)
+      .mockResolvedValueOnce(okCancelled);
+
+    const promise = pipelineCancelRender('job-cancel-1');
+    await vi.advanceTimersByTimeAsync(0); // attempt 1 → 503 → Retry-After delay scheduled
+    await vi.advanceTimersByTimeAsync(1000); // delay elapses → attempt 2 → 200
+
+    await expect(promise).resolves.toEqual({ status: 'cancelled', job_id: 'job-cancel-1' });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy).toHaveBeenNthCalledWith(1, '/api/pipeline/cancel_render', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ job_id: 'job-cancel-1' }),
+    }));
+    expect(fetchSpy).toHaveBeenNthCalledWith(2, '/api/pipeline/cancel_render', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ job_id: 'job-cancel-1' }),
+    }));
+  });
+
+  it('pipelineCancelRender rejects when both attempts return 503 and makes NO third attempt', async () => {
+    fetchSpy.mockResolvedValue(retry503); // both attempts → 503
+
+    const promise = pipelineCancelRender('job-cancel-1');
+    const assertion = expect(promise).rejects.toThrow('transaction contention'); // attach handler before advancing
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    await assertion;
+    expect(fetchSpy).toHaveBeenCalledTimes(2); // exactly 2 attempts — never a 3rd
+  });
+
+  it('pipelineCancelRender does NOT retry a 503 without a Retry-After header', async () => {
+    fetchSpy.mockResolvedValue(noHeader503);
+
+    const promise = pipelineCancelRender('job-cancel-1');
+    const assertion = expect(promise).rejects.toThrow('transaction contention'); // attach handler before advancing
+    await vi.advanceTimersByTimeAsync(0);
+
+    await assertion;
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // no Retry-After → no retry
+  });
+
+  it('cancelPipelineRender() posts /cancel_render for the ACTIVE job and surfaces the failure via the existing catch path when both attempts are 503', async () => {
+    vi.mocked(API.post).mockResolvedValue({ job_id: 'job-cancel-1' }); // render start
+    vi.mocked(API.get)
+      .mockResolvedValueOnce({ job_id: 'job-cancel-1', status: 'running', output_dir: null, error: null })
+      .mockResolvedValue({ job_id: 'job-cancel-1', status: 'completed', output_dir: null, error: null });
+    fetchSpy.mockResolvedValue(retry503); // both cancel attempts → 503
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const renderPromise = pipelineRenderAll();
+    await vi.advanceTimersByTimeAsync(0); // render starts → _currentRenderJobId set
+
+    const cancelPromise = cancelPipelineRender(); // explicit user Cancel (button handler)
+    await vi.advanceTimersByTimeAsync(0); // attempt 1 → 503 → delay scheduled
+    await vi.advanceTimersByTimeAsync(1000); // delay elapses → attempt 2 → 503 → error surfaced
+
+    // Cleanup FIRST: let the render poll reach terminal state (running →
+    // completed) so _currentRenderJobId is cleared even if an assertion below
+    // fails (avoids leaking module-private state into later tests).
+    await vi.advanceTimersByTimeAsync(2000); // tick 1 → still running
+    await vi.advanceTimersByTimeAsync(2000); // tick 2 → completed → render resolves
+    await renderPromise;
+    await cancelPromise;
+
+    // Exactly 2 POST attempts to /cancel_render with the ACTIVE job id — no 3rd.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy).toHaveBeenNthCalledWith(1, '/api/pipeline/cancel_render', expect.objectContaining({
+      body: JSON.stringify({ job_id: 'job-cancel-1' }),
+    }));
+    expect(fetchSpy).toHaveBeenNthCalledWith(2, '/api/pipeline/cancel_render', expect.objectContaining({
+      body: JSON.stringify({ job_id: 'job-cancel-1' }),
+    }));
+    // Existing catch path surfaces the failure (cancelPipelineRender logs, it
+    // does not toast) — and the buttons are restored.
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Cancel error:', expect.any(Error));
+    const btnCancel = document.getElementById('btn-pipeline-cancel');
+    const btnRender = document.getElementById('btn-pipeline-render');
+    expect(btnCancel?.style.display).toBe('none');
+    expect(btnRender?.style.display).toBe('inline-block');
+
+    consoleErrorSpy.mockRestore();
+  });
+});
+
 describe('Editor Tab — Testability Exports', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1587,6 +1998,622 @@ describe('Editor Tab — Sequence Playback (Audio Surface)', () => {
           '/api/pipeline/export/chunk/job-seq-1/2',
         ]);
       });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Export M4B form + cover upload (Plan F, Phase 4)
+//
+// Backend contract (app/pipeline/api_export.py export_m4b — verified,
+// unchanged): POST /api/pipeline/export/m4b is a MULTIPART form route
+// (FastAPI Form(...) + File(...) — NOT JSON):
+//   job_id (required) + title/author/narrator/year/description (default '')
+//   + cover (optional UploadFile).
+// Success (200): { status:'ok', output_path, mp3, mp3_path, audacity,
+//   audacity_path } with an optional `message` key when libmp3lame is missing
+//   (M4B-only degrade — full feature-detect UI is Phase 5; here the message
+//   is surfaced as an info alert in the export card).
+// Errors: 404 unknown/non-completed job, 410 expired, 409 format mismatch,
+//   400 no chunks — the frontend surfaces the backend `detail` via an error
+//   toast and keeps the form usable.
+//
+// The multipart POST MUST go through raw fetch + FormData (the API.post
+// wrapper JSON-stringifies and would break the route). FormData inspection in
+// jsdom: capture the fetch init.body and iterate [...formData.entries()];
+// File values asserted via instanceof File / name.
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Export M4B (Plan F, Phase 4)', () => {
+  const originalFetch = globalThis.fetch;
+
+  const okExport = {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: { get: () => null },
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+    }),
+  };
+  const okExportM4bOnly = {
+    ...okExport,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: false,
+      mp3_path: null,
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+      message:
+        'MP3 export unavailable: the libmp3lame encoder was not found in this ffmpeg build; exported M4B only.',
+    }),
+  };
+  const errExport = {
+    ok: false,
+    status: 409,
+    statusText: 'Conflict',
+    headers: { get: () => null },
+    json: async () => ({ detail: 'format mismatch: cover must be jpeg/png' }),
+  };
+
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    state.pipelineBookId = 'book-123';
+    state.pipelineRenderJobId = 'job-exp-1';
+    document.body.innerHTML = `
+      <button id="btn-pipeline-render"></button>
+      <button id="btn-pipeline-regen"></button>
+      <button id="btn-pipeline-cancel" style="display:none;"></button>
+      <button id="btn-pipeline-download" style="display:none;"></button>
+      <button id="btn-pipeline-play-book" style="display:none;"></button>
+      <div class="progress" style="height: 25px;">
+        <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+      </div>
+      <span id="render-failures-badge" class="badge bg-danger" style="display:none;"></span>
+      <span id="pipeline-render-job" class="d-none"></span>
+      <div id="spans-table-body"></div>
+      <div id="export-m4b-card" style="display:none;">
+        <form id="export-m4b-form" enctype="multipart/form-data">
+          <input type="text" id="export-m4b-title" name="title">
+          <input type="text" id="export-m4b-author" name="author">
+          <input type="text" id="export-m4b-narrator" name="narrator">
+          <input type="text" id="export-m4b-year" name="year">
+          <textarea id="export-m4b-description" name="description"></textarea>
+          <input type="file" id="export-m4b-cover" name="cover">
+          <button type="submit" id="btn-export-m4b">Export M4B</button>
+          <div id="export-m4b-info" style="display:none;"></div>
+        </form>
+      </div>
+    `;
+    fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy;
+  });
+
+  afterEach(async () => {
+    state.pipelineRenderJobId = null;
+    await cancelPipelineRender(true);
+    globalThis.fetch = originalFetch;
+    // Drop leftover mock implementations/Once queues so a failing test cannot
+    // leak render_status payloads into later describes (Phase 1 isolation
+    // pattern: mockReset clears implementations, clearAllMocks does not).
+    vi.mocked(API.get).mockReset();
+    vi.mocked(API.post).mockReset();
+    vi.useRealTimers();
+  });
+
+  describe('pipelineExportM4b — multipart FormData shape', () => {
+    it('posts job_id + the 5 metadata fields as multipart FormData to /api/pipeline/export/m4b', async () => {
+      fetchSpy.mockResolvedValue(okExport);
+
+      const result = await pipelineExportM4b({
+        jobId: 'job-exp-1',
+        title: 'Pride and Prejudice',
+        author: 'Jane Austen',
+        narrator: 'Narrator',
+        year: '1813',
+        description: 'A novel of manners.',
+      });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe('/api/pipeline/export/m4b');
+      const fd = (init as RequestInit).body as FormData;
+      expect(fd).toBeInstanceOf(FormData);
+      expect((init as RequestInit).method).toBe('POST');
+      // Exactly the 6 string fields — no cover entry when none selected.
+      expect([...fd.entries()].map(([k]) => k).sort()).toEqual(
+        ['author', 'description', 'job_id', 'narrator', 'title', 'year'],
+      );
+      expect(fd.get('job_id')).toBe('job-exp-1');
+      expect(fd.get('title')).toBe('Pride and Prejudice');
+      expect(fd.get('author')).toBe('Jane Austen');
+      expect(fd.get('narrator')).toBe('Narrator');
+      expect(fd.get('year')).toBe('1813');
+      expect(fd.get('description')).toBe('A novel of manners.');
+      expect(fd.get('cover')).toBeNull();
+      expect(result).toEqual(expect.objectContaining({
+        status: 'ok',
+        output_path: '/data/render_root/book.m4b',
+      }));
+    });
+
+    it('appends the cover File when provided and omits the cover entry otherwise', async () => {
+      const cover = new File(['fake-jpeg-bytes'], 'cover.jpg', { type: 'image/jpeg' });
+
+      fetchSpy.mockResolvedValue(okExport);
+      await pipelineExportM4b({
+        jobId: 'job-exp-1', title: 'T', author: 'A', narrator: 'N', year: '', description: '', cover,
+      });
+      const withCover = (fetchSpy.mock.calls[0][1] as RequestInit).body as FormData;
+      expect([...withCover.entries()]).toHaveLength(7); // job_id + 5 fields + cover
+      const coverEntry = [...withCover.entries()].find(([k]) => k === 'cover');
+      expect(coverEntry).toBeDefined();
+      expect(coverEntry?.[1]).toBeInstanceOf(File);
+      expect((coverEntry?.[1] as File).name).toBe('cover.jpg');
+      expect((coverEntry?.[1] as File).type).toBe('image/jpeg');
+
+      fetchSpy.mockClear();
+      await pipelineExportM4b({
+        jobId: 'job-exp-1', title: 'T', author: 'A', narrator: 'N', year: '', description: '',
+      });
+      const noCover = (fetchSpy.mock.calls[0][1] as RequestInit).body as FormData;
+      expect([...noCover.entries()]).toHaveLength(6);
+      expect([...noCover.entries()].find(([k]) => k === 'cover')).toBeUndefined();
+    });
+  });
+
+  describe('index.html export form markup', () => {
+    it('declares the Export M4B form with the 5 metadata fields, cover file input, submit button, hidden until a render completes', () => {
+      const html = readIndexHtml();
+
+      expect(html).toContain('id="export-m4b-form"');
+      for (const id of [
+        'export-m4b-title',
+        'export-m4b-author',
+        'export-m4b-narrator',
+        'export-m4b-year',
+        'export-m4b-description',
+        'export-m4b-cover',
+      ]) {
+        expect(html).toContain(`id="${id}"`);
+      }
+      expect(html).toContain('id="btn-export-m4b"');
+      expect(html).toContain('type="submit"');
+      // Idle state: hidden until a render completes (same moment the
+      // download/play buttons are revealed).
+      expect(html).toMatch(/id="export-m4b-card"[^>]*style="display:\s*none;"/);
+      // Reachable: the export card lives inside the editor tab.
+      const editorTabStart = html.indexOf('id="editor-tab"');
+      const exportIdx = html.indexOf('id="export-m4b-card"');
+      expect(editorTabStart).toBeGreaterThan(-1);
+      expect(exportIdx).toBeGreaterThan(editorTabStart);
+    });
+  });
+
+  describe('form submit flow (initEditor wiring)', () => {
+    it('submits job_id + form values and reveals the play/download surface with a success toast', async () => {
+      const { showToast } = await import('../../src/utils');
+      fetchSpy.mockResolvedValue(okExport);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-title') as HTMLInputElement).value = 'Pride and Prejudice';
+      (document.getElementById('export-m4b-author') as HTMLInputElement).value = 'Jane Austen';
+      (document.getElementById('export-m4b-narrator') as HTMLInputElement).value = 'Narrator';
+      (document.getElementById('export-m4b-year') as HTMLInputElement).value = '1813';
+      (document.getElementById('export-m4b-description') as HTMLTextAreaElement).value = 'A novel of manners.';
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+      });
+      expect(fetchSpy.mock.calls[0][0]).toBe('/api/pipeline/export/m4b');
+      const fd = (fetchSpy.mock.calls[0][1] as RequestInit).body as FormData;
+      expect(fd.get('job_id')).toBe('job-exp-1');
+      expect(fd.get('title')).toBe('Pride and Prejudice');
+      expect(fd.get('author')).toBe('Jane Austen');
+      expect(fd.get('narrator')).toBe('Narrator');
+      expect(fd.get('year')).toBe('1813');
+      expect(fd.get('description')).toBe('A novel of manners.');
+
+      await vi.waitFor(() => {
+        expect(showToast).toHaveBeenCalledWith('M4B export complete', 'success');
+      });
+      // Result surface revealed: play + download enabled for the exported job.
+      const btnDownload = document.getElementById('btn-pipeline-download') as HTMLElement;
+      const btnPlayBook = document.getElementById('btn-pipeline-play-book') as HTMLElement;
+      expect(btnDownload.style.display).toBe('inline-block');
+      expect(btnDownload.getAttribute('data-job-id')).toBe('job-exp-1');
+      expect(btnPlayBook.style.display).toBe('inline-block');
+      // Form reset after success (values cleared).
+      expect((document.getElementById('export-m4b-title') as HTMLInputElement).value).toBe('');
+    });
+
+    it('surfaces the backend error detail via an error toast and keeps the form usable', async () => {
+      const { showToast } = await import('../../src/utils');
+      fetchSpy.mockResolvedValue(errExport); // 409 format mismatch
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      const titleInput = document.getElementById('export-m4b-title') as HTMLInputElement;
+      titleInput.value = 'Pride and Prejudice';
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect(showToast).toHaveBeenCalledWith(
+          'Export failed: format mismatch: cover must be jpeg/png',
+          'error',
+        );
+      });
+
+      // Form stays usable: values preserved, submit button not disabled.
+      expect(titleInput.value).toBe('Pride and Prejudice');
+      expect((document.getElementById('btn-export-m4b') as HTMLButtonElement).disabled).toBe(false);
+      // No result-surface reveal on failure.
+      expect((document.getElementById('btn-pipeline-download') as HTMLElement).style.display).toBe('none');
+    });
+
+    it('surfaces the M4B-only message from the response in the export card when present', async () => {
+      fetchSpy.mockResolvedValue(okExportM4bOnly);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('block');
+      });
+      const info = document.getElementById('export-m4b-info') as HTMLElement;
+      expect(info.textContent).toContain('libmp3lame');
+      expect(info.textContent).toContain('exported M4B only');
+    });
+  });
+
+  describe('render lifecycle (card hidden idle, revealed on completion, reset on new render)', () => {
+    it('reveals the Export M4B card when a render completes — same moment as play/download', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-exp-r1' });
+      vi.mocked(API.get).mockResolvedValue({
+        job_id: 'job-exp-r1', status: 'completed', mode: 'individual',
+        output_dir: null, error: null, total_chunks: 5, completed_chunks: 5, failed_chunks: 0,
+      });
+
+      const card = document.getElementById('export-m4b-card') as HTMLElement;
+      expect(card.style.display).toBe('none'); // idle before any render result
+
+      const promise = pipelineRenderAll();
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+
+      expect(card.style.display).toBe('block');
+      const btnDownload = document.getElementById('btn-pipeline-download') as HTMLElement;
+      expect(btnDownload.style.display).toBe('inline-block');
+      expect(btnDownload.getAttribute('data-job-id')).toBe('job-exp-r1');
+    });
+
+    it('hides + resets the form when a new render starts, then reveals it again on completion', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-exp-r2' });
+      vi.mocked(API.get).mockResolvedValue({
+        job_id: 'job-exp-r2', status: 'completed', mode: 'batch',
+        output_dir: null, error: null,
+      });
+
+      const card = document.getElementById('export-m4b-card') as HTMLElement;
+      const titleInput = document.getElementById('export-m4b-title') as HTMLInputElement;
+      card.style.display = 'block'; // stale from a previous completed render
+      titleInput.value = 'Stale title';
+
+      const promise = pipelineRenderAll();
+      // Render start hides + resets the stale export form synchronously.
+      expect(card.style.display).toBe('none');
+      expect(titleInput.value).toBe('');
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+
+      expect(card.style.display).toBe('block'); // revealed again on completion
+    });
+
+    it('warns and does not POST when no completed render job exists', async () => {
+      const { showToast } = await import('../../src/utils');
+      state.pipelineRenderJobId = null;
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-title') as HTMLInputElement).value = 'No job';
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect(showToast).toHaveBeenCalledWith(
+          'No completed render to export. Render the audiobook first.',
+          'warning',
+        );
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Export capability affordances — MP3 + Audacity ZIP_STORED (Plan F, Phase 5)
+//
+// Feature-detect contract (app/pipeline/api_export.py export_m4b — verified,
+// unchanged): the /export/m4b response IS the capability carrier — there is no
+// separate capability endpoint:
+//   mp3: true|false          (true when the libmp3lame encoder is present)
+//   mp3_path: '<path>'|null  (the run-dir audiobook.mp3, null when absent)
+//   audacity: true           (the ZIP_STORED bundle is always producible)
+//   audacity_path: '<path>'  (the run-dir audiobook-audacity.zip)
+//   message: '<str>'         (present ONLY when mp3=false — M4B-only degrade)
+// The affordances are rendered from these flags after a successful export:
+// mp3=true → MP3 download link visible (href = mp3_path); audacity=true →
+// Audacity bundle link visible (href = audacity_path); mp3=false → MP3 link
+// suppressed + the M4B-only message surfaced (response.message, or the
+// frontend default 'MP3 export unavailable — M4B-only' when the key is
+// absent). The affordances reset when a new render starts (hideExportM4bForm)
+// so a stale capability row from a previous job never lingers.
+//
+// URL scheme: the hrefs are the artifact paths VERBATIM (mp3_path /
+// audacity_path) as returned by the export response. NOTE (documented backend
+// gap): the backend currently serves NO HTTP route for the mp3 / audacity zip
+// — only /api/pipeline/download/{job_id} (the m4b via output_artifact_path)
+// and /api/pipeline/export/audio/{job_id} exist; the returned paths are
+// server-side filesystem locations. Phase 5 is frontend-only, so the
+// affordances surface the backend's own path contract; a future phase should
+// add a serving route (e.g. /api/pipeline/download/{job_id}?format=mp3|audacity).
+// In jsdom, anchor.href resolves against the document base URL — assert the
+// RAW attribute via getAttribute('href') to pin the verbatim path.
+// ---------------------------------------------------------------------------
+
+describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', () => {
+  const originalFetch = globalThis.fetch;
+
+  const okExportFull = {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: { get: () => null },
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+    }),
+  };
+  const okExportM4bOnly = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: false,
+      mp3_path: null,
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+      message:
+        'MP3 export unavailable: the libmp3lame encoder was not found in this ffmpeg build; exported M4B only.',
+    }),
+  };
+  // mp3=false with NO message key — the frontend must supply the degrade copy.
+  const okExportM4bOnlyNoMessage = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: false,
+      mp3_path: null,
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+    }),
+  };
+  // audacity=false — feature-detect is per-flag; the bundle link must hide.
+  const okExportNoAudacity = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: false,
+      audacity_path: null,
+    }),
+  };
+
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    state.pipelineBookId = 'book-123';
+    state.pipelineRenderJobId = 'job-cap-1';
+    document.body.innerHTML = `
+      <button id="btn-pipeline-render"></button>
+      <button id="btn-pipeline-regen"></button>
+      <button id="btn-pipeline-cancel" style="display:none;"></button>
+      <button id="btn-pipeline-download" style="display:none;"></button>
+      <button id="btn-pipeline-play-book" style="display:none;"></button>
+      <div class="progress" style="height: 25px;">
+        <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+      </div>
+      <span id="render-failures-badge" class="badge bg-danger" style="display:none;"></span>
+      <span id="pipeline-render-job" class="d-none"></span>
+      <div id="spans-table-body"></div>
+      <div id="export-m4b-card" style="display:none;">
+        <form id="export-m4b-form" enctype="multipart/form-data">
+          <input type="text" id="export-m4b-title" name="title">
+          <input type="text" id="export-m4b-author" name="author">
+          <input type="text" id="export-m4b-narrator" name="narrator">
+          <input type="text" id="export-m4b-year" name="year">
+          <textarea id="export-m4b-description" name="description"></textarea>
+          <input type="file" id="export-m4b-cover" name="cover">
+          <button type="submit" id="btn-export-m4b">Export M4B</button>
+          <div id="export-m4b-info" style="display:none;"></div>
+        </form>
+        <a id="export-mp3-link" href="#" download style="display:none;">Download MP3</a>
+        <a id="export-audacity-link" href="#" download style="display:none;">Download Audacity bundle</a>
+      </div>
+    `;
+    fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy;
+  });
+
+  afterEach(async () => {
+    state.pipelineRenderJobId = null;
+    await cancelPipelineRender(true);
+    globalThis.fetch = originalFetch;
+    vi.mocked(API.get).mockReset();
+    vi.mocked(API.post).mockReset();
+    vi.useRealTimers();
+  });
+
+  describe('index.html capability markup', () => {
+    it('declares the MP3 + Audacity download links inside the export card, hidden by default', () => {
+      const html = readIndexHtml();
+
+      expect(html).toContain('id="export-mp3-link"');
+      expect(html).toContain('id="export-audacity-link"');
+      // Idle state: both affordances hidden (capability row appears only after
+      // a successful export reports support).
+      expect(html).toMatch(/id="export-mp3-link"[^>]*style="display:\s*none;"/);
+      expect(html).toMatch(/id="export-audacity-link"[^>]*style="display:\s*none;"/);
+      // Inside the export card (a capability of the export flow, not a
+      // standalone surface).
+      const exportIdx = html.indexOf('id="export-m4b-card"');
+      const mp3Idx = html.indexOf('id="export-mp3-link"');
+      const audacityIdx = html.indexOf('id="export-audacity-link"');
+      expect(exportIdx).toBeGreaterThan(-1);
+      expect(mp3Idx).toBeGreaterThan(exportIdx);
+      expect(audacityIdx).toBeGreaterThan(exportIdx);
+    });
+  });
+
+  describe('capability rendering from the export response (submit flow)', () => {
+    it('shows MP3 + Audacity download links with the response artifact paths when the backend reports both (mp3:true, audacity:true)', async () => {
+      fetchSpy.mockResolvedValue(okExportFull);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-mp3-link') as HTMLElement).style.display).toBe('inline-block');
+      });
+      const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
+      const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
+      // URL scheme pinned: href = the response artifact path verbatim.
+      expect(mp3.getAttribute('href')).toBe('/data/render_root/book.mp3');
+      expect(audacity.style.display).toBe('inline-block');
+      expect(audacity.getAttribute('href')).toBe('/data/render_root/audiobook-audacity.zip');
+      // mp3=true → no degrade message.
+      expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('none');
+    });
+
+    it('suppresses the MP3 affordance and surfaces the M4B-only response message when mp3:false (libmp3lame missing)', async () => {
+      fetchSpy.mockResolvedValue(okExportM4bOnly);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('block');
+      });
+      const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
+      const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
+      // M4B-only degrade: MP3 suppressed, Audacity still offered.
+      expect(mp3.style.display).toBe('none');
+      expect(audacity.style.display).toBe('inline-block');
+      expect(audacity.getAttribute('href')).toBe('/data/render_root/audiobook-audacity.zip');
+      const info = document.getElementById('export-m4b-info') as HTMLElement;
+      expect(info.textContent).toContain('libmp3lame');
+      expect(info.textContent).toContain('exported M4B only');
+    });
+
+    it('shows the frontend default M4B-only message when mp3:false and the response carries no message key', async () => {
+      fetchSpy.mockResolvedValue(okExportM4bOnlyNoMessage);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('block');
+      });
+      const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
+      expect(mp3.style.display).toBe('none');
+      expect((document.getElementById('export-m4b-info') as HTMLElement).textContent).toBe(
+        'MP3 export unavailable — M4B-only',
+      );
+    });
+
+    it('hides the Audacity affordance when audacity:false (feature-detect is per-flag)', async () => {
+      fetchSpy.mockResolvedValue(okExportNoAudacity);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        // Positive condition — the handler sets MP3 visible only after the
+        // export resolves and the capability row renders (a wait on the
+        // audacity 'none' would pass trivially from the fixture default).
+        expect((document.getElementById('export-mp3-link') as HTMLElement).style.display).toBe('inline-block');
+      });
+      const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
+      expect(audacity.style.display).toBe('none');
+      const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
+      expect(mp3.getAttribute('href')).toBe('/data/render_root/book.mp3');
+    });
+  });
+
+  describe('render lifecycle (stale capability reset)', () => {
+    it('hides + clears the capability links when a new render starts — no stale buttons from a previous export', async () => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-cap-r1' });
+      vi.mocked(API.get).mockResolvedValue({
+        job_id: 'job-cap-r1', status: 'completed', mode: 'individual',
+        output_dir: null, error: null, total_chunks: 5, completed_chunks: 5, failed_chunks: 0,
+      });
+
+      // Stale capability state from a previous completed export.
+      const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
+      const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
+      mp3.style.display = 'inline-block';
+      mp3.setAttribute('href', '/data/render_root/stale.mp3');
+      audacity.style.display = 'inline-block';
+      audacity.setAttribute('href', '/data/render_root/stale-audacity.zip');
+      (document.getElementById('export-m4b-card') as HTMLElement).style.display = 'block';
+      (document.getElementById('export-m4b-info') as HTMLElement).style.display = 'block';
+      (document.getElementById('export-m4b-info') as HTMLElement).textContent = 'stale message';
+
+      const promise = pipelineRenderAll();
+      // New render start resets the stale capability row synchronously.
+      expect(mp3.style.display).toBe('none');
+      expect(mp3.getAttribute('href')).toBe('');
+      expect(audacity.style.display).toBe('none');
+      expect(audacity.getAttribute('href')).toBe('');
+      expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('none');
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
     });
   });
 });

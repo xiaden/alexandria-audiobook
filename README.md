@@ -22,7 +22,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Automatic Script Annotation** - A serial 9-walk LLM pipeline (2a→2i) converts your book into structured spans with speakers, dialogue, and TTS instruct directions
 - **Confidence Review** - Low-confidence annotations are flagged for human review (accept / reject / override) instead of silently propagating errors
 - **Voice Audition & Assignment** - The pipeline generates a voice description for every character, auditions it against your voice catalog, and assigns voices automatically — one click from book to fully-voiced cast
-- **Speaker Aliases** - Map multiple speaker names to the same voice (e.g. "YOUNG ELENA" → "ELENA") so variants share a single voice configuration
+- **Speaker Aliases** - Speaker-name variants are resolved automatically during annotation into aliases of a single character (e.g. "YOUNG ELENA" → "ELENA"), so variants share one voice configuration
 
 ### Voice Generation
 - **Built-in TTS Engine** - Qwen3-TTS runs locally with no external server required
@@ -44,11 +44,13 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Span Editor** - Edit speaker, text, and instruct for any line
 - **Structural Operations** - Split, merge, move, and delete spans directly in the editor
 - **Batch Processing** - Optimized batch rendering with sub-batching for efficient GPU utilization
-- **Live Progress** - Real-time walk status and render progress tracking
-- **Audio Preview** - Preview voices and listen to rendered audio before final download
+- **Live Progress** - Real-time walk status and render progress: per-chunk completed/total counts with failure badges for individual renders, job-level progress for batch renders
+- **Audio Preview** - Preview voices, listen to individual rendered spans, and play the whole rendered book before final download
 
 ### Export Options
-- **M4B Audiobook** - Chaptered M4B (AAC) with embedded chapter markers for audiobook players (Audiobookshelf, Apple Books, VLC, etc.)
+- **M4B Audiobook** - Chaptered M4B (AAC) with embedded chapter markers, exported from the Editor tab via a metadata form (title, author, narrator, year, description + optional cover). Plays in Audiobookshelf, Apple Books, VLC, etc.
+- **MP3** - MP3 export produced when the backend's ffmpeg supports MP3 (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag, but the backend serves no HTTP route for the mp3 artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
+- **Audacity Bundle** - ZIP_STORED bundle of the raw WAV chunks for DAW editing, produced alongside the M4B. The download link appears per the capability flag, but the backend serves no HTTP route for the zip artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
 - **Raw Chunks** - Download the rendered audio chunks as a ZIP for DAW editing or manual assembly
 
 ## Requirements
@@ -196,15 +198,15 @@ The pipeline's voice assignment walk (2h) automatically assigns a voice to every
 - Change any assignment via the dropdown — this saves to the character ledger immediately
 - For each voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, or Voice Design
 - For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
-- **Speaker Aliases** — Map one speaker to another character's voice config (e.g., set "YOUNG ELENA" as alias of "ELENA"). Aliased speakers use the target's voice config during generation
+- **Speaker Aliases** — Speaker-name variants are resolved automatically during annotation into aliases of a single character (e.g., "YOUNG ELENA" → "ELENA"), so variants share one character record and voice configuration
 - See [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types) for guidance on each type
 
 **Step 4 — Editor**
-- Click **Render** to generate audio for all spans in batch
+- Click **Render** to generate audio — individual renders show real-time per-chunk progress (completed/total with failure badges), batch renders show job-level progress
 - Edit any span's text, speaker, or instruct inline and regenerate it
 - Use **Split / Merge / Move / Delete** operations to restructure the script
 - Resolve low-confidence annotations flagged by the confidence review
-- When satisfied, click **Merge** to combine everything into the final M4B, then **Download**
+- When satisfied, use the **Export M4B** form (metadata + optional cover → chaptered M4B), or click **Merge** then **Download** for the plain audiobook
 
 ### Advanced Tools (Optional)
 
@@ -252,7 +254,8 @@ Upload an EPUB file and run the annotation walks. Onboarding is EPUB-only — th
 - **Onboard** - Upload and load the book into the pipeline
 - **Run All Walks** - Execute the 9-walk annotation DAG in sequence
 - **Walk status** - Per-walk progress shown in real time; each walk can also be re-run individually
-- **Cancel Walks** - Stop a running walk cycle
+- **Walk runs** - A run-history list below the walk badges (`GET /api/pipeline/walks/{book_id}/runs`) with created/finished times and a status badge per run
+- **Cancel Walks** - Stop a running walk cycle (the request retries once automatically on 503 contention)
 - **Re-onboard** - Reload the book and reset the pipeline state
 
 ### Voices Tab
@@ -260,15 +263,10 @@ The pipeline assigns a voice to every character during walk 2h. The Voices tab l
 
 - **Character list** - Every character from the character ledger with its assigned voice
 - **Assignment dropdown** - Change a character's voice from the catalog; saved immediately via `PUT /api/pipeline/characters/{id}/voice`
-- **Voice catalog** - Create and manage voice configs (Custom, Clone, LoRA, Voice Design) that can be assigned to characters
+- **Voice catalog** - Browse and preview available voice configs (Custom, Clone, LoRA, Voice Design) and assign them to characters
 
 **Speaker Aliases:**
-Each voice config can be set as an alias of another. Setting a speaker as an alias of another speaker means it will use the target's voice configuration during audio generation. Useful for:
-- Character name variants (e.g., "DR. SMITH" → "SMITH")
-- Age variants (e.g., "YOUNG ELENA" → "ELENA")
-- Reducing the number of voices to configure
-
-Aliases resolve transitively (A → B → C uses C's config) with cycle detection.
+Speaker-name variants are resolved automatically during annotation (walk 2c) into aliases of a single character, so variants share one character record and voice configuration — e.g., "DR. SMITH" → "SMITH" and "YOUNG ELENA" → "ELENA". The Voices tab shows each character's resolved aliases as badges.
 
 **Custom Voice Mode:**
 - Select from 9 pre-trained voices: Aiden, Dylan, Eric, Ono_anna, Ryan, Serena, Sohee, Uncle_fu, Vivian
@@ -335,10 +333,12 @@ Fine-tune your audiobook before export:
 - **View all spans** in a table with status indicators and confidence scores
 - **Edit inline** - Click to modify speaker, text, or instruct
 - **Structural operations** - Split, merge, move, or delete a span
-- **Render** - Generate audio for all pending spans in batch (with progress polling)
+- **Render** - Generate audio for the pending spans with real-time progress: per-chunk completed/total counts and failure badges for individual renders, job-level progress for batch renders
+- **Cancel** - Stop a running render job (the request retries once automatically on 503 contention)
 - **Confidence review** - Accept, reject, or override low-confidence annotations
-- **Merge** - Combine rendered chunks into the final M4B audiobook
-- **Download** - Download the merged M4B (or the raw chunks as a ZIP)
+- **Play / Preview** - Play the whole rendered book or preview individual spans in the browser
+- **Export M4B** - Metadata form (title, author, narrator, year, description + optional cover) producing a chaptered M4B; MP3 download appears when the backend reports support, while the Audacity bundle is produced alongside the M4B. The download links appear per the capability flags, but the backend serves no HTTP route for the MP3/Audacity artifacts yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat them as backend-produced files pending a serving route
+- **Merge / Download** - Combine rendered chunks into the final M4B audiobook and download it (or the raw chunks as a ZIP)
 
 ## Performance
 
@@ -411,10 +411,12 @@ Vocalizations are written as real pronounceable text that the TTS speaks directl
 
 ## Output Files
 
-Rendering produces per-span audio chunks in a job-specific output directory, which the pipeline then merges into a single M4B:
+Rendering produces per-span audio chunks in a job-specific output directory. The Editor tab's Export M4B form turns a completed render into the finished audiobook:
 
 **Final Audiobook:**
-- `audiobook.m4b` - AAC audiobook with embedded chapter markers (Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players)
+- `audiobook.m4b` - AAC audiobook with embedded chapter markers and the metadata entered in the Export M4B form (title, author, narrator, year, description, optional cover). Plays in Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players
+- `audiobook.mp3` - MP3 export produced when the backend's ffmpeg includes MP3 support (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag, but the backend serves no HTTP route for the mp3 artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
+- `audiobook-audacity.zip` - ZIP_STORED bundle of the raw WAV chunks for editing in Audacity or other DAWs, produced alongside the M4B. The download link appears per the capability flag, but the backend serves no HTTP route for the zip artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
 
 **Render job output (per render):**
 - `chunk_0000.wav`, `chunk_0001.wav`, ... - One WAV per span, numbered in timeline order
@@ -471,6 +473,14 @@ curl http://127.0.0.1:4200/api/pipeline/review/<book_id>
 curl -X POST http://127.0.0.1:4200/api/pipeline/review/accept \
   -H "Content-Type: application/json" \
   -d '{"item_id": "<item_id>"}'
+
+# Cancel running walks (the UI retries once automatically on 503 contention)
+curl -X POST http://127.0.0.1:4200/api/pipeline/cancel_walks \
+  -H "Content-Type: application/json" \
+  -d '{"book_id": "<book_id>"}'
+
+# Walk run history for a book (created/finished times + status per run)
+curl http://127.0.0.1:4200/api/pipeline/walks/<book_id>/runs
 ```
 
 ### Voice Catalog
@@ -613,8 +623,22 @@ curl -X POST http://127.0.0.1:4200/api/pipeline/render \
   -d '{"book_id": "<book_id>", "use_batch": true}'
 # → {"job_id": "...", "status": "started"}
 
-# Poll render status until completed
+# Poll render status until completed.
+# Individual renders include `mode` plus per-chunk counts
+# (completed_chunks / total_chunks / failed_chunks); batch renders are job-level.
 curl http://127.0.0.1:4200/api/pipeline/render_status/<job_id>
+
+# Cancel a running render job (the UI retries once automatically on 503 contention)
+curl -X POST http://127.0.0.1:4200/api/pipeline/cancel_render \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "<job_id>"}'
+
+# Export a chaptered M4B with metadata + optional cover (multipart)
+curl -X POST http://127.0.0.1:4200/api/pipeline/export/m4b \
+  -F "job_id=<job_id>" \
+  -F "title=My Book" -F "author=Jane Doe" -F "narrator=John Roe" \
+  -F "year=2026" -F "description=An audiobook." \
+  -F "cover=@cover.jpg"
 
 # Merge rendered chunks into audiobook.m4b
 curl -X POST http://127.0.0.1:4200/api/pipeline/merge \
