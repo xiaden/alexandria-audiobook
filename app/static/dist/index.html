@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-DrlCd_0a.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-CtEIBS8P.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -535,7 +535,56 @@
                         <div class="mb-3">
                             <label class="form-label fw-bold">Voice Catalog</label>
                             <div id="voice-catalog"></div>
-                            <div class="form-text">Preview each available voice before assigning it to a character or narrator.</div>
+                            <div class="form-text">Preview each available voice before assigning it to a character or narrator. Use Edit to adjust a voice's config.</div>
+                        </div>
+
+                        <!-- Voice config edit form: populated + shown by openVoiceEditForm(voiceId) -->
+                        <div id="voice-edit-form" style="display:none;" class="card mb-3">
+                            <div class="card-header">
+                                <h6 class="m-0">Edit Voice Config — <span id="voice-edit-title"></span></h6>
+                            </div>
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label for="voice-edit-character-style" class="form-label fw-bold">Character Style</label>
+                                    <input type="text" id="voice-edit-character-style" class="form-control form-control-sm" placeholder="e.g. warm, cheerful, stern">
+                                    <div class="form-text">Style hint passed to the TTS engine.</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="voice-edit-ref-audio" class="form-label fw-bold">Reference Audio</label>
+                                    <input type="text" id="voice-edit-ref-audio" class="form-control form-control-sm" placeholder="/path/to/reference.wav or https://...">
+                                    <div class="form-text">Path or URL of the reference sample (clone voices). No file upload — a path/URL string only.</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="voice-edit-ref-text" class="form-label fw-bold">Reference Text</label>
+                                    <div class="d-flex gap-2">
+                                        <input type="text" id="voice-edit-ref-text" class="form-control form-control-sm" placeholder="Transcript of the reference audio">
+                                        <button type="button" class="btn btn-sm btn-outline-success flex-shrink-0" data-action="preview-voice-form" title="Preview this voice — synthesizes the reference text above, or the default sample text when empty">
+                                            <i class="fas fa-play me-1"></i>Preview
+                                        </button>
+                                    </div>
+                                    <div class="form-text">Reference transcript aligned with the reference audio. Preview synthesizes it with the current config.</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="voice-edit-type" class="form-label fw-bold">Voice Type</label>
+                                    <select id="voice-edit-type" class="form-select form-select-sm">
+                                        <option value="custom">custom</option>
+                                        <option value="clone">clone</option>
+                                        <option value="builtin_lora">builtin_lora</option>
+                                        <option value="lora">lora</option>
+                                        <option value="design">design</option>
+                                    </select>
+                                    <div class="form-text">Voice type: custom, clone, builtin_lora, lora, or design.</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="voice-edit-alias-of" class="form-label fw-bold">Alias Of</label>
+                                    <select id="voice-edit-alias-of" class="form-select form-select-sm"></select>
+                                    <div class="form-text">Alias this voice to another existing voice ('—' clears the alias). Populated from the voice catalog.</div>
+                                </div>
+                                <div class="d-flex gap-2">
+                                    <button type="button" class="btn btn-sm btn-primary" data-action="save-voice">Save</button>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" data-action="cancel-voice">Cancel</button>
+                                </div>
+                            </div>
                         </div>
 
                         <div id="character-ledger"></div>

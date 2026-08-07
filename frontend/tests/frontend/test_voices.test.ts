@@ -3,13 +3,16 @@
  *
  * Tests cover: pipeline character loading, character ledger display,
  * voice assignment dropdown persistence, narrator voice selector (Phase 19),
- * voice catalog rendering & preview (Phase 23), and the voices-GET failure path.
+ * voice catalog rendering & preview (Phase 23), the voices-GET failure path,
+ * and the voice config edit form (Plan H): style/type metadata, full-row
+ * carry, edit-form pre-fill, exclude_unset save, form preview and the
+ * isolated click-through save wiring.
  *
  * Run with `npm test` (vitest run) from frontend/ — vitest ^4.1.10 and
  * jsdom ^30.0.1 are installed (see frontend/package.json and vitest.config.ts).
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from 'vitest';
 import {
   Character,
   pipelineCharacters,
@@ -939,5 +942,682 @@ describe('voice preview (Phase 23)', () => {
     // Button is restored after the play failure
     expect(button.disabled).toBe(false);
     expect(button.innerHTML).toContain('fas fa-play');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice config style/type metadata + full-row carry (Plan H phase 1)
+// ---------------------------------------------------------------------------
+
+/** A voice config row carrying all 12 voice_config columns (GET /voices). */
+const FULL_CATALOG_ROW: VoiceConfigRow = {
+  id: 'alice',
+  name: 'Alice',
+  description: 'A friendly clone',
+  type: 'clone',
+  voice: 'Alice',
+  character_style: 'warm',
+  seed: '42',
+  ref_audio: '/refs/alice.wav',
+  ref_text: 'This is the reference line.',
+  adapter_id: 'adapter-1',
+  adapter_path: '/adapters/alice',
+  alias_of: 'alice-base',
+};
+
+describe('voice config style/type metadata (Plan H phase 1)', () => {
+  it('renders the character style on the card when present', () => {
+    const html = createVoiceCard(FULL_CATALOG_ROW);
+    expect(html).toContain('voice-style-badge');
+    expect(html).toContain('warm');
+  });
+
+  it('renders the type badge from a full 12-column row', () => {
+    const html = createVoiceCard(FULL_CATALOG_ROW);
+    expect(html).toContain('>clone<');
+  });
+
+  it('omits the style element when the row has no character_style', () => {
+    const html = createVoiceCard({ id: 'plain', name: 'Plain', voice: 'Plain', type: 'custom' });
+    expect(html).not.toContain('voice-style-badge');
+  });
+});
+
+describe('voice config full-row carry for the edit form (Plan H phase 1)', () => {
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div id="pipeline-voices-section" style="display:none;">
+        <select id="narrator-voice-select"></select>
+        <div id="voice-catalog"></div>
+        <div id="character-ledger"></div>
+      </div>
+    `;
+    vi.clearAllMocks();
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve([FULL_CATALOG_ROW]);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+  });
+
+  it('exposes the fetched 12-column row so the edit form can be pre-filled', async () => {
+    state.pipelineBookId = 'book-abc';
+    await loadVoices();
+
+    // Phase 2's edit form consumes the full fetched voice config (all 12
+    // columns) to pre-fill its fields — phase 1 carries the row through
+    // registerVoiceCatalog/loadVoices and exposes it via getVoiceConfigRow.
+    const { getVoiceConfigRow } = await import('../../src/tabs/voices');
+    const row = getVoiceConfigRow('alice');
+    expect(row).toEqual(FULL_CATALOG_ROW);
+  });
+
+  it('returns undefined for an id not in the fetched catalog', async () => {
+    state.pipelineBookId = 'book-abc';
+    await loadVoices();
+
+    const { getVoiceConfigRow } = await import('../../src/tabs/voices');
+    expect(getVoiceConfigRow('missing')).toBeUndefined();
+  });
+
+  it('renders the fetched style and type metadata onto the catalog card', async () => {
+    state.pipelineBookId = 'book-abc';
+    await loadVoices();
+
+    const card = document.querySelector('.voice-card[data-voice-id="alice"]');
+    expect(card).not.toBeNull();
+    expect(card!.textContent).toContain('warm');
+    expect(card!.textContent).toContain('clone');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice config edit form (Plan H phase 2)
+// ---------------------------------------------------------------------------
+
+/** Catalog whose alias targets are all in-catalog (for alias-option tests). */
+const ALIAS_CATALOG_VOICES: VoiceConfigRow[] = [
+  { id: 'alice', name: 'Alice', voice: 'Alice', type: 'custom' },
+  { id: 'bob', name: 'Bob', voice: 'Bob', type: 'custom' },
+  { id: 'NARRATOR', name: 'NARRATOR', voice: 'Ryan', type: 'custom' },
+];
+
+describe('voice config edit form (Plan H phase 2)', () => {
+  // Register the delegated listeners ONCE for this describe. Each test below
+  // dispatches DOMContentLoaded to wire the CURRENT fixture DOM — a per-test
+  // initVoices() would stack document-level listeners and double-fire the
+  // handlers (exec-worker log L141). New exports are imported dynamically so
+  // the RED phase cannot break module load of the whole file.
+  beforeAll(() => {
+    initVoices();
+  });
+
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div id="pipeline-voices-section" style="display:none;">
+        <select id="narrator-voice-select"></select>
+        <div id="voice-catalog"></div>
+        <div id="voice-edit-form" style="display:none;">
+          <span id="voice-edit-title"></span>
+          <input id="voice-edit-character-style">
+          <input id="voice-edit-ref-audio">
+          <input id="voice-edit-ref-text">
+          <select id="voice-edit-type">
+            <option value="custom">custom</option>
+            <option value="clone">clone</option>
+            <option value="builtin_lora">builtin_lora</option>
+            <option value="lora">lora</option>
+            <option value="design">design</option>
+          </select>
+          <select id="voice-edit-alias-of"></select>
+          <button data-action="save-voice"></button>
+          <button data-action="cancel-voice"></button>
+        </div>
+        <div id="character-ledger"></div>
+      </div>
+    `;
+    vi.clearAllMocks();
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve([FULL_CATALOG_ROW]);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+  });
+
+  it('renders an edit button on each voice card', () => {
+    const html = createVoiceCard(FULL_CATALOG_ROW);
+    expect(html).toContain('data-action="edit-voice"');
+    expect(html).toContain('data-voice-id="alice"');
+    expect(html).toContain('fas fa-edit');
+  });
+
+  it('clicking Edit on a card opens the shared form pre-filled with the voice config', async () => {
+    state.pipelineBookId = 'book-abc';
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    // Cards render from the mocked GET /voices (12-column FULL_CATALOG_ROW)
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]')).not.toBeNull();
+    });
+
+    const editButton = document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]') as HTMLButtonElement;
+    editButton.click();
+
+    // The shared form is now visible
+    const form = document.getElementById('voice-edit-form') as HTMLElement;
+    expect(form.style.display).not.toBe('none');
+
+    // Pre-filled from getVoiceConfigRow(voiceId): style, ref audio, ref text, type
+    const styleInput = document.getElementById('voice-edit-character-style') as HTMLInputElement;
+    expect(styleInput.value).toBe('warm');
+    const refAudio = document.getElementById('voice-edit-ref-audio') as HTMLInputElement;
+    expect(refAudio.value).toBe('/refs/alice.wav');
+    const refText = document.getElementById('voice-edit-ref-text') as HTMLInputElement;
+    expect(refText.value).toBe('This is the reference line.');
+    const typeSelect = document.getElementById('voice-edit-type') as HTMLSelectElement;
+    expect(typeSelect.value).toBe('clone');
+
+    // Alias pre-fill: the row's alias_of ('alice-base') is NOT in the loaded
+    // catalog — the stale current alias is still surfaced as the selection.
+    const aliasSelect = document.getElementById('voice-edit-alias-of') as HTMLSelectElement;
+    expect(aliasSelect.value).toBe('alice-base');
+
+    // Form carries Save + Cancel actions (the Save PUT lands in Phase 3)
+    expect(document.querySelector('[data-action="save-voice"]')).not.toBeNull();
+    expect(document.querySelector('[data-action="cancel-voice"]')).not.toBeNull();
+  });
+
+  it('type select exposes exactly the 5 supported voice types', async () => {
+    state.pipelineBookId = 'book-abc';
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]')).not.toBeNull();
+    });
+    (document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]') as HTMLButtonElement).click();
+
+    const typeSelect = document.getElementById('voice-edit-type') as HTMLSelectElement;
+    const options = Array.from(typeSelect.options).map(o => o.value);
+    expect(options).toEqual(['custom', 'clone', 'builtin_lora', 'lora', 'design']);
+  });
+
+  it('alias_of select lists other existing voices, excluding the edited voice and NARRATOR', async () => {
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve(ALIAS_CATALOG_VOICES);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+    state.pipelineBookId = 'book-abc';
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]')).not.toBeNull();
+    });
+    (document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]') as HTMLButtonElement).click();
+
+    const aliasSelect = document.getElementById('voice-edit-alias-of') as HTMLSelectElement;
+    const values = Array.from(aliasSelect.options).map(o => o.value);
+    // First option clears the alias; only other existing voices are offered
+    expect(values[0]).toBe('');
+    expect(values).toContain('bob');
+    expect(values).not.toContain('alice'); // the voice being edited
+    expect(values).not.toContain('NARRATOR'); // the narrator pseudo-row
+  });
+
+  it('cancel closes the edit form', async () => {
+    state.pipelineBookId = 'book-abc';
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]')).not.toBeNull();
+    });
+    (document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]') as HTMLButtonElement).click();
+
+    const form = document.getElementById('voice-edit-form') as HTMLElement;
+    expect(form.style.display).not.toBe('none');
+
+    (document.querySelector('[data-action="cancel-voice"]') as HTMLButtonElement).click();
+    expect(form.style.display).toBe('none');
+  });
+
+  it('reports an unknown voice id without opening the form', async () => {
+    state.pipelineBookId = 'book-abc';
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]')).not.toBeNull();
+    });
+
+    const { openVoiceEditForm } = await import('../../src/tabs/voices');
+    openVoiceEditForm('ghost');
+
+    expect(showToast).toHaveBeenCalledWith('Voice config not found: ghost', 'error');
+    const form = document.getElementById('voice-edit-form') as HTMLElement;
+    expect(form.style.display).toBe('none');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice config save — PUT /voices/{id} with exclude_unset (Plan H phase 3)
+// ---------------------------------------------------------------------------
+
+describe('voice config save (Plan H phase 3)', () => {
+  // Deliberately NO initVoices()/DOMContentLoaded dispatch here: the Phase-2
+  // describe's beforeAll initVoices() listener persists for the rest of the
+  // file, so a click-through save test dispatching DOMContentLoaded would fire
+  // BOTH listeners → the save handler runs twice → PUT fires twice (exec-worker
+  // log L162). These tests call the exported saveVoiceConfig directly with a
+  // constructed form DOM and assert with toHaveBeenCalledWith (call-count
+  // agnostic). API.put is mockReset in beforeEach so a failed test cannot leak
+  // an unconsumed mockResolvedValueOnce queue into the next test (log L139).
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div id="pipeline-voices-section" style="display:none;">
+        <select id="narrator-voice-select"></select>
+        <div id="voice-catalog"></div>
+        <div id="voice-edit-form" style="display:none;">
+          <span id="voice-edit-title"></span>
+          <input id="voice-edit-character-style">
+          <input id="voice-edit-ref-audio">
+          <input id="voice-edit-ref-text">
+          <select id="voice-edit-type">
+            <option value="custom">custom</option>
+            <option value="clone">clone</option>
+            <option value="builtin_lora">builtin_lora</option>
+            <option value="lora">lora</option>
+            <option value="design">design</option>
+          </select>
+          <select id="voice-edit-alias-of"></select>
+          <button data-action="save-voice"></button>
+          <button data-action="cancel-voice"></button>
+        </div>
+        <div id="character-ledger"></div>
+      </div>
+    `;
+    vi.clearAllMocks();
+    vi.mocked(API.put).mockReset();
+  });
+
+  it('PUTs only the edited fields (exclude_unset semantics)', async () => {
+    vi.mocked(API.put).mockResolvedValueOnce({ ...FULL_CATALOG_ROW });
+
+    const { openVoiceEditForm, saveVoiceConfig } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    // Edit ONLY ref_text — the unchanged fields must not appear in the body.
+    (document.getElementById('voice-edit-ref-text') as HTMLInputElement).value = 'A new reference line.';
+    saveVoiceConfig('alice');
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/voices/alice', {
+      ref_text: 'A new reference line.',
+    });
+  });
+
+  it('type switch sends the chosen type verbatim', async () => {
+    vi.mocked(API.put).mockResolvedValueOnce({ ...FULL_CATALOG_ROW });
+
+    const { openVoiceEditForm, saveVoiceConfig } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    (document.getElementById('voice-edit-type') as HTMLSelectElement).value = 'design';
+    saveVoiceConfig('alice');
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/voices/alice', { type: 'design' });
+  });
+
+  it('sends null for a blanked text field (clears per contract)', async () => {
+    vi.mocked(API.put).mockResolvedValueOnce({ ...FULL_CATALOG_ROW });
+
+    const { openVoiceEditForm, saveVoiceConfig } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    // character_style was 'warm'; blanking it must clear via null.
+    (document.getElementById('voice-edit-character-style') as HTMLInputElement).value = '';
+    saveVoiceConfig('alice');
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/voices/alice', { character_style: null });
+  });
+
+  it('sends alias_of null when the alias selection is cleared', async () => {
+    vi.mocked(API.put).mockResolvedValueOnce({ ...FULL_CATALOG_ROW });
+
+    const { openVoiceEditForm, saveVoiceConfig } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    // Pre-fill surfaces the stale current alias; selecting the clear option ('')
+    // must send alias_of: null per the contract.
+    const aliasSelect = document.getElementById('voice-edit-alias-of') as HTMLSelectElement;
+    expect(aliasSelect.value).toBe('alice-base');
+    aliasSelect.value = '';
+    saveVoiceConfig('alice');
+
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/voices/alice', { alias_of: null });
+  });
+
+  it('re-renders the card from the response and closes the form on success', async () => {
+    const updated = { ...FULL_CATALOG_ROW, type: 'design', character_style: 'calm' };
+    vi.mocked(API.put).mockResolvedValueOnce(updated);
+
+    const { openVoiceEditForm, saveVoiceConfig } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    renderVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    (document.getElementById('voice-edit-type') as HTMLSelectElement).value = 'design';
+    saveVoiceConfig('alice');
+
+    // The catalog card reflects the response's new type + style…
+    await vi.waitFor(() => {
+      const card = document.querySelector('.voice-card[data-voice-id="alice"]');
+      expect(card).not.toBeNull();
+      expect(card!.textContent).toContain('design');
+      expect(card!.textContent).toContain('calm');
+    });
+
+    // …and the form is closed with a success toast.
+    const form = document.getElementById('voice-edit-form') as HTMLElement;
+    expect(form.style.display).toBe('none');
+    expect(showToast).toHaveBeenCalledWith('Voice config saved: Alice', 'success');
+  });
+
+  it('shows an error toast and keeps the form open when the PUT fails', async () => {
+    // Backend validation (e.g. 422) surfaces through handleError as a rejected
+    // promise — the error toast is the failure surface, and the form stays
+    // open so the user can correct the values.
+    vi.mocked(API.put).mockRejectedValueOnce(new Error('422: invalid voice type'));
+
+    const { openVoiceEditForm, saveVoiceConfig } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    (document.getElementById('voice-edit-type') as HTMLSelectElement).value = 'design';
+    saveVoiceConfig('alice');
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith('Failed to save voice config: 422: invalid voice type', 'error');
+    });
+    expect((document.getElementById('voice-edit-form') as HTMLElement).style.display).not.toBe('none');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Narrator override + preview reuse (Plan H phase 4)
+// ---------------------------------------------------------------------------
+
+describe('narrator + form preview (Plan H phase 4)', () => {
+  // The Phase-2 describe's beforeAll initVoices() listener persists for the
+  // rest of the file (exec-worker log L162). The click-through test below
+  // registers its own initVoices() here, so dispatching DOMContentLoaded fires
+  // BOTH listeners — and because BOTH wire a click handler for
+  // [data-action="preview-voice-form"] on #voice-edit-form, a single click
+  // fires the form preview TWICE (stacked-listener gotcha, logs L141/L162).
+  // The second POST hits the consumed mockResolvedValueOnce (post is a bare
+  // vi.fn after mockReset) and fails with an UNASSERTED error toast; the test
+  // only pins the first POST's args via toHaveBeenCalledWith, which is
+  // call-count agnostic. All other tests call the exported handlers directly
+  // with a constructed form DOM (Phase-3 convention) and assert with
+  // toHaveBeenCalledWith (call-count agnostic). API.put/post are mockReset in
+  // beforeEach so a failed test cannot leak an unconsumed mockResolvedValueOnce
+  // queue into the next test (log L139).
+  beforeAll(() => {
+    initVoices();
+  });
+
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div id="pipeline-voices-section" style="display:none;">
+        <select id="narrator-voice-select"></select>
+        <div id="voice-catalog"></div>
+        <div id="voice-edit-form" style="display:none;">
+          <span id="voice-edit-title"></span>
+          <input id="voice-edit-character-style">
+          <input id="voice-edit-ref-audio">
+          <input id="voice-edit-ref-text">
+          <select id="voice-edit-type">
+            <option value="custom">custom</option>
+            <option value="clone">clone</option>
+            <option value="builtin_lora">builtin_lora</option>
+            <option value="lora">lora</option>
+            <option value="design">design</option>
+          </select>
+          <select id="voice-edit-alias-of"></select>
+          <button data-action="preview-voice-form"><i class="fas fa-play me-1"></i>Preview</button>
+          <button data-action="save-voice"></button>
+          <button data-action="cancel-voice"></button>
+        </div>
+        <div id="character-ledger"></div>
+      </div>
+    `;
+    vi.clearAllMocks();
+    vi.mocked(API.put).mockReset();
+    vi.mocked(API.post).mockReset();
+    audioInstances = [];
+    vi.stubGlobal('Audio', MockAudio);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('narrator selector PUT body carries ONLY the voice key (exclude_unset preserved)', async () => {
+    // Pin the narrator regression: handleNarratorVoiceChange must keep sending
+    // { voice } only — the Phase-3 save handler's exclude_unset body must not
+    // leak into the narrator path, and the UNKNOWN→NARRATOR fallback (a
+    // backend rule) must not be worked around on the frontend.
+    vi.mocked(API.put).mockResolvedValueOnce({ id: 'NARRATOR', voice: 'Bob' });
+
+    handleNarratorVoiceChange('Bob');
+
+    const narratorCall = vi.mocked(API.put).mock.calls.find(
+      ([url]) => url === '/api/pipeline/voices/NARRATOR',
+    );
+    expect(narratorCall).toBeDefined();
+    const [url, body] = narratorCall!;
+    expect(url).toBe('/api/pipeline/voices/NARRATOR');
+    // Only the `voice` key — no character_style/ref_text/type/alias_of etc.
+    expect(Object.keys(body as Record<string, unknown>)).toEqual(['voice']);
+    expect(body).toEqual({ voice: 'Bob' });
+    expect(getCurrentNarratorVoice()).toBe('Bob');
+  });
+
+  it('form preview POSTs /voices/{id}/preview with the form ref_text as the sample text', async () => {
+    vi.mocked(API.post).mockResolvedValueOnce({
+      audio_url: '/designed_voices/previews/alice.wav',
+      voice_id: 'alice',
+    });
+
+    const { openVoiceEditForm, previewVoiceFromForm } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    // The form carries a preview trigger near ref_text.
+    const button = document.querySelector('[data-action="preview-voice-form"]') as HTMLButtonElement;
+    expect(button).not.toBeNull();
+
+    // The form's ref_text (non-empty) is sent as sample_text, NOT the default.
+    (document.getElementById('voice-edit-ref-text') as HTMLInputElement).value = 'This is the reference line.';
+    previewVoiceFromForm(button);
+
+    await vi.waitFor(() => {
+      expect(API.post).toHaveBeenCalledWith('/api/pipeline/voices/alice/preview', {
+        sample_text: 'This is the reference line.',
+      });
+    });
+
+    // The returned audio is played via the existing previewVoice pattern.
+    await vi.waitFor(() => {
+      expect(audioInstances.length).toBe(1);
+      expect(audioInstances[0].src).toBe('/designed_voices/previews/alice.wav');
+      expect(audioInstances[0].play).toHaveBeenCalled();
+    });
+    expect(showToast).toHaveBeenCalledWith('Preview generated successfully', 'success');
+    expect(button.disabled).toBe(false);
+  });
+
+  it('form preview falls back to the default sample text when ref_text is empty', async () => {
+    vi.mocked(API.post).mockResolvedValueOnce({
+      audio_url: '/designed_voices/previews/alice.wav',
+      voice_id: 'alice',
+    });
+
+    const { openVoiceEditForm, previewVoiceFromForm } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    // Blank the pre-filled ref_text — the default sample text is sent.
+    (document.getElementById('voice-edit-ref-text') as HTMLInputElement).value = '';
+    const button = document.querySelector('[data-action="preview-voice-form"]') as HTMLButtonElement;
+    previewVoiceFromForm(button);
+
+    await vi.waitFor(() => {
+      expect(API.post).toHaveBeenCalledWith('/api/pipeline/voices/alice/preview', {
+        sample_text: 'This is a preview of the voice.',
+      });
+    });
+  });
+
+  it('form preview shows an error toast and restores the button when the preview API rejects', async () => {
+    vi.mocked(API.post).mockRejectedValueOnce(new Error('TTS engine not available'));
+
+    const { openVoiceEditForm, previewVoiceFromForm } = await import('../../src/tabs/voices');
+    registerVoiceCatalog([FULL_CATALOG_ROW]);
+    openVoiceEditForm('alice');
+
+    const button = document.querySelector('[data-action="preview-voice-form"]') as HTMLButtonElement;
+    previewVoiceFromForm(button);
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith('Failed to generate preview: TTS engine not available', 'error');
+    });
+    expect(button.disabled).toBe(false);
+    expect(button.innerHTML).toContain('fas fa-play');
+  });
+
+  it('clicking the form preview button POSTs the form ref_text sample (wired through initVoices)', async () => {
+    vi.mocked(API.post).mockResolvedValueOnce({
+      audio_url: '/designed_voices/previews/alice.wav',
+      voice_id: 'alice',
+    });
+
+    state.pipelineBookId = 'book-abc';
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    // Wait for the catalog card to render, then open the form via Edit.
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]')).not.toBeNull();
+    });
+    (document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]') as HTMLButtonElement).click();
+
+    const form = document.getElementById('voice-edit-form') as HTMLElement;
+    expect(form.style.display).not.toBe('none');
+
+    (document.getElementById('voice-edit-ref-text') as HTMLInputElement).value = 'Click-through sample.';
+    (document.querySelector('[data-action="preview-voice-form"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(API.post).toHaveBeenCalledWith('/api/pipeline/voices/alice/preview', {
+        sample_text: 'Click-through sample.',
+      });
+    });
+
+    // Double-fire hardening: only the FIRST POST resolves with an audio URL —
+    // the second hits the consumed mock and fails before `new Audio` — so
+    // exactly one Audio instance is created despite the stacked listeners.
+    await vi.waitFor(() => {
+      expect(audioInstances.length).toBe(1);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Click-through save (Plan H — TestAnalyzer gap #1): the initVoices
+// [data-action="save-voice"] branch is only reachable through the DOM, which
+// the Phase-3 direct-call tests never exercise.
+// ---------------------------------------------------------------------------
+
+describe('voice config save click-through (Plan H, isolated initVoices)', () => {
+  // Third initVoices() registration in this file. Dispatching DOMContentLoaded
+  // in the test below fires THREE listeners (Phase-2, Phase-4 and this one) —
+  // each wires its own [data-action="save-voice"] click handler on
+  // #voice-edit-form, so one Save click invokes saveVoiceConfig three times
+  // (stacked-listener gotcha, logs L141/L162). The test absorbs the stacked
+  // triple-fire by giving API.put a PERSISTENT mockResolvedValue (not Once —
+  // the 2nd/3rd calls must also resolve, or `undefined.then` throws) and
+  // asserting count-agnostically (toHaveBeenCalledWith + form closed + success
+  // toast). A single-fire click-through is impossible without disturbing the
+  // earlier describes' harness, so this is the cleanest isolated exercise of
+  // the branch.
+  beforeAll(() => {
+    initVoices();
+  });
+
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div id="pipeline-voices-section" style="display:none;">
+        <select id="narrator-voice-select"></select>
+        <div id="voice-catalog"></div>
+        <div id="voice-edit-form" style="display:none;">
+          <span id="voice-edit-title"></span>
+          <input id="voice-edit-character-style">
+          <input id="voice-edit-ref-audio">
+          <input id="voice-edit-ref-text">
+          <select id="voice-edit-type">
+            <option value="custom">custom</option>
+            <option value="clone">clone</option>
+            <option value="builtin_lora">builtin_lora</option>
+            <option value="lora">lora</option>
+            <option value="design">design</option>
+          </select>
+          <select id="voice-edit-alias-of"></select>
+          <button data-action="preview-voice-form"><i class="fas fa-play me-1"></i>Preview</button>
+          <button data-action="save-voice"></button>
+          <button data-action="cancel-voice"></button>
+        </div>
+        <div id="character-ledger"></div>
+      </div>
+    `;
+    vi.clearAllMocks();
+    vi.mocked(API.get).mockImplementation((url: string) => {
+      if (url === '/api/pipeline/voices') return Promise.resolve([FULL_CATALOG_ROW]);
+      if (url.startsWith('/api/pipeline/characters/')) return Promise.resolve(MOCK_CHARACTERS);
+      return Promise.resolve([]);
+    });
+    // Persistent (not Once): the stacked listeners fire saveVoiceConfig three
+    // times on a single click — every PUT must resolve so no call hits an
+    // unconsumed mock and throws `undefined.then`.
+    vi.mocked(API.put).mockResolvedValue({ ...FULL_CATALOG_ROW, ref_text: 'Click-through saved.' });
+  });
+
+  it('clicking Save PUTs only the edited field and closes the form (wired through initVoices)', async () => {
+    state.pipelineBookId = 'book-abc';
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    // Cards render from the mocked GET /voices; open the form via Edit.
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]')).not.toBeNull();
+    });
+    (document.querySelector('[data-action="edit-voice"][data-voice-id="alice"]') as HTMLButtonElement).click();
+
+    const form = document.getElementById('voice-edit-form') as HTMLElement;
+    expect(form.style.display).not.toBe('none');
+
+    // Change ONLY ref_text — the PUT body must carry just that key (exclude_unset).
+    (document.getElementById('voice-edit-ref-text') as HTMLInputElement).value = 'Click-through saved.';
+    (document.querySelector('[data-action="save-voice"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(API.put).toHaveBeenCalledWith('/api/pipeline/voices/alice', {
+        ref_text: 'Click-through saved.',
+      });
+    });
+    // Success path: form closes + success toast (count-agnostic assertions).
+    await vi.waitFor(() => {
+      expect(form.style.display).toBe('none');
+      expect(showToast).toHaveBeenCalledWith('Voice config saved: Alice', 'success');
+    });
   });
 });
