@@ -56,9 +56,11 @@ export async function post<T = unknown>(endpoint: string, body: unknown): Promis
  *    ``retryStatus=409`` for that contract.
  *
  * ``retryStatus`` defaults to 503 for backward compatibility with the
- * legacy two-argument callers (cancel_render/cancel_walks). No endpoint
- * currently produces 503 + Retry-After — the ConcurrentTransactionError
- * 503 mapping in the API layer is a known follow-up, not a live contract.
+ * legacy two-argument callers (cancel_render/cancel_walks). That 503
+ * contract is now live (Plan K): a concurrent pipeline storage write
+ * raises ConcurrentTransactionError, which the API layer maps to 503 +
+ * Retry-After: 5 app-wide — so cancel_render/cancel_walks retry once
+ * when the write lock is held by a walk/render.
  *
  * The Retry-After delay (integer seconds; the load endpoint sends "5") is
  * honored before the single retry. Any non-retryable response — or a

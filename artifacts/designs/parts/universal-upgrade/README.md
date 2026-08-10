@@ -4,8 +4,8 @@
 **Adversarial record:** [`artifacts/designs/process/ADVERSARIAL-universal-upgrade.md`](../../process/ADVERSARIAL-universal-upgrade.md) (FP1-FP8, open risks Q1-Q9)
 **Upstream feature:** [`../epub-audiobook-pipeline-rewrite/README.md`](../epub-audiobook-pipeline-rewrite/README.md) — Plan Q terminal, pipeline-only mode active.
 **Contracts ledger (authoritative schema/API registration):** [`../epub-audiobook-pipeline-rewrite/CONTRACTS.md`](../epub-audiobook-pipeline-rewrite/CONTRACTS.md) § Universal Upgrade (lines 906-948) — ALREADY REGISTERED by the DD. This feature's ledger is [`CONTRACTS.md`](CONTRACTS.md).
-**Status:** Decomposed — 10 plans (A-J), 6 execution rounds, 4 ship groups.
-**Last updated:** 2026-08-06
+**Status:** Decomposed — 10 plans (A-J), 6 execution rounds, 4 ship groups. **Plan K (parity-gap closure) added as follow-up** closing three Plan F/QA gaps (mp3/audacity serving routes, 503 retry mapping, pause disclosure).
+**Last updated:** 2026-08-07
 
 ---
 
@@ -27,8 +27,9 @@ Restore the 8 pre-rewrite utilities (audio surface, real progress/cancellation, 
 | H | Voice Config Edit Form | E | voices.ts, index.html, README.md, tests | ~9K |
 | I | Snapshot Projects | B, E | api_operations.py, api.py, projects.ts, index.html, adapter.py, tests | ~16K |
 | J | Single-Speaker, Undo & Iteration UX | D, I | tts_integration.py, editor-pipeline.ts, review.py, index.html, tests | ~17K |
+| K | Parity-Gap Closure (artifact serving routes, 503 retry mapping, pause disclosure) | F (gaps), J (pause decision) | api_export.py, app.py, editor-pipeline.ts, api.ts, index.html, setup.ts, tests, README.md | ~7K |
 
-Total ≈ 154K weighted chars, ~40 unique files, matching the DD's LARGE estimate.
+Total ≈ 161K weighted chars, ~42 unique files, matching the DD's LARGE estimate.
 
 ## Dependency Graph
 
@@ -45,7 +46,7 @@ A (schema + transaction foundation)
 
 - **Max dependency depth:** 3 (J: A→B→D/I)
 - **Max dependencies per plan:** 2
-- **Contiguous letters in execution order:** A→B→C→D→E→F→G→H→I→J ✓
+- **Contiguous letters in execution order:** A→B→C→D→E→F→G→H→I→J→K ✓ (K is a post-J follow-up closing gaps logged in Plan F)
 
 ## Execution Rounds
 
@@ -57,6 +58,7 @@ A (schema + transaction foundation)
 | 4 | E | Ship 2 (frontend audio) | singleton player (createPreviewPlayer), per-span preview, sequence playback, **tab-navigation foundation** (evidence-based addition, see below), vitest media stubs |
 | 5 | F, G, H, I | Ships 2-4 | F: progress/cancel + export UI. G: raw-JSON config merge + walk_override. H: voice edit form + alias picker. I: project_snapshot endpoints + projects tab |
 | 6 | J | Ship 4 | single-speaker render boundary + toggle, undo wiring (value-restore + snapshot restore), pause-after verification, doc-drift archive |
+| 7 | K | Ship 4 (follow-up) | parity-gap closure: GET /export/mp3/{job_id} + GET /export/audacity/{job_id} serving routes (rows=truth), ConcurrentTransactionError → 503 + Retry-After: 5 app exception handler, pause capability disclosure (pauses_applied/pauses_message + honest UI wording) |
 
 ## Per-Part Scope
 
@@ -92,4 +94,4 @@ The DD is the source of truth; these adjustments come from verified codebase evi
 - `artifacts/designs/pending/DD-universal-upgrade.md` — source of truth
 - `artifacts/designs/parts/epub-audiobook-pipeline-rewrite/CONTRACTS.md` § Universal Upgrade — registered schema/API
 - `artifacts/plans/completed/TASK-epub-audiobook-pipeline-rewrite-{A..Q}-*.md` — prior feature history (Q terminal)
-- `artifacts/plans/pending/TASK-universal-upgrade-{A..J}-*.md` — this decomposition's plans
+- `artifacts/plans/pending/TASK-universal-upgrade-{A..K}-*.md` — this decomposition's plans (A-J executed + archived; K pending)

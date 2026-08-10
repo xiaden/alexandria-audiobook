@@ -363,7 +363,24 @@ export interface M4bExportResult {
   audacity: boolean;
   audacity_path: string | null;
   message?: string;
+  /**
+   * Plan K: false when the pause values are recorded/carried to the engine but
+   * the engine does not insert audible silence into the merged audio (honest
+   * disclosure — the backend sends pauses_applied:false + pauses_message on
+   * every success). Absent/undefined on older responses ⇒ no disclosure shown.
+   */
+  pauses_applied?: boolean;
+  /** Honest limitation copy carried from the backend (_PAUSES_MESSAGE). */
+  pauses_message?: string;
 }
+
+/**
+ * Plan K frontend default for the pause capability disclosure when the export
+ * response reports pauses_applied:false but omits pauses_message (mirrors the
+ * backend _PAUSES_MESSAGE copy in api_export.py).
+ */
+const PAUSES_DISCLOSURE_MESSAGE =
+  'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.';
 
 /** Form values for the Export M4B form (5 metadata fields + optional cover). */
 export interface ExportM4bPayload {
@@ -1346,30 +1363,32 @@ function resetExportM4bForm(): void {
 
 /**
  * Render the MP3/Audacity capability affordances from an export response
- * (Plan F, Phase 5 feature-detect).
+ * (Plan F, Phase 5 feature-detect; Plan K serving routes).
  *
  * The /export/m4b response IS the capability carrier — there is no separate
  * capability endpoint. The flags drive the affordances:
- *   mp3:true      → MP3 download link visible, href = mp3_path
- *   audacity:true → Audacity bundle link visible, href = audacity_path
+ *   mp3:true      → MP3 download link visible, href = serving route
+ *   audacity:true → Audacity bundle link visible, href = serving route
  *   mp3:false     → MP3 link suppressed + the M4B-only degrade message
  *                   surfaced (response.message, or the frontend default
  *                   'MP3 export unavailable — M4B-only' when the key is
  *                   absent), so the degrade is explicit to the user.
  *
- * URL scheme: the hrefs are the artifact paths VERBATIM as returned by the
- * backend. NOTE (backend gap, frontend-only phase): api_export.py serves no
- * HTTP route for the mp3 / audacity zip — only /download/{job_id} (the m4b
- * via output_artifact_path) and /export/audio/{job_id} exist; the returned
- * paths are server-side filesystem locations. The affordances surface the
- * backend's own path contract; a future phase should add a serving route
- * (e.g. /api/pipeline/download/{job_id}?format=mp3|audacity).
+ * URL scheme (Plan K): the hrefs are same-origin serving routes built from
+ * the completed render's job id — /api/pipeline/export/mp3/{job_id} and
+ * /api/pipeline/export/audacity/{job_id} — served by api_export.py via
+ * FileResponse404. The artifact paths in the response (mp3_path /
+ * audacity_path) are server-side filesystem locations and are NEVER exposed
+ * to the browser; they still gate visibility exactly as before (a link is
+ * shown iff its flag AND its path are present — the path is the capability
+ * signal, not the href). The `download` attribute lives on the anchors in
+ * index.html and is preserved.
  */
-function renderExportCapabilities(result: M4bExportResult): void {
+function renderExportCapabilities(result: M4bExportResult, jobId: string): void {
   const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement | null;
   if (mp3) {
     if (result.mp3 && result.mp3_path) {
-      mp3.href = result.mp3_path;
+      mp3.href = `/api/pipeline/export/mp3/${jobId}`;
       mp3.style.display = 'inline-block';
     } else {
       mp3.style.display = 'none';
@@ -1379,7 +1398,7 @@ function renderExportCapabilities(result: M4bExportResult): void {
   const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement | null;
   if (audacity) {
     if (result.audacity && result.audacity_path) {
-      audacity.href = result.audacity_path;
+      audacity.href = `/api/pipeline/export/audacity/${jobId}`;
       audacity.style.display = 'inline-block';
     } else {
       audacity.style.display = 'none';
@@ -1393,6 +1412,19 @@ function renderExportCapabilities(result: M4bExportResult): void {
       infoAlert.style.display = 'block';
     } else {
       infoAlert.style.display = 'none';
+    }
+  }
+  // Plan K: pause capability disclosure (distinct from the M4B-only degrade
+  // message). Shown only when the backend reports pauses_applied === false;
+  // absent (undefined) or true ⇒ no disclosure, no breakage.
+  const pauseInfo = document.getElementById('export-pauses-info');
+  if (pauseInfo) {
+    if (result.pauses_applied === false) {
+      pauseInfo.textContent = result.pauses_message || PAUSES_DISCLOSURE_MESSAGE;
+      pauseInfo.style.display = 'block';
+    } else {
+      pauseInfo.textContent = '';
+      pauseInfo.style.display = 'none';
     }
   }
 }
@@ -1413,6 +1445,13 @@ function resetExportCapabilities(): void {
   if (audacity) {
     audacity.style.display = 'none';
     audacity.href = '';
+  }
+  // Plan K: clear + hide the pause capability disclosure so a stale limitation
+  // message from a previous export cannot outlive its job.
+  const pauseInfo = document.getElementById('export-pauses-info');
+  if (pauseInfo) {
+    pauseInfo.textContent = '';
+    pauseInfo.style.display = 'none';
   }
 }
 
@@ -1468,9 +1507,10 @@ export async function handleExportM4bSubmit(e?: Event): Promise<void> {
     // must survive the reset (Plan F Phase 4).
     resetExportM4bForm();
     // Render the MP3/Audacity capability affordances from the response flags
-    // (Phase 5 feature-detect: mp3/audacity flags + artifact paths + the
-    // M4B-only degrade message).
-    renderExportCapabilities(result);
+    // (Phase 5 feature-detect: mp3/audacity flags gate the affordances; the
+    // hrefs are the Plan K serving routes built from the job id — the
+    // M4B-only degrade message is surfaced when mp3 is absent).
+    renderExportCapabilities(result, jobId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     showToast('Export failed: ' + msg, 'error');

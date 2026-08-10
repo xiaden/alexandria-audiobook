@@ -37,7 +37,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Batch Processing** - Generate dozens of spans simultaneously with 3-6x real-time throughput
 - **Codec Compilation** - Optional `torch.compile` optimization for 3-4x faster batch decoding
 - **Non-verbal Sounds** - LLM writes natural vocalizations ("Ahh!", "Mmm...", "Haha!") with context-aware instruct directions
-- **Natural Pauses** - Configurable pause between speakers (default 500 ms) and same-speaker segments (default 250 ms), carried through the render boundary for merge
+- **Natural Pauses** - Configurable pause between speakers (default 500 ms) and same-speaker segments (default 250 ms), recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio
 
 ### Web UI Editor
 - **Streamlined Interface** - Core pipeline tabs (Setup, Script, Voices, Editor) plus advanced tools (Designer, Preparer, Dataset, Training)
@@ -49,8 +49,8 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ### Export Options
 - **M4B Audiobook** - Chaptered M4B (AAC) with embedded chapter markers, exported from the Editor tab via a metadata form (title, author, narrator, year, description + optional cover). Plays in Audiobookshelf, Apple Books, VLC, etc.
-- **MP3** - MP3 export produced when the backend's ffmpeg supports MP3 (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag, but the backend serves no HTTP route for the mp3 artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
-- **Audacity Bundle** - ZIP_STORED bundle of the raw WAV chunks for DAW editing, produced alongside the M4B. The download link appears per the capability flag, but the backend serves no HTTP route for the zip artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
+- **MP3** - MP3 export produced when the backend's ffmpeg supports MP3 (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag and points at the same-origin serving route `GET /api/pipeline/export/mp3/{job_id}`
+- **Audacity Bundle** - ZIP_STORED bundle of the raw WAV chunks for DAW editing, produced alongside the M4B. The download link appears per the capability flag and points at the same-origin serving route `GET /api/pipeline/export/audacity/{job_id}`
 - **Raw Chunks** - Download the rendered audio chunks as a ZIP for DAW editing or manual assembly
 
 ## Requirements
@@ -241,8 +241,9 @@ Configure connections to your LLM and TTS engine.
 - **Min Sub-batch Size** - Minimum chunks per sub-batch before allowing a split (default: 4)
 - **Length Ratio** - Maximum longest/shortest text length ratio before forcing a sub-batch split (default: 5)
 - **Max Sub-batch Items** - Upper bound on chunks per sub-batch
-- **Speaker Change Pause** - Pause between different speakers (carried through the render boundary for merge; default: 500 ms)
-- **Same Speaker Pause** - Pause when the same speaker continues (carried through the render boundary for merge; default: 250 ms)
+- **Speaker Change Pause** - Pause between different speakers (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default: 500 ms)
+- **Same Speaker Pause** - Pause when the same speaker continues (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default: 250 ms)
+- **Pause limitation** - Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio. The export response discloses this via the `pauses_applied` / `pauses_message` fields, surfaced in the Editor tab's export surface
 
 ### Script Tab
 Upload an EPUB file and run the annotation walks. Onboarding is EPUB-only — the file is converted to plain text server-side on upload. The pipeline runs 9 serial LLM walks that convert your book into a structured span graph with:
@@ -336,7 +337,7 @@ Fine-tune your audiobook before export:
 - **Cancel** - Stop a running render job (the request retries once automatically on 503 contention)
 - **Confidence review** - Accept, reject, or override low-confidence annotations
 - **Play / Preview** - Play the whole rendered book or preview individual spans in the browser
-- **Export M4B** - Metadata form (title, author, narrator, year, description + optional cover) producing a chaptered M4B; MP3 download appears when the backend reports support, while the Audacity bundle is produced alongside the M4B. The download links appear per the capability flags, but the backend serves no HTTP route for the MP3/Audacity artifacts yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat them as backend-produced files pending a serving route
+- **Export M4B** - Metadata form (title, author, narrator, year, description + optional cover) producing a chaptered M4B; MP3 download appears when the backend reports support, while the Audacity bundle is produced alongside the M4B. The download links appear per the capability flags and point at the same-origin serving routes `GET /api/pipeline/export/mp3/{job_id}` and `GET /api/pipeline/export/audacity/{job_id}`
 - **Merge / Download** - Combine rendered chunks into the final M4B audiobook and download it (or the raw chunks as a ZIP)
 
 ## Performance
@@ -414,8 +415,8 @@ Rendering produces per-span audio chunks in a job-specific output directory. The
 
 **Final Audiobook:**
 - `audiobook.m4b` - AAC audiobook with embedded chapter markers and the metadata entered in the Export M4B form (title, author, narrator, year, description, optional cover). Plays in Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players
-- `audiobook.mp3` - MP3 export produced when the backend's ffmpeg includes MP3 support (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag, but the backend serves no HTTP route for the mp3 artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
-- `audiobook-audacity.zip` - ZIP_STORED bundle of the raw WAV chunks for editing in Audacity or other DAWs, produced alongside the M4B. The download link appears per the capability flag, but the backend serves no HTTP route for the zip artifact yet (only /api/pipeline/download/{job_id} for the M4B and /api/pipeline/export/audio/{job_id} for playback) — treat it as a backend-produced file pending a serving route
+- `audiobook.mp3` - MP3 export produced when the backend's ffmpeg includes MP3 support (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag and is served via `GET /api/pipeline/export/mp3/{job_id}`
+- `audiobook-audacity.zip` - ZIP_STORED bundle of the raw WAV chunks for editing in Audacity or other DAWs, produced alongside the M4B. The download link appears per the capability flag and is served via `GET /api/pipeline/export/audacity/{job_id}`
 
 **Render job output (per render):**
 - `chunk_0000.wav`, `chunk_0001.wav`, ... - One WAV per span, numbered in timeline order

@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
@@ -27,7 +27,11 @@ from app.pipeline.api import router as pipeline_router
 # Tombstoning GC scheduler (Plan C phase 3) — hourly, off the hot request path.
 # Started from the lifespan below; NEVER at module import time (importing
 # app.app must not spawn threads — the tests import it directly).
-from app.pipeline.adapter import start_gc_scheduler, stop_gc_scheduler
+from app.pipeline.adapter import (
+    ConcurrentTransactionError,
+    start_gc_scheduler,
+    stop_gc_scheduler,
+)
 
 # TTS engine factory (replaces legacy project engine access)
 from app.engine import get_tts_engine, reset_tts_engine
@@ -115,6 +119,31 @@ app.add_middleware(
 
 # Mount pipeline API router
 app.include_router(pipeline_router)
+
+# ConcurrentTransactionError -> 503 + Retry-After (CONTRACTS.md rule #4, Plan K).
+# A concurrent pipeline storage write (owner-thread guard violation, or
+# BEGIN IMMEDIATE timing out under contention) is transient and retryable:
+# the client backs off for the advertised delay and re-dispatches its
+# idempotent write. The 409 snapshot-block contract (POST /projects/load)
+# keeps its own Retry-After in api_operations._RETRY_AFTER_SECONDS and is
+# NOT affected by this handler — HTTPException(409) never reaches it.
+_CONCURRENT_WRITE_RETRY_AFTER_SECONDS = 5
+
+
+async def concurrent_transaction_error_handler(
+    request: Request, exc: ConcurrentTransactionError
+) -> JSONResponse:
+    """Map a concurrent pipeline write to HTTP 503 + ``Retry-After``."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Concurrent write in progress — retry after the advertised delay"
+        },
+        headers={"Retry-After": str(_CONCURRENT_WRITE_RETRY_AFTER_SECONDS)},
+    )
+
+
+app.add_exception_handler(ConcurrentTransactionError, concurrent_transaction_error_handler)
 
 # --- System Helpers ---
 

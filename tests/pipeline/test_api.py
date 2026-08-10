@@ -18,7 +18,9 @@ Covers:
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
@@ -40,6 +42,29 @@ from app.pipeline.operations import OperationExecutor
 from app.pipeline.review import ReviewManager
 from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import WalkRunner
+
+
+# -- Test-harness import path setup (mirrors test_legacy_removed.py) ----------
+# app/app.py imports app-local bare modules (``utils``, ``hf_utils``) at module
+# level.  Load them into sys.modules before importing app.app so the real
+# application — including the Plan K ConcurrentTransactionError 503 exception
+# handler — can be exercised through TestClient below.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_APP_DIR = _REPO_ROOT / "app"
+
+
+def _load_app_local_module(name: str) -> None:
+    """Load an app/*.py module under its bare name (e.g. ``utils`` -> app/utils.py)."""
+    spec = importlib.util.spec_from_file_location(name, _APP_DIR / f"{name}.py")
+    assert spec is not None and spec.loader is not None, f"cannot locate app/{name}.py"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+
+
+for _name in ("utils", "hf_utils"):
+    if _name not in sys.modules:
+        _load_app_local_module(_name)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +212,29 @@ def client(
     app.dependency_overrides[get_tts_engine] = lambda: tts_engine
 
     return TestClient(app)
+
+
+@pytest.fixture()
+def real_client(
+    storage, walk_runner, review_manager, operation_executor, character_ledger, tts_engine
+):
+    """TestClient over the REAL ``app.app`` (Plan K exception handler live).
+
+    The plain ``client`` fixture builds a router-only FastAPI app and therefore
+    does NOT see the ConcurrentTransactionError -> 503 handler registered on
+    ``app.app``.  This fixture overrides the same dependencies on the real
+    application so request-path writes can exercise the live 503 mapping.
+    """
+    import app.app as real_app
+
+    real_app.app.dependency_overrides[get_storage] = lambda: storage
+    real_app.app.dependency_overrides[get_walk_runner] = lambda: walk_runner
+    real_app.app.dependency_overrides[get_review_manager] = lambda: review_manager
+    real_app.app.dependency_overrides[get_operation_executor] = lambda: operation_executor
+    real_app.app.dependency_overrides[get_character_ledger] = lambda: character_ledger
+    real_app.app.dependency_overrides[get_tts_engine] = lambda: tts_engine
+
+    return TestClient(real_app.app)
 
 
 # ---------------------------------------------------------------------------
@@ -858,15 +906,18 @@ class TestReviewActionDispatch:
 class TestReviewActionRollback:
     """P5: a failing value-restore through the API is ATOMIC — nothing commits.
 
-    The storage error propagates out of the endpoint (TestClient re-raises it);
-    the item row stays ``pending`` and the target row keeps the walk's value.
+    The storage error surfaces as HTTP 503 + Retry-After (Plan K live
+    contract — was a TestClient re-raise); the item row stays ``pending``
+    and the target row keeps the walk's value.
     """
 
-    def test_restore_failure_rolls_back_via_api(self, client, storage, monkeypatch):
+    def test_restore_failure_rolls_back_via_api(self, real_client, storage, monkeypatch):
         """The restore write SUCCEEDS inside the txn, then the status UPDATE
-        fails — the endpoint surfaces the error and BOTH writes are rolled
-        back (target unchanged, item still pending).  Without the transaction
-        the restore would have autocommitted and stayed visible."""
+        fails — the API surfaces the transient write failure as 503 +
+        Retry-After (Plan K live contract, was re-raise) and BOTH writes are
+        rolled back (target unchanged, item still pending).  Without the
+        transaction wrap the restore would have autocommitted and stayed
+        visible."""
         _seed_walk_review_items(storage)
 
         real_update = storage.execute_update
@@ -877,10 +928,14 @@ class TestReviewActionRollback:
             return real_update(sql, params)
 
         monkeypatch.setattr(storage, "execute_update", failing_status_update)
-        with pytest.raises(ConcurrentTransactionError):
-            client.post(
-                "/api/pipeline/review/reject", json={"item_id": "walkitem:wp1"}
-            )
+        resp = real_client.post(
+            "/api/pipeline/review/reject", json={"item_id": "walkitem:wp1"}
+        )
+        assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "5"
+        assert resp.json()["detail"] == (
+            "Concurrent write in progress — retry after the advertised delay"
+        )
 
         assert _walk_status(storage, "wp1") == "pending"
         rows = storage.execute_query(
@@ -888,6 +943,76 @@ class TestReviewActionRollback:
             "WHERE character_id = 'c1' AND key = 'voice_profile'"
         )
         assert rows[0]["value"] == '{"voice":"new"}'  # unchanged
+
+
+class TestConcurrentTransactionErrorMapping:
+    """Plan K: ConcurrentTransactionError -> 503 + Retry-After: 5 (live)."""
+
+    def test_handler_returns_503_json_with_retry_after(self):
+        """Unit: the app-level handler maps CTE to 503 JSON + Retry-After: 5."""
+        import asyncio
+        import json as json_module
+
+        from fastapi import Request
+
+        from app.app import (
+            _CONCURRENT_WRITE_RETRY_AFTER_SECONDS,
+            concurrent_transaction_error_handler,
+        )
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/pipeline/cancel_walks",
+                "headers": [],
+            }
+        )
+        exc = ConcurrentTransactionError("simulated contention")
+        response = asyncio.run(concurrent_transaction_error_handler(request, exc))
+
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == str(
+            _CONCURRENT_WRITE_RETRY_AFTER_SECONDS
+        )
+        assert response.headers["Retry-After"] == "5"
+        assert json_module.loads(response.body) == {
+            "detail": "Concurrent write in progress — retry after the advertised delay"
+        }
+
+    def test_cancel_walks_cte_maps_to_503(self, real_client, storage, monkeypatch):
+        """P3-S4: the out-of-transaction cancel write raising CTE -> 503 +
+        Retry-After: 5 (was 500/re-raise).  The cancel path writes
+        ``cancel_requested=1`` directly on the storage adapter, so the
+        transient failure surfaces through the app handler instead of a
+        500 internal server error."""
+        import time as time_module
+
+        now = int(time_module.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES ('wr-cte', 'b1', 'walk_2a_scene_segmentation', 'running', ?)",
+            (now,),
+        )
+
+        def failing_cancel_update(sql, params=()):
+            raise ConcurrentTransactionError("simulated cancel-write contention")
+
+        monkeypatch.setattr(storage, "execute_update", failing_cancel_update)
+        resp = real_client.post(
+            "/api/pipeline/cancel_walks", json={"book_id": "b1"}
+        )
+
+        assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "5"
+        assert resp.json()["detail"] == (
+            "Concurrent write in progress — retry after the advertised delay"
+        )
+        # The cancel flag was NOT persisted (the write never committed).
+        rows = storage.execute_query(
+            "SELECT cancel_requested FROM walk_run WHERE run_id = 'wr-cte'"
+        )
+        assert rows[0]["cancel_requested"] == 0
 
 
 # ---------------------------------------------------------------------------

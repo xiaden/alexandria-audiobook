@@ -703,6 +703,8 @@ _AUDIO_EXTENSION_MEDIA_TYPES = {
     ".oga": "audio/ogg",
     ".opus": "audio/ogg",
     ".webm": "audio/webm",
+    # Non-audio artifact bundles served by the pipeline export routes.
+    ".zip": "application/zip",
 }
 
 
@@ -1159,6 +1161,108 @@ async def download_render(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/pipeline/export/mp3/{job_id} + /export/audacity/{job_id}
+# ---------------------------------------------------------------------------
+
+# Hardcoded artifact file names inside a run dir — the exact names the
+# POST /api/pipeline/export/m4b phase-3 mux writes (audiobook.mp3 via
+# libmp3lame, audiobook-audacity.zip as the ZIP_STORED Audacity bundle).
+# Constants only: no user input ever reaches a path.
+_MP3_ARTIFACT_NAME = "audiobook.mp3"
+_AUDACITY_ARTIFACT_NAME = "audiobook-audacity.zip"
+
+# Pause capability disclosure (Plan K, decision #13; DD cannot-restore #5):
+# the global pause values are recorded and carried per-chunk to the engine,
+# but the engine (app/tts.py, byte-for-byte immutable) reads only
+# index/text/instruct/speaker and drops unknown keys — no audible silence is
+# inserted into the merged audio.  The per-span pause_after variant is not
+# restorable.  Truthful, user-facing copy carried on every successful export.
+_PAUSES_MESSAGE = (
+    "Pause values are recorded and carried to the engine, but the current "
+    "engine does not insert audible silence into the merged audio."
+)
+
+
+def _completed_run_dir(storage: PipelineStorage, job_id: str) -> str:
+    """Row-backed dispatch: the run dir of a completed render job, or 4xx.
+
+    Rows = truth (rule #3): the ``render_job`` row decides what is servable
+    — never the in-process ``_render_jobs`` dict.  Dispatch mirrors
+    ``download_render`` / ``export_m4b``: unknown job -> 404
+    'Unknown job_id: {job_id}'; expired (GC tombstone) -> 410 'Job expired
+    by garbage collection'; non-completed -> 404 'Job not completed
+    (status: {status})'; missing output dir -> 404 'Output directory not
+    found'.  The run dir comes from the row's ``output_dir`` or the derived
+    ``RENDER_ROOT/book-{book_id}/{job_id}`` layout.  Raises HTTPException;
+    the caller builds the artifact response.
+    """
+    rows = storage.execute_query(
+        "SELECT book_id, mode, status, output_dir FROM render_job WHERE job_id = ?",
+        (job_id,),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+    row = rows[0]
+    status = row["status"]
+    if status == "expired":
+        raise HTTPException(status_code=410, detail="Job expired by garbage collection")
+    if status != "completed":
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job not completed (status: {status})",
+        )
+    run_dir = row["output_dir"] or os.path.join(
+        get_render_root(), f"book-{row['book_id']}", job_id
+    )
+    if not run_dir or not os.path.isdir(run_dir):
+        raise HTTPException(status_code=404, detail="Output directory not found")
+    return run_dir
+
+
+@router.get("/export/mp3/{job_id}")
+async def export_mp3_artifact(
+    job_id: str,
+    storage: PipelineStorage = Depends(get_storage),
+) -> FileResponse:
+    """Serve the MP3 artifact (``audiobook.mp3``) for a completed render job.
+
+    The artifact name is a hardcoded constant — the same ``audiobook.mp3``
+    the POST /api/pipeline/export/m4b phase-3 mux writes — so no user input
+    reaches the path.  Served via ``FileResponse404`` (JSON 404 when the
+    file is missing) with the media type for the extension (audio/mpeg) and
+    an attachment Content-Disposition of ``audiobook.mp3``.
+    """
+    run_dir = _completed_run_dir(storage, job_id)
+    artifact_path = os.path.join(run_dir, _MP3_ARTIFACT_NAME)
+    return FileResponse404(
+        artifact_path,
+        media_type=_media_type_for_artifact(artifact_path),
+        filename=os.path.basename(artifact_path),
+    )
+
+
+@router.get("/export/audacity/{job_id}")
+async def export_audacity_artifact(
+    job_id: str,
+    storage: PipelineStorage = Depends(get_storage),
+) -> FileResponse:
+    """Serve the Audacity bundle (``audiobook-audacity.zip``) for a completed job.
+
+    Same row-backed dispatch as the mp3 route; the artifact name is the
+    hardcoded ``audiobook-audacity.zip`` written by the m4b export.  Served
+    as application/zip with an attachment Content-Disposition of
+    ``audiobook-audacity.zip`` via ``FileResponse404``.
+    """
+    run_dir = _completed_run_dir(storage, job_id)
+    artifact_path = os.path.join(run_dir, _AUDACITY_ARTIFACT_NAME)
+    return FileResponse404(
+        artifact_path,
+        media_type=_media_type_for_artifact(artifact_path),
+        filename=os.path.basename(artifact_path),
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /api/pipeline/merge
 # ---------------------------------------------------------------------------
 
@@ -1471,6 +1575,10 @@ def export_m4b(
         ``audiobook-audacity.zip`` path).  A ``message`` key is present only
         when libmp3lame is unavailable and the export is degraded to
         M4B-only (DD open item #8), explaining why no MP3 was produced.
+        Every successful export also carries the pause capability disclosure
+        (Plan K, decision #13): ``pauses_applied`` (always False — the
+        engine does not insert audible silence) and ``pauses_message``
+        (user-facing copy, ``_PAUSES_MESSAGE``).
     """
     # 0. Row lookup — rows are the source of truth (phase-5 dispatch).
     rows = storage.execute_query(
@@ -1557,8 +1665,8 @@ def export_m4b(
     intermediate_wav = os.path.join(tmp_dir, "intermediate.wav")
     m4b_path = os.path.join(run_dir, "audiobook.m4b")
     ffmetadata_path = os.path.join(run_dir, "audiobook.ffmetadata")
-    mp3_path = os.path.join(run_dir, "audiobook.mp3")
-    zip_path = os.path.join(run_dir, "audiobook-audacity.zip")
+    mp3_path = os.path.join(run_dir, _MP3_ARTIFACT_NAME)
+    zip_path = os.path.join(run_dir, _AUDACITY_ARTIFACT_NAME)
     mp3_produced = False
     try:
         # Cover upload: validate and persist before any ffmpeg work.  The
@@ -1660,7 +1768,7 @@ def export_m4b(
             for path in candidates:
                 zf.write(path, arcname=os.path.basename(path))
             if mp3_produced:
-                zf.write(mp3_path, arcname="audiobook.mp3")
+                zf.write(mp3_path, arcname=_MP3_ARTIFACT_NAME)
 
         # 8. Rows = truth: record the m4b as the job's output artifact so the
         #    phase-5 whole-book path serves it.  Only on full success — a
@@ -1683,6 +1791,13 @@ def export_m4b(
         "mp3_path": mp3_path if mp3_produced else None,
         "audacity": True,
         "audacity_path": zip_path,
+        # Pause capability disclosure (Plan K, decision #13): honest by
+        # construction — the global pause values ride on every chunk but the
+        # engine never inserts audible silence into the merged audio
+        # (app/tts.py immutable; per-span pause_after not restorable — DD
+        # cannot-restore #5).
+        "pauses_applied": False,
+        "pauses_message": _PAUSES_MESSAGE,
     }
     if not _libmp3lame_available():
         response["message"] = (

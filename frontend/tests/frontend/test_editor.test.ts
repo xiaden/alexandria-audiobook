@@ -2461,23 +2461,23 @@ describe('Editor Tab — Export M4B (Plan F, Phase 4)', () => {
 //   audacity_path: '<path>'  (the run-dir audiobook-audacity.zip)
 //   message: '<str>'         (present ONLY when mp3=false — M4B-only degrade)
 // The affordances are rendered from these flags after a successful export:
-// mp3=true → MP3 download link visible (href = mp3_path); audacity=true →
-// Audacity bundle link visible (href = audacity_path); mp3=false → MP3 link
-// suppressed + the M4B-only message surfaced (response.message, or the
-// frontend default 'MP3 export unavailable — M4B-only' when the key is
-// absent). The affordances reset when a new render starts (hideExportM4bForm)
-// so a stale capability row from a previous job never lingers.
+// mp3=true → MP3 download link visible; audacity=true → Audacity bundle link
+// visible; mp3=false → MP3 link suppressed + the M4B-only message surfaced
+// (response.message, or the frontend default 'MP3 export unavailable —
+// M4B-only' when the key is absent). The affordances reset when a new render
+// starts (hideExportM4bForm) so a stale capability row from a previous job
+// never lingers.
 //
-// URL scheme: the hrefs are the artifact paths VERBATIM (mp3_path /
-// audacity_path) as returned by the export response. NOTE (documented backend
-// gap): the backend currently serves NO HTTP route for the mp3 / audacity zip
-// — only /api/pipeline/download/{job_id} (the m4b via output_artifact_path)
-// and /api/pipeline/export/audio/{job_id} exist; the returned paths are
-// server-side filesystem locations. Phase 5 is frontend-only, so the
-// affordances surface the backend's own path contract; a future phase should
-// add a serving route (e.g. /api/pipeline/download/{job_id}?format=mp3|audacity).
-// In jsdom, anchor.href resolves against the document base URL — assert the
-// RAW attribute via getAttribute('href') to pin the verbatim path.
+// URL scheme (Plan K): the hrefs are same-origin serving routes built from
+// the job id — /api/pipeline/export/mp3/{job_id} and
+// /api/pipeline/export/audacity/{job_id} — served by api_export.py via
+// FileResponse404. The artifact paths in the response (mp3_path /
+// audacity_path) are server-side filesystem locations and never reach the
+// browser; they still gate visibility exactly as before (a link is shown iff
+// its flag AND its path are present — the path is the capability signal, not
+// the href), so a suppressed link carries no route at all. In jsdom,
+// anchor.href resolves against the document base URL — assert the RAW
+// attribute via getAttribute('href').
 // ---------------------------------------------------------------------------
 
 describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', () => {
@@ -2534,6 +2534,63 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       audacity_path: null,
     }),
   };
+  // mp3=true but mp3_path=null — the gating is (mp3 && mp3_path): the path is
+  // the capability signal, so the MP3 affordance must hide even though the
+  // serving route IS constructible from the job id (Plan K: hidden regardless
+  // of route).
+  const okExportMp3NoPath = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: null,
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+    }),
+  };
+  // Plan K pause capability disclosure fixtures. pauses_applied:false → honest
+  // limitation disclosure in #export-pauses-info; pauses_applied:true or
+  // absent (undefined) → no disclosure. The backend sends pauses_message on
+  // every success, but the frontend must fall back to its own copy when absent.
+  const okExportWithPauseDisclosure = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+      pauses_applied: false,
+      pauses_message:
+        'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.',
+    }),
+  };
+  const okExportPauseNoMessage = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+      pauses_applied: false,
+    }),
+  };
+  const okExportPausesApplied = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+      pauses_applied: true,
+    }),
+  };
 
   let fetchSpy: ReturnType<typeof vi.fn>;
 
@@ -2563,6 +2620,7 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
           <input type="file" id="export-m4b-cover" name="cover">
           <button type="submit" id="btn-export-m4b">Export M4B</button>
           <div id="export-m4b-info" style="display:none;"></div>
+          <div id="export-pauses-info" style="display:none;"></div>
         </form>
         <a id="export-mp3-link" href="#" download style="display:none;">Download MP3</a>
         <a id="export-audacity-link" href="#" download style="display:none;">Download Audacity bundle</a>
@@ -2587,6 +2645,10 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
 
       expect(html).toContain('id="export-mp3-link"');
       expect(html).toContain('id="export-audacity-link"');
+      // Plan K pause capability disclosure element (dedicated, distinct from
+      // the M4B-only degrade message).
+      expect(html).toContain('id="export-pauses-info"');
+      expect(html).toMatch(/id="export-pauses-info"[^>]*style="display:\s*none;"/);
       // Idle state: both affordances hidden (capability row appears only after
       // a successful export reports support).
       expect(html).toMatch(/id="export-mp3-link"[^>]*style="display:\s*none;"/);
@@ -2603,7 +2665,7 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
   });
 
   describe('capability rendering from the export response (submit flow)', () => {
-    it('shows MP3 + Audacity download links with the response artifact paths when the backend reports both (mp3:true, audacity:true)', async () => {
+    it('shows MP3 + Audacity download links with the serving routes when the backend reports both (mp3:true, audacity:true)', async () => {
       fetchSpy.mockResolvedValue(okExportFull);
       initEditor();
       document.dispatchEvent(new Event('DOMContentLoaded'));
@@ -2616,10 +2678,11 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       });
       const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
       const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
-      // URL scheme pinned: href = the response artifact path verbatim.
-      expect(mp3.getAttribute('href')).toBe('/data/render_root/book.mp3');
+      // URL scheme pinned: href = the serving route built from the job id —
+      // the response artifact path is a server-side location, never exposed.
+      expect(mp3.getAttribute('href')).toBe('/api/pipeline/export/mp3/job-cap-1');
       expect(audacity.style.display).toBe('inline-block');
-      expect(audacity.getAttribute('href')).toBe('/data/render_root/audiobook-audacity.zip');
+      expect(audacity.getAttribute('href')).toBe('/api/pipeline/export/audacity/job-cap-1');
       // mp3=true → no degrade message.
       expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('none');
     });
@@ -2637,10 +2700,14 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       });
       const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
       const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
-      // M4B-only degrade: MP3 suppressed, Audacity still offered.
+      // M4B-only degrade: MP3 suppressed, Audacity still offered. The
+      // suppressed link carries NO route — the serving route is never applied
+      // to a link hidden by the flag gating (Plan K: hidden regardless of
+      // route).
       expect(mp3.style.display).toBe('none');
+      expect(mp3.getAttribute('href')).toBe('');
       expect(audacity.style.display).toBe('inline-block');
-      expect(audacity.getAttribute('href')).toBe('/data/render_root/audiobook-audacity.zip');
+      expect(audacity.getAttribute('href')).toBe('/api/pipeline/export/audacity/job-cap-1');
       const info = document.getElementById('export-m4b-info') as HTMLElement;
       expect(info.textContent).toContain('libmp3lame');
       expect(info.textContent).toContain('exported M4B only');
@@ -2681,7 +2748,93 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
       expect(audacity.style.display).toBe('none');
       const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
-      expect(mp3.getAttribute('href')).toBe('/data/render_root/book.mp3');
+      expect(mp3.getAttribute('href')).toBe('/api/pipeline/export/mp3/job-cap-1');
+    });
+
+    it('hides the MP3 link with no route when the flag gating fails (mp3:true but mp3_path:null) — route availability never overrides the capability signal', async () => {
+      fetchSpy.mockResolvedValue(okExportMp3NoPath);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-audacity-link') as HTMLElement).style.display).toBe('inline-block');
+      });
+      const mp3 = document.getElementById('export-mp3-link') as HTMLAnchorElement;
+      const audacity = document.getElementById('export-audacity-link') as HTMLAnchorElement;
+      // Gating is (mp3 && mp3_path): the path signal is absent → the link
+      // stays hidden AND carries no href, even though the job id could build
+      // a serving route.
+      expect(mp3.style.display).toBe('none');
+      expect(mp3.getAttribute('href')).toBe('');
+      // The audacity affordance is unaffected (route applied).
+      expect(audacity.getAttribute('href')).toBe('/api/pipeline/export/audacity/job-cap-1');
+    });
+
+    it('surfaces the pause capability disclosure when pauses_applied:false (Plan K) — the honest limitation message renders in #export-pauses-info', async () => {
+      fetchSpy.mockResolvedValue(okExportWithPauseDisclosure);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('block');
+      });
+      const pauseInfo = document.getElementById('export-pauses-info') as HTMLElement;
+      expect(pauseInfo.textContent).toBe(
+        'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.',
+      );
+      // The MP3/Audacity affordances render normally alongside the disclosure.
+      expect((document.getElementById('export-mp3-link') as HTMLElement).style.display).toBe('inline-block');
+      expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('none');
+    });
+
+    it('shows the frontend default pause disclosure copy when pauses_applied:false and the response carries no pauses_message', async () => {
+      fetchSpy.mockResolvedValue(okExportPauseNoMessage);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('block');
+      });
+      expect((document.getElementById('export-pauses-info') as HTMLElement).textContent).toBe(
+        'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.',
+      );
+    });
+
+    it('shows no pause disclosure when pauses_applied:true (a future engine that inserts silence)', async () => {
+      fetchSpy.mockResolvedValue(okExportPausesApplied);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-mp3-link') as HTMLElement).style.display).toBe('inline-block');
+      });
+      expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('none');
+    });
+
+    it('shows no pause disclosure when the response omits pauses_applied (undefined — not === false)', async () => {
+      fetchSpy.mockResolvedValue(okExportFull);
+      initEditor();
+      document.dispatchEvent(new Event('DOMContentLoaded'));
+
+      (document.getElementById('export-m4b-form') as HTMLFormElement)
+        .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        expect((document.getElementById('export-mp3-link') as HTMLElement).style.display).toBe('inline-block');
+      });
+      expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('none');
     });
   });
 
@@ -2704,6 +2857,8 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       (document.getElementById('export-m4b-card') as HTMLElement).style.display = 'block';
       (document.getElementById('export-m4b-info') as HTMLElement).style.display = 'block';
       (document.getElementById('export-m4b-info') as HTMLElement).textContent = 'stale message';
+      (document.getElementById('export-pauses-info') as HTMLElement).style.display = 'block';
+      (document.getElementById('export-pauses-info') as HTMLElement).textContent = 'stale pause disclosure';
 
       const promise = pipelineRenderAll();
       // New render start resets the stale capability row synchronously.
@@ -2712,6 +2867,9 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       expect(audacity.style.display).toBe('none');
       expect(audacity.getAttribute('href')).toBe('');
       expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('none');
+      // The pause disclosure is cleared too — no stale limitation message.
+      expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('none');
+      expect((document.getElementById('export-pauses-info') as HTMLElement).textContent).toBe('');
 
       await vi.advanceTimersByTimeAsync(2000);
       await promise;

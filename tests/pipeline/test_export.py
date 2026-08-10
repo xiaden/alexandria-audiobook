@@ -1213,6 +1213,23 @@ class TestExportM4B:
         probe = _ffprobe_json("-show_chapters", body["output_path"])
         assert len(probe["chapters"]) == 2
 
+    def test_pauses_disclosure_in_success_response(self, client, storage, tmp_path):
+        """Successful exports disclose the pause capability contract (Plan K,
+        decision #13): pauses_applied is always False and pauses_message
+        documents that the global pause values are recorded and carried to the
+        engine but the current engine does not insert audible silence into the
+        merged audio (app/tts.py immutable; per-span pause_after not
+        restorable — DD cannot-restore #5)."""
+        import app.pipeline.api_export as api_export_module
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        resp = self._export(client, storage, "job-pauses", run_dir, title="T")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pauses_applied"] is False
+        assert body["pauses_message"] == api_export_module._PAUSES_MESSAGE
+
     def test_output_artifact_path_updated_and_servable(self, client, storage, tmp_path):
         """The render_job row's output_artifact_path is updated to the m4b and
         the m4b becomes servable through the phase-5 whole-book artifact path
@@ -1566,3 +1583,142 @@ class TestExportM4B:
         resp = self._post(client, "job-noffmpeg")
         assert resp.status_code == 500
         assert "not found" in resp.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipeline/export/mp3/{job_id} + /export/audacity/{job_id}
+# (Plan K parity routes: row-backed MP3 / Audacity bundle artifact serving)
+# ---------------------------------------------------------------------------
+
+
+class TestExportMp3Artifact:
+    """GET /api/pipeline/export/mp3/{job_id} — row-backed MP3 artifact serving.
+
+    Rows = truth: the render_job row decides what is served (dispatch mirrors
+    download_render / export_m4b — never the in-process _render_jobs dict).
+    A completed job whose run dir holds ``audiobook.mp3`` is served as
+    audio/mpeg with an attachment Content-Disposition of audiobook.mp3.
+    Unknown job -> 404 JSON, expired (GC tombstone) -> 410, non-completed ->
+    404, run dir missing -> 404, artifact file missing -> JSON 404 via
+    FileResponse404.
+    """
+
+    @staticmethod
+    def _write_mp3(run_dir):
+        (run_dir / "audiobook.mp3").write_bytes(b"MP3-ARTIFACT")
+
+    def test_present_mp3_served_200(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        self._write_mp3(run_dir)
+        _seed_job_row(storage, "job-mp3-ok", output_dir=str(run_dir))
+        resp = client.get("/api/pipeline/export/mp3/job-mp3-ok")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/mpeg"
+        assert (
+            resp.headers["content-disposition"]
+            == 'attachment; filename="audiobook.mp3"'
+        )
+        assert resp.content == b"MP3-ARTIFACT"
+
+    def test_unknown_job_404(self, client, storage):
+        resp = client.get("/api/pipeline/export/mp3/does-not-exist")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Unknown job_id: does-not-exist"
+
+    def test_expired_job_410(self, client, storage):
+        _seed_job_row(storage, "job-mp3-expired", status="expired")
+        resp = client.get("/api/pipeline/export/mp3/job-mp3-expired")
+        assert resp.status_code == 410
+        assert "expired" in resp.json()["detail"].lower()
+
+    def test_non_completed_job_404(self, client, storage):
+        _seed_job_row(storage, "job-mp3-running", status="running")
+        resp = client.get("/api/pipeline/export/mp3/job-mp3-running")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not completed (status: running)"
+
+    def test_missing_run_dir_404(self, client, storage, tmp_path):
+        _seed_job_row(storage, "job-mp3-nodir", output_dir=str(tmp_path / "nowhere"))
+        resp = client.get("/api/pipeline/export/mp3/job-mp3-nodir")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Output directory not found"
+
+    def test_missing_artifact_404_json(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_job_row(storage, "job-mp3-noartifact", output_dir=str(run_dir))
+        resp = client.get("/api/pipeline/export/mp3/job-mp3-noartifact")
+        assert resp.status_code == 404
+        assert resp.headers.get("content-type", "").startswith("application/json")
+        assert resp.json()["detail"] == "File not found"
+
+    def test_derived_run_dir_when_output_dir_null(
+        self, client, storage, tmp_path, monkeypatch
+    ):
+        render_root = tmp_path / "render_root"
+        run_dir = render_root / "book-b1" / "job-mp3-derived"
+        run_dir.mkdir(parents=True)
+        self._write_mp3(run_dir)
+        monkeypatch.setenv("RENDER_ROOT", str(render_root))
+        _seed_job_row(storage, "job-mp3-derived", output_dir=None)
+        resp = client.get("/api/pipeline/export/mp3/job-mp3-derived")
+        assert resp.status_code == 200
+        assert resp.content == b"MP3-ARTIFACT"
+
+
+class TestExportAudacityArtifact:
+    """GET /api/pipeline/export/audacity/{job_id} — row-backed Audacity bundle.
+
+    Same row-backed dispatch as the mp3 route; a completed job whose run dir
+    holds ``audiobook-audacity.zip`` is served as application/zip with an
+    attachment Content-Disposition of audiobook-audacity.zip.  Unknown job ->
+    404 JSON, expired -> 410, non-completed -> 404, run dir missing -> 404,
+    artifact file missing -> JSON 404 via FileResponse404.
+    """
+
+    def test_present_zip_served_200(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "audiobook-audacity.zip").write_bytes(b"ZIP-ARTIFACT")
+        _seed_job_row(storage, "job-aud-ok", output_dir=str(run_dir))
+        resp = client.get("/api/pipeline/export/audacity/job-aud-ok")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "application/zip"
+        assert (
+            resp.headers["content-disposition"]
+            == 'attachment; filename="audiobook-audacity.zip"'
+        )
+        assert resp.content == b"ZIP-ARTIFACT"
+
+    def test_unknown_job_404(self, client, storage):
+        resp = client.get("/api/pipeline/export/audacity/does-not-exist")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Unknown job_id: does-not-exist"
+
+    def test_expired_job_410(self, client, storage):
+        _seed_job_row(storage, "job-aud-expired", status="expired")
+        resp = client.get("/api/pipeline/export/audacity/job-aud-expired")
+        assert resp.status_code == 410
+        assert "expired" in resp.json()["detail"].lower()
+
+    def test_non_completed_job_404(self, client, storage):
+        _seed_job_row(storage, "job-aud-running", status="running")
+        resp = client.get("/api/pipeline/export/audacity/job-aud-running")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not completed (status: running)"
+
+    def test_missing_run_dir_404(self, client, storage, tmp_path):
+        _seed_job_row(storage, "job-aud-nodir", output_dir=str(tmp_path / "nowhere"))
+        resp = client.get("/api/pipeline/export/audacity/job-aud-nodir")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Output directory not found"
+
+    def test_missing_artifact_404_json(self, client, storage, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_job_row(storage, "job-aud-noartifact", output_dir=str(run_dir))
+        resp = client.get("/api/pipeline/export/audacity/job-aud-noartifact")
+        assert resp.status_code == 404
+        assert resp.headers.get("content-type", "").startswith("application/json")
+        assert resp.json()["detail"] == "File not found"
