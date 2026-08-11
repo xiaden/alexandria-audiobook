@@ -1584,8 +1584,9 @@ class TestPauseSettingsConcurrentMapping:
 
 class TestRenderStatusPauseContract:
     def test_render_status_exposes_resolved_pause_and_pending_state(self, client, storage):
-        """A book override resolves through config defaults; tri-state is pending
-        while assembly is not wired (Phase 2)."""
+        """A book override resolves through config defaults; assembly runs at
+        render Step 6 (P3) but render_status conservatively reports 'pending';
+        the truthful applied/failed tri-state is attached on export_m4b (P4)."""
         storage.execute_update(
             "UPDATE book SET pause_between_speakers_ms = 700 WHERE id = 'b1'"
         )

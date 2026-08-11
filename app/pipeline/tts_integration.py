@@ -56,10 +56,11 @@ BATCH_SEED_RANDOM: int = -1
 
 #: Global pause defaults — mirror the ``TTSConfig`` pydantic defaults
 #: (app/app.py) and the legacy ``combine_audio_with_pauses`` defaults
-#: (app/tts.py).  Carried through the render boundary (Plan J Phase 4) so
-#: the values the Setup tab submits are the values a merge step can apply.
-#: The per-span ``pause_after`` variant is NOT restorable (DD cannot-restore
-#: #5) — only the global pair exists here.
+#: (app/tts.py).  Carried through the render boundary (Plan L) so the
+#: effective pair (request → book → config → these defaults) resolved by
+#: ``resolve_effective_pauses`` is applied to the paused assembly.  The
+#: per-span ``pause_after_ms`` variant is separately persisted (P1) and
+#: applied per-boundary by ``_assemble_paused_artifact`` (P3).
 PAUSE_BETWEEN_SPEAKERS_MS: int = 500
 PAUSE_SAME_SPEAKER_MS: int = 250
 
@@ -354,10 +355,10 @@ def _build_chunks(
     Each chunk has the keys required by ``TTSEngine.generate_batch``:
     ``index`` (0-based), ``text``, ``instruct``, and ``speaker``.  The
     global pause values (``pause_between_speakers_ms`` /
-    ``pause_same_speaker_ms``) are carried on every chunk so the values
-    configured in the Setup tab survive the render boundary and are
-    available to a merge step (the engine ignores unknown chunk keys).
-    The per-span ``pause_after`` variant is not restorable.
+    ``pause_same_speaker_ms``) are carried on every chunk so the resolved
+    effective pair survives the render boundary.  The per-span
+    ``pause_after_ms`` variant is applied separately by
+    ``_assemble_paused_artifact``.
 
     Parameters
     ----------
@@ -920,12 +921,15 @@ def render_audiobook(
         :class:`CancelledError`.
     tts_config:
         Optional TTS config dict (the ``tts`` section of ``config.json``,
-        e.g. from ``load_tts_config``).  Its global pause values
-        (``pause_between_speakers_ms`` / ``pause_same_speaker_ms``) are
-        carried through the boundary onto the batch chunk dicts so a merge
-        step can apply them; absent fields keep the 500 / 250 ms defaults.
-        Individual mode has no chunk channel (per-span preview clips are
-        generated standalone) so it accepts the config without carrying it.
+        e.g. from ``load_tts_config``).  Serves as the config tier of the
+        effective-pause resolution (request → book → config → 500 / 250 ms
+        fallback): its global pause values (``pause_between_speakers_ms`` /
+        ``pause_same_speaker_ms``) apply when the current book's nullable
+        pause columns are NULL.  The resolved pair is carried onto the batch
+        chunk dicts and threaded into the render-time paused assembly
+        (``_assemble_paused_artifact``).  Individual mode has no chunk
+        channel (per-span preview clips are generated standalone) but the
+        resolved pair still feeds the paused assembly.
 
     Returns
     -------
@@ -979,11 +983,25 @@ def render_audiobook(
         # (Step 1) and the chunk ``speaker`` fields below stay faithful.
         voice_config = _enforce_single_speaker(voice_config, storage, book_id)
 
-        # Step 4c: Global pause passthrough — resolve the TTSConfig pause
-        # values (500/250 ms defaults) and ride them through the boundary on
-        # the chunk dicts.  The per-span ``pause_after`` variant is NOT
-        # restorable (DD cannot-restore #5).
-        pause_between_ms, pause_same_ms = _resolve_pause_ms(tts_config)
+        # Step 4c: Resolve the effective pause pair by documented precedence
+        # (request → book → config → 500/250).  The current book's nullable
+        # pause_between_speakers_ms / pause_same_speaker_ms overrides (NULL =
+        # fall through to the config tier, 0 = intentional no-gap) are read
+        # from storage, then resolve_effective_pauses applies the full
+        # precedence against the config tier (the ``tts`` section carried in
+        # as ``tts_config``).  The resolved pair is threaded into both the
+        # batch chunk boundary (_build_chunks) and the render-time paused
+        # assembly (_assemble_paused_artifact) so a book-tier override
+        # genuinely reaches the audio — matching the value export reports.
+        book_pause_rows = storage.execute_query(
+            "SELECT pause_between_speakers_ms, pause_same_speaker_ms"
+            " FROM book WHERE id = ?",
+            (book_id,),
+        )
+        book_pause_overrides = book_pause_rows[0] if book_pause_rows else {}
+        pause_between_ms, pause_same_ms = resolve_effective_pauses(
+            book_overrides=book_pause_overrides, config_defaults=tts_config
+        )
 
         # Step 5: Build chunks and dispatch
         if use_batch:

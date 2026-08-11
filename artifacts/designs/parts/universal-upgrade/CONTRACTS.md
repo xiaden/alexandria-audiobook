@@ -163,7 +163,7 @@
 - `span.pause_after_ms INTEGER NULL` is nullable and round-trips through project snapshots. Existing rows migrate idempotently with NULL values; snapshot restore preserves NULL versus 0.
 - `render_audiobook` performs deterministic post-render assembly from ordered WAV **file paths** into `pydub.AudioSegment` values while speakers and pause metadata are still in-memory. It validates same WAV format, invokes the existing helper, exports with explicit source format, atomically publishes the canonical paused artifact, fsyncs, and cleans temp files on all paths.
 - Final whole-book surfaces (M4B, MP3, Audacity, `/export/audio`) consume the canonical paused artifact. Per-span source WAV rows remain available for previews and are not silently rewritten to include a trailing pause.
-- Render/export status reports `pauses_applied` false until assembly succeeds, true only after the canonical artifact is committed, and false with a bounded failure detail when assembly fails. Export responses include resolved pause metadata without leaking filesystem paths.
+- Pause status reporting: `render_status` conservatively reports `pauses_applied` false / `pauses_state` "pending" (assembly runs at render Step 6, but the background job may not have reached it when the status is polled). The export responses (`export_m4b`) carry the truthful tri-state: `pauses_applied` true / `pauses_state` "applied" only after the canonical artifact is committed and consumed as the export source; `"failed"` with a bounded `pauses_error` when assembly was unavailable. Export responses include resolved pause metadata without leaking filesystem paths.
 - New config/project/span routes, if needed, must be added only to existing `/api/pipeline` routers with parameterized SQL, book/span ownership checks, existing transaction semantics, and no legacy aliases. The existing Plan K 409/503 retry contracts and row-authority rules remain unchanged.
 
 ### Phase 3 concrete contracts (P3-S1..S4 — implemented)
@@ -267,3 +267,21 @@ JSON (manifest `schema_version` stays `1`) gains:
 See `tests/pipeline/test_pause_validation.py` (bounds + precedence) and
 `tests/pipeline/test_snapshots.py::TestPauseRoundTrip` (NULL-vs-0 + old
 snapshot + corrupt-value) and `test_schema_migration.py::TestCreateSchemaPauseColumns`.
+
+### Phase 2 concrete contracts (P2-S1..S4 — implemented)
+
+- **Book pause-settings endpoints** — `GET /api/pipeline/book/{book_id}/pause_settings` (200 `{book_id, pause_between_speakers_ms, pause_same_speaker_ms}` — each `int | null`; unknown book → 404) and `PUT /api/pipeline/book/{book_id}/pause_settings` (body `PauseSettingsUpdateRequest`, both fields `Optional[int]`, partial-update via `model_fields_set`; `None` = resolve default, `0` = intentional no-gap, bounded `0..PAUSE_MAX_MS` → 422 on out-of-range; 404 unknown book). Rows are `book.pause_between_speakers_ms` / `book.pause_same_speaker_ms` (`INTEGER NULL`).
+- **Per-span pause endpoints** — `GET /api/pipeline/span/{span_id}/pause_after` (200 `{span_id, pause_after_ms: int|null}`) and `PUT /api/pipeline/span/{span_id}/pause_after` (body `SpanPauseUpdateRequest` with nullable `pause_after_ms`; `None` clears, `0` = no-gap, bounded; 404 orphan/unknown via span→book containment SQL). Row is `span.pause_after_ms` (`INTEGER NULL CHECK NULL OR >= 0`).
+- **Status contract** — `render_status`/`export_m4b`/`export-audio` expose `resolved_pause_between_speakers_ms` / `resolved_pause_same_speaker_ms` / `pause_override_count` (spans with non-NULL `pause_after_ms`) plus the tri-state `pauses_state` (`pending`/`applied`/`failed`), derived `pauses_applied`, and `pauses_error`. `render_status` reports `pending` conservatively; `export_m4b` carries the truthful `applied`/`failed`.
+
+### Phase 4 concrete contracts (P4-S1..S4 — implemented)
+
+- `export_m4b` consumes the canonical `audiobook-paused.wav` via `_paused_artifact_path(run_dir)` when present and usable (single export source); otherwise it falls back to the per-chunk WAV concat. It attaches the truthful tri-state: `applied` + concise `pauses_message` when the paused artifact was the source, `failed` + bounded `pauses_error` (no filesystem paths) on fallback.
+- M4B / MP3 / Audacity (`audiobook.mp3`, `audiobook-audacity.zip`) and `/export/audio` all derive from the canonical paused artifact when available; `_pause_contract_payload` (conservative `pending`) is retained for `render_status` and `export-audio`, which do not commit an artifact.
+- 409/503 retry contracts (active-run 409 + Retry-After, `ConcurrentTransactionError → 503` + Retry-After) unchanged.
+
+### Phase 5 concrete contracts (P5-S1..S4 — implemented)
+
+- **Setup tab book overrides** — inputs `#book-pause-between-speakers` / `#book-pause-same-speaker` (blank = inherit/config default; value submitted as the book-level override, `0` = no-gap) plus the global default fields. Overrides surface through the `GET/PUT /api/pipeline/book/{book_id}/pause_settings` endpoints.
+- **Per-span "Pause After (ms)" column** — editor table column editing each span's `pause_after_ms` via `PUT /api/pipeline/span/{span_id}/pause_after` (blank = resolved default, `0` = no-gap).
+- **Tri-state surfaces** — `#render-pause-info` (render_status, conservative `pending`) and `#export-pauses-info` (export result, truthful `applied`/`failed`) display resolved values, span-override count, and assembly tri-state.

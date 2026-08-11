@@ -200,7 +200,7 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 
 **说话人来源：** 说话人顺序与暂停元数据取自**渲染时的内存脚本/分块**——绝不根据文件名或 manifest 推断。后处理器在 `render_audiobook` 期间、该元数据仍在内存中时运行。
 
-**产物状态字段：** 渲染状态与 M4B 导出响应会报告 `resolved_pause_between_speakers_ms`、`resolved_pause_same_speaker_ms`、`pause_override_count`（具有非空 `pause_after_ms` 的 span 数量），以及如实的三态 `pauses_state`：`pending`（尚未执行组装）、`applied`（暂停产物存在并用作导出源，附简洁的 `pauses_message`）、或 `failed`（组装不可用；`pauses_error` 携带受限的详细信息且不含文件系统路径）。`pauses_applied` 是派生布尔值（当且仅当 `applied` 时为 `true`）。失败绝不宣称成功。
+**产物状态字段：** 渲染状态与 M4B 导出响应会报告 `resolved_pause_between_speakers_ms`、`resolved_pause_same_speaker_ms`、`pause_override_count`（具有非空 `pause_after_ms` 的 span 数量），以及三态 `pauses_state`：`pending`（组装尚未观察到）、`applied`（暂停产物存在并用作导出源，附简洁的 `pauses_message`）、或 `failed`（组装不可用；`pauses_error` 携带受限的详细信息且不含文件系统路径）。`pauses_applied` 是派生布尔值（当且仅当 `applied` 时为 `true`）。失败绝不宣称成功。渲染状态保守地报告 `pending`（组装在渲染第 6 步运行，但后台作业在状态被轮询时可能尚未执行到该步）；导出响应在消费已提交的暂停产物后，如实报告 `applied`/`failed` 三态。
 
 **迁移与向后兼容：** 现有项目可幂等迁移——其 `book` 行会获得 `NULL` 暂停覆盖列，每个 `span` 获得可空的 `pause_after_ms`（解析默认值，绝不强转为 0）。迁移前创建的项目快照（无暂停键）在恢复时不会改动当前暂停状态。当没有可用的暂停产物时（例如一次未执行组装的渲染），导出会透明地回退到现有的逐 span 分块拼接，并报告 `failed` 三态。
 
@@ -308,7 +308,7 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 
 最终有声书为带章节标记的 `audiobook.m4b`（AAC 128kbps）。章节自动检测（基于脚本标题）或按块生成。下载后兼容 Audiobookshelf、Apple Books、VLC 等播放器。当规范暂停产物可用时，它由暂停源 WAV 组装而成（见 *暂停插入*），因此解析后的说话人暂停在最终成书中可听。
 
-MP3 导出（`audiobook.mp3`）在 ffmpeg 支持 MP3（libmp3lame）时生成，否则降级为仅 M4B 并给出明确提示；链接按能力标志显示，经 `GET /api/pipeline/export/mp3/{job_id}` 提供。Audacity 打包（`audiobook-audacity.zip`，ZIP_STORED）在暂停产物可用时包含 `audiobook-paused.wav`（暂停的整本音频源）与 MP3，否则回退到逐 span 语音块；链接经 `GET /api/pipeline/export/audacity/{job_id}` 提供。
+MP3 导出（`audiobook.mp3`）在 ffmpeg 支持 MP3（libmp3lame）时生成，否则降级为仅 M4B 并给出明确提示；链接按能力标志显示，经 `GET /api/pipeline/export/mp3/{job_id}` 提供；与 M4B 一样，在暂停产物可用时它由暂停源 WAV 派生。Audacity 打包（`audiobook-audacity.zip`，ZIP_STORED）在暂停产物可用时包含 `audiobook-paused.wav`（暂停的整本音频源）与 MP3，否则回退到逐 span 语音块；链接经 `GET /api/pipeline/export/audacity/{job_id}` 提供。
 
 ### 原始语音块
 

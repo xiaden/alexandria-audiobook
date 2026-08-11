@@ -98,8 +98,8 @@ class MergeRequest(BaseModel):
 # The render/job-status and export responses surface a tri-state lifecycle
 # describing whether the paused audio was actually assembled into the output:
 #
-#   pauses_state    "pending"   assembly has not run yet (Phase 2: postprocessor
-#                               not wired — always the current value)
+#   pauses_state    "pending"   assembly has not run / not yet applied (the
+#                               conservative value render_status reports)
 #                   "applied"   the paused artifact was assembled and used
 #                   "failed"    assembly was attempted but raised (see pauses_error)
 #   pauses_applied  True        iff pauses_state == "applied" (a derived boolean
@@ -108,9 +108,11 @@ class MergeRequest(BaseModel):
 #
 # Alongside the tri-state, every response resolves the effective pause pair for
 # the book (book override -> config default -> built-in fallback) and reports
-# how many per-span ``pause_after_ms`` overrides are present.  Assembly itself
-# is implemented in Phase 3; Phase 2 only defines and serves this contract,
-# always in the "pending" state.
+# how many per-span ``pause_after_ms`` overrides are present.  Assembly runs at
+# render Step 6 (P3); ``render_status`` deliberately keeps ``pauses_state`` at
+# ``'pending'`` because the background render job may not have reached assembly
+# yet, while the export responses (``export_m4b``) carry the truthful
+# ``applied``/``failed`` tri-state once the committed artifact is consumed.
 # ---------------------------------------------------------------------------
 
 
@@ -158,7 +160,13 @@ def _resolved_pause_metadata(storage: PipelineStorage, book_id: str) -> dict:
 
 
 def _pause_contract_payload(storage: PipelineStorage, book_id: str) -> dict:
-    """Resolved pause metadata + tri-state (Phase 2: always 'pending')."""
+    """Resolved pause metadata + conservative ``'pending'`` tri-state.
+
+    Serves the render_status / export-audio surface, where assembly may not
+    have reached the committed artifact yet; the truthful ``applied``/``failed``
+    tri-state is attached only on ``export_m4b`` after it consumes the paused
+    artifact (P4).
+    """
     payload = _resolved_pause_metadata(storage, book_id)
     payload["pauses_applied"] = False
     payload["pauses_state"] = _PAUSES_STATE_PENDING
@@ -437,8 +445,10 @@ async def render_status(
             response["total_chunks"] = sum(by_status.values())
             response["completed_chunks"] = by_status.get("done", 0)
             response["failed_chunks"] = by_status.get("failed", 0)
-        # Plan L (P2-S3): resolved pause settings + tri-state lifecycle
-        # (Phase 2: assembly not wired, so pauses_state is always 'pending').
+        # Plan L: resolved pause settings + conservative 'pending' tri-state.
+        # render_status reports 'pending' (assembly runs at render Step 6 but
+        # the background job may not have applied it yet); the truthful
+        # applied/failed tri-state is attached on export_m4b (P4).
         response.update(_pause_contract_payload(storage, row["book_id"]))
         return response
 

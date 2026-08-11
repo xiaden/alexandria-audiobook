@@ -244,7 +244,7 @@ Configure connections to your LLM and TTS engine.
 - **Speaker Change Pause** - Global default pause between different speakers, inserted into the merged audio (default: 500 ms; 0–10000 ms)
 - **Same Speaker Pause** - Global default pause when the same speaker continues, inserted into the merged audio (default: 250 ms; 0–10000 ms)
 - **Book Pause Overrides** - Per-book pause overrides that take precedence over the config defaults (leave blank to inherit). The resolved values are shown as a preview on the Setup tab.
- - **Per-Span Pause** - Each span in the Editor can set a pause-after override (blank = resolved default, 0 = no gap). M4B export inserts the resolved speaker pauses into the merged audio; the export surface reports the assembly tri-state (`applied` / `failed` / pending) with the resolved values and span-override count.
+- **Per-Span Pause** - Each span in the Editor can set a pause-after override (blank = resolved default, 0 = no gap). M4B export inserts the resolved speaker pauses into the merged audio; the export surface reports the assembly tri-state (`applied` / `failed` / pending) with the resolved values and span-override count.
 
 ### Pause Insertion
 
@@ -295,11 +295,15 @@ is still in memory.
 **Artifact status fields:** render status and M4B export responses report
 `resolved_pause_between_speakers_ms`, `resolved_pause_same_speaker_ms`,
 `pause_override_count` (spans with a non-null `pause_after_ms`), and the
-truthful tri-state `pauses_state`: `pending` (assembly not yet run),
-`applied` (paused artifact present and used as the export source, with a
-concise `pauses_message`), or `failed` (assembly unavailable; `pauses_error`
-carries bounded detail and no filesystem paths). `pauses_applied` is the
-derived boolean (`true` iff `applied`). Failures never claim success.
+tri-state `pauses_state`: `pending` (assembly not yet observed), `applied`
+(paused artifact present and used as the export source, with a concise
+`pauses_message`), or `failed` (assembly unavailable; `pauses_error` carries
+bounded detail and no filesystem paths). `pauses_applied` is the derived
+boolean (`true` iff `applied`). Failures never claim success. Render status
+conservatively reports `pending` (assembly runs at render Step 6, but the
+background job may not have reached it when the status is polled); the export
+responses report the truthful `applied` / `failed` tri-state once the committed
+paused artifact is consumed.
 
 **Migration & backward compatibility:** existing projects migrate idempotently —
 their `book` rows gain `NULL` pause-override columns and every `span` gains a

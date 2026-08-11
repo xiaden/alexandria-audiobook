@@ -1628,8 +1628,9 @@ class TestPauseConfigBoundary:
     ``pause_between_speakers_ms`` / ``pause_same_speaker_ms`` are carried
     through ``render_audiobook`` into the engine dispatch unchanged, with the
     ``TTSConfig`` defaults (500 / 250 ms) applied when a value is omitted.
-    The per-span ``pause_after`` variant is NOT restorable (DD cannot-restore
-    #5) — these tests pin the global variant only.
+    The per-span ``pause_after_ms`` variant is separately persisted (P1) and
+    applied per-boundary by ``_assemble_paused_artifact`` (P3); these tests pin
+    the global variant only.
     """
 
     def test_batch_chunks_carry_default_pause_values(self, storage, fake_engine):
@@ -2101,6 +2102,96 @@ class TestPausedAssemblyWiring:
             "SELECT status FROM render_job WHERE job_id = ?", (job_id,)
         )
         assert rows[0]["status"] == "completed"
+
+
+class TestBookTierPauseOverrideWiring:
+    """P7-S1/S2: book-tier pause overrides genuinely reach the paused artifact.
+
+    QA Round 1 flagged that book.pause_between_speakers_ms / book.pause_same_speaker_ms
+    were persisted (P1), exposed (P2), and reported (P5) but never applied at
+    render-time assembly — the audio always used the config default.  These
+    tests pin that a persisted book override now reaches ``audiobook-paused.wav``,
+    that a NULL book column falls back to the config tier, and that the per-span
+    ``pause_after_ms`` override still wins at its own boundary (no regression).
+    """
+
+    def test_book_override_reaches_paused_artifact(self, storage, _render_root):
+        """A persisted 700 ms between-speakers override lands in the audio."""
+        storage.execute_update(
+            "UPDATE book SET pause_between_speakers_ms = 700"
+            " WHERE id = 'b1'"
+        )
+        engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
+        job_id = render_audiobook("b1", storage, engine)
+        run_dir = os.path.join(_render_root, "book-b1", job_id)
+        paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+        assert os.path.isfile(paused)
+        rows = storage.execute_query(
+            "SELECT status, output_artifact_path FROM render_job WHERE job_id = ?",
+            (job_id,),
+        )
+        assert rows[0]["status"] == "completed"
+        assert rows[0]["output_artifact_path"] == paused  # canonical artifact
+        # sp1(Alice)→sp2(NARRATOR)→sp3(Bob): two different-speaker gaps @ 700 ms.
+        combined = AudioSegment.from_wav(paused)
+        assert len(combined) == 600 + 2 * 700
+        assert abs(_silence_duration_ms(combined) - 2 * 700) <= 2
+
+    def test_same_speaker_book_override_reaches_paused_artifact(
+        self, storage, _render_root
+    ):
+        """A persisted pause_same_speaker_ms override lands on same-speaker gaps."""
+        storage.execute_update(
+            "UPDATE book SET pause_same_speaker_ms = 300"
+            " WHERE id = 'b1'"
+        )
+        # Force sp2 to be the same speaker as sp1 by giving it Alice's junction.
+        storage.execute_insert(
+            """INSERT INTO character_span (character_id, span_id, relation_type, source, confidence)
+               VALUES ('c1', 'sp2', 'speaker', 'walk', 0.9)"""
+        )
+        engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
+        job_id = render_audiobook("b1", storage, engine)
+        run_dir = os.path.join(_render_root, "book-b1", job_id)
+        paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+        combined = AudioSegment.from_wav(paused)
+        # sp1(Alice)→sp2(Alice) same-speaker @ 300 ms; sp2→sp3(Bob) @ default 500.
+        assert len(combined) == 600 + 300 + 500
+        assert abs(_silence_duration_ms(combined) - (300 + 500)) <= 2
+
+    def test_book_null_falls_back_to_config_default(self, storage, _render_root):
+        """NULL book override -> config tier applies (existing default flow)."""
+        engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
+        job_id = render_audiobook(
+            "b1",
+            storage,
+            engine,
+            tts_config={"pause_between_speakers_ms": 900, "pause_same_speaker_ms": 400},
+        )
+        run_dir = os.path.join(_render_root, "book-b1", job_id)
+        paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+        combined = AudioSegment.from_wav(paused)
+        # Two different-speaker gaps, config value 900 ms (book columns NULL).
+        assert len(combined) == 600 + 2 * 900
+        assert abs(_silence_duration_ms(combined) - 2 * 900) <= 2
+
+    def test_per_span_override_still_wins_over_book(self, storage, _render_root):
+        """Per-span pause_after_ms overrides book/config at its own boundary."""
+        storage.execute_update(
+            "UPDATE book SET pause_between_speakers_ms = 700"
+            " WHERE id = 'b1'"
+        )
+        storage.execute_update(
+            "UPDATE span SET pause_after_ms = 900 WHERE id = 'sp1'"
+        )
+        engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
+        job_id = render_audiobook("b1", storage, engine)
+        run_dir = os.path.join(_render_root, "book-b1", job_id)
+        paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+        combined = AudioSegment.from_wav(paused)
+        # sp1→sp2 gap uses the span override 900; sp2→sp3 gap uses book 700.
+        assert len(combined) == 600 + 900 + 700
+        assert abs(_silence_duration_ms(combined) - (900 + 700)) <= 2
 
 
 class TestPausedAssemblyEmptyAndGuard:

@@ -1070,8 +1070,10 @@ function updateRenderProgress(status: RenderStatus): void {
 
   // Resolved-pause / pause-assembly surface (P5-S3): show the effective pause
   // values + override count + tri-state whenever the render_status payload
-  // carries them; hide otherwise. The backend reports 'pending' until M4B
-  // export runs assembly, so this confirms the values that will be inserted.
+  // carries them; hide otherwise. Assembly runs at render Step 6; render_status
+  // conservatively reports 'pending' until the M4B export consumes the committed
+  // artifact and reports the truthful applied/failed tri-state. This confirms
+  // the values that will be inserted.
   const pauseInfo = document.getElementById('render-pause-info');
   if (pauseInfo && (status.resolved_pause_between_speakers_ms != null || status.pause_override_count != null || status.pauses_state)) {
     const between = status.resolved_pause_between_speakers_ms ?? 500;
