@@ -43,7 +43,7 @@
 - **数据集构建器** - 为 LoRA 训练构建数据集
 - **批量处理** - 批量合成音频，速度提升 3-6 倍
 - **编解码器编译** - 使用 torch.compile 提升 3-4 倍速度
-- **自然停顿** - 可配置的说话人切换暂停（默认 500 ms）与同说话人继续时的暂停（默认 250 ms），记录并传递至引擎，但当前引擎不会在合并音频中插入可听的静音
+- **自然停顿** - 可配置的说话人切换暂停（默认 500 ms）与同说话人继续时的暂停（默认 250 ms），支持按书覆盖与按 span 编辑。解析后的暂停值会在 M4B 导出时插入合并音频。
 
 ### Web UI 编辑器
 - **简洁界面** - 核心流水线标签页（设置、脚本、声音、编辑器）加高级工具（设计器、预处理、数据集、训练）
@@ -175,8 +175,34 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 | Min Sub-batch Size | 最小子批大小（默认 4） |
 | Length Ratio | 子批长度比例（默认 5） |
 | Max Sub-batch Items | 单个子批次的最大项数 |
-| Speaker Change Pause | 说话人切换暂停（记录并传递至引擎，但当前引擎不会在合并音频中插入可听的静音；默认 500 ms） |
-| Same Speaker Pause | 同说话人继续时的暂停（记录并传递至引擎，但当前引擎不会在合并音频中插入可听的静音；默认 250 ms） |
+| Speaker Change Pause | 说话人切换暂停的全局默认值，插入合并音频（默认 500 ms；0–10000 ms） |
+| Same Speaker Pause | 同说话人继续时的暂停的全局默认值，插入合并音频（默认 250 ms；0–10000 ms） |
+| Book Pause Overrides | 按书覆盖的暂停值，优先于配置默认值（留空表示继承）；解析值在设置页以预览形式显示 |
+
+### 暂停插入
+
+流水线会向合并后的整本有声书中插入可配置、确定性的说话人暂停。这些暂停是写入规范暂停产物 `audiobook-paused.wav` 的真实可听静音，并成为 M4B、MP3 与 Audacity 导出共用的唯一音频源。
+
+**优先级（解析顺序）：** 对于两种暂停设置（说话人切换与同说话人继续），解析值取自第一个提供非空值的层级：
+
+1. 渲染请求覆盖（若支持）
+2. 按书覆盖（`GET`/`PUT /api/pipeline/book/{book_id}/pause_settings`）
+3. 持久化配置默认值（`tts.pause_between_speakers_ms` / `tts.pause_same_speaker_ms`，通过 `POST /api/config` 保存）
+4. 内置回退值 — 说话人切换 **500 ms**，同说话人继续 **250 ms**
+
+**边界：** 每个暂停值都是 **0–10000 ms**（最大 10 秒）范围内的**非负整毫秒数**。配置保存、按书/按 span 覆盖以及逐 span 编辑都会以稳定的 422 错误（配置或 API）拒绝负数、小数、布尔值、NaN/无穷以及超出范围的值。不存在无界的暂停值。
+
+**可空与零的区别：** 缺失/`NULL` 值表示*解析适用的默认值*；显式的 `0` 表示*有意无间隔*的覆盖（绝不强转为默认值）。此区别在保存/加载以及项目快照往返中均被保留。
+
+**逐 span 暂停：** 每个 span 可通过 `GET`/`PUT /api/pipeline/span/{span_id}/pause_after` 设置 `pause_after_ms` 覆盖（空白/NULL = 解析默认值，`0` = 无间隔，正数 = 显式毫秒数）。span 覆盖总是优先于解析出的按书/配置默认值。
+
+**格式与清理保证：** 暂停产物在组装时会显式保留源 WAV 格式（采样率、声道数、采样位深 — 否则 pydub 会把低采样率来源提升到 11025 Hz）。产物先导出到运行目录中的临时文件，执行 fsync，原子重命名到位，再对目录执行 fsync。在每条成功或失败路径上都会清理临时/中间文件。
+
+**说话人来源：** 说话人顺序与暂停元数据取自**渲染时的内存脚本/分块**——绝不根据文件名或 manifest 推断。后处理器在 `render_audiobook` 期间、该元数据仍在内存中时运行。
+
+**产物状态字段：** 渲染状态与 M4B 导出响应会报告 `resolved_pause_between_speakers_ms`、`resolved_pause_same_speaker_ms`、`pause_override_count`（具有非空 `pause_after_ms` 的 span 数量），以及如实的三态 `pauses_state`：`pending`（尚未执行组装）、`applied`（暂停产物存在并用作导出源，附简洁的 `pauses_message`）、或 `failed`（组装不可用；`pauses_error` 携带受限的详细信息且不含文件系统路径）。`pauses_applied` 是派生布尔值（当且仅当 `applied` 时为 `true`）。失败绝不宣称成功。
+
+**迁移与向后兼容：** 现有项目可幂等迁移——其 `book` 行会获得 `NULL` 暂停覆盖列，每个 `span` 获得可空的 `pause_after_ms`（解析默认值，绝不强转为 0）。迁移前创建的项目快照（无暂停键）在恢复时不会改动当前暂停状态。当没有可用的暂停产物时（例如一次未执行组装的渲染），导出会透明地回退到现有的逐 span 分块拼接，并报告 `failed` 三态。
 
 ### 脚本标签页
 
@@ -280,11 +306,13 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 
 ### M4B 有声书（推荐）
 
-最终有声书为带章节标记的 `audiobook.m4b`（AAC 128kbps）。章节自动检测（基于脚本标题）或按块生成。下载后兼容 Audiobookshelf、Apple Books、VLC 等播放器。
+最终有声书为带章节标记的 `audiobook.m4b`（AAC 128kbps）。章节自动检测（基于脚本标题）或按块生成。下载后兼容 Audiobookshelf、Apple Books、VLC 等播放器。当规范暂停产物可用时，它由暂停源 WAV 组装而成（见 *暂停插入*），因此解析后的说话人暂停在最终成书中可听。
+
+MP3 导出（`audiobook.mp3`）在 ffmpeg 支持 MP3（libmp3lame）时生成，否则降级为仅 M4B 并给出明确提示；链接按能力标志显示，经 `GET /api/pipeline/export/mp3/{job_id}` 提供。Audacity 打包（`audiobook-audacity.zip`，ZIP_STORED）在暂停产物可用时包含 `audiobook-paused.wav`（暂停的整本音频源）与 MP3，否则回退到逐 span 语音块；链接经 `GET /api/pipeline/export/audacity/{job_id}` 提供。
 
 ### 原始语音块
 
-每个渲染作业在作业目录中生成 `chunk_0000.wav`、`chunk_0001.wav` 等文件（按时间顺序编号）。下载端点服务 `audiobook.m4b`（合并后）或 `audiobook.zip`（未合并的语音块，ZIP 打包）。
+每个渲染作业在作业目录中生成 `chunk_0000.wav`、`chunk_0001.wav` 等文件（按时间顺序编号），以及规范暂停产物 `audiobook-paused.wav`（解析了说话人暂停的整本音频；见 *暂停插入*）。下载端点服务 `audiobook.m4b`（合并后）或 `audiobook.zip`（未合并的语音块，ZIP 打包）。
 
 ## API 参考
 

@@ -1355,6 +1355,268 @@ class TestSingleSpeakerFlagEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Plan L P2-S2: book pause settings
+# GET/PUT /api/pipeline/book/{book_id}/pause_settings
+# ---------------------------------------------------------------------------
+
+
+class TestBookPauseSettingsEndpoint:
+    """Both pause override columns are nullable: NULL = resolve default,
+    0 = intentional no-gap.  PUT is a partial update on explicit fields."""
+
+    def test_get_defaults_to_none(self, client):
+        """Unset book reports both overrides as None (never coerced)."""
+        response = client.get("/api/pipeline/book/b1/pause_settings")
+        assert response.status_code == 200
+        assert response.json() == {
+            "book_id": "b1",
+            "pause_between_speakers_ms": None,
+            "pause_same_speaker_ms": None,
+        }
+
+    def test_put_sets_and_round_trips(self, client, storage):
+        """PUT persists both fields (incl. 0 as intentional no-gap) and round-trips."""
+        response = client.put(
+            "/api/pipeline/book/b1/pause_settings",
+            json={"pause_between_speakers_ms": 700, "pause_same_speaker_ms": 0},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "book_id": "b1",
+            "pause_between_speakers_ms": 700,
+            "pause_same_speaker_ms": 0,
+        }
+        rows = storage.execute_query(
+            "SELECT pause_between_speakers_ms, pause_same_speaker_ms FROM book"
+            " WHERE id = 'b1'"
+        )
+        assert rows[0]["pause_between_speakers_ms"] == 700
+        assert rows[0]["pause_same_speaker_ms"] == 0
+        read = client.get("/api/pipeline/book/b1/pause_settings").json()
+        assert read["pause_between_speakers_ms"] == 700
+        assert read["pause_same_speaker_ms"] == 0
+
+    def test_put_null_clears_to_resolve_default(self, client, storage):
+        """Explicit null clears the override back to resolve-default (SQL NULL)."""
+        client.put(
+            "/api/pipeline/book/b1/pause_settings",
+            json={"pause_between_speakers_ms": 700, "pause_same_speaker_ms": 0},
+        )
+        response = client.put(
+            "/api/pipeline/book/b1/pause_settings",
+            json={"pause_between_speakers_ms": None},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["pause_between_speakers_ms"] is None
+        # Partial update: the untouched field keeps its persisted value.
+        assert body["pause_same_speaker_ms"] == 0
+        rows = storage.execute_query(
+            "SELECT pause_between_speakers_ms, pause_same_speaker_ms FROM book"
+            " WHERE id = 'b1'"
+        )
+        assert rows[0]["pause_between_speakers_ms"] is None
+        assert rows[0]["pause_same_speaker_ms"] == 0
+
+    def test_put_partial_update_leaves_other_field_untouched(self, client):
+        client.put(
+            "/api/pipeline/book/b1/pause_settings",
+            json={"pause_between_speakers_ms": 700},
+        )
+        response = client.put(
+            "/api/pipeline/book/b1/pause_settings",
+            json={"pause_same_speaker_ms": 300},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["pause_between_speakers_ms"] == 700
+        assert body["pause_same_speaker_ms"] == 300
+
+    def test_put_empty_body_is_noop_returns_current(self, client):
+        """An empty body (no explicit fields) is a no-op returning current state."""
+        response = client.put("/api/pipeline/book/b1/pause_settings", json={})
+        assert response.status_code == 200
+        assert response.json()["pause_between_speakers_ms"] is None
+        assert response.json()["pause_same_speaker_ms"] is None
+
+    def test_get_unknown_book_404(self, client):
+        response = client.get("/api/pipeline/book/nope/pause_settings")
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    def test_put_unknown_book_404(self, client):
+        response = client.put(
+            "/api/pipeline/book/nope/pause_settings",
+            json={"pause_between_speakers_ms": 100},
+        )
+        assert response.status_code == 404
+
+    def test_put_invalid_value_422(self, client):
+        """Out-of-range / wrong-type pause values are rejected with 422."""
+        for bad in (
+            {"pause_between_speakers_ms": -1},
+            {"pause_same_speaker_ms": "abc"},
+            {"pause_between_speakers_ms": True},
+            {"pause_between_speakers_ms": 1.5},
+            {"pause_same_speaker_ms": 999999999},
+        ):
+            response = client.put("/api/pipeline/book/b1/pause_settings", json=bad)
+            assert response.status_code == 422, bad
+
+
+# ---------------------------------------------------------------------------
+# Plan L P2-S2: per-span pause-after override
+# GET/PUT /api/pipeline/span/{span_id}/pause_after
+# ---------------------------------------------------------------------------
+
+
+class TestSpanPauseAfterEndpoint:
+    """span.pause_after_ms: NULL = clear, 0 = intentional no-gap, else validated.
+
+    Containment: the span must be reachable from a book through the spine
+    edges — unknown or orphan spans are rejected with 404."""
+
+    def test_get_defaults_to_none(self, client):
+        response = client.get("/api/pipeline/span/sp1/pause_after")
+        assert response.status_code == 200
+        assert response.json() == {"span_id": "sp1", "pause_after_ms": None}
+
+    def test_put_sets_and_round_trips(self, client, storage):
+        response = client.put(
+            "/api/pipeline/span/sp1/pause_after", json={"pause_after_ms": 120}
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "span_id": "sp1",
+            "pause_after_ms": 120,
+        }
+        rows = storage.execute_query(
+            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
+        )
+        assert rows[0]["pause_after_ms"] == 120
+        assert (
+            client.get("/api/pipeline/span/sp1/pause_after").json()["pause_after_ms"]
+            == 120
+        )
+
+    def test_put_zero_intentional_no_gap(self, client, storage):
+        response = client.put(
+            "/api/pipeline/span/sp1/pause_after", json={"pause_after_ms": 0}
+        )
+        assert response.status_code == 200
+        assert response.json()["pause_after_ms"] == 0
+        rows = storage.execute_query(
+            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
+        )
+        assert rows[0]["pause_after_ms"] == 0
+
+    def test_put_null_clears(self, client, storage):
+        client.put("/api/pipeline/span/sp1/pause_after", json={"pause_after_ms": 120})
+        response = client.put(
+            "/api/pipeline/span/sp1/pause_after", json={"pause_after_ms": None}
+        )
+        assert response.status_code == 200
+        assert response.json()["pause_after_ms"] is None
+        rows = storage.execute_query(
+            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
+        )
+        assert rows[0]["pause_after_ms"] is None
+
+    def test_get_unknown_span_404(self, client):
+        response = client.get("/api/pipeline/span/nope/pause_after")
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    def test_put_unknown_span_404(self, client):
+        response = client.put(
+            "/api/pipeline/span/nope/pause_after", json={"pause_after_ms": 100}
+        )
+        assert response.status_code == 404
+
+    def test_orphan_span_not_in_book_404(self, client, storage):
+        """A span row not reachable from any book is rejected (containment)."""
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text) VALUES ('orphan', 'quotation', 'x')"
+        )
+        response = client.put(
+            "/api/pipeline/span/orphan/pause_after", json={"pause_after_ms": 100}
+        )
+        assert response.status_code == 404
+
+    def test_put_invalid_value_422(self, client):
+        for bad in (
+            {"pause_after_ms": -1},
+            {"pause_after_ms": "abc"},
+            {"pause_after_ms": True},
+            {"pause_after_ms": 1.5},
+        ):
+            response = client.put("/api/pipeline/span/sp1/pause_after", json=bad)
+            assert response.status_code == 422, bad
+
+
+# ---------------------------------------------------------------------------
+# Plan L P2-S2: concurrent pause write -> 503 + Retry-After (live)
+# ---------------------------------------------------------------------------
+
+
+class TestPauseSettingsConcurrentMapping:
+    def test_book_pause_write_cte_maps_to_503(self, real_client, storage, monkeypatch):
+        """A pause write raising ConcurrentTransactionError -> 503 + Retry-After: 5."""
+
+        def failing(sql, params=()):
+            raise ConcurrentTransactionError("simulated pause-write contention")
+
+        monkeypatch.setattr(storage, "execute_update", failing)
+        resp = real_client.put(
+            "/api/pipeline/book/b1/pause_settings",
+            json={"pause_between_speakers_ms": 900},
+        )
+        assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "5"
+
+
+# ---------------------------------------------------------------------------
+# Plan L P2-S3: render_status resolves pause settings + tri-state lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestRenderStatusPauseContract:
+    def test_render_status_exposes_resolved_pause_and_pending_state(self, client, storage):
+        """A book override resolves through config defaults; tri-state is pending
+        while assembly is not wired (Phase 2)."""
+        storage.execute_update(
+            "UPDATE book SET pause_between_speakers_ms = 700 WHERE id = 'b1'"
+        )
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status) "
+            "VALUES ('rs-p', 'b1', 'batch', 'running')",
+            (),
+        )
+        data = client.get("/api/pipeline/render_status/rs-p").json()
+        assert data["resolved_pause_between_speakers_ms"] == 700
+        # pause_same_speaker_ms falls back to the built-in config default (250).
+        assert data["resolved_pause_same_speaker_ms"] == 250
+        assert data["pause_override_count"] == 0
+        assert data["pauses_applied"] is False
+        assert data["pauses_state"] == "pending"
+        assert data["pauses_error"] is None
+
+    def test_render_status_counts_span_overrides(self, client, storage):
+        storage.execute_update(
+            "UPDATE span SET pause_after_ms = 120 WHERE id = 'sp1'"
+        )
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status) "
+            "VALUES ('rs-c', 'b1', 'batch', 'running')",
+            (),
+        )
+        data = client.get("/api/pipeline/render_status/rs-c").json()
+        assert data["pause_override_count"] == 1
+
+
+# ---------------------------------------------------------------------------
 # P1-S12: GET /api/pipeline/export/{book_id}
 # ---------------------------------------------------------------------------
 

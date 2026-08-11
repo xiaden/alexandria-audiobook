@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-CATQWzIm.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-CoEHB2gz.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -417,14 +417,36 @@
                         </div>
                         <div class="row mb-3">
                             <div class="col-md-2">
-                                <label class="form-label" for="pause-between-speakers" title="Pause between different speakers (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default 500 ms)">Speaker Change Pause (ms)</label>
-                                <input type="number" class="form-control" id="pause-between-speakers" value="500" min="0" step="50" title="Pause between different speakers (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default 500 ms)">
-                                <div class="form-text">Pause between different speakers (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default 500 ms)</div>
+                                <label class="form-label" for="pause-between-speakers" title="Global default pause between different speakers, inserted into the merged audio (default 500 ms; 0-10000 ms)">Speaker Change Pause (ms)</label>
+                                <input type="number" class="form-control" id="pause-between-speakers" value="500" min="0" step="50" title="Global default pause between different speakers, inserted into the merged audio (default 500 ms; 0-10000 ms)">
+                                <div class="form-text">Inserted between different speakers (default 500 ms)</div>
                             </div>
                             <div class="col-md-2">
-                                <label class="form-label" for="pause-same-speaker" title="Pause when the same speaker continues (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default 250 ms)">Same Speaker Pause (ms)</label>
-                                <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" step="50" title="Pause when the same speaker continues (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default 250 ms)">
-                                <div class="form-text">Pause when the same speaker continues (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default 250 ms)</div>
+                                <label class="form-label" for="pause-same-speaker" title="Global default pause when the same speaker continues, inserted into the merged audio (default 250 ms; 0-10000 ms)">Same Speaker Pause (ms)</label>
+                                <input type="number" class="form-control" id="pause-same-speaker" value="250" min="0" step="50" title="Global default pause when the same speaker continues, inserted into the merged audio (default 250 ms; 0-10000 ms)">
+                                <div class="form-text">Inserted when the same speaker continues (default 250 ms)</div>
+                            </div>
+                        </div>
+                        <div class="row mb-2">
+                            <div class="col-12">
+                                <h6 class="text-muted mb-1">Book Pause Overrides <small class="text-muted fw-normal">(this project — leave blank to inherit the config default)</small></h6>
+                            </div>
+                        </div>
+                        <div class="row mb-2">
+                            <div class="col-md-2">
+                                <label class="form-label" for="book-pause-between-speakers" title="Per-book override for the pause between different speakers. Blank = inherit the config default; 0 = no gap. 0-10000 ms.">Speaker Change Pause (ms)</label>
+                                <input type="number" class="form-control" id="book-pause-between-speakers" min="0" step="1" placeholder="default" title="Per-book override for the pause between different speakers. Blank = inherit the config default; 0 = no gap. 0-10000 ms.">
+                                <div class="form-text">Blank = config default</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label" for="book-pause-same-speaker" title="Per-book override for the pause when the same speaker continues. Blank = inherit the config default; 0 = no gap. 0-10000 ms.">Same Speaker Pause (ms)</label>
+                                <input type="number" class="form-control" id="book-pause-same-speaker" min="0" step="1" placeholder="default" title="Per-book override for the pause when the same speaker continues. Blank = inherit the config default; 0 = no gap. 0-10000 ms.">
+                                <div class="form-text">Blank = config default</div>
+                            </div>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-md-4">
+                                <div id="pause-resolved-preview" class="form-text" title="Effective pause values after applying book overrides over config defaults (500/250 ms fallback)">Resolved: 500 ms between speakers · 250 ms same speaker</div>
                             </div>
                         </div>
 
@@ -1071,6 +1093,9 @@
                         </div>
                         <!-- Per-chunk failure badge (individual renders; hidden until a chunk fails) -->
                         <span id="render-failures-badge" class="badge bg-danger mb-3" style="display:none;"></span>
+                        <!-- Resolved-pause + pause-assembly status surface (Plan L) — populated from
+                             render_status; cleared on a new render job. -->
+                        <div id="render-pause-info" class="form-text mb-3" style="display:none;"></div>
 
                         <!-- Single-speaker render toggle (Plan J, Phase 2) — a UI write of
                              book.single_speaker; enforcement happens ONLY at the render boundary
@@ -1090,9 +1115,10 @@
                                     <tr>
                                         <th width="8%">Index / Select</th>
                                         <th width="10%">Speaker</th>
-                                        <th width="42%">Text</th>
-                                        <th width="15%">Instruct</th>
-                                        <th width="25%">Operations</th>
+                                        <th width="38%">Text</th>
+                                        <th width="13%">Pause After (ms)</th>
+                                        <th width="14%">Instruct</th>
+                                        <th width="17%">Operations</th>
                                     </tr>
                                 </thead>
                                 <tbody id="spans-table-body">
@@ -1149,15 +1175,18 @@
                             </div>
                         </form>
                         <!-- Export capability affordances (Plan F, Phase 5; Plan K
-                             serving-route fix) — feature-detected from the
-                             /export/m4b response: mp3:true → MP3 link to the
-                             same-origin serving route /api/pipeline/export/mp3/{job_id}
-                             (never the filesystem path); audacity:true → Audacity
-                             ZIP_STORED bundle link /api/pipeline/export/audacity/{job_id};
-                             mp3:false → MP3 link suppressed + M4B-only degrade message
-                             in #export-m4b-info. Plan K: pauses_applied:false → honest
-                             pause limitation message in #export-pauses-info. Hidden by
-                             default; reset when a new render starts. -->
+                             serving-route fix; Plan L tri-state pause surface) —
+                             feature-detected from the /export/m4b response: mp3:true →
+                             MP3 link to the same-origin serving route
+                             /api/pipeline/export/mp3/{job_id} (never the filesystem path);
+                             audacity:true → Audacity ZIP_STORED bundle link
+                             /api/pipeline/export/audacity/{job_id}; mp3:false → MP3 link
+                             suppressed + M4B-only degrade message in #export-m4b-info.
+                             Plan L: #export-pauses-info surfaces the truthful pause
+                             assembly tri-state — 'applied' (resolved values + override
+                             count), 'failed' (bounded pauses_error), or hidden when the
+                             response carries no pause tri-state. Hidden by default;
+                             reset when a new render starts. -->
                         <div class="d-flex align-items-center gap-2 mt-2" id="export-capabilities-row">
                             <a id="export-mp3-link" class="btn btn-sm btn-outline-success" href="#" download style="display:none;">
                                 <i class="fas fa-file-audio me-1"></i>Download MP3

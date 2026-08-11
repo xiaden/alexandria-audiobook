@@ -121,7 +121,8 @@ class TestGraph1TreeColumns:
     def test_book_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "book")}
         assert set(cols.keys()) == {
-            "id", "series_id", "book_number", "version", "position", "single_speaker"
+            "id", "series_id", "book_number", "version", "position", "single_speaker",
+            "pause_between_speakers_ms", "pause_same_speaker_ms",
         }
         # version DEFAULT 1
         assert cols["version"][4] == '1'  # dflt_value (returned as string)
@@ -144,7 +145,7 @@ class TestGraph1TreeColumns:
 
     def test_span_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "span")}
-        assert set(cols.keys()) == {"id", "span_type", "instruct", "text"}
+        assert set(cols.keys()) == {"id", "span_type", "instruct", "text", "pause_after_ms"}
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +200,8 @@ class TestEdgeUniqueConstraints:
     def test_child_id_unique_book_chapter(self, conn):
         """Each child can only appear once (UNIQUE on child_id)."""
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
-        conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b2', 's1', 2, 1, 2, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
 
         # Insert first edge
@@ -212,7 +213,7 @@ class TestEdgeUniqueConstraints:
 
     def test_child_id_unique_chapter_scene(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
@@ -224,7 +225,7 @@ class TestEdgeUniqueConstraints:
 
     def test_child_id_unique_scene_paragraph(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
         conn.execute("INSERT INTO scene VALUES ('sc2')")
@@ -238,7 +239,7 @@ class TestEdgeUniqueConstraints:
     def test_child_id_unique_paragraph_span(self, conn):
         conn.execute("INSERT INTO paragraph VALUES ('p1')")
         conn.execute("INSERT INTO paragraph VALUES ('p2')")
-        conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
 
         conn.execute("INSERT INTO paragraph_span VALUES ('sp1', 'p1', 1)")
 
@@ -248,7 +249,7 @@ class TestEdgeUniqueConstraints:
     def test_parent_position_unique_book_chapter(self, conn):
         """Same parent cannot have two children at the same position."""
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
 
@@ -259,7 +260,7 @@ class TestEdgeUniqueConstraints:
 
     def test_parent_position_unique_chapter_scene(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
         conn.execute("INSERT INTO scene VALUES ('sc2')")
@@ -281,8 +282,8 @@ class TestEdgeUniqueConstraints:
 
     def test_parent_position_unique_paragraph_span(self, conn):
         conn.execute("INSERT INTO paragraph VALUES ('p1')")
-        conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
-        conn.execute("INSERT INTO span VALUES ('sp2', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp2', 'sentence', NULL, NULL)")
 
         conn.execute("INSERT INTO paragraph_span VALUES ('sp1', 'p1', 1)")
 
@@ -297,14 +298,14 @@ class TestEdgeUniqueConstraints:
 
 class TestCheckConstraints:
     def test_span_type_check_sentence(self, conn):
-        conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
 
     def test_span_type_check_quotation(self, conn):
-        conn.execute("INSERT INTO span VALUES ('sp1', 'quotation', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'quotation', NULL, NULL)")
 
     def test_span_type_check_invalid(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("INSERT INTO span VALUES ('sp1', 'invalid', NULL, NULL)")
+            conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'invalid', NULL, NULL)")
 
     def test_source_check_walk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
@@ -388,28 +389,28 @@ class TestCheckConstraints:
             )
 
     def test_character_span_relation_type_speaker(self, conn):
-        conn.execute("INSERT INTO span VALUES ('sp1', 'quotation', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'quotation', NULL, NULL)")
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         conn.execute(
             "INSERT INTO character_span VALUES ('ch1', 'sp1', 'speaker', 'walk', 0.9, 0)"
         )
 
     def test_character_span_relation_type_mentioned(self, conn):
-        conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         conn.execute(
             "INSERT INTO character_span VALUES ('ch1', 'sp1', 'mentioned', 'walk', 0.7, 0)"
         )
 
     def test_character_span_relation_type_present(self, conn):
-        conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         conn.execute(
             "INSERT INTO character_span VALUES ('ch1', 'sp1', 'present', 'walk', 0.6, 0)"
         )
 
     def test_character_span_relation_type_invalid(self, conn):
-        conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
@@ -429,7 +430,7 @@ class TestNotNullConstraints:
 
     def test_span_type_not_null(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("INSERT INTO span VALUES ('sp1', NULL, NULL, NULL)")
+            conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', NULL, NULL, NULL)")
 
     def test_source_not_null(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
@@ -489,7 +490,7 @@ class TestForeignKeyConstraints:
     def test_book_series_fk(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO book VALUES ('b1', 'nonexistent', 1, 1, 1, 0)"
+                "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 'nonexistent', 1, 1, 1, 0)"
             )
 
     def test_chapter_book_fk(self, conn):
@@ -498,7 +499,7 @@ class TestForeignKeyConstraints:
 
     def test_book_chapter_child_fk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO book_chapter VALUES ('nonexistent', 'b1', 1)"
@@ -506,7 +507,7 @@ class TestForeignKeyConstraints:
 
     def test_book_chapter_parent_fk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
@@ -545,7 +546,7 @@ class TestForeignKeyConstraints:
             )
 
     def test_character_span_character_fk(self, conn):
-        conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO character_span VALUES ('nonexistent', 'sp1', 'speaker', 'walk', 0.9, 0)"
@@ -615,8 +616,8 @@ def _populate_spine(conn: sqlite3.Connection):
                 span sp5 (position=1, quotation)
     """
     conn.execute("INSERT INTO series VALUES ('s1')")
-    conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
-    conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2, 0)")
+    conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+    conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b2', 's1', 2, 1, 2, 0)")
     conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
     conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
     conn.execute("INSERT INTO chapter VALUES ('c3', 'b2')")
@@ -627,11 +628,11 @@ def _populate_spine(conn: sqlite3.Connection):
     conn.execute("INSERT INTO paragraph VALUES ('p2')")
     conn.execute("INSERT INTO paragraph VALUES ('p3')")
     conn.execute("INSERT INTO paragraph VALUES ('p4')")
-    conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp2', 'quotation', 'angrily', NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp3', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp4', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp5', 'quotation', 'softly', NULL)")
+    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp2', 'quotation', 'angrily', NULL)")
+    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp3', 'sentence', NULL, NULL)")
+    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp4', 'sentence', NULL, NULL)")
+    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp5', 'quotation', 'softly', NULL)")
 
     # Edge tables
     conn.execute("INSERT INTO book_chapter VALUES ('c1', 'b1', 1)")

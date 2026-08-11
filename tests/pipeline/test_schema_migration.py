@@ -299,3 +299,101 @@ class TestCreateSchemaMigrationForUniversalUpgrade:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(book)").fetchall()]
         assert cols.count("single_speaker") == 1
         conn.close()
+
+
+class TestCreateSchemaPauseColumns:
+    """create_schema adds nullable Plan L pause columns idempotently."""
+
+    def test_legacy_book_gains_nullable_pause_columns(self, tmp_path: Path) -> None:
+        """A legacy book table gains the two pause override columns, NULL."""
+        db_path = tmp_path / "legacy_pause.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE book (
+                id TEXT PRIMARY KEY,
+                series_id TEXT NOT NULL REFERENCES series(id),
+                book_number INTEGER,
+                version INTEGER DEFAULT 1,
+                position INTEGER,
+                single_speaker INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position) "
+            "VALUES ('b1', 's1', 1, 1, 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(book)").fetchall()}
+        assert "pause_between_speakers_ms" in cols
+        assert "pause_same_speaker_ms" in cols
+        # Existing row migrates with NULL (no override) — never coerced to 0.
+        row = conn.execute(
+            "SELECT pause_between_speakers_ms, pause_same_speaker_ms"
+            " FROM book WHERE id='b1'"
+        ).fetchone()
+        assert row == (None, None)
+        conn.close()
+
+    def test_legacy_span_gains_pause_after_with_check(self, tmp_path: Path) -> None:
+        """A legacy span table gains pause_after_ms INTEGER NULL + CHECK."""
+        db_path = tmp_path / "legacy_span_pause.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE span (
+                id TEXT PRIMARY KEY,
+                span_type TEXT,
+                instruct TEXT,
+                text TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) "
+            "VALUES ('sp1', 'sentence', NULL, 'hello')"
+        )
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        col_info = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(span)").fetchall()
+        }
+        assert "pause_after_ms" in col_info
+        # nullable column (notnull = 0)
+        assert col_info["pause_after_ms"][3] == 0
+        # CHECK constraint registered in the table's DDL
+        span_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='span'"
+        ).fetchone()[0]
+        assert "pause_after_ms IS NULL OR pause_after_ms >= 0" in span_sql
+        # existing row migrates with NULL
+        row = conn.execute(
+            "SELECT pause_after_ms FROM span WHERE id='sp1'"
+        ).fetchone()
+        assert row == (None,)
+        # CHECK rejects negative, accepts 0 and NULL
+        conn.execute("UPDATE span SET pause_after_ms = 0 WHERE id='sp1'")
+        conn.execute("UPDATE span SET pause_after_ms = 500 WHERE id='sp1'")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE span SET pause_after_ms = -1 WHERE id='sp1'")
+        conn.close()
+
+    def test_create_schema_pause_columns_idempotent(self, tmp_path: Path) -> None:
+        """Running create_schema twice adds the pause columns only once."""
+        db_path = tmp_path / "pause_schema.db"
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        conn.close()
+
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        book_cols = [r[1] for r in conn.execute("PRAGMA table_info(book)").fetchall()]
+        assert book_cols.count("pause_between_speakers_ms") == 1
+        assert book_cols.count("pause_same_speaker_ms") == 1
+        span_cols = [r[1] for r in conn.execute("PRAGMA table_info(span)").fetchall()]
+        assert span_cols.count("pause_after_ms") == 1
+        conn.close()

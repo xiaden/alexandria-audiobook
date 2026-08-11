@@ -8,7 +8,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTa
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from typing import List, Optional
 import re
 import time
@@ -35,6 +35,12 @@ from app.pipeline.adapter import (
 
 # TTS engine factory (replaces legacy project engine access)
 from app.engine import get_tts_engine, reset_tts_engine
+
+# Shared bounded pause validation (Plan L) — the single source of truth for
+# the pause bound (0..PAUSE_MAX_MS) used by config saves and the pipeline
+# override/edit endpoints.  tts_integration is already loaded transitively
+# via app.pipeline.api, so this import adds no cycle.
+from app.pipeline.tts_integration import validate_pause_ms
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -285,6 +291,20 @@ class TTSConfig(BaseModel):
     batch_group_by_type: bool = False  # group chunks by voice type for efficient batching
     pause_between_speakers_ms: int = 500  # silence (ms) between different speakers during merge
     pause_same_speaker_ms: int = 250  # silence (ms) when same speaker continues during merge
+
+    @field_validator("pause_between_speakers_ms", "pause_same_speaker_ms", mode="before")
+    @classmethod
+    def _validate_pause_ms(cls, value: object) -> int:
+        """Reject out-of-bounds pause values on config saves (stable 422).
+
+        Applies the shared Plan L bound (``validate_pause_ms``: non-negative
+        integer ``<= PAUSE_MAX_MS``; rejects negative, fractional, boolean,
+        NaN, and above-max values) to the two TTS pause defaults before the
+        value is persisted by ``POST /api/config``.  ``mode="before"`` sees
+        the raw JSON value so booleans/fractional floats are caught here
+        rather than silently coerced to ``int`` by pydantic's lax coercion.
+        """
+        return validate_pause_ms(value)
 
 class AppConfig(BaseModel):
     # Validation-only schema (CONTRACTS.md rule #11): unknown top-level keys

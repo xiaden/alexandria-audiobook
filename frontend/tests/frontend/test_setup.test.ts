@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { WALK_TASK_NAMES, collectTaskOverrides, loadConfig, buildConfigPayload } from '../../src/tabs/setup';
+import { WALK_TASK_NAMES, collectTaskOverrides, loadConfig, buildConfigPayload, initSetup } from '../../src/tabs/setup';
 import { state, setPipelineBookId, initState } from '../../src/state';
 import * as API from '../../src/api';
 
@@ -18,6 +18,7 @@ import * as API from '../../src/api';
 vi.mock('../../src/api', () => ({
   get: vi.fn(),
   post: vi.fn(),
+  put: vi.fn(),
 }));
 
 // Mock showToast to avoid DOM dependencies
@@ -524,5 +525,102 @@ describe('prompt override contract lock (P5-S5)', () => {
       const expected = configWithWalkPrompts.walk_override?.[task]?.prompt ?? '';
       expect(input?.value, `prompt input for ${task}`).toBe(expected);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Book Pause Overrides (Plan L, Phase 5)
+// ---------------------------------------------------------------------------
+// The setup tab gains real pause controls: validated global defaults (config
+// tts.pause_*_ms), per-book overrides via GET/PUT
+// /api/pipeline/book/{book_id}/pause_settings (blank = inherit the config
+// default; explicit 0 = intentional no-gap), and a resolved-value preview that
+// applies precedence: book override → config default → 500/250 ms.
+
+describe('Book Pause Overrides (Plan L, Phase 5)', () => {
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <select id="tts-mode"><option value="external">External</option></select>
+      <input id="pause-between-speakers" />
+      <input id="pause-same-speaker" />
+      <input id="book-pause-between-speakers" />
+      <input id="book-pause-same-speaker" />
+      <div id="pause-resolved-preview"></div>
+    `;
+    state.pipelineBookId = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  it('loads the book pause overrides and renders the resolved preview when a book is onboarded', async () => {
+    state.pipelineBookId = 'book-abc';
+    const mockConfig = { llm: {}, tts: { mode: 'external', pause_between_speakers_ms: 500, pause_same_speaker_ms: 250 } };
+    vi.mocked(API.get)
+      .mockResolvedValueOnce(mockConfig) // /api/config
+      .mockResolvedValueOnce({ pause_between_speakers_ms: 700, pause_same_speaker_ms: 350 }); // pause_settings
+
+    await loadConfig();
+
+    expect((document.getElementById('book-pause-between-speakers') as HTMLInputElement).value).toBe('700');
+    expect((document.getElementById('book-pause-same-speaker') as HTMLInputElement).value).toBe('350');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/book/book-abc/pause_settings');
+    // Resolved preview = book override (700/350) over the config default (500/250).
+    const preview = document.getElementById('pause-resolved-preview') as HTMLElement;
+    expect(preview.textContent).toContain('700 ms between speakers');
+    expect(preview.textContent).toContain('350 ms same speaker');
+  });
+
+  it('clears stale book overrides and previews the config default when no book is onboarded', async () => {
+    state.pipelineBookId = null;
+    const mockConfig = { llm: {}, tts: { mode: 'external', pause_between_speakers_ms: 500, pause_same_speaker_ms: 250 } };
+    vi.mocked(API.get).mockResolvedValueOnce(mockConfig);
+    // Simulate stale override values from a previously onboarded book.
+    (document.getElementById('book-pause-between-speakers') as HTMLInputElement).value = '700';
+    (document.getElementById('book-pause-same-speaker') as HTMLInputElement).value = '350';
+
+    await loadConfig();
+
+    expect((document.getElementById('book-pause-between-speakers') as HTMLInputElement).value).toBe('');
+    expect((document.getElementById('book-pause-same-speaker') as HTMLInputElement).value).toBe('');
+    const preview = document.getElementById('pause-resolved-preview') as HTMLElement;
+    expect(preview.textContent).toContain('500 ms between speakers');
+    expect(preview.textContent).toContain('250 ms same speaker');
+  });
+
+  it('falls back to 500/250 ms in the resolved preview when neither override nor config default is set', async () => {
+    state.pipelineBookId = null;
+    const mockConfig = { llm: {}, tts: { mode: 'external' } }; // no pause fields
+    vi.mocked(API.get).mockResolvedValueOnce(mockConfig);
+
+    await loadConfig();
+
+    const preview = document.getElementById('pause-resolved-preview') as HTMLElement;
+    expect(preview.textContent).toContain('500 ms between speakers');
+    expect(preview.textContent).toContain('250 ms same speaker');
+  });
+
+  it('persists the book pause overrides via PUT when the config form submits with a book onboarded (blank → null)', async () => {
+    state.pipelineBookId = 'book-abc';
+    // A config-form element is required for the submit wiring (initSetup).
+    document.body.innerHTML += `<form id="config-form"></form>`;
+    (document.getElementById('book-pause-between-speakers') as HTMLInputElement).value = '700';
+    (document.getElementById('book-pause-same-speaker') as HTMLInputElement).value = '';
+    vi.mocked(API.post).mockResolvedValue({ status: 'ok' });
+    vi.mocked(API.put).mockResolvedValue({ status: 'ok' });
+
+    initSetup();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    (document.getElementById('config-form') as HTMLFormElement)
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await vi.waitFor(() => {
+      expect(API.post).toHaveBeenCalledWith('/api/config', expect.anything());
+    });
+    await vi.waitFor(() => {
+      expect(API.put).toHaveBeenCalledWith('/api/pipeline/book/book-abc/pause_settings', {
+        pause_between_speakers_ms: 700,
+        pause_same_speaker_ms: null,
+      });
+    });
   });
 });

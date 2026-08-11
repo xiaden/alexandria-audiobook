@@ -60,6 +60,8 @@ import {
   undoLastSpanEdit,
   clearUndoStack,
   getUndoStack,
+  pipelineGetSpanPause,
+  pipelineSetSpanPause,
 } from '../../src/tabs/editor';
 import { state } from '../../src/state';
 import { getPreviewPlayer } from '../../src/player';
@@ -2549,36 +2551,12 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       audacity_path: '/data/render_root/audiobook-audacity.zip',
     }),
   };
-  // Plan K pause capability disclosure fixtures. pauses_applied:false → honest
-  // limitation disclosure in #export-pauses-info; pauses_applied:true or
-  // absent (undefined) → no disclosure. The backend sends pauses_message on
-  // every success, but the frontend must fall back to its own copy when absent.
-  const okExportWithPauseDisclosure = {
-    ...okExportFull,
-    json: async () => ({
-      status: 'ok',
-      output_path: '/data/render_root/book.m4b',
-      mp3: true,
-      mp3_path: '/data/render_root/book.mp3',
-      audacity: true,
-      audacity_path: '/data/render_root/audiobook-audacity.zip',
-      pauses_applied: false,
-      pauses_message:
-        'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.',
-    }),
-  };
-  const okExportPauseNoMessage = {
-    ...okExportFull,
-    json: async () => ({
-      status: 'ok',
-      output_path: '/data/render_root/book.m4b',
-      mp3: true,
-      mp3_path: '/data/render_root/book.mp3',
-      audacity: true,
-      audacity_path: '/data/render_root/audiobook-audacity.zip',
-      pauses_applied: false,
-    }),
-  };
+  // Plan L pause-assembly tri-state fixtures. pauses_state 'applied' → the
+  // canonical paused artifact was used (resolved values + override count + the
+  // backend pauses_message render in #export-pauses-info); 'failed' → bounded
+  // pauses_error (assembly unavailable; unpaused fallback exported); absent →
+  // no pause surface. The legacy pauses_applied:true flag still satisfies the
+  // 'applied' branch for backward-compatible responses.
   const okExportPausesApplied = {
     ...okExportFull,
     json: async () => ({
@@ -2589,6 +2567,44 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       audacity: true,
       audacity_path: '/data/render_root/audiobook-audacity.zip',
       pauses_applied: true,
+      pauses_state: 'applied',
+      pauses_message: 'Pauses applied: the exported audio includes the resolved speaker pauses between spans.',
+      resolved_pause_between_speakers_ms: 600,
+      resolved_pause_same_speaker_ms: 300,
+      pause_override_count: 2,
+    }),
+  };
+  const okExportPausesAppliedNoMessage = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+      pauses_applied: true,
+      pauses_state: 'applied',
+      resolved_pause_between_speakers_ms: 500,
+      resolved_pause_same_speaker_ms: 250,
+      pause_override_count: 1,
+    }),
+  };
+  const okExportPauseFailed = {
+    ...okExportFull,
+    json: async () => ({
+      status: 'ok',
+      output_path: '/data/render_root/book.m4b',
+      mp3: true,
+      mp3_path: '/data/render_root/book.mp3',
+      audacity: true,
+      audacity_path: '/data/render_root/audiobook-audacity.zip',
+      pauses_applied: false,
+      pauses_state: 'failed',
+      pauses_error: 'Paused audio assembly artifact not found; exported the concatenated source audio without inserted pauses.',
+      resolved_pause_between_speakers_ms: 500,
+      resolved_pause_same_speaker_ms: 250,
+      pause_override_count: 1,
     }),
   };
 
@@ -2773,8 +2789,8 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       expect(audacity.getAttribute('href')).toBe('/api/pipeline/export/audacity/job-cap-1');
     });
 
-    it('surfaces the pause capability disclosure when pauses_applied:false (Plan K) — the honest limitation message renders in #export-pauses-info', async () => {
-      fetchSpy.mockResolvedValue(okExportWithPauseDisclosure);
+    it('surfaces the pause-assembly tri-state when pauses_state:applied — resolved values + override count render in #export-pauses-info', async () => {
+      fetchSpy.mockResolvedValue(okExportPausesApplied);
       initEditor();
       document.dispatchEvent(new Event('DOMContentLoaded'));
 
@@ -2785,16 +2801,18 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
         expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('block');
       });
       const pauseInfo = document.getElementById('export-pauses-info') as HTMLElement;
-      expect(pauseInfo.textContent).toBe(
-        'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.',
-      );
-      // The MP3/Audacity affordances render normally alongside the disclosure.
+      expect(pauseInfo.textContent).toContain('600 ms between speakers');
+      expect(pauseInfo.textContent).toContain('300 ms same speaker');
+      expect(pauseInfo.textContent).toContain('2 span overrides');
+      // The backend pauses_message is appended to the resolved-value line.
+      expect(pauseInfo.textContent).toContain('resolved speaker pauses');
+      // The MP3/Audacity affordances render normally alongside the pause surface.
       expect((document.getElementById('export-mp3-link') as HTMLElement).style.display).toBe('inline-block');
       expect((document.getElementById('export-m4b-info') as HTMLElement).style.display).toBe('none');
     });
 
-    it('shows the frontend default pause disclosure copy when pauses_applied:false and the response carries no pauses_message', async () => {
-      fetchSpy.mockResolvedValue(okExportPauseNoMessage);
+    it('shows the resolved-value fallback line when pauses_state:applied but the response carries no pauses_message', async () => {
+      fetchSpy.mockResolvedValue(okExportPausesAppliedNoMessage);
       initEditor();
       document.dispatchEvent(new Event('DOMContentLoaded'));
 
@@ -2804,13 +2822,14 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
       await vi.waitFor(() => {
         expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('block');
       });
-      expect((document.getElementById('export-pauses-info') as HTMLElement).textContent).toBe(
-        'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.',
-      );
+      const pauseInfo = document.getElementById('export-pauses-info') as HTMLElement;
+      expect(pauseInfo.textContent).toContain('Pauses applied: 500 ms between speakers');
+      expect(pauseInfo.textContent).toContain('250 ms same speaker');
+      expect(pauseInfo.textContent).toContain('1 span override');
     });
 
-    it('shows no pause disclosure when pauses_applied:true (a future engine that inserts silence)', async () => {
-      fetchSpy.mockResolvedValue(okExportPausesApplied);
+    it('surfaces the bounded pauses_error when pauses_state:failed — assembly unavailable', async () => {
+      fetchSpy.mockResolvedValue(okExportPauseFailed);
       initEditor();
       document.dispatchEvent(new Event('DOMContentLoaded'));
 
@@ -2818,9 +2837,11 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
         .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
 
       await vi.waitFor(() => {
-        expect((document.getElementById('export-mp3-link') as HTMLElement).style.display).toBe('inline-block');
+        expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('block');
       });
-      expect((document.getElementById('export-pauses-info') as HTMLElement).style.display).toBe('none');
+      const pauseInfo = document.getElementById('export-pauses-info') as HTMLElement;
+      expect(pauseInfo.textContent).toContain('Pause assembly unavailable:');
+      expect(pauseInfo.textContent).toContain('without inserted pauses');
     });
 
     it('shows no pause disclosure when the response omits pauses_applied (undefined — not === false)', async () => {
@@ -2878,8 +2899,104 @@ describe('Editor Tab — Export Capabilities MP3/Audacity (Plan F, Phase 5)', ()
 });
 
 // ---------------------------------------------------------------------------
-// Editor Tab — Single-Speaker Toggle (Plan J, Phase 2)
+// Editor Tab — Per-Span Pause Override (Plan L, Phase 5)
 // ---------------------------------------------------------------------------
+// Each span row exposes a bounded number input (0..10000 ms). The change
+// handler persists via PUT /api/pipeline/span/{id}/pause_after, mapping
+// blank → null (clear override → resolve the applicable default) and explicit
+// 0 → intentional no-gap. The value is enriched on load via GET.
+
+describe('Editor Tab — Per-Span Pause Override (Plan L, Phase 5)', () => {
+  const rawWithIds = [
+    { id: 'span-1', speaker: 'Narrator', text: 'Once upon a time', instruct: 'calm' },
+    { id: 'span-2', speaker: 'Lizzy', text: 'Indeed', instruct: 'brisk' },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(API.get).mockReset();
+    vi.mocked(API.put).mockReset();
+    state.pipelineBookId = 'book-123';
+    document.body.innerHTML = `<div id="spans-table-body"></div><div id="full-progress-bar"></div>`;
+  });
+
+  afterEach(() => {
+    state.pipelineBookId = null;
+  });
+
+  it('GET /span/{id}/pause_after returns the persisted pause override', async () => {
+    vi.mocked(API.get).mockResolvedValue({ pause_after_ms: 800 });
+    const res = await pipelineGetSpanPause('span-1');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/span/span-1/pause_after');
+    expect(res.pause_after_ms).toBe(800);
+  });
+
+  it('PUT /span/{id}/pause_after persists a positive pause override', async () => {
+    vi.mocked(API.put).mockResolvedValue({ status: 'ok' });
+    await pipelineSetSpanPause('span-1', 800);
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/span/span-1/pause_after', { pause_after_ms: 800 });
+  });
+
+  it('PUT /span/{id}/pause_after with null clears the override (resolve default)', async () => {
+    vi.mocked(API.put).mockResolvedValue({ status: 'ok' });
+    await pipelineSetSpanPause('span-1', null);
+    expect(API.put).toHaveBeenCalledWith('/api/pipeline/span/span-1/pause_after', { pause_after_ms: null });
+  });
+
+  it('enriches each span pause on load — unset spans render an empty (default) input', async () => {
+    vi.mocked(API.get).mockResolvedValue(rawWithIds); // export + enrichment GETs both resolve to raw
+    await loadSpans();
+    const input = document.querySelector<HTMLInputElement>('.span-pause[data-span-id="span-1"]');
+    expect(input).toBeTruthy();
+    // Unset → empty value + placeholder 'default' (never '0', which is no-gap).
+    expect(input!.value).toBe('');
+    expect(input!.placeholder).toBe('default');
+  });
+
+  it('persists a committed positive value via PUT and mirrors it into the cache', async () => {
+    vi.mocked(API.get).mockResolvedValue(rawWithIds);
+    document.dispatchEvent(new Event('DOMContentLoaded')); // wire spansTableBody change listener
+    await loadSpans();
+    const input = document.querySelector<HTMLInputElement>('.span-pause[data-span-id="span-1"]')!;
+    input.value = '800';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(API.put).toHaveBeenCalledWith('/api/pipeline/span/span-1/pause_after', { pause_after_ms: 800 });
+    });
+    // The handler mirrors the value into the cache AFTER the PUT resolves.
+    await vi.waitFor(() => {
+      expect(getCachedSpans().find(s => s.global_index === 1)?.pause_after_ms).toBe(800);
+    });
+  });
+
+  it('persists null (resolve default) when the committed input is blank — 0 is never conflated with empty', async () => {
+    vi.mocked(API.get).mockResolvedValue(rawWithIds);
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    await loadSpans();
+    const input = document.querySelector<HTMLInputElement>('.span-pause[data-span-id="span-1"]')!;
+    input.value = '';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(API.put).toHaveBeenCalledWith('/api/pipeline/span/span-1/pause_after', { pause_after_ms: null });
+    });
+  });
+
+  it('rejects an out-of-bounds value client-side — no PUT is issued and the input reverts', async () => {
+    vi.mocked(API.get).mockResolvedValue(rawWithIds);
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    await loadSpans();
+    const input = document.querySelector<HTMLInputElement>('.span-pause[data-span-id="span-1"]')!;
+    input.value = '15000';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => {
+      // Reverted to the cached value (empty = unset) after the rejection.
+      expect(input.value).toBe('');
+    });
+    expect(API.put).not.toHaveBeenCalled();
+  });
+});
+
+
 // The toggle is a UI write of book.single_speaker (CONTRACTS decision #9):
 // enforcement happens ONLY at the render boundary (tts_integration
 // _enforce_single_speaker); the script stays faithful. The toggle must write

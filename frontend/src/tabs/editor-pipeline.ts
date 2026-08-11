@@ -44,6 +44,10 @@ export interface PipelineSpan {
   speaker: string;
   text: string;
   instruct: string;
+  /** Per-span pause-after override (Plan L). null/undefined = unset → resolve
+   * the applicable default; 0 = intentional no-gap. Persisted via
+   * PUT /api/pipeline/span/{id}/pause_after. */
+  pause_after_ms?: number | null;
 }
 
 /** A confidence review item from the pipeline */
@@ -85,6 +89,18 @@ export interface RenderStatus {
   total_chunks?: number;
   completed_chunks?: number;
   failed_chunks?: number;
+  /**
+   * Plan L (P2-S3): resolved effective pause pair for the book (book override
+   * -> config default -> 500/250 built-in fallback) plus the number of
+   * per-span pause_after_ms overrides present, and the tri-state lifecycle of
+   * pause assembly ('pending' until Phase 3 wires the postprocessor).
+   */
+  resolved_pause_between_speakers_ms?: number;
+  resolved_pause_same_speaker_ms?: number;
+  pause_override_count?: number;
+  pauses_applied?: boolean;
+  pauses_state?: 'pending' | 'applied' | 'failed';
+  pauses_error?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +232,24 @@ export async function pipelineGetSingleSpeaker(bookId: string): Promise<boolean>
 /** PUT /api/pipeline/book/{bookId}/single_speaker — persist the flag. */
 export async function pipelineSetSingleSpeaker(bookId: string, enabled: boolean): Promise<void> {
   await API.put(`/api/pipeline/book/${bookId}/single_speaker`, { single_speaker: enabled });
+}
+
+/**
+ * GET /api/pipeline/span/{spanId}/pause_after — the span's per-span pause
+ * override. ``pause_after_ms`` is null when the span is unset (resolve the
+ * applicable default), 0 = intentional no-gap, else a positive ms value.
+ */
+export async function pipelineGetSpanPause(spanId: string): Promise<{ pause_after_ms: number | null }> {
+  return API.get<{ pause_after_ms: number | null }>(`/api/pipeline/span/${spanId}/pause_after`);
+}
+
+/**
+ * PUT /api/pipeline/span/{spanId}/pause_after — persist the per-span pause
+ * override. ``null`` clears the override (resolve default); ``0`` is an
+ * intentional no-gap. Bounded 0..10000 by the backend validate_pause_ms.
+ */
+export async function pipelineSetSpanPause(spanId: string, pauseAfterMs: number | null): Promise<void> {
+  await API.put(`/api/pipeline/span/${spanId}/pause_after`, { pause_after_ms: pauseAfterMs });
 }
 
 /**
@@ -364,23 +398,26 @@ export interface M4bExportResult {
   audacity_path: string | null;
   message?: string;
   /**
-   * Plan K: false when the pause values are recorded/carried to the engine but
-   * the engine does not insert audible silence into the merged audio (honest
-   * disclosure — the backend sends pauses_applied:false + pauses_message on
-   * every success). Absent/undefined on older responses ⇒ no disclosure shown.
+   * Truthful pause tri-state (Plan L, P4-S2): true iff the canonical paused
+   * artifact (audiobook-paused.wav) was the export source. false with
+   * pauses_state 'failed' when assembly was unavailable and the unpaused
+   * per-chunk concat was exported instead. Absent/undefined on older
+   * responses.
    */
   pauses_applied?: boolean;
-  /** Honest limitation copy carried from the backend (_PAUSES_MESSAGE). */
+  /** Concise message carried only when pauses_applied === true (the paused
+   * artifact was used). Absent on the failed fallback. */
   pauses_message?: string;
+  /** Plan L (P2-S3): resolved pause pair + override count + tri-state. */
+  resolved_pause_between_speakers_ms?: number;
+  resolved_pause_same_speaker_ms?: number;
+  pause_override_count?: number;
+  /** 'pending' = assembly not yet run; 'applied' = paused artifact used;
+   * 'failed' = assembly unavailable (see pauses_error). */
+  pauses_state?: 'pending' | 'applied' | 'failed';
+  /** Bounded failure detail when pauses_state === 'failed' (no fs paths). */
+  pauses_error?: string | null;
 }
-
-/**
- * Plan K frontend default for the pause capability disclosure when the export
- * response reports pauses_applied:false but omits pauses_message (mirrors the
- * backend _PAUSES_MESSAGE copy in api_export.py).
- */
-const PAUSES_DISCLOSURE_MESSAGE =
-  'Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio.';
 
 /** Form values for the Export M4B form (5 metadata fields + optional cover). */
 export interface ExportM4bPayload {
@@ -428,6 +465,9 @@ export async function pipelineExportM4b(payload: ExportM4bPayload): Promise<M4bE
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
+
+/** Pause bound (mirror of the backend validate_pause_ms / PAUSE_MAX_MS=10_000). */
+export const PAUSE_MAX_MS = 10000;
 
 /** Cached pipeline spans for the current book */
 let _cachedSpans: PipelineSpan[] = [];
@@ -509,6 +549,19 @@ export async function loadSpans(): Promise<void> {
   try {
     const raw = await pipelineExportSpans();
     const spans = toPipelineSpans(raw);
+    // Enrich each span with its per-span pause override (P5-S2) so the Pause
+    // column shows the persisted value (null → 'default' placeholder). Fetched
+    // in parallel via GET /api/pipeline/span/{id}/pause_after; a read failure
+    // leaves the span unset (treats as default) rather than blocking the table.
+    await Promise.all(spans.map(async (span) => {
+      if (!span.id) return;
+      try {
+        const { pause_after_ms } = await pipelineGetSpanPause(span.id);
+        span.pause_after_ms = pause_after_ms;
+      } catch {
+        span.pause_after_ms = null;
+      }
+    }));
     _cachedSpans = spans;
     // The cache was replaced — any undo entry references a stale span set
     // (book switch / tab re-load / snapshot load); clear it (Plan J, Phase 3).
@@ -557,6 +610,9 @@ export function renderSpanRow(span: PipelineSpan): string {
       </td>
       <td><span class="fw-bold">${escapeHtml(span.speaker)}</span></td>
       <td><div class="span-text" contenteditable="true" data-span-id="${escapeHtml(span.id)}" data-index="${span.global_index}" title="Click to edit span text" style="min-width: 200px; padding: 4px 8px; border: 1px solid transparent; border-radius: 4px; cursor: text;">${escapeHtml(span.text)}</div></td>
+      <td>
+        <input type="number" class="form-control form-control-sm span-pause" data-span-id="${escapeHtml(span.id)}" data-index="${span.global_index}" min="0" max="${PAUSE_MAX_MS}" step="1" placeholder="default" title="Pause after this span, in ms. Blank = use the resolved default; 0 = no pause. 0-10000 ms." value="${span.pause_after_ms != null ? span.pause_after_ms : ''}">
+      </td>
       <td><div class="span-instruct text-muted small">${escapeHtml(span.instruct)}</div></td>
       <td class="text-center align-middle">
         <div class="btn-group btn-group-sm" role="group">
@@ -988,6 +1044,13 @@ function resetRenderProgress(): void {
     badge.style.display = 'none';
     badge.innerText = '';
   }
+  // Clear the resolved-pause/assembly surface so stale values never outlive a
+  // render (P5-S3).
+  const pauseInfo = document.getElementById('render-pause-info');
+  if (pauseInfo) {
+    pauseInfo.style.display = 'none';
+    pauseInfo.textContent = '';
+  }
 }
 
 /**
@@ -1004,6 +1067,25 @@ function resetRenderProgress(): void {
 function updateRenderProgress(status: RenderStatus): void {
   const bar = document.getElementById('full-progress-bar');
   const badge = document.getElementById('render-failures-badge');
+
+  // Resolved-pause / pause-assembly surface (P5-S3): show the effective pause
+  // values + override count + tri-state whenever the render_status payload
+  // carries them; hide otherwise. The backend reports 'pending' until M4B
+  // export runs assembly, so this confirms the values that will be inserted.
+  const pauseInfo = document.getElementById('render-pause-info');
+  if (pauseInfo && (status.resolved_pause_between_speakers_ms != null || status.pause_override_count != null || status.pauses_state)) {
+    const between = status.resolved_pause_between_speakers_ms ?? 500;
+    const same = status.resolved_pause_same_speaker_ms ?? 250;
+    const overrides = status.pause_override_count ?? 0;
+    pauseInfo.textContent =
+      `Resolved pauses: ${between} ms between speakers · ${same} ms same speaker · ` +
+      `${overrides} span override${overrides === 1 ? '' : 's'}. ` +
+      `Assembly: ${status.pauses_state ?? 'pending'}.`;
+    pauseInfo.style.display = 'block';
+  } else if (pauseInfo) {
+    pauseInfo.style.display = 'none';
+    pauseInfo.textContent = '';
+  }
 
   if (status.mode === 'individual' && status.total_chunks && status.total_chunks > 0) {
     const completed = status.completed_chunks ?? 0;
@@ -1414,13 +1496,30 @@ function renderExportCapabilities(result: M4bExportResult, jobId: string): void 
       infoAlert.style.display = 'none';
     }
   }
-  // Plan K: pause capability disclosure (distinct from the M4B-only degrade
-  // message). Shown only when the backend reports pauses_applied === false;
-  // absent (undefined) or true ⇒ no disclosure, no breakage.
+  // Plan L: truthful pause-assembly tri-state (distinct from the M4B-only
+  // degrade message). 'applied' → the canonical paused artifact was used; show
+  // the resolved values + override count (+ pauses_message when the backend
+  // carries it). 'failed' → bounded pauses_error (assembly unavailable; the
+  // unpaused concat was exported). Absent (undefined) → no pause surface, no
+  // breakage.
   const pauseInfo = document.getElementById('export-pauses-info');
   if (pauseInfo) {
-    if (result.pauses_applied === false) {
-      pauseInfo.textContent = result.pauses_message || PAUSES_DISCLOSURE_MESSAGE;
+    const applied = result.pauses_state === 'applied' || result.pauses_applied === true;
+    if (applied) {
+      const between = result.resolved_pause_between_speakers_ms ?? 500;
+      const same = result.resolved_pause_same_speaker_ms ?? 250;
+      const overrides = result.pause_override_count ?? 0;
+      const base =
+        `Pauses applied: ${between} ms between speakers · ${same} ms same speaker · ` +
+        `${overrides} span override${overrides === 1 ? '' : 's'}.`;
+      pauseInfo.textContent = result.pauses_message
+        ? `${base} ${result.pauses_message}`
+        : base;
+      pauseInfo.style.display = 'block';
+    } else if (result.pauses_state === 'failed') {
+      pauseInfo.textContent = `Pause assembly unavailable: ${
+        result.pauses_error ?? 'exported the concatenated source audio without inserted pauses.'
+      }`;
       pauseInfo.style.display = 'block';
     } else {
       pauseInfo.textContent = '';
@@ -1446,8 +1545,8 @@ function resetExportCapabilities(): void {
     audacity.style.display = 'none';
     audacity.href = '';
   }
-  // Plan K: clear + hide the pause capability disclosure so a stale limitation
-  // message from a previous export cannot outlive its job.
+  // Plan L: clear + hide the pause-assembly tri-state surface so a stale
+  // result from a previous export cannot outlive its job.
   const pauseInfo = document.getElementById('export-pauses-info');
   if (pauseInfo) {
     pauseInfo.textContent = '';

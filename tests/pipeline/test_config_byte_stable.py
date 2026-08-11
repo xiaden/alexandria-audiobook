@@ -189,6 +189,90 @@ def test_known_keys_still_validated(client):
     assert r.status_code == 422, r.text
 
 
+# -- P2-S1: pause defaults round-trip byte-stable + validation bounds -----------
+
+
+def test_pause_defaults_round_trip_byte_stable(client, tmp_path):
+    """Custom pause defaults POSTed round-trip via GET and land on disk byte-stable.
+
+    The two global pause defaults are known TTSConfig fields (validated by
+    ``validate_pause_ms``), so a save materialises them and a subsequent GET
+    returns the persisted values while unknown keys stay untouched.
+    """
+    body = {
+        **_KNOWN_OK,
+        "tts": {
+            **_KNOWN_OK["tts"],
+            "pause_between_speakers_ms": 900,
+            "pause_same_speaker_ms": 400,
+        },
+        **_UNKNOWN,
+    }
+    r = client.post("/api/config", json=body)
+    assert r.status_code == 200, r.text
+
+    data = client.get("/api/config").json()
+    assert data["tts"]["pause_between_speakers_ms"] == 900
+    assert data["tts"]["pause_same_speaker_ms"] == 400
+
+    on_disk = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert on_disk["tts"]["pause_between_speakers_ms"] == 900
+    assert on_disk["tts"]["pause_same_speaker_ms"] == 400
+    # Unknown sections survive alongside the pause defaults.
+    assert on_disk["generation"] == _UNKNOWN["generation"]
+
+
+def test_pause_zero_config_round_trips():
+    """An explicit 0 default (intentional no-gap) is preserved, not coerced."""
+    from app.pipeline.tts_integration import validate_pause_ms
+
+    # 0 is a valid pause (intentional no-gap) and survives the validator.
+    assert validate_pause_ms(0) == 0
+
+
+def test_pause_config_out_of_bounds_422(client):
+    """A pause default above PAUSE_MAX_MS is rejected with 422 (stable)."""
+    from app.pipeline.tts_integration import PAUSE_MAX_MS
+
+    bad = {
+        **_KNOWN_OK,
+        "tts": {**_KNOWN_OK["tts"], "pause_between_speakers_ms": PAUSE_MAX_MS + 1},
+    }
+    r = client.post("/api/config", json=bad)
+    assert r.status_code == 422, r.text
+
+
+def test_pause_config_non_int_422(client):
+    """Non-integer pause defaults are rejected with 422 (boolean, string)."""
+    for bad_value in (True, "abc", 1.5, -1):
+        bad = {
+            **_KNOWN_OK,
+            "tts": {**_KNOWN_OK["tts"], "pause_same_speaker_ms": bad_value},
+        }
+        r = client.post("/api/config", json=bad)
+        assert r.status_code == 422, (bad_value, r.status_code)
+
+
+def test_pause_config_zero_materialised_in_get(client, tmp_path):
+    """An explicit 0 on disk is read back as 0 (not coerced to a default)."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "llm": {"base_url": "http://localhost:11434/v1", "api_key": "local", "model_name": "m"},
+                "tts": {
+                    "mode": "local",
+                    "pause_between_speakers_ms": 0,
+                    "pause_same_speaker_ms": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    data = client.get("/api/config").json()
+    assert data["tts"]["pause_between_speakers_ms"] == 0
+    assert data["tts"]["pause_same_speaker_ms"] == 0
+
+
 # -- P1-S1: schema_version stamp -----------------------------------------------
 
 

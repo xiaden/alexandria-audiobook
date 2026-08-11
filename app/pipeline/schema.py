@@ -292,6 +292,52 @@ def _ensure_book_single_speaker_column(connection: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_book_pause_columns(connection: sqlite3.Connection) -> None:
+    """Add nullable book-level pause override columns if they do not exist.
+
+    Plan L pause contract — nullable project/book override columns
+    ``pause_between_speakers_ms INTEGER NULL`` and
+    ``pause_same_speaker_ms INTEGER NULL`` on the ``book`` table (the
+    project/book carrier, mirroring the ``book.single_speaker`` guarded
+    ALTER pattern).  ``NULL`` means "resolve the applicable default";
+    ``0`` is an intentional no-gap override.  Existing rows migrate with
+    ``NULL`` (no override) — nothing is silently coerced to 0.  Guarded via
+    ``PRAGMA table_info`` so ``create_schema`` stays idempotent.
+    """
+    cols = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(book)").fetchall()
+    }
+    for col, ddl in (
+        ("pause_between_speakers_ms", "pause_between_speakers_ms INTEGER NULL"),
+        ("pause_same_speaker_ms", "pause_same_speaker_ms INTEGER NULL"),
+    ):
+        if col not in cols:
+            connection.execute(f"ALTER TABLE book ADD COLUMN {ddl}")
+
+
+def _ensure_span_pause_column(connection: sqlite3.Connection) -> None:
+    """Add nullable ``span.pause_after_ms`` with a CHECK if it does not exist.
+
+    Plan L pause contract — nullable per-span override column
+    ``pause_after_ms INTEGER NULL`` with ``CHECK (pause_after_ms IS NULL OR
+    pause_after_ms >= 0)``.  ``NULL`` means "resolve the applicable default";
+    ``0`` is an intentional no-gap override.  SQLite supports ``ALTER TABLE
+    ADD COLUMN`` with a CHECK constraint (verified against 3.46.1); existing
+    rows migrate with ``NULL``.  Guarded via ``PRAGMA table_info`` so
+    ``create_schema`` stays idempotent.
+    """
+    cols = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(span)").fetchall()
+    }
+    if "pause_after_ms" not in cols:
+        connection.execute(
+            "ALTER TABLE span ADD COLUMN pause_after_ms INTEGER NULL"
+            " CHECK (pause_after_ms IS NULL OR pause_after_ms >= 0)"
+        )
+
+
 def create_schema(connection: sqlite3.Connection) -> None:
     """Create all pipeline tables and views on *connection*.
 
@@ -307,3 +353,5 @@ def create_schema(connection: sqlite3.Connection) -> None:
         + _UNIVERSAL_UPGRADE_DDL
     )
     _ensure_book_single_speaker_column(connection)
+    _ensure_book_pause_columns(connection)
+    _ensure_span_pause_column(connection)

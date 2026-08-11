@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
 from typing import Callable
+
+from pydub import AudioSegment
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.assembly import export_annotated_script
@@ -59,6 +62,111 @@ BATCH_SEED_RANDOM: int = -1
 #: #5) — only the global pair exists here.
 PAUSE_BETWEEN_SPEAKERS_MS: int = 500
 PAUSE_SAME_SPEAKER_MS: int = 250
+
+#: Documented maximum acceptable pause value in milliseconds (Plan L).
+#: Pauses are bounded non-negative integers; ``10_000`` ms (10 s) is the
+#: documented ceiling, shared by config, project/book override, and per-span
+#: edit validation (``validate_pause_ms``) and by the render resolver
+#: (``resolve_effective_pauses``).  No unbounded values are accepted.
+PAUSE_MAX_MS: int = 10_000
+
+#: Canonical filename of the deterministic render-time paused artifact (Plan L
+#: P3-S4).  This is the whole-book WAV produced by ``combine_audio_with_pauses``
+#: during ``render_audiobook``, after all per-span TTS WAVs are durably written.
+#: Phase 4 export surfaces (M4B/MP3/Audacity/whole-book audio) consume this file.
+PAUSED_ARTIFACT_NAME: str = "audiobook-paused.wav"
+
+
+def validate_pause_ms(value: object) -> int:
+    """Validate and return a pause value as a bounded integer millisecond count.
+
+    Plan L pause contract — a pause is a non-negative integer in
+    ``[0, PAUSE_MAX_MS]`` (``10_000`` ms).  ``0`` is an intentional no-gap
+    override, distinct from ``NULL``/missing which means "resolve the
+    applicable default"; it is never coerced.  Rejects negative, fractional,
+    boolean, NaN/±infinity, string, and above-maximum values with
+    ``ValueError``.
+
+    This is the single shared source of truth for the pause bound: the
+    ``TTSConfig`` field validators in app.py (config saves → 422), the
+    project/book override and per-span edit endpoints (Plan L Phase 2 → 422),
+    and the render resolver all call it, so a bound change is one constant
+    plus one function.
+    """
+    if isinstance(value, bool):
+        raise ValueError("pause must be an integer, not a boolean")
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("pause must be a finite integer, not NaN/infinity")
+        truncated = int(value)
+        if truncated != value:
+            raise ValueError("pause must be an integer (no fractional milliseconds)")
+        value = truncated
+    if not isinstance(value, int):
+        raise ValueError("pause must be an integer millisecond value")
+    if value < 0:
+        raise ValueError("pause must be non-negative")
+    if value > PAUSE_MAX_MS:
+        raise ValueError(f"pause exceeds the maximum of {PAUSE_MAX_MS} ms")
+    return value
+
+
+def _resolve_pause_field(
+    *tiers: dict | None,
+    key: str,
+    fallback: int,
+) -> int:
+    """First non-``None`` *key* across *tiers*, else *fallback* (per field).
+
+    Walk the precedence tiers in order; the first tier that carries the key
+    with a non-``None`` value wins.  ``0`` is honored (a non-``None`` value).
+    ``None``/missing at a higher tier means "resolve the next tier".  The
+    winning value is validated via ``validate_pause_ms``.
+    """
+    for tier in tiers:
+        if tier is None:
+            continue
+        value = tier.get(key)
+        if value is None:
+            continue
+        return validate_pause_ms(value)
+    return fallback
+
+
+def resolve_effective_pauses(
+    *,
+    request_overrides: dict | None = None,
+    book_overrides: dict | None = None,
+    config_defaults: dict | None = None,
+) -> tuple[int, int]:
+    """Resolve the effective pause pair by documented precedence (Plan L).
+
+    Per field, precedence is: render-request override → project/book override
+    → persisted config default → ``PAUSE_BETWEEN_SPEAKERS_MS`` /
+    ``PAUSE_SAME_SPEAKER_MS`` fallback.  A ``NULL``/missing value at a higher
+    tier means "resolve the next tier"; ``0`` is an intentional no-gap
+    override and is honored (never coerced to the fallback).
+
+    Each tier is a dict with optional ``pause_between_speakers_ms`` /
+    ``pause_same_speaker_ms`` keys (``None`` or missing → fall through).
+    Returns the resolved ``(between, same)`` pair, each validated via
+    ``validate_pause_ms`` so no unbounded value can reach the renderer.
+    """
+    between = _resolve_pause_field(
+        request_overrides,
+        book_overrides,
+        config_defaults,
+        key="pause_between_speakers_ms",
+        fallback=PAUSE_BETWEEN_SPEAKERS_MS,
+    )
+    same = _resolve_pause_field(
+        request_overrides,
+        book_overrides,
+        config_defaults,
+        key="pause_same_speaker_ms",
+        fallback=PAUSE_SAME_SPEAKER_MS,
+    )
+    return between, same
 
 
 # ---------------------------------------------------------------------------
@@ -402,18 +510,21 @@ def _finalize_job(
     *,
     error: str | None = None,
     resolved_dir: str | None = None,
+    paused_artifact_path: str | None = None,
 ) -> None:
     """Write the final ``render_job`` transition inside a single transaction.
 
-    ``completed`` also records ``output_dir`` and ``output_artifact_path``
-    (the ``audiobook.m4b`` path when present, otherwise the output dir).
-    ``failed`` records the error; ``cancelled`` transitions status only.
-    Always stamps ``finished_ms``.
+    ``completed`` also records ``output_dir`` and ``output_artifact_path``.
+    The artifact priority is: the canonical paused artifact (when present and
+    committed) → ``audiobook.m4b`` → the output dir.  ``failed`` records the
+    error; ``cancelled`` transitions status only.  Always stamps ``finished_ms``.
     """
     with storage.transaction():
         if status == "completed":
             artifact_path = resolved_dir
-            if resolved_dir:
+            if paused_artifact_path and os.path.isfile(paused_artifact_path):
+                artifact_path = paused_artifact_path
+            elif resolved_dir:
                 m4b_path = os.path.join(resolved_dir, "audiobook.m4b")
                 if os.path.isfile(m4b_path):
                     artifact_path = m4b_path
@@ -503,6 +614,26 @@ def _batch_output_paths(resolved_dir: str) -> list[str]:
     return paths
 
 
+def _ordered_batch_paths(resolved_dir: str, script: list[dict]) -> list[str]:
+    """Return batch output paths ordered to match the render-time script.
+
+    Batch mode has no per-chunk rows, so the produced ``temp_batch_<idx>.wav``
+    files must be re-aligned to the in-memory script's order.  The chunk index
+    in the filename equals the script position (``_build_chunks`` assigns
+    ``index = enumerate(script)``), so position *i* of the script maps to
+    ``temp_batch_<i>.wav``.  Lexicographic sorting breaks past 9 chunks
+    (``temp_batch_10`` before ``temp_batch_2``), so we order by the numeric
+    chunk index.  A chunk whose file is missing (partial batch failure) is
+    dropped — the assembly length check then fails non-fatally.
+    """
+    by_index: dict[int, str] = {}
+    for name in os.listdir(resolved_dir):
+        match = re.fullmatch(r"temp_batch_(\d+)\.wav", name)
+        if match:
+            by_index[int(match.group(1))] = os.path.join(resolved_dir, name)
+    return [by_index[i] for i in range(len(script)) if i in by_index]
+
+
 def _write_manifest(
     resolved_dir: str,
     *,
@@ -511,12 +642,18 @@ def _write_manifest(
     mode: str,
     chunk_paths: list[str],
     status: str,
+    paused_artifact: str | None = None,
 ) -> None:
     """Atomically write ``manifest.json`` into the run dir (derived cache).
 
     The manifest is **derived** — ``render_job`` / ``render_chunk`` rows
     remain the authority.  Chunk ``wav_path`` entries are stored relative to
     the run dir (portable across relocations); the rows carry absolute paths.
+
+    When *paused_artifact* (the canonical whole-book paused WAV) is provided it
+    is recorded as a relative ``paused_artifact`` entry.  It is only written
+    after the artifact has been atomically committed, so its presence in the
+    manifest is proof the canonical artifact exists.
 
     Write is crash-safe: tmp file → ``fsync`` → ``os.replace`` → fsync parent.
     """
@@ -532,6 +669,8 @@ def _write_manifest(
         "status": status,
         "created_ms": _now_ms(),
     }
+    if paused_artifact:
+        manifest["paused_artifact"] = os.path.relpath(paused_artifact, resolved_dir)
     manifest_path = os.path.join(resolved_dir, "manifest.json")
     tmp_path = f"{manifest_path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -551,6 +690,7 @@ def _write_manifest_best_effort(
     mode: str,
     chunk_paths: list[str],
     status: str,
+    paused_artifact: str | None = None,
 ) -> None:
     """Write the derived manifest without failing the render on cache errors.
 
@@ -565,9 +705,155 @@ def _write_manifest_best_effort(
             mode=mode,
             chunk_paths=chunk_paths,
             status=status,
+            paused_artifact=paused_artifact,
         )
     except Exception as exc:  # noqa: BLE001 — derived cache; see docstring
         print(f"warning: failed to write manifest for {job_id}: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# P3: Deterministic render-time paused assembly
+# ---------------------------------------------------------------------------
+
+
+def _reject_unsafe_assembly_paths(
+    wav_paths: list[str],
+    run_dir: str,
+) -> None:
+    """Reject missing / non-WAV / out-of-run-dir paths **before** any loading.
+
+    Defensive validation (Plan L P3-S2): every input path must resolve to a
+    real file *inside* the run dir.  Absolute paths outside the run dir, path
+    traversal (``..``), symlink escapes, missing files, and non-``.wav``
+    inputs are all rejected up front so we never hand a hostile path to
+    ``AudioSegment.from_wav``.
+    """
+    run_real = os.path.realpath(run_dir)
+    for path in wav_paths:
+        if not isinstance(path, str) or not path:
+            raise ValueError("paused assembly: empty or non-string WAV path")
+        if not path.endswith(".wav"):
+            raise ValueError(f"paused assembly: not a .wav path: {path!r}")
+        real = os.path.realpath(path)
+        # Must live strictly inside the run dir (traversal / absolute-out-of-run
+        # both fail this containment check).
+        if not (real == run_real or real.startswith(run_real + os.sep)):
+            raise ValueError(f"paused assembly: path outside run dir: {path!r}")
+        if not os.path.isfile(real):
+            raise ValueError(f"paused assembly: missing WAV file: {path!r}")
+
+
+def _assemble_paused_artifact(
+    wav_paths: list[str],
+    script: list[dict],
+    *,
+    pause_between_speakers_ms: int,
+    pause_same_speaker_ms: int,
+    span_pause_after_ms: dict[str, int | None],
+    run_dir: str,
+    output_path: str,
+) -> None:
+    """Deterministic post-render assembly of the canonical paused artifact.
+
+    Receives the ordered per-span WAV paths plus the ordered in-memory
+    ``script`` (each entry carries the span ``id`` and ``speaker``) so the
+    speaker order is taken from the render-time script — NOT from filenames or
+    the manifest.  Loads each WAV via ``pydub.AudioSegment.from_wav``, validates
+    they share a frame rate / channels / sample width, resolves nullable
+    per-span pause overrides (``None`` → default logic, ``0`` → explicit
+    no-gap, positive → explicit override), and calls the existing immutable
+    ``combine_audio_with_pauses`` helper.
+
+    The ``pause_overrides`` list is aligned with the segments: entry *i* is the
+    pause inserted after segment *i* (the helper ignores the final entry).  A
+    per-span override is ``None`` when the span resolves its default (speaker
+    change → *pause_between_speakers_ms*, same speaker → *pause_same_speaker_ms*);
+    ``0`` inserts a true zero-gap; a positive value inserts that exact pause.
+
+    The combined segment is exported preserving the source format, written to a
+    temp sibling, ``fsync``-ed, atomically renamed over *output_path* (same run
+    dir), and the parent dir is fsync-ed.  Temp files are removed on **every**
+    error path via ``finally``.
+    """
+    if len(wav_paths) != len(script):
+        raise ValueError(
+            "paused assembly: WAV path count does not match script "
+            f"({len(wav_paths)} != {len(script)})"
+        )
+    _reject_unsafe_assembly_paths(wav_paths, run_dir)
+
+    segments = [AudioSegment.from_wav(path) for path in wav_paths]
+    ref_frame_rate = segments[0].frame_rate
+    ref_channels = segments[0].channels
+    ref_sample_width = segments[0].sample_width
+    for segment in segments[1:]:
+        if (
+            segment.frame_rate != ref_frame_rate
+            or segment.channels != ref_channels
+            or segment.sample_width != ref_sample_width
+        ):
+            raise ValueError(
+                "paused assembly: source WAVs differ in format "
+                f"({ref_frame_rate}/{ref_channels}/{ref_sample_width} vs "
+                f"{segment.frame_rate}/{segment.channels}/{segment.sample_width})"
+            )
+
+    # Speaker order and per-span overrides come from the in-memory script.
+    from app.tts import combine_audio_with_pauses  # local import: app.tts chain
+
+    speakers = [entry["speaker"] for entry in script]
+    pause_overrides = [
+        span_pause_after_ms.get(entry["id"]) for entry in script
+    ]
+    combined = combine_audio_with_pauses(
+        segments,
+        speakers,
+        pause_ms=pause_between_speakers_ms,
+        same_speaker_pause_ms=pause_same_speaker_ms,
+        pause_overrides=pause_overrides,
+    )
+
+    # Preserve the source format explicitly (the helper's silent() gaps default
+    # to 11025 Hz and _sync() would otherwise bump low-rate sources up).
+    combined = (
+        combined.set_frame_rate(ref_frame_rate)
+        .set_channels(ref_channels)
+        .set_sample_width(ref_sample_width)
+    )
+
+    tmp_path = f"{output_path}.tmp"
+    try:
+        combined.export(tmp_path, format="wav")
+        _fsync_file(tmp_path)
+        os.replace(tmp_path, output_path)
+        _fsync_dir(run_dir)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:  # best-effort cleanup
+                pass
+
+
+def _span_pause_overrides(
+    storage: PipelineStorage, script: list[dict]
+) -> dict[str, int | None]:
+    """Load each span's raw ``pause_after_ms`` keyed by span id (P3-S1).
+
+    Only the spans referenced by *script* are queried.  A missing span or a
+    ``NULL`` value maps to ``None`` (resolve default); ``0`` is kept as an
+    explicit no-gap.  Values are read straight from the row (already bounded by
+    ``validate_pause_ms`` at the write boundary / schema CHECK).
+    """
+    if not script:
+        return {}
+    ids = tuple(entry["id"] for entry in script)
+    placeholders = ",".join("?" * len(ids))
+    rows = storage.execute_query(
+        f"SELECT id, pause_after_ms FROM span WHERE id IN ({placeholders})",
+        ids,
+    )
+    return {row["id"]: row["pause_after_ms"] for row in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -768,8 +1054,49 @@ def render_audiobook(
         _finalize_job(storage, resolved_job_id, "failed", error=str(exc))
         raise
 
+    # Step 6 (P3): Deterministic render-time paused assembly.  Runs after every
+    # per-span WAV is durably written (chunk rows done / batch files fsynced)
+    # and before the final job transaction, while speaker + pause metadata is
+    # still in-memory.  The canonical paused artifact becomes the job's
+    # output_artifact_path.  Assembly is best-effort: a failure (e.g. missing/
+    # malformed WAV) must NOT fail the render — the job still completes with
+    # the per-span WAVs intact and pauses_applied stays false (tri-state).
+    paused_artifact_path = None
+    try:
+        paused_artifact_path = os.path.join(resolved_dir, PAUSED_ARTIFACT_NAME)
+        # Speaker order follows the render-time script.  Individual-mode
+        # chunk_paths are already script-ordered; batch mode re-aligns the
+        # temp_batch_<idx>.wav files by numeric chunk index.
+        assembly_paths = (
+            _ordered_batch_paths(resolved_dir, script)
+            if mode == "batch"
+            else chunk_paths
+        )
+        span_pause = _span_pause_overrides(storage, script)
+        _assemble_paused_artifact(
+            assembly_paths,
+            script,
+            pause_between_speakers_ms=pause_between_ms,
+            pause_same_speaker_ms=pause_same_ms,
+            span_pause_after_ms=span_pause,
+            run_dir=resolved_dir,
+            output_path=paused_artifact_path,
+        )
+    except Exception as exc:  # noqa: BLE001 — non-fatal; see docstring
+        paused_artifact_path = None
+        print(
+            f"warning: paused assembly skipped for {resolved_job_id}: {exc}",
+            file=sys.stderr,
+        )
+
     # Final transaction: job completed + output artifact path
-    _finalize_job(storage, resolved_job_id, "completed", resolved_dir=resolved_dir)
+    _finalize_job(
+        storage,
+        resolved_job_id,
+        "completed",
+        resolved_dir=resolved_dir,
+        paused_artifact_path=paused_artifact_path,
+    )
     # Derived cache (rows stay the authority): written after the row reaches
     # 'completed' so a missing manifest is exactly the state Phase 2 rebuilds.
     _write_manifest_best_effort(
@@ -779,6 +1106,7 @@ def render_audiobook(
         mode=mode,
         chunk_paths=chunk_paths,
         status="completed",
+        paused_artifact=paused_artifact_path,
     )
 
     return resolved_job_id

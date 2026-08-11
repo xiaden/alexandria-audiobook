@@ -153,3 +153,117 @@
 | 11 | PATCH /projects/{name} for rename | I | DD design decision "auto-named, rename PATCH" — appended beyond the 10 registered endpoints |
 | 12 | Tab-navigation foundation fixed in Plan E | E | Evidence-based: frontend tabs are unreachable today (no click handler); all new UI lives in hidden tabs |
 | 13 | Gap 3 = pause capability disclosure, NOT silence insertion | K | Faithful two-value silence (500 between-speakers / 250 same-speaker) requires per-chunk speaker identity, which neither `render_chunk` rows nor `manifest.json` persist — insertion would need a schema migration + speaker persistence, overriding the recorded Plan J decision ("no audible-silence insertion: cannot-restore #5"). A uniform-gap approximation would violate the two-value semantic. Disclosure (`pauses_applied`/`pauses_message` on export response + honest UI wording) is the contract-compliant, safest pipeline-native behavior. |
+| 14 | Render-time pause assembly supersedes decision 13 and the pause portion of cannot-restore #5 | L | `render_audiobook` already retains ordered speakers/chunks in memory; it invokes the existing immutable `app.tts.combine_audio_with_pauses` before final export, avoiding merge-time speaker reconstruction and preserving the two-value semantic. |
+| 15 | Phase 1 pause data contracts supersede decision 13's disclosure-only stance and the cannot-restore #5 pause portion; Plan K serving routes + 409/503 retry contracts retained | L | Decision #14 commits to render-time pause assembly; Phase 1 delivers the contracts that make it sound: `validate_pause_ms`/`PAUSE_MAX_MS=10_000` bounded validation (stable 422 config errors), nullable `book.pause_between_speakers_ms`/`book.pause_same_speaker_ms` + `span.pause_after_ms` with `CHECK (NULL OR >= 0)` persisted idempotently, and `resolve_effective_pauses` precedence (request → book/project → config → 500/250). NULL = resolve default, 0 = intentional no-gap, never coerced. The disclosure-only surface (`pauses_applied: False`/`pauses_message` on export) is superseded for the pause feature as real insertion lands (later phases); the Plan K MP3/Audacity serving routes and the `ConcurrentTransactionError → 503 + Retry-After: 5` / active-run 409 retry contracts remain unchanged. |
+
+## Plan L Pause Contracts
+
+- `app/tts.py` remains byte-for-byte unchanged; TTSEngine public signatures remain unchanged. The only implementation seam is `app/pipeline/tts_integration.py`, using the existing `combine_audio_with_pauses`/`compute_timeline` helpers.
+- Pause settings are bounded non-negative integer milliseconds. `NULL`/missing means resolve the applicable default; `0` is an intentional no-gap override. Resolved precedence is request override (when present), project/book override, persisted TTS config, then 500/250 defaults. The exact maximum and error text are part of the API DTO validation contract and must be documented and tested.
+- `span.pause_after_ms INTEGER NULL` is nullable and round-trips through project snapshots. Existing rows migrate idempotently with NULL values; snapshot restore preserves NULL versus 0.
+- `render_audiobook` performs deterministic post-render assembly from ordered WAV **file paths** into `pydub.AudioSegment` values while speakers and pause metadata are still in-memory. It validates same WAV format, invokes the existing helper, exports with explicit source format, atomically publishes the canonical paused artifact, fsyncs, and cleans temp files on all paths.
+- Final whole-book surfaces (M4B, MP3, Audacity, `/export/audio`) consume the canonical paused artifact. Per-span source WAV rows remain available for previews and are not silently rewritten to include a trailing pause.
+- Render/export status reports `pauses_applied` false until assembly succeeds, true only after the canonical artifact is committed, and false with a bounded failure detail when assembly fails. Export responses include resolved pause metadata without leaking filesystem paths.
+- New config/project/span routes, if needed, must be added only to existing `/api/pipeline` routers with parameterized SQL, book/span ownership checks, existing transaction semantics, and no legacy aliases. The existing Plan K 409/503 retry contracts and row-authority rules remain unchanged.
+
+### Phase 3 concrete contracts (P3-S1..S4 — implemented)
+
+P3-S1/S2 **Deterministic render-time paused assembly** — implemented in
+`app/pipeline/tts_integration.py`:
+
+- **Canonical artifact name/location (decision):** `audiobook-paused.wav`, written
+  into the run dir next to the per-span WAVs (`os.path.join(run_dir,
+  PAUSED_ARTIFACT_NAME)`). Deterministic, documented here. After a successful
+  assembly the `render_job.output_artifact_path` is set to this file (highest
+  priority, above `audiobook.m4b`/the run dir) and `manifest.json` records a
+  relative `paused_artifact` entry — both **only after** the artifact is
+  atomically committed (temp sibling → fsync → `os.replace` → fsync dir).
+- Private postprocessor `_assemble_paused_artifact(wav_paths, script, *,
+  pause_between_speakers_ms, pause_same_speaker_ms, span_pause_after_ms,
+  run_dir, output_path)`. Receives ordered WAV paths + the ordered in-memory
+  `script` (span `id` + `speaker`), so **speaker order comes from the
+  render-time script — never from filenames or the manifest**. Loads each via
+  `AudioSegment.from_wav`, validates identical frame_rate/channels/sample_width,
+  resolves per-span overrides (NULL→default logic, `0`→explicit no-gap,
+  positive→explicit), calls the existing immutable `combine_audio_with_pauses`,
+  and re-sets the combined segment to the source format before export (pydub's
+  `_sync` would otherwise bump low-rate sources toward 11025 Hz).
+- Defensive path validation `_reject_unsafe_assembly_paths` runs **before** any
+  loading: rejects non-`.wav`, missing files, path traversal, and paths
+  resolving outside the run dir.
+- `pause_overrides` is aligned with segments (entry *i* = pause after segment
+  *i*; the helper ignores the final entry). Temp files are removed on every
+  error path via `finally`.
+
+P3-S3 **Wiring** — the postprocessor runs in `render_audiobook` (both batch and
+individual paths) after every per-span WAV is durably written and before the
+final job transaction. Batch mode re-aligns `temp_batch_<idx>.wav` to script
+order via `_ordered_batch_paths` (lexicographic sort breaks past 9 chunks).
+Assembly is **best-effort**: a failure (missing/malformed WAV) must not fail the
+render — the job completes with per-span WAVs intact and `pauses_applied` stays
+false (tri-state). Helper `_span_pause_overrides` reads per-span `pause_after_ms`
+parameterized by the script's span ids.
+
+### Phase 1 concrete data contracts (P1-S1..S4 — implemented)
+
+P1-S1 **Shared bounded pause validation** — single source of truth lives in
+`app/pipeline/tts_integration.py`:
+
+- `PAUSE_MAX_MS: int = 10_000` — documented maximum (10 s). No unbounded values.
+- `validate_pause_ms(value: object) -> int` — accepts `0` and integers up to
+  `PAUSE_MAX_MS` inclusive (integral floats like `500.0` normalized to `int`);
+  rejects negative (`"pause must be non-negative"`), fractional
+  (`"pause must be an integer (no fractional milliseconds)"`), boolean
+  (`"pause must be an integer, not a boolean"`), NaN/±inf
+  (`"pause must be a finite integer, not NaN/infinity"`), string
+  (`"pause must be an integer millisecond value"`), and above-max
+  (`"pause exceeds the maximum of 10000 ms"`) — each via `ValueError`.
+- `TTSConfig` in `app/app.py` enforces the same bound on config saves via
+  `@field_validator("pause_between_speakers_ms", "pause_same_speaker_ms", mode="before")`
+  calling `validate_pause_ms` — an out-of-bounds `POST /api/config` yields a
+  stable pydantic 422 (`validation_error`) before anything is persisted.
+- `resolve_effective_pauses(*, request_overrides=None, book_overrides=None, config_defaults=None) -> tuple[int, int]`
+  — per-field precedence request override → book/project override → config
+  default → `PAUSE_BETWEEN_SPEAKERS_MS`/`PAUSE_SAME_SPEAKER_MS` (500/250)
+  fallback; a `None`/missing value at a higher tier resolves the next tier;
+  `0` is honored (never coerced to fallback); every winning value passes
+  `validate_pause_ms` so no unbounded value reaches the renderer. Private
+  helper `_resolve_pause_field(*tiers, key, fallback) -> int`.
+
+P1-S2 **Idempotent schema/migration** (all in `app/pipeline/schema.py`,
+guarded via `PRAGMA table_info` so `create_schema` is idempotent; existing
+rows migrate with `NULL` = resolve default, never coerced to `0`):
+
+- Global defaults remain in config.json via `AppConfig.tts`
+  (`pause_between_speakers_ms`/`pause_same_speaker_ms`) — NOT in the DB.
+- `book.pause_between_speakers_ms INTEGER NULL` +
+  `book.pause_same_speaker_ms INTEGER NULL` — project/book override columns
+  (the `book` table is the project/book carrier, mirroring the
+  `book.single_speaker` guarded-ALTER pattern via
+  `_ensure_book_pause_columns(connection)`).
+- `span.pause_after_ms INTEGER NULL` with `CHECK (pause_after_ms IS NULL OR
+  pause_after_ms >= 0)` via `_ensure_span_pause_column(connection)` (SQLite
+  supports ADD COLUMN with CHECK — verified 3.46.1).
+- `_ensure_book_single_speaker_column`, `_ensure_book_pause_columns`,
+  `_ensure_span_pause_column` are all invoked from `create_schema(connection)`
+  after the base `CREATE TABLE IF NOT EXISTS` block.
+
+P1-S3 **Resolution + snapshot round-trip** — precedence as above. Snapshot
+JSON (manifest `schema_version` stays `1`) gains:
+
+- Book level: `pause_between_speakers_ms` / `pause_same_speaker_ms` keys
+  (value `null` = resolve default, `0` = no-gap override) — written in
+  `create_project_snapshot` (`app/pipeline/api_operations.py`) from a
+  parameterized `SELECT` on `book`.
+- Per span: `pause_after_ms` key (parameterized span→book join to fetch the
+  column for every span; `null` when unset) — merged onto each
+  `export_annotated_script` entry.
+- `_apply_snapshot_merge` restores both only when the key is PRESENT:
+  `None`→SQL `NULL`, `0`→`0`, bounded int verbatim; out-of-range values from
+  a corrupt snapshot are defensively dropped (text/instruct still restore) —
+  enforcing "no unbounded pause in the DB". Pre-pause snapshots (keys absent)
+  leave current book/span pause state untouched.
+
+See `tests/pipeline/test_pause_validation.py` (bounds + precedence) and
+`tests/pipeline/test_snapshots.py::TestPauseRoundTrip` (NULL-vs-0 + old
+snapshot + corrupt-value) and `test_schema_migration.py::TestCreateSchemaPauseColumns`.

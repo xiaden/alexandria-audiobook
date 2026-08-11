@@ -1213,22 +1213,174 @@ class TestExportM4B:
         probe = _ffprobe_json("-show_chapters", body["output_path"])
         assert len(probe["chapters"]) == 2
 
-    def test_pauses_disclosure_in_success_response(self, client, storage, tmp_path):
-        """Successful exports disclose the pause capability contract (Plan K,
-        decision #13): pauses_applied is always False and pauses_message
-        documents that the global pause values are recorded and carried to the
-        engine but the current engine does not insert audible silence into the
-        merged audio (app/tts.py immutable; per-span pause_after not
-        restorable — DD cannot-restore #5)."""
-        import app.pipeline.api_export as api_export_module
-
+    def test_pauses_truthful_fallback_when_no_paused_artifact(self, client, storage, tmp_path):
+        """Without a canonical paused artifact (a render that completed without
+        assembly, e.g. a fake engine) the export falls back to the per-chunk
+        concat so legacy rows still export, and the tri-state truthfully reports
+        pauses_applied=false / pauses_state='failed' with a bounded pauses_error
+        (no filesystem paths) and NO pauses_message (Plan L, superseding the
+        Plan K disclosure)."""
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         resp = self._export(client, storage, "job-pauses", run_dir, title="T")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["pauses_applied"] is False
-        assert body["pauses_message"] == api_export_module._PAUSES_MESSAGE
+        assert body["pauses_state"] == "failed"
+        assert body["pauses_error"]  # bounded detail
+        # No filesystem-path leakage in the failure detail.
+        assert "/" not in body["pauses_error"] and "\\" not in body["pauses_error"]
+        assert "pauses_message" not in body
+        # Resolved pause metadata is always present.
+        assert "resolved_pause_between_speakers_ms" in body
+        assert "resolved_pause_same_speaker_ms" in body
+        assert "pause_override_count" in body
+
+    def test_paused_artifact_used_truthful_and_duration_matches(self, client, storage, tmp_path):
+        """When the canonical paused artifact is present it is the export source:
+        pauses_applied=true / pauses_state='applied' with a concise message, and
+        the decoded m4b duration equals the paused artifact duration (not the
+        shorter per-chunk concat) — proving the gaps ride in the output and the
+        unpaused chunks are never exported as the whole-book artifact (P4-S3)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-paused", run_dir)
+        # 2 x 0.5 s chunks concat to 1.0 s; the paused artifact is 1.5 s — a
+        # clearly distinct duration so the export source is provable.
+        paused_path = run_dir / "audiobook-paused.wav"
+        paused_path.write_bytes(_make_wav(b"\x00\x00" * 24000))  # 1.5 s
+        resp = self._post(client, "job-paused", title="T")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pauses_applied"] is True
+        assert body["pauses_state"] == "applied"
+        assert body["pauses_error"] is None
+        assert "pauses_message" in body
+        paused_ms = _wav_duration_ms(str(paused_path))
+        # m4b duration == paused artifact duration (within encoder tolerance).
+        m4b_ms = int(
+            round(
+                float(
+                    _ffprobe_json("-show_entries", "format=duration", body["output_path"])
+                    ["format"]["duration"]
+                )
+                * 1000
+            )
+        )
+        assert m4b_ms == pytest.approx(paused_ms, abs=250), (m4b_ms, paused_ms)
+        # The mp3 derives from the same paused source.
+        mp3_ms = int(
+            round(
+                float(
+                    _ffprobe_json("-show_entries", "format=duration", body["mp3_path"])
+                    ["format"]["duration"]
+                )
+                * 1000
+            )
+        )
+        assert mp3_ms == pytest.approx(paused_ms, abs=250), (mp3_ms, paused_ms)
+        # The Audacity bundle carries the paused source, never the unpaused chunks.
+        with zipfile.ZipFile(body["audacity_path"]) as zf:
+            names = zf.namelist()
+        assert "audiobook-paused.wav" in names
+        assert not any(n.startswith("chunk_") for n in names)
+        # Single source -> a single whole-book chapter.
+        probe = _ffprobe_json("-show_chapters", body["output_path"])
+        assert len(probe["chapters"]) == 1
+
+    def test_paused_artifact_used_batch_mode(self, client, storage, tmp_path):
+        """Batch-mode export with the paused artifact present uses it as the
+        single source — the batch *.wav enumeration never double-counts it
+        (P4-S3, batch side of the stale-manifest exclusion)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-bp", run_dir, mode="batch")
+        paused_path = run_dir / "audiobook-paused.wav"
+        paused_path.write_bytes(_make_wav(b"\x00\x00" * 24000))  # 1.5 s
+        resp = self._post(client, "job-bp")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pauses_applied"] is True
+        paused_ms = _wav_duration_ms(str(paused_path))
+        m4b_ms = int(
+            round(
+                float(
+                    _ffprobe_json("-show_entries", "format=duration", body["output_path"])
+                    ["format"]["duration"]
+                )
+                * 1000
+            )
+        )
+        assert m4b_ms == pytest.approx(paused_ms, abs=250), (m4b_ms, paused_ms)
+        with zipfile.ZipFile(body["audacity_path"]) as zf:
+            names = zf.namelist()
+        assert "audiobook-paused.wav" in names
+        assert not any(n.startswith("chunk_") for n in names)
+
+    def test_malformed_paused_artifact_falls_back(self, client, storage, tmp_path):
+        """A malformed (non-WAV) paused artifact is treated as absent: the export
+        falls back to the per-chunk concat without crashing and the tri-state
+        reports failed (failed-pydub-assembly negative space)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-mal", run_dir)
+        (run_dir / "audiobook-paused.wav").write_bytes(b"not a wav")
+        resp = self._post(client, "job-mal")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pauses_applied"] is False
+        assert body["pauses_state"] == "failed"
+        # The unpaused per-chunk concat (2 x 0.5 s = 1.0 s) was still exported.
+        m4b_ms = int(
+            round(
+                float(
+                    _ffprobe_json("-show_entries", "format=duration", body["output_path"])
+                    ["format"]["duration"]
+                )
+                * 1000
+            )
+        )
+        assert m4b_ms == pytest.approx(1000, abs=250), m4b_ms
+
+    def test_repeated_export_idempotent(self, client, storage, tmp_path):
+        """Exporting the same completed job twice succeeds both times; the row
+        stays completed and output_artifact_path is refreshed (P4-S4 repeated
+        rerender)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-again", run_dir)
+        r1 = self._post(client, "job-again")
+        r2 = self._post(client, "job-again")
+        assert r1.status_code == 200, r1.text
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["output_path"] == r1.json()["output_path"]
+
+    def test_cancelled_job_404(self, client, storage, tmp_path):
+        """A cancelled render is not completed -> the export returns 404
+        (P4-S4 cancelled-render negative space)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _seed_two_chunk_job(storage, "job-cancel", run_dir, status="cancelled")
+        resp = self._post(client, "job-cancel")
+        assert resp.status_code == 404
+
+    def test_export_audio_serves_paused_artifact(self, client, storage, tmp_path):
+        """GET /export/audio/{job_id} serves the canonical paused artifact
+        (output_artifact_path) as a range-served WAV — the /export/audio whole-
+        book surface consumes the paused source (P4-S1)."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        paused_path = run_dir / "audiobook-paused.wav"
+        paused_path.write_bytes(_make_wav(b"\x00\x00" * 8000))  # 0.5 s
+        _seed_two_chunk_job(storage, "job-srv", run_dir, artifact=str(paused_path))
+        resp = client.get("/api/pipeline/export/audio/job-srv")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/wav"
+        rng = client.get(
+            "/api/pipeline/export/audio/job-srv", headers={"Range": "bytes=0-9"}
+        )
+        assert rng.status_code == 206
+
 
     def test_output_artifact_path_updated_and_servable(self, client, storage, tmp_path):
         """The render_job row's output_artifact_path is updated to the m4b and

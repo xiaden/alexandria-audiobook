@@ -22,10 +22,13 @@ import pytest
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.tts_integration import (
     NARRATOR_VOICE,
+    PAUSED_ARTIFACT_NAME,
+    _assemble_paused_artifact,
     _build_chunks,
     _build_voice_config,
     render_audiobook,
 )
+from pydub import AudioSegment
 
 
 # ---------------------------------------------------------------------------
@@ -1708,3 +1711,429 @@ class TestPauseConfigBoundary:
             tts_config={"pause_between_speakers_ms": 600},
         )
         assert len(fake_engine.voice_calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# P3: Deterministic render-time paused assembly (Plan L)
+# ---------------------------------------------------------------------------
+
+
+class _RealWavBatchEngine:
+    """Writes genuine pydub WAVs (with a distinct sample_rate) per chunk."""
+
+    def __init__(self, duration_ms=200, sample_rate=22050, channels=1, sample_width=2):
+        self.duration_ms = duration_ms
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.sample_width = sample_width
+        self.batch_calls = []
+        self.voice_calls = []
+
+    def _write(self, output_path):
+        seg = _tone_segment(self.duration_ms, self.sample_rate)
+        seg = seg.set_channels(self.channels).set_sample_width(self.sample_width)
+        seg.export(output_path, format="wav")
+
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+        self.batch_calls.append(list(chunks))
+        for chunk in chunks:
+            self._write(os.path.join(output_dir, f"temp_batch_{chunk['index']}.wav"))
+        return {"completed": [c["index"] for c in chunks], "failed": []}
+
+    def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        self.voice_calls.append(output_path)
+        self._write(output_path)
+        return True
+
+
+def _tone_segment(duration_ms: int, sample_rate: int = 22050) -> AudioSegment:
+    """Return a genuine audible tone (so inserted gaps are measurable silence)."""
+    import array
+    import math
+
+    n = int(sample_rate * duration_ms / 1000.0)
+    frames = array.array("h", (int(8000 * math.sin(2 * math.pi * 440 * i / sample_rate)) for i in range(n)))
+    return AudioSegment(
+        frames.tobytes(),
+        frame_rate=sample_rate,
+        sample_width=2,
+        channels=1,
+    )
+
+
+def _silence_duration_ms(segment: AudioSegment) -> int:
+    """Return the total length (ms) of silence in *segment*.
+
+    Uses pydub's ``dBFS`` per-millisecond sampling: a frame at or below
+    ``-50 dBFS`` counts as silence.  With tone chunks, every inserted gap is
+    genuine low-amplitude silence and the tones are loud, so this measures the
+    exact inserted gap length.
+    """
+    total = 0
+    for ms in range(0, len(segment)):
+        if segment[ms : ms + 1].dBFS <= -50:
+            total += 1
+    return total
+
+
+class TestPausedAssembly:
+    """P3-S1/S2: the private ``_assemble_paused_artifact`` postprocessor."""
+
+    def _write_chunks(self, tmp_path, count, duration_ms=200, sample_rate=22050):
+        paths = []
+        for i in range(count):
+            p = os.path.join(str(tmp_path), f"chunk_{i:04d}.wav")
+            _tone_segment(duration_ms, sample_rate).export(p, format="wav")
+            paths.append(p)
+        return paths
+
+    @staticmethod
+    def _script(speakers):
+        return [{"id": f"sp{i}", "speaker": s} for i, s in enumerate(speakers)]
+
+    def test_different_speaker_gap_present(self, tmp_path):
+        """Different speakers insert pause_between_speakers_ms between them."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        _assemble_paused_artifact(
+            paths, script,
+            pause_between_speakers_ms=400,
+            pause_same_speaker_ms=100,
+            span_pause_after_ms={},
+            run_dir=str(tmp_path),
+            output_path=out,
+        )
+        combined = AudioSegment.from_wav(out)
+        # 100ms + 400ms gap + 100ms = 600ms
+        assert len(combined) == 600
+        assert _silence_duration_ms(combined) == 400
+
+    def test_same_speaker_gap_uses_same_speaker_pause(self, tmp_path):
+        """Same speaker inserts pause_same_speaker_ms between them."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        script = self._script(["Alice", "Alice"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        _assemble_paused_artifact(
+            paths, script,
+            pause_between_speakers_ms=400,
+            pause_same_speaker_ms=80,
+            span_pause_after_ms={},
+            run_dir=str(tmp_path),
+            output_path=out,
+        )
+        combined = AudioSegment.from_wav(out)
+        assert len(combined) == 280  # 100 + 80 + 100
+        assert _silence_duration_ms(combined) == 80
+
+    def test_positive_override_replaces_default(self, tmp_path):
+        """A positive span.pause_after_ms override inserts exactly that gap."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        _assemble_paused_artifact(
+            paths, script,
+            pause_between_speakers_ms=400,
+            pause_same_speaker_ms=100,
+            span_pause_after_ms={"sp0": 900},
+            run_dir=str(tmp_path),
+            output_path=out,
+        )
+        combined = AudioSegment.from_wav(out)
+        assert len(combined) == 1100  # 100 + 900 override + 100
+        # boundary sampling can shave 1ms off a gap; allow ±2ms
+        assert abs(_silence_duration_ms(combined) - 900) <= 2
+
+    def test_zero_override_is_no_gap(self, tmp_path):
+        """0 override = intentional no-gap (never coerced to default)."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        _assemble_paused_artifact(
+            paths, script,
+            pause_between_speakers_ms=400,
+            pause_same_speaker_ms=100,
+            span_pause_after_ms={"sp0": 0},
+            run_dir=str(tmp_path),
+            output_path=out,
+        )
+        combined = AudioSegment.from_wav(out)
+        assert len(combined) == 200  # 100 + 0 + 100
+        assert _silence_duration_ms(combined) == 0
+
+    def test_last_span_override_ignored(self, tmp_path):
+        """The final entry's pause is ignored (no pause after the last span)."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        _assemble_paused_artifact(
+            paths, script,
+            pause_between_speakers_ms=400,
+            pause_same_speaker_ms=100,
+            # sp1 is the LAST span — its override must be ignored.
+            span_pause_after_ms={"sp1": 9999},
+            run_dir=str(tmp_path),
+            output_path=out,
+        )
+        combined = AudioSegment.from_wav(out)
+        assert len(combined) == 600  # 100 + 400 + 100 (last override ignored)
+        assert _silence_duration_ms(combined) == 400
+
+    def test_single_span_no_pause(self, tmp_path):
+        """A single span produces the segment unchanged (no trailing pause)."""
+        paths = self._write_chunks(tmp_path, 1, duration_ms=250, sample_rate=22050)
+        script = self._script(["Alice"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        _assemble_paused_artifact(
+            paths, script,
+            pause_between_speakers_ms=400,
+            pause_same_speaker_ms=100,
+            span_pause_after_ms={},
+            run_dir=str(tmp_path),
+            output_path=out,
+        )
+        combined = AudioSegment.from_wav(out)
+        assert len(combined) == 250
+        assert _silence_duration_ms(combined) == 0
+
+    def test_format_preserved(self, tmp_path):
+        """frame_rate / channels / sample_width preserved from source."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=44100)
+        # widen to stereo 8-bit to prove all three are preserved
+        seg0 = AudioSegment.silent(duration=100, frame_rate=44100).set_channels(2)
+        seg0.export(paths[0], format="wav")
+        seg1 = AudioSegment.silent(duration=100, frame_rate=44100).set_channels(2)
+        seg1.export(paths[1], format="wav")
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        _assemble_paused_artifact(
+            paths, script,
+            pause_between_speakers_ms=100,
+            pause_same_speaker_ms=100,
+            span_pause_after_ms={},
+            run_dir=str(tmp_path),
+            output_path=out,
+        )
+        combined = AudioSegment.from_wav(out)
+        assert (combined.frame_rate, combined.channels, combined.sample_width) == (
+            44100, 2, 2,
+        )
+
+    def test_mismatched_formats_rejected(self, tmp_path):
+        """Mixed frame rates are rejected before assembly."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        other = os.path.join(str(tmp_path), "chunk_0001.wav")
+        AudioSegment.silent(duration=100, frame_rate=44100).export(other, format="wav")
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        with pytest.raises(ValueError, match="differ in format"):
+            _assemble_paused_artifact(
+                paths, script,
+                pause_between_speakers_ms=400,
+                pause_same_speaker_ms=100,
+                span_pause_after_ms={},
+                run_dir=str(tmp_path),
+                output_path=out,
+            )
+
+    def test_missing_wav_rejected_before_processing(self, tmp_path):
+        """Missing / out-of-run-dir paths rejected up front."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        paths[1] = os.path.join(str(tmp_path), "does-not-exist.wav")
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        with pytest.raises(ValueError, match="missing WAV"):
+            _assemble_paused_artifact(
+                paths, script,
+                pause_between_speakers_ms=400,
+                pause_same_speaker_ms=100,
+                span_pause_after_ms={},
+                run_dir=str(tmp_path),
+                output_path=out,
+            )
+
+    def test_path_traversal_rejected(self, tmp_path):
+        """A path escaping the run dir is rejected."""
+        outside = tempfile.mkdtemp()
+        seg = AudioSegment.silent(duration=100, frame_rate=22050)
+        outside_path = os.path.join(outside, "chunk.wav")
+        seg.export(outside_path, format="wav")
+        paths = self._write_chunks(tmp_path, 1, duration_ms=100, sample_rate=22050)
+        paths.append(outside_path)
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        with pytest.raises(ValueError, match="outside run dir"):
+            _assemble_paused_artifact(
+                paths, script,
+                pause_between_speakers_ms=400,
+                pause_same_speaker_ms=100,
+                span_pause_after_ms={},
+                run_dir=str(tmp_path),
+                output_path=out,
+            )
+
+    def test_path_count_mismatch_rejected(self, tmp_path):
+        """WAV count != script count is rejected."""
+        paths = self._write_chunks(tmp_path, 1, duration_ms=100, sample_rate=22050)
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+        with pytest.raises(ValueError, match="does not match script"):
+            _assemble_paused_artifact(
+                paths, script,
+                pause_between_speakers_ms=400,
+                pause_same_speaker_ms=100,
+                span_pause_after_ms={},
+                run_dir=str(tmp_path),
+                output_path=out,
+            )
+
+    def test_temp_cleaned_on_export_failure(self, tmp_path, monkeypatch):
+        """A failed pydub export leaves no temp files behind."""
+        paths = self._write_chunks(tmp_path, 2, duration_ms=100, sample_rate=22050)
+        script = self._script(["Alice", "Bob"])
+        out = os.path.join(str(tmp_path), "audiobook-paused.wav")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("ffmpeg exploded")
+
+        monkeypatch.setattr(AudioSegment, "export", _boom)
+        with pytest.raises(RuntimeError, match="ffmpeg exploded"):
+            _assemble_paused_artifact(
+                paths, script,
+                pause_between_speakers_ms=400,
+                pause_same_speaker_ms=100,
+                span_pause_after_ms={},
+                run_dir=str(tmp_path),
+                output_path=out,
+            )
+        assert not os.path.exists(f"{out}.tmp")
+        assert not os.path.exists(out)
+
+
+class TestPausedAssemblyWiring:
+    """P3-S3/S4: postprocessor wired into render_audiobook."""
+
+    def test_batch_render_produces_canonical_paused_artifact(
+        self, storage, _render_root
+    ):
+        """Batch render writes audiobook-paused.wav + points output_artifact_path at it."""
+        engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
+        job_id = render_audiobook("b1", storage, engine)
+        run_dir = os.path.join(_render_root, "book-b1", job_id)
+        paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+        assert os.path.isfile(paused)
+        rows = storage.execute_query(
+            "SELECT status, output_artifact_path FROM render_job WHERE job_id = ?",
+            (job_id,),
+        )
+        assert rows[0]["status"] == "completed"
+        assert rows[0]["output_artifact_path"] == paused
+        # manifest records the paused artifact (relative)
+        manifest = json.loads(open(os.path.join(run_dir, "manifest.json")).read())
+        assert manifest["paused_artifact"] == PAUSED_ARTIFACT_NAME
+        # 3 spans × 200ms + 2 different-speaker gaps × 500ms defaults
+        combined = AudioSegment.from_wav(paused)
+        assert len(combined) == 600 + 2 * 500
+
+    def test_individual_render_produces_canonical_paused_artifact(
+        self, storage, _render_root
+    ):
+        """Individual render wires the postprocessor too."""
+        engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
+        job_id = render_audiobook(
+            "b1", storage, engine, use_batch=False
+        )
+        run_dir = os.path.join(_render_root, "book-b1", job_id)
+        paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+        assert os.path.isfile(paused)
+        rows = storage.execute_query(
+            "SELECT status, output_artifact_path FROM render_job WHERE job_id = ?",
+            (job_id,),
+        )
+        assert rows[0]["output_artifact_path"] == paused
+        combined = AudioSegment.from_wav(paused)
+        assert len(combined) == 600 + 2 * 500
+
+    def test_batch_individual_parity(self, storage, _render_root):
+        """Batch and individual render produce byte-identical paused artifacts."""
+        batch_job = render_audiobook(
+            "b1", storage, _RealWavBatchEngine(duration_ms=200), job_id="p3-par-b"
+        )
+        ind_job = render_audiobook(
+            "b1", storage, _RealWavBatchEngine(duration_ms=200),
+            use_batch=False, job_id="p3-par-i",
+        )
+        batch_paused = os.path.join(
+            _render_root, "book-b1", batch_job, PAUSED_ARTIFACT_NAME
+        )
+        ind_paused = os.path.join(
+            _render_root, "book-b1", ind_job, PAUSED_ARTIFACT_NAME
+        )
+        with open(batch_paused, "rb") as f:
+            batch_bytes = f.read()
+        with open(ind_paused, "rb") as f:
+            ind_bytes = f.read()
+        assert batch_bytes == ind_bytes
+
+    def test_deterministic_across_runs(self, storage, _render_root):
+        """Two identical batch renders produce identical paused artifacts."""
+        j1 = render_audiobook(
+            "b1", storage, _RealWavBatchEngine(duration_ms=200), job_id="p3-det-1"
+        )
+        j2 = render_audiobook(
+            "b1", storage, _RealWavBatchEngine(duration_ms=200), job_id="p3-det-2"
+        )
+        p1 = os.path.join(_render_root, "book-b1", j1, PAUSED_ARTIFACT_NAME)
+        p2 = os.path.join(_render_root, "book-b1", j2, PAUSED_ARTIFACT_NAME)
+        with open(p1, "rb") as f:
+            b1 = f.read()
+        with open(p2, "rb") as f:
+            b2 = f.read()
+        assert b1 == b2
+
+    def test_fake_engine_skips_assembly_nonfatally(self, storage, fake_engine, _render_root):
+        """Non-WAV outputs fail assembly non-fatally; job still completes."""
+        job_id = render_audiobook("b1", storage, fake_engine)
+        run_dir = os.path.join(_render_root, "book-b1", job_id)
+        paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+        assert not os.path.exists(paused)
+        rows = storage.execute_query(
+            "SELECT status FROM render_job WHERE job_id = ?", (job_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+
+class TestPausedAssemblyEmptyAndGuard:
+    """P3-S5: empty-script behavior + no TTSEngine signature change."""
+
+    def test_empty_script_no_paused_artifact(self, storage, _render_root):
+        """An empty book renders no paused artifact (early return, job completes)."""
+        # b-empty has no spans in the document spine
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s-empty')")
+        storage.execute_insert(
+            "INSERT INTO book (id, series_id, position) VALUES ('b-empty', 's-empty', 1)"
+        )
+        job_id = render_audiobook(
+            "b-empty", storage, _RealWavBatchEngine(duration_ms=100),
+            job_id="p3-empty",
+        )
+        run_dir = os.path.join(_render_root, "book-b-empty", job_id)
+        assert not os.path.exists(os.path.join(run_dir, PAUSED_ARTIFACT_NAME))
+        rows = storage.execute_query(
+            "SELECT status FROM render_job WHERE job_id = ?", (job_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+    def test_tts_helper_signature_unchanged(self):
+        """Guard: app.tts's combine_audio_with_pauses signature is stable."""
+        from app.tts import combine_audio_with_pauses
+
+        assert callable(combine_audio_with_pauses)
+        # The postprocessor calls it with exactly these kwargs.
+        import inspect
+
+        sig = inspect.signature(combine_audio_with_pauses)
+        params = list(sig.parameters)
+        for required in ("audio_segments", "speakers", "pause_ms",
+                         "same_speaker_pause_ms", "pause_overrides"):
+            assert required in params, f"missing param {required}"

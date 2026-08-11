@@ -29,13 +29,16 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
 from app.pipeline.assembly import export_annotated_script, get_book_version
 from app.pipeline.operations import OperationExecutor
-from app.pipeline.tts_integration import get_render_root
+from app.pipeline.tts_integration import (
+    get_render_root,
+    validate_pause_ms,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +250,195 @@ async def update_book_single_speaker(
 
 
 # ---------------------------------------------------------------------------
+# Plan L (P2-S2) — Book pause settings + per-span pause-after override
+#
+# GET/PUT /api/pipeline/book/{book_id}/pause_settings
+#   book.pause_between_speakers_ms / book.pause_same_speaker_ms are nullable
+#   INTEGER overrides: NULL means "resolve the default"; 0 means "intentional
+#   no-gap override".  Never coerce NULL to 0.  PUT applies only the fields
+#   the caller explicitly provides (partial update); an explicit null clears
+#   the override back to resolve-default.
+#
+# GET/PUT /api/pipeline/span/{span_id}/pause_after
+#   span.pause_after_ms (nullable INTEGER, CHECK NULL OR >= 0): NULL clears
+#   the override, 0 is an intentional no-gap, any other value is validated by
+#   ``validate_pause_ms``.  Containment check: the span must be reachable from
+#   a book through the spine edges (mirrors the snapshot enrichment join) so
+#   unknown/orphan spans are rejected with 404.
+#
+# All SQL is parameterized (book_id/span_id are user-supplied); writes ride
+# the adapter's transaction() owner-thread discipline (ConcurrentTransactionError
+# -> 503 + Retry-After at the app layer).  No new modules — these live in the
+# existing api_operations router beside update_span_text / single_speaker.
+# ---------------------------------------------------------------------------
+
+
+class PauseSettingsUpdateRequest(BaseModel):
+    """Request body for PUT /api/pipeline/book/{book_id}/pause_settings.
+
+    Both fields are nullable and optional.  A field that is present in the
+    payload is applied (``None`` clears the override to resolve-default, ``0``
+    is an intentional no-gap, other values are validated by
+    ``validate_pause_ms``).  A field absent from the payload is left untouched.
+    """
+
+    pause_between_speakers_ms: Optional[int] = None
+    pause_same_speaker_ms: Optional[int] = None
+
+    @field_validator("pause_between_speakers_ms", "pause_same_speaker_ms", mode="before")
+    @classmethod
+    def _validate_pause_field(cls, value):
+        if value is None:
+            return None
+        return validate_pause_ms(value)
+
+
+class SpanPauseUpdateRequest(BaseModel):
+    """Request body for PUT /api/pipeline/span/{span_id}/pause_after.
+
+    ``pause_after_ms`` is nullable: ``None`` clears the per-span override,
+    ``0`` is an intentional no-gap, any other value is validated by
+    ``validate_pause_ms`` (bounded by PAUSE_MAX_MS).
+    """
+
+    pause_after_ms: Optional[int] = None
+
+    @field_validator("pause_after_ms", mode="before")
+    @classmethod
+    def _validate_pause_after(cls, value):
+        if value is None:
+            return None
+        return validate_pause_ms(value)
+
+
+# Per-book span containment query: a span must be reachable from a book through
+# the spine edge chain so an unknown or orphan span is rejected with 404.
+_SPAN_IN_BOOK_SQL = (
+    "SELECT span.id FROM span"
+    " JOIN paragraph_span AS span_edge ON span.id = span_edge.child_id"
+    " JOIN scene_paragraph AS paragraph_edge"
+    "     ON span_edge.parent_id = paragraph_edge.child_id"
+    " JOIN chapter_scene AS scene_edge"
+    "     ON paragraph_edge.parent_id = scene_edge.child_id"
+    " JOIN book_chapter AS chapter_edge"
+    "     ON scene_edge.parent_id = chapter_edge.child_id"
+    " JOIN book ON chapter_edge.parent_id = book.id"
+    " WHERE span.id = ? LIMIT 1"
+)
+
+
+@router.get("/book/{book_id}/pause_settings")
+async def get_book_pause_settings(
+    book_id: str,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Return the book's pause override columns (NULL = resolve default).
+
+    Raises 404 if no book with *book_id* exists.  Reads the raw nullable
+    columns — ``None`` is reported as ``None`` (never coerced to a default).
+    """
+    rows = storage.execute_query(
+        "SELECT pause_between_speakers_ms, pause_same_speaker_ms FROM book"
+        " WHERE id = ?",
+        (book_id,),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Book '{book_id}' not found")
+
+    return {
+        "book_id": book_id,
+        "pause_between_speakers_ms": rows[0]["pause_between_speakers_ms"],
+        "pause_same_speaker_ms": rows[0]["pause_same_speaker_ms"],
+    }
+
+
+@router.put("/book/{book_id}/pause_settings")
+async def update_book_pause_settings(
+    book_id: str,
+    request: PauseSettingsUpdateRequest,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Persist the book's pause overrides (partial update on explicit fields).
+
+    Raises 404 if no book with *book_id* exists; 422 if a provided value is
+    invalid (via pydantic + ``validate_pause_ms``).  NULL persists as SQL NULL
+    (resolve default); 0 persists as an intentional no-gap.  Returns the
+    post-update persisted columns.
+    """
+    rows = storage.execute_query("SELECT id FROM book WHERE id = ?", (book_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Book '{book_id}' not found")
+
+    set_clauses = []
+    params: list = []
+    for key in ("pause_between_speakers_ms", "pause_same_speaker_ms"):
+        if key in request.model_fields_set:
+            set_clauses.append(f"{key} = ?")
+            params.append(getattr(request, key))
+    if set_clauses:
+        params.append(book_id)
+        storage.execute_update(
+            f"UPDATE book SET {', '.join(set_clauses)} WHERE id = ?", tuple(params)
+        )
+
+    current = storage.execute_query(
+        "SELECT pause_between_speakers_ms, pause_same_speaker_ms FROM book"
+        " WHERE id = ?",
+        (book_id,),
+    )[0]
+    return {
+        "status": "ok",
+        "book_id": book_id,
+        "pause_between_speakers_ms": current["pause_between_speakers_ms"],
+        "pause_same_speaker_ms": current["pause_same_speaker_ms"],
+    }
+
+
+@router.get("/span/{span_id}/pause_after")
+async def get_span_pause_after(
+    span_id: str,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Return the span's ``pause_after_ms`` override (NULL = resolve default).
+
+    Raises 404 if no span with *span_id* exists or the span is not reachable
+    from a book through the spine edges.
+    """
+    if not storage.execute_query(_SPAN_IN_BOOK_SQL, (span_id,)):
+        raise HTTPException(status_code=404, detail=f"Span '{span_id}' not found")
+
+    rows = storage.execute_query(
+        "SELECT pause_after_ms FROM span WHERE id = ?", (span_id,)
+    )
+    return {
+        "span_id": span_id,
+        "pause_after_ms": rows[0]["pause_after_ms"],
+    }
+
+
+@router.put("/span/{span_id}/pause_after")
+async def update_span_pause_after(
+    span_id: str,
+    request: SpanPauseUpdateRequest,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Persist the span's ``pause_after_ms`` override.
+
+    Raises 404 if the span is unknown or not reachable from a book; 422 if the
+    provided value is invalid (via pydantic + ``validate_pause_ms``).  NULL
+    clears the override to resolve-default; 0 is an intentional no-gap.
+    """
+    if not storage.execute_query(_SPAN_IN_BOOK_SQL, (span_id,)):
+        raise HTTPException(status_code=404, detail=f"Span '{span_id}' not found")
+
+    value = request.pause_after_ms
+    storage.execute_update(
+        "UPDATE span SET pause_after_ms = ? WHERE id = ?", (value, span_id)
+    )
+    return {"status": "ok", "span_id": span_id, "pause_after_ms": value}
+
+
+# ---------------------------------------------------------------------------
 # Plan I — Snapshot projects (auto-named; no free-form name input)
 # ---------------------------------------------------------------------------
 
@@ -372,6 +564,27 @@ async def create_project_snapshot(
 
     created_ms = int(time.time() * 1000)
     script = export_annotated_script(request.book_id, storage)
+    # Plan L (P1-S3): enrich each span entry with its nullable
+    # ``pause_after_ms`` so the snapshot round-trips per-span overrides
+    # without losing NULL (resolve default) versus 0 (intentional no-gap).
+    # The script entries carry ``id``; a single parameterized query fetches
+    # the pause column for every span of this book and we merge by id.
+    span_pause_rows = storage.execute_query(
+        "SELECT span.id, span.pause_after_ms FROM span"
+        " JOIN paragraph_span AS span_edge ON span.id = span_edge.child_id"
+        " JOIN scene_paragraph AS paragraph_edge"
+        "     ON span_edge.parent_id = paragraph_edge.child_id"
+        " JOIN chapter_scene AS scene_edge"
+        "     ON paragraph_edge.parent_id = scene_edge.child_id"
+        " JOIN book_chapter AS chapter_edge"
+        "     ON scene_edge.parent_id = chapter_edge.child_id"
+        " JOIN book ON chapter_edge.parent_id = book.id"
+        " WHERE book.id = ?",
+        (request.book_id,),
+    )
+    span_pause = {row["id"]: row["pause_after_ms"] for row in span_pause_rows}
+    for entry in script:
+        entry["pause_after_ms"] = span_pause.get(entry["id"])
     character_rows = storage.execute_query(
         "SELECT character.id, character.name, character.voice_assignment_id"
         " FROM character"
@@ -379,6 +592,15 @@ async def create_project_snapshot(
         " WHERE character_book.book_id = ?",
         (request.book_id,),
     )
+    # Plan L (P1-S3): book-level pause override columns (NULL = resolve
+    # default; 0 = intentional no-gap) ride in the manifest so a snapshot
+    # round-trips the project's pause settings verbatim.
+    book_pause_rows = storage.execute_query(
+        "SELECT pause_between_speakers_ms, pause_same_speaker_ms"
+        " FROM book WHERE id = ?",
+        (request.book_id,),
+    )
+    book_pause = book_pause_rows[0] if book_pause_rows else {}
     manifest = {
         "schema_version": 1,
         "book_id": request.book_id,
@@ -387,6 +609,8 @@ async def create_project_snapshot(
         "spans": script,
         "characters": character_rows,
         "audio_run_dir": _latest_completed_run_dir(storage, request.book_id),
+        "pause_between_speakers_ms": book_pause.get("pause_between_speakers_ms"),
+        "pause_same_speaker_ms": book_pause.get("pause_same_speaker_ms"),
     }
     snapshot_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
 
@@ -601,9 +825,63 @@ def _apply_snapshot_merge(
         for span in manifest.get("spans", []):
             if not isinstance(span, dict) or not span.get("id"):
                 continue
+            # Plan L (P1-S3): round-trip the per-span ``pause_after_ms``.
+            # The key is present on snapshots saved after the pause feature
+            # landed (value is ``None`` = resolve default, ``0`` = no-gap
+            # override, or a bounded int).  It is intentionally NOT coerced:
+            # ``None`` stays NULL and ``0`` stays 0.  Older snapshots (key
+            # absent) leave the span's current pause untouched.  Out-of-range
+            # values from a corrupt snapshot are defensively dropped (the
+            # invariant "no unbounded pause in the DB" wins; text/instruct
+            # still restore).
+            span_update = "text = ?, instruct = ?"
+            span_params: list = [span.get("text") or "", span.get("instruct") or ""]
+            if "pause_after_ms" in span:
+                pause = span.get("pause_after_ms")
+                if pause is None:
+                    span_update += ", pause_after_ms = ?"
+                    span_params.append(None)
+                elif isinstance(pause, bool):
+                    pass  # drop invalid boolean
+                else:
+                    try:
+                        validated = validate_pause_ms(pause)
+                    except ValueError:
+                        pass  # drop out-of-range/fractional; keep text/instruct
+                    else:
+                        span_update += ", pause_after_ms = ?"
+                        span_params.append(validated)
+            span_params.append(span["id"])
             storage.execute_update(
-                "UPDATE span SET text = ?, instruct = ? WHERE id = ?",
-                (span.get("text") or "", span.get("instruct") or "", span["id"]),
+                f"UPDATE span SET {span_update} WHERE id = ?", tuple(span_params)
+            )
+        # Plan L (P1-S3): round-trip the book-level pause override columns.
+        # Only present on snapshots saved after the pause feature landed; key
+        # absent → leave current book pause overrides untouched.  NULL vs 0 is
+        # preserved verbatim; out-of-range values are defensively dropped.
+        book_pause_updates: list[str] = []
+        book_pause_params: list = []
+        for pause_key in ("pause_between_speakers_ms", "pause_same_speaker_ms"):
+            if pause_key not in manifest:
+                continue
+            pause = manifest.get(pause_key)
+            if pause is None:
+                book_pause_updates.append(f"{pause_key} = ?")
+                book_pause_params.append(None)
+            elif isinstance(pause, bool):
+                continue
+            else:
+                try:
+                    validated = validate_pause_ms(pause)
+                except ValueError:
+                    continue
+                book_pause_updates.append(f"{pause_key} = ?")
+                book_pause_params.append(validated)
+        if book_pause_updates:
+            book_pause_params.append(book_id)
+            storage.execute_update(
+                f"UPDATE book SET {', '.join(book_pause_updates)} WHERE id = ?",
+                tuple(book_pause_params),
             )
         for char in manifest.get("characters", []):
             if not isinstance(char, dict) or not char.get("id"):

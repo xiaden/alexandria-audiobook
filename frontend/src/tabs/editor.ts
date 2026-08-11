@@ -45,6 +45,10 @@ import {
   pipelineSetSingleSpeaker,
   loadSingleSpeakerToggle,
   handleSingleSpeakerToggleChange,
+  // Per-span pause override (Plan L, Phase 5)
+  pipelineGetSpanPause,
+  pipelineSetSpanPause,
+  PAUSE_MAX_MS,
   // Span-text undo (Plan J, Phase 3)
   pushUndoEntry,
   undoLastSpanEdit,
@@ -120,6 +124,13 @@ export {
   pipelineSetSingleSpeaker,
   loadSingleSpeakerToggle,
   handleSingleSpeakerToggleChange,
+};
+
+// Re-export per-span pause override (Plan L, Phase 5)
+export {
+  pipelineGetSpanPause,
+  pipelineSetSpanPause,
+  PAUSE_MAX_MS,
 };
 
 // Re-export span-text undo (Plan J, Phase 3)
@@ -369,6 +380,46 @@ export function initEditor(): void {
           if (span) {
             target.textContent = span.text;
           }
+        }
+      });
+
+      // Per-span pause override (Plan L, Phase 5): 'change' fires on blur /
+      // Enter after the number input is committed. Blank → null (clear the
+      // override → resolve the applicable default); explicit 0 → intentional
+      // no-gap; positive → that many ms. Bounded 0..10000 (mirrors the backend
+      // validate_pause_ms 422).
+      spansTableBody.addEventListener('change', async (e) => {
+        const target = e.target as HTMLInputElement;
+        if (!target.classList.contains('span-pause')) return;
+        const spanId = target.dataset.spanId;
+        if (!spanId) return;
+        const idx = parseInt(target.dataset.index || '0', 10);
+        const cachedSpans = getCachedSpans();
+        const span = cachedSpans.find(s => s.global_index === idx);
+        const revert = () => {
+          target.value = span && span.pause_after_ms != null ? String(span.pause_after_ms) : '';
+        };
+        const raw = target.value.trim();
+        let pause: number | null;
+        if (raw === '') {
+          pause = null;
+        } else {
+          const n = Number(raw);
+          if (!Number.isInteger(n) || n < 0 || n > PAUSE_MAX_MS) {
+            showToast(`Pause must be a whole number between 0 and ${PAUSE_MAX_MS} ms`, 'error');
+            revert();
+            return;
+          }
+          pause = n;
+        }
+        try {
+          await pipelineSetSpanPause(spanId, pause);
+          if (span) span.pause_after_ms = pause;
+          showToast(pause === null ? 'Span pause cleared (uses default)' : `Span pause set to ${pause} ms`, 'success');
+        } catch (err) {
+          console.error('Failed to update span pause:', err);
+          showToast('Failed to update span pause', 'error');
+          revert();
         }
       });
     }

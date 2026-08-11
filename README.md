@@ -37,7 +37,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Batch Processing** - Generate dozens of spans simultaneously with 3-6x real-time throughput
 - **Codec Compilation** - Optional `torch.compile` optimization for 3-4x faster batch decoding
 - **Non-verbal Sounds** - LLM writes natural vocalizations ("Ahh!", "Mmm...", "Haha!") with context-aware instruct directions
-- **Natural Pauses** - Configurable pause between speakers (default 500 ms) and same-speaker segments (default 250 ms), recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio
+- **Natural Pauses** - Configurable pause between speakers (default 500 ms) and same-speaker segments (default 250 ms), with per-book overrides and per-span pause editing. The resolved pause values are inserted into the merged audio during M4B export.
 
 ### Web UI Editor
 - **Streamlined Interface** - Core pipeline tabs (Setup, Script, Voices, Editor) plus advanced tools (Designer, Preparer, Dataset, Training)
@@ -241,9 +241,73 @@ Configure connections to your LLM and TTS engine.
 - **Min Sub-batch Size** - Minimum chunks per sub-batch before allowing a split (default: 4)
 - **Length Ratio** - Maximum longest/shortest text length ratio before forcing a sub-batch split (default: 5)
 - **Max Sub-batch Items** - Upper bound on chunks per sub-batch
-- **Speaker Change Pause** - Pause between different speakers (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default: 500 ms)
-- **Same Speaker Pause** - Pause when the same speaker continues (recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio; default: 250 ms)
-- **Pause limitation** - Pause values are recorded and carried to the engine, but the current engine does not insert audible silence into the merged audio. The export response discloses this via the `pauses_applied` / `pauses_message` fields, surfaced in the Editor tab's export surface
+- **Speaker Change Pause** - Global default pause between different speakers, inserted into the merged audio (default: 500 ms; 0–10000 ms)
+- **Same Speaker Pause** - Global default pause when the same speaker continues, inserted into the merged audio (default: 250 ms; 0–10000 ms)
+- **Book Pause Overrides** - Per-book pause overrides that take precedence over the config defaults (leave blank to inherit). The resolved values are shown as a preview on the Setup tab.
+ - **Per-Span Pause** - Each span in the Editor can set a pause-after override (blank = resolved default, 0 = no gap). M4B export inserts the resolved speaker pauses into the merged audio; the export surface reports the assembly tri-state (`applied` / `failed` / pending) with the resolved values and span-override count.
+
+### Pause Insertion
+
+The pipeline inserts configurable, deterministic speaker pauses into the merged
+whole-book audio. Pauses are real audible silence written into a canonical
+paused artifact (`audiobook-paused.wav`), which becomes the single source for
+the M4B, MP3, and Audacity exports.
+
+**Precedence (resolution order):** for each of the two pause settings —
+different-speaker and same-speaker — the resolved value is taken from the
+first tier that supplies a non-null value:
+
+1. Render request override (when supported)
+2. Book/project override (`GET`/`PUT /api/pipeline/book/{book_id}/pause_settings`)
+3. Persisted config default (`tts.pause_between_speakers_ms` /
+   `tts.pause_same_speaker_ms`, saved via `POST /api/config`)
+4. Built-in fallback — **500 ms** between different speakers, **250 ms** when
+   the same speaker continues
+
+**Bounds:** every pause value is a **non-negative integer millisecond count**
+in the range **0–10000 ms** (max 10 s). Config saves, book/span overrides, and
+per-span edits all reject negative, fractional, boolean, NaN/inf, and
+out-of-range values with a stable 422 (config or API) error. There are no
+unbounded pause values.
+
+**Nullable vs. zero:** a missing/`NULL` value means *resolve the applicable
+default*; an explicit `0` is an *intentional no-gap* override (never coerced
+to a default). This distinction survives save/load and project snapshot
+round-trips.
+
+**Per-span pauses:** each span can set a `pause_after_ms` override via
+`GET`/`PUT /api/pipeline/span/{span_id}/pause_after` (blank/NULL = resolved
+default, `0` = no gap, positive = explicit ms). A span override always wins
+over the resolved book/config default.
+
+**Format & cleanup guarantees:** the paused artifact is assembled with the
+source WAV format explicitly preserved (frame rate, channels, sample width —
+pydub would otherwise bump low-rate sources). It is exported to a temporary
+file in the run directory, fsynced, atomically renamed into place, and the
+directory is fsynced. Temporary/intermediate files are removed on every
+success or failure path.
+
+**Speaker source:** speaker order and pause metadata are taken from the
+**render-time in-memory script/chunks** — never inferred from filenames or the
+manifest. The postprocessor runs during `render_audiobook` while this metadata
+is still in memory.
+
+**Artifact status fields:** render status and M4B export responses report
+`resolved_pause_between_speakers_ms`, `resolved_pause_same_speaker_ms`,
+`pause_override_count` (spans with a non-null `pause_after_ms`), and the
+truthful tri-state `pauses_state`: `pending` (assembly not yet run),
+`applied` (paused artifact present and used as the export source, with a
+concise `pauses_message`), or `failed` (assembly unavailable; `pauses_error`
+carries bounded detail and no filesystem paths). `pauses_applied` is the
+derived boolean (`true` iff `applied`). Failures never claim success.
+
+**Migration & backward compatibility:** existing projects migrate idempotently —
+their `book` rows gain `NULL` pause-override columns and every `span` gains a
+nullable `pause_after_ms` (resolving defaults, never coerced to 0). Pre-pause
+project snapshots (no pause keys) restore without touching current pause
+state. When no paused artifact is available (e.g. a render that completed
+without assembly), exports transparently fall back to the existing per-span
+chunk concatenation and report the `failed` tri-state.
 
 ### Script Tab
 Upload an EPUB file and run the annotation walks. Onboarding is EPUB-only — the file is converted to plain text server-side on upload. The pipeline runs 9 serial LLM walks that convert your book into a structured span graph with:
@@ -414,12 +478,13 @@ Vocalizations are written as real pronounceable text that the TTS speaks directl
 Rendering produces per-span audio chunks in a job-specific output directory. The Editor tab's Export M4B form turns a completed render into the finished audiobook:
 
 **Final Audiobook:**
-- `audiobook.m4b` - AAC audiobook with embedded chapter markers and the metadata entered in the Export M4B form (title, author, narrator, year, description, optional cover). Plays in Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players
-- `audiobook.mp3` - MP3 export produced when the backend's ffmpeg includes MP3 support (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag and is served via `GET /api/pipeline/export/mp3/{job_id}`
-- `audiobook-audacity.zip` - ZIP_STORED bundle of the raw WAV chunks for editing in Audacity or other DAWs, produced alongside the M4B. The download link appears per the capability flag and is served via `GET /api/pipeline/export/audacity/{job_id}`
+- `audiobook.m4b` - AAC audiobook with embedded chapter markers and the metadata entered in the Export M4B form (title, author, narrator, year, description, optional cover). Plays in Audiobookshelf, Apple Books, VLC, Haruna, and most audiobook players. When the canonical paused artifact is available it is assembled from the paused source WAV (see *Pause Insertion*), so the resolved speaker pauses are audible in the final book
+- `audiobook.mp3` - MP3 export produced when the backend's ffmpeg includes MP3 support (libmp3lame); otherwise the export degrades to M4B-only with a clear message. The download link appears per the capability flag and is served via `GET /api/pipeline/export/mp3/{job_id}`. Like the M4B, it derives from the paused source WAV when available
+- `audiobook-audacity.zip` - ZIP_STORED bundle produced alongside the M4B for editing in Audacity or other DAWs. When the paused artifact is available it contains `audiobook-paused.wav` (the paused whole-book source) plus the MP3; otherwise it falls back to the per-span WAV chunks. The download link appears per the capability flag and is served via `GET /api/pipeline/export/audacity/{job_id}`
 
 **Render job output (per render):**
 - `chunk_0000.wav`, `chunk_0001.wav`, ... - One WAV per span, numbered in timeline order
+- `audiobook-paused.wav` - the canonical deterministic paused whole-book artifact (assembly resolved the speaker pauses; see *Pause Insertion*). It becomes the job's `output_artifact_path` and the single source for M4B, MP3, and Audacity exports
 - The `GET /api/pipeline/download/{job_id}` endpoint serves the merged `audiobook.m4b` when available, otherwise packages the chunks into `audiobook.zip` for manual assembly
 
 ## API Reference

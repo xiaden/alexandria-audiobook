@@ -279,7 +279,7 @@ def _rebuild_manifests(conn: sqlite3.Connection, render_root: str) -> dict[str, 
     """
     # Deferred import: tts_integration imports PipelineStorage from this
     # module at load time, so a module-level import here would be circular.
-    from app.pipeline.tts_integration import _write_manifest
+    from app.pipeline.tts_integration import PAUSED_ARTIFACT_NAME, _write_manifest
 
     conn.row_factory = sqlite3.Row
     now_ms = int(time.time() * 1000)
@@ -312,10 +312,16 @@ def _rebuild_manifests(conn: sqlite3.Connection, render_root: str) -> dict[str, 
                 ).fetchall()
             ]
         else:
+            # Batch mode has no per-chunk rows; the run-dir *.wav files are the
+            # per-chunk sources.  The canonical paused whole-book artifact
+            # (PAUSED_ARTIFACT_NAME) also lives in the run dir and is NOT a
+            # per-chunk WAV — it must be excluded here or the startup rebuild
+            # would mis-register it as a chunk (P4 stale-manifest fix).
             chunk_paths = [
                 os.path.join(run_dir, name)
                 for name in sorted(os.listdir(run_dir))
                 if name.endswith(".wav")
+                and name != PAUSED_ARTIFACT_NAME
                 and os.path.isfile(os.path.join(run_dir, name))
             ]
         if _manifest_is_stale(run_dir, row, chunk_paths):

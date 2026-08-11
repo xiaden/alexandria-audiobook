@@ -7,6 +7,10 @@
 
 import * as API from '../api';
 import { showToast } from '../utils';
+import { state } from '../state';
+
+/** Pause bound (mirror of the backend validate_pause_ms / PAUSE_MAX_MS=10_000). */
+const PAUSE_MAX_MS = 10000;
 
 /**
  * Canonical walk task names matching WalkRunner.WALK_ORDER in runner.py.
@@ -209,11 +213,11 @@ export async function loadConfig(): Promise<void> {
     if (subBatchMaxItemsEl && config.tts.sub_batch_max_items != null) {
       subBatchMaxItemsEl.value = String(config.tts.sub_batch_max_items);
     }
-    // Global pause fields (DD cannot-restore #5: no per-span pause_after):
-    // recorded and carried to the engine, but the current engine does not
-    // insert audible silence into the merged audio — pause_between_speakers_ms
-    // between different speakers (default 500 ms), pause_same_speaker_ms when
-    // the same speaker continues (default 250 ms).
+    // Global pause fields — the config-wide defaults that are resolved into
+    // the merged audio: pause_between_speakers_ms between different speakers
+    // (default 500 ms), pause_same_speaker_ms when the same speaker continues
+    // (default 250 ms). These are the defaults the book-level overrides below
+    // fall back to (and render/export resolve them via precedence).
     if (pauseBetweenSpeakersEl && config.tts.pause_between_speakers_ms != null) {
       pauseBetweenSpeakersEl.value = String(config.tts.pause_between_speakers_ms);
     }
@@ -222,6 +226,10 @@ export async function loadConfig(): Promise<void> {
     }
 
     toggleTTSMode();
+    // Load the per-book pause overrides + resolved preview after the global
+    // config populates the inputs (book overrides take precedence; blank =
+    // inherit these config defaults).
+    await loadBookPauseSettings();
   } catch (e) {
     console.error('Failed to load config', e);
   }
@@ -342,10 +350,9 @@ export function buildConfigPayload(): AppConfig {
       sub_batch_min_size: parseInt(subBatchMinSizeEl?.value || '') || 4,
       sub_batch_ratio: parseFloat(subBatchRatioEl?.value || '') || 5,
       sub_batch_max_items: parseInt(subBatchMaxItemsEl?.value || '') || 0,
-      // Global pause fields — recorded and carried onto the batch chunk dicts
-      // (tts_integration._build_chunks), but the engine does not insert audible
-      // silence into the merged audio; fall back to the TTSConfig defaults
-      // (500/250 ms) when the input is empty/invalid.
+      // Global pause defaults — carried into the config that the render chain
+      // resolves (tts_integration._build_chunks) into the merged audio; fall
+      // back to the TTSConfig defaults (500/250 ms) when the input is empty.
       pause_between_speakers_ms: parseInt(pauseBetweenSpeakersEl?.value || '') || 500,
       pause_same_speaker_ms: parseInt(pauseSameSpeakerEl?.value || '') || 250,
     },
@@ -358,19 +365,134 @@ export function buildConfigPayload(): AppConfig {
 }
 
 /**
+ * Read a pause (ms) input value into a nullable integer.
+ *
+ * Empty/blank → ``null`` (NULL = resolve the applicable default / inherit).
+ * Non-empty must be an integer in 0..PAUSE_MAX_MS; anything invalid returns
+ * ``null`` too (callers run validatePauseInputs() before submit, so the
+ * invalid case is caught client-side and never persisted).
+ */
+function readPauseInput(value: string | undefined): number | null {
+  if (value === undefined || value.trim() === '') return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > PAUSE_MAX_MS) return null;
+  return n;
+}
+
+/**
+ * Validate the pause inputs (global defaults + book overrides) client-side,
+ * mirroring the backend 422 (validate_pause_ms / PAUSE_MAX_MS). Empty inputs
+ * are allowed (inherit/fallback); any non-empty value must be an integer in
+ * 0..10000. Returns false and toasts the first offending field.
+ */
+function validatePauseInputs(): boolean {
+  const fields: Array<[string, string]> = [
+    ['pause-between-speakers', 'Speaker change pause'],
+    ['pause-same-speaker', 'Same speaker pause'],
+    ['book-pause-between-speakers', 'Book speaker-change pause'],
+    ['book-pause-same-speaker', 'Book same-speaker pause'],
+  ];
+  for (const [id, label] of fields) {
+    const input = document.getElementById(id) as HTMLInputElement | null;
+    if (!input || input.value.trim() === '') continue;
+    const n = Number(input.value);
+    if (!Number.isInteger(n) || n < 0 || n > PAUSE_MAX_MS) {
+      showToast(`${label} must be a whole number between 0 and ${PAUSE_MAX_MS} ms`, 'error');
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Recompute the resolved-pause preview line from precedence:
+ * book override → global config default (current global input) → 500/250 ms.
+ */
+function updatePauseResolvedPreview(): void {
+  const preview = document.getElementById('pause-resolved-preview');
+  if (!preview) return;
+  const globalBetween = readPauseInput(
+    (document.getElementById('pause-between-speakers') as HTMLInputElement | null)?.value,
+  );
+  const globalSame = readPauseInput(
+    (document.getElementById('pause-same-speaker') as HTMLInputElement | null)?.value,
+  );
+  const bookBetween = readPauseInput(
+    (document.getElementById('book-pause-between-speakers') as HTMLInputElement | null)?.value,
+  );
+  const bookSame = readPauseInput(
+    (document.getElementById('book-pause-same-speaker') as HTMLInputElement | null)?.value,
+  );
+  const between = bookBetween ?? globalBetween ?? 500;
+  const same = bookSame ?? globalSame ?? 250;
+  preview.textContent = `Resolved: ${between} ms between speakers · ${same} ms same speaker`;
+}
+
+/**
+ * Load the current book's pause overrides (GET /api/pipeline/book/{book_id}/
+ * pause_settings) into the override inputs. With no book onboarded, clears the
+ * overrides and shows the config-default preview. Failure is non-fatal.
+ */
+async function loadBookPauseSettings(): Promise<void> {
+  const betweenEl = document.getElementById('book-pause-between-speakers') as HTMLInputElement | null;
+  const sameEl = document.getElementById('book-pause-same-speaker') as HTMLInputElement | null;
+  if (!state.pipelineBookId) {
+    if (betweenEl) betweenEl.value = '';
+    if (sameEl) sameEl.value = '';
+    updatePauseResolvedPreview();
+    return;
+  }
+  try {
+    const settings = await API.get<{
+      pause_between_speakers_ms: number | null;
+      pause_same_speaker_ms: number | null;
+    }>(`/api/pipeline/book/${state.pipelineBookId}/pause_settings`);
+    if (betweenEl) {
+      betweenEl.value = settings.pause_between_speakers_ms != null ? String(settings.pause_between_speakers_ms) : '';
+    }
+    if (sameEl) {
+      sameEl.value = settings.pause_same_speaker_ms != null ? String(settings.pause_same_speaker_ms) : '';
+    }
+    updatePauseResolvedPreview();
+  } catch {
+    // Book-override load failure is non-fatal — keep the inputs at their
+    // current (possibly empty = inherit) values and show the default preview.
+    updatePauseResolvedPreview();
+  }
+}
+
+/**
  * Handle config form submission.
  * Builds the config payload from the retained raw config merged with current
  * form values (unknown top-level sections preserved — byte-stable round-trip)
- * and POSTs it to /api/config.
+ * and POSTs it to /api/config. Also persists the per-book pause overrides via
+ * PUT /api/pipeline/book/{book_id}/pause_settings when a book is onboarded.
  */
 async function handleConfigSubmit(e: Event): Promise<void> {
   e.preventDefault();
+
+  if (!validatePauseInputs()) return;
 
   const config = buildConfigPayload();
 
   try {
     await API.post('/api/config', config);
+    // Persist the per-book pause overrides (P5-S1). Blank → null (inherit the
+    // config default); explicit 0 → intentional no-gap. Partial-update via
+    // model_fields_set: always send both keys so a cleared field reverts to
+    // inherit.
+    if (state.pipelineBookId) {
+      await API.put(`/api/pipeline/book/${state.pipelineBookId}/pause_settings`, {
+        pause_between_speakers_ms: readPauseInput(
+          (document.getElementById('book-pause-between-speakers') as HTMLInputElement | null)?.value,
+        ),
+        pause_same_speaker_ms: readPauseInput(
+          (document.getElementById('book-pause-same-speaker') as HTMLInputElement | null)?.value,
+        ),
+      });
+    }
     showToast('Configuration Saved!', 'success');
+    updatePauseResolvedPreview();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     showToast('Error saving config: ' + msg, 'error');
@@ -397,6 +519,14 @@ export function initSetup(): void {
     if (ttsModeEl) {
       ttsModeEl.addEventListener('change', () => toggleTTSMode());
     }
+
+    // Live resolved-pause preview: recompute whenever a global default or a
+    // book override input changes (P5-S1).
+    ['pause-between-speakers', 'pause-same-speaker', 'book-pause-between-speakers', 'book-pause-same-speaker']
+      .forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', () => updatePauseResolvedPreview());
+      });
 
     // Load config on init
     loadConfig();

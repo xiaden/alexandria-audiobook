@@ -58,15 +58,30 @@ def _populate_test_spine(conn: sqlite3.Connection) -> dict:
     Returns dict with span IDs for reference.
     """
     conn.execute("INSERT INTO series VALUES ('s1')")
-    conn.execute("INSERT INTO book VALUES ('b1', 's1', 1, 1, 1, 0)")
+    conn.execute(
+        "INSERT INTO book (id, series_id, book_number, version, position) "
+        "VALUES ('b1', 's1', 1, 1, 1)"
+    )
     conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
     conn.execute("INSERT INTO scene VALUES ('sc1')")
     conn.execute("INSERT INTO paragraph VALUES ('p1')")
     conn.execute("INSERT INTO paragraph VALUES ('p2')")
-    conn.execute("INSERT INTO span VALUES ('sp1', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp2', 'quotation', 'angrily', 'Hello')")
-    conn.execute("INSERT INTO span VALUES ('sp3', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span VALUES ('sp4', 'sentence', NULL, NULL)")
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) "
+        "VALUES ('sp1', 'sentence', NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) "
+        "VALUES ('sp2', 'quotation', 'angrily', 'Hello')"
+    )
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) "
+        "VALUES ('sp3', 'sentence', NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) "
+        "VALUES ('sp4', 'sentence', NULL, NULL)"
+    )
 
     # Edge tables
     conn.execute("INSERT INTO book_chapter VALUES ('c1', 'b1', 1)")
@@ -130,11 +145,17 @@ def _add_second_book(conn: sqlite3.Connection) -> None:
               paragraph p2b (position=1)
                 span sp2_1 (position=1, sentence) - b2 global_index=1
     """
-    conn.execute("INSERT INTO book VALUES ('b2', 's1', 2, 1, 2, 0)")
+    conn.execute(
+        "INSERT INTO book (id, series_id, book_number, version, position) "
+        "VALUES ('b2', 's1', 2, 1, 2)"
+    )
     conn.execute("INSERT INTO chapter VALUES ('c2', 'b2')")
     conn.execute("INSERT INTO scene VALUES ('sc2')")
     conn.execute("INSERT INTO paragraph VALUES ('p2b')")
-    conn.execute("INSERT INTO span VALUES ('sp2_1', 'sentence', NULL, 'Book 2 text')")
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) "
+        "VALUES ('sp2_1', 'sentence', NULL, 'Book 2 text')"
+    )
     conn.execute("INSERT INTO book_chapter VALUES ('c2', 'b2', 1)")
     conn.execute("INSERT INTO chapter_scene VALUES ('sc2', 'c2', 1)")
     conn.execute("INSERT INTO scene_paragraph VALUES ('p2b', 'sc2', 1)")

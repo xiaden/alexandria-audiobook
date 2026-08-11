@@ -53,7 +53,15 @@ from starlette.responses import MalformedRangeHeader, PlainTextResponse, RangeNo
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
 from app.pipeline.assembly import export_annotated_script
-from app.pipeline.tts_integration import CancelledError, get_render_root, render_audiobook
+from app.pipeline.tts_integration import (
+    PAUSE_BETWEEN_SPEAKERS_MS,
+    PAUSE_SAME_SPEAKER_MS,
+    PAUSED_ARTIFACT_NAME,
+    CancelledError,
+    get_render_root,
+    render_audiobook,
+    resolve_effective_pauses,
+)
 from app.utils import load_tts_config
 
 
@@ -82,6 +90,115 @@ class MergeRequest(BaseModel):
 
     book_id: str
     job_id: str
+
+
+# ---------------------------------------------------------------------------
+# Pause-assembly status contract (Plan L, P2-S3)
+#
+# The render/job-status and export responses surface a tri-state lifecycle
+# describing whether the paused audio was actually assembled into the output:
+#
+#   pauses_state    "pending"   assembly has not run yet (Phase 2: postprocessor
+#                               not wired — always the current value)
+#                   "applied"   the paused artifact was assembled and used
+#                   "failed"    assembly was attempted but raised (see pauses_error)
+#   pauses_applied  True        iff pauses_state == "applied" (a derived boolean
+#                               for consumers that only need the flag)
+#   pauses_error    str | None  failure detail when pauses_state == "failed"
+#
+# Alongside the tri-state, every response resolves the effective pause pair for
+# the book (book override -> config default -> built-in fallback) and reports
+# how many per-span ``pause_after_ms`` overrides are present.  Assembly itself
+# is implemented in Phase 3; Phase 2 only defines and serves this contract,
+# always in the "pending" state.
+# ---------------------------------------------------------------------------
+
+
+_PAUSES_STATE_PENDING = "pending"
+_PAUSES_STATE_APPLIED = "applied"
+_PAUSES_STATE_FAILED = "failed"
+
+
+def _resolved_pause_metadata(storage: PipelineStorage, book_id: str) -> dict:
+    """Resolve the effective pause pair for *book_id* + its override count.
+
+    Precedence mirrors ``resolve_effective_pauses``: book override ->
+    config default (``load_tts_config``) -> built-in 500/250 fallback.  NULL
+    book columns resolve to the next tier; ``0`` is honored as an intentional
+    no-gap.  ``pause_override_count`` counts spans with a non-NULL
+    ``pause_after_ms``.
+    """
+    book_rows = storage.execute_query(
+        "SELECT pause_between_speakers_ms, pause_same_speaker_ms FROM book"
+        " WHERE id = ?",
+        (book_id,),
+    )
+    book_overrides = book_rows[0] if book_rows else {}
+    between, same = resolve_effective_pauses(
+        book_overrides=book_overrides, config_defaults=load_tts_config()
+    )
+    override_count = storage.execute_query(
+        "SELECT COUNT(*) AS cnt FROM span"
+        " JOIN paragraph_span AS span_edge ON span.id = span_edge.child_id"
+        " JOIN scene_paragraph AS paragraph_edge"
+        "     ON span_edge.parent_id = paragraph_edge.child_id"
+        " JOIN chapter_scene AS scene_edge"
+        "     ON paragraph_edge.parent_id = scene_edge.child_id"
+        " JOIN book_chapter AS chapter_edge"
+        "     ON scene_edge.parent_id = chapter_edge.child_id"
+        " JOIN book ON chapter_edge.parent_id = book.id"
+        " WHERE book.id = ? AND span.pause_after_ms IS NOT NULL",
+        (book_id,),
+    )
+    return {
+        "resolved_pause_between_speakers_ms": between,
+        "resolved_pause_same_speaker_ms": same,
+        "pause_override_count": override_count[0]["cnt"],
+    }
+
+
+def _pause_contract_payload(storage: PipelineStorage, book_id: str) -> dict:
+    """Resolved pause metadata + tri-state (Phase 2: always 'pending')."""
+    payload = _resolved_pause_metadata(storage, book_id)
+    payload["pauses_applied"] = False
+    payload["pauses_state"] = _PAUSES_STATE_PENDING
+    payload["pauses_error"] = None
+    return payload
+
+
+def _paused_artifact_path(run_dir: str) -> str | None:
+    """Return the canonical paused whole-book artifact when it is usable.
+
+    The paused artifact (``PAUSED_ARTIFACT_NAME``, ``audiobook-paused.wav``) is
+    the whole book with the resolved pauses baked in and is the authoritative
+    source for every whole-book export surface (P4-S1).  It is usable when it
+    exists as a file inside *run_dir* AND parses as a PCM WAV (a malformed or
+    truncated file from a partial write is treated as absent so the caller
+    falls back to the per-chunk concat).  Returns ``None`` when absent or
+    unusable.
+    """
+    if not run_dir:
+        return None
+    path = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        _parse_wav(path)
+    except ValueError:
+        return None
+    return path
+
+
+def _pause_contract_placeholder() -> dict:
+    """Tri-state shape for row-less jobs (no book_id): built-in defaults."""
+    return {
+        "resolved_pause_between_speakers_ms": PAUSE_BETWEEN_SPEAKERS_MS,
+        "resolved_pause_same_speaker_ms": PAUSE_SAME_SPEAKER_MS,
+        "pause_override_count": 0,
+        "pauses_applied": False,
+        "pauses_state": _PAUSES_STATE_PENDING,
+        "pauses_error": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +414,8 @@ async def render_status(
     ``cancel_event`` channel and as a fallback for jobs with no row.
     """
     rows = storage.execute_query(
-        "SELECT mode, status, error, output_dir FROM render_job WHERE job_id = ?",
+        "SELECT mode, status, error, output_dir, book_id FROM render_job"
+        " WHERE job_id = ?",
         (job_id,),
     )
     if rows:
@@ -319,6 +437,9 @@ async def render_status(
             response["total_chunks"] = sum(by_status.values())
             response["completed_chunks"] = by_status.get("done", 0)
             response["failed_chunks"] = by_status.get("failed", 0)
+        # Plan L (P2-S3): resolved pause settings + tri-state lifecycle
+        # (Phase 2: assembly not wired, so pauses_state is always 'pending').
+        response.update(_pause_contract_payload(storage, row["book_id"]))
         return response
 
     # Fallback: in-process tracker (legacy entries / cancel_event holder)
@@ -330,6 +451,7 @@ async def render_status(
         "status": job["status"],
         "output_dir": job["output_dir"],
         "error": job["error"],
+        **_pause_contract_placeholder(),
     }
 
 
@@ -1039,7 +1161,9 @@ async def export_audio(
         candidates = sorted(
             os.path.join(run_dir, name)
             for name in names
-            if name.endswith(".wav") and os.path.isfile(os.path.join(run_dir, name))
+            if name.endswith(".wav")
+            and name != PAUSED_ARTIFACT_NAME
+            and os.path.isfile(os.path.join(run_dir, name))
         )
         if not candidates:
             raise HTTPException(
@@ -1171,17 +1295,6 @@ async def download_render(
 _MP3_ARTIFACT_NAME = "audiobook.mp3"
 _AUDACITY_ARTIFACT_NAME = "audiobook-audacity.zip"
 
-# Pause capability disclosure (Plan K, decision #13; DD cannot-restore #5):
-# the global pause values are recorded and carried per-chunk to the engine,
-# but the engine (app/tts.py, byte-for-byte immutable) reads only
-# index/text/instruct/speaker and drops unknown keys — no audible silence is
-# inserted into the merged audio.  The per-span pause_after variant is not
-# restorable.  Truthful, user-facing copy carried on every successful export.
-_PAUSES_MESSAGE = (
-    "Pause values are recorded and carried to the engine, but the current "
-    "engine does not insert audible silence into the merged audio."
-)
-
 
 def _completed_run_dir(storage: PipelineStorage, job_id: str) -> str:
     """Row-backed dispatch: the run dir of a completed render job, or 4xx.
@@ -1290,12 +1403,22 @@ async def merge_audiobook(request: MergeRequest) -> dict:
     if not output_dir or not os.path.isdir(output_dir):
         raise HTTPException(status_code=404, detail="Output directory not found")
 
-    # Find WAV chunks sorted by name (chunk_0000.wav, chunk_0001.wav, ...)
-    chunk_files = sorted(
-        f
-        for f in os.listdir(output_dir)
-        if f.endswith(".wav") and f.startswith("chunk_")
-    )
+    # Find WAV chunks sorted by name (chunk_0000.wav, chunk_0001.wav, ...).
+    # P4-S1: when the canonical paused whole-book artifact (PAUSED_ARTIFACT_NAME)
+    # is present it is the authoritative source — merge it (single entry)
+    # rather than re-concatenating the unpaused per-chunk WAVs.  Fall back to
+    # the per-chunk concat when it is absent (a render that completed without
+    # assembly).
+    names = os.listdir(output_dir)
+    paused_path = os.path.join(output_dir, PAUSED_ARTIFACT_NAME)
+    if PAUSED_ARTIFACT_NAME in names and os.path.isfile(paused_path):
+        chunk_files = [PAUSED_ARTIFACT_NAME]
+    else:
+        chunk_files = sorted(
+            f
+            for f in names
+            if f.endswith(".wav") and f.startswith("chunk_")
+        )
 
     if not chunk_files:
         raise HTTPException(
@@ -1547,19 +1670,25 @@ def export_m4b(
 ) -> dict:
     """3-phase FFMETADATA1 polished M4B export for a completed render job.
 
-    Phase 1 CONCAT: ffmpeg concat demuxer joins the chunk WAVs in order
-    (render_chunk rows by idx for individual mode — rows = truth; sorted
-    *.wav files for batch mode) into an intermediate WAV in a hidden subdir.
+    Phase 1 CONCAT: when the canonical paused whole-book artifact
+    (``PAUSED_ARTIFACT_NAME``) is present and parseable in the run dir it is the
+    single export source (P4-S1) — the whole book with the resolved pauses baked
+    in — and ffmpeg concat encodes it directly.  Otherwise ffmpeg concat demuxer
+    joins the chunk WAVs in order (render_chunk rows by idx for individual mode
+    — rows = truth; sorted *.wav files for batch mode, excluding the paused
+    artifact) into an intermediate WAV in a hidden subdir.
     Phase 2 METADATA: ``audiobook.ffmetadata`` written atomically with the
-    global tags (title/artist/album_artist/date/comment) and one auto chapter
-    per chunk — START/END in integer ms, TIMEBASE=1/1000, and the last END
+    global tags (title/artist/album_artist/date/comment) and auto chapter
+    markers (one per export source; the whole book is a single source when the
+    paused artifact is used) — START/END in integer ms, TIMEBASE=1/1000, and the
+    last END
     clamped to the concatenated duration from a single ffprobe pass (never
     exceeding the real stream duration).  Phase 3 MUX: m4b (aac, ipod
     container) carrying the tags/chapters and an optional uploaded cover as an
     mjpeg ``attached_pic`` stream; then an mp3 via libmp3lame when the encoder
     is feature-detected (else M4B-only with a message, DD open item #8); and
-    an always-producible ``audiobook-audacity.zip`` (ZIP_STORED, per-chunk
-    WAVs + mp3) for Audacity import.  On success the render_job row's
+    an always-producible ``audiobook-audacity.zip`` (ZIP_STORED, the export
+    source(s) + mp3) for Audacity import.  On success the render_job row's
     ``output_artifact_path`` is updated to the m4b (rows = truth) so the
     phase-5 whole-book endpoint serves it.  Dispatch mirrors export_audio:
     unknown job -> 404, expired -> 410, non-completed -> 404, evicted/non-done
@@ -1575,10 +1704,14 @@ def export_m4b(
         ``audiobook-audacity.zip`` path).  A ``message`` key is present only
         when libmp3lame is unavailable and the export is degraded to
         M4B-only (DD open item #8), explaining why no MP3 was produced.
-        Every successful export also carries the pause capability disclosure
-        (Plan K, decision #13): ``pauses_applied`` (always False — the
-        engine does not insert audible silence) and ``pauses_message``
-        (user-facing copy, ``_PAUSES_MESSAGE``).
+        Every successful export also carries the resolved pause metadata
+        (``resolved_pause_between_speakers_ms`` / ``resolved_pause_same_speaker_ms``
+        / ``pause_override_count``) and the truthful pause tri-state (P4-S2):
+        ``pauses_applied``/``pauses_state`` is true/'applied' with a concise
+        ``pauses_message`` when the canonical paused artifact was the source;
+        false/'failed' with a bounded ``pauses_error`` (no filesystem paths)
+        when assembly was unavailable and the unpaused per-chunk concat was
+        exported instead.
     """
     # 0. Row lookup — rows are the source of truth (phase-5 dispatch).
     rows = storage.execute_query(
@@ -1636,10 +1769,25 @@ def export_m4b(
         candidates = sorted(
             os.path.join(run_dir, name)
             for name in names
-            if name.endswith(".wav") and os.path.isfile(os.path.join(run_dir, name))
+            if name.endswith(".wav")
+            and name != PAUSED_ARTIFACT_NAME
+            and os.path.isfile(os.path.join(run_dir, name))
         )
         if not candidates:
             raise HTTPException(status_code=400, detail="No audio files found in output directory")
+
+    # P4-S1: consume the canonical paused whole-book artifact when it is
+    # usable.  The paused artifact (PAUSED_ARTIFACT_NAME) is the whole book with
+    # the resolved pauses baked in — the authoritative source for whole-book
+    # export.  When present and parseable it REPLACES the per-chunk source set
+    # so the export never mixes paused audio with the unpaused per-chunk concat.
+    # When absent (a render that completed without assembly, e.g. a fake
+    # engine), fall back to the per-chunk concat so legacy rows still export —
+    # the truthful tri-state in the response reflects which path ran.
+    paused_path = _paused_artifact_path(run_dir)
+    paused_used = paused_path is not None
+    if paused_used:
+        candidates = [paused_path]
 
     # 2. Validate the chunk set before any ffmpeg work: every chunk parses as
     #    PCM WAV and all share one format (phase-5 rule).
@@ -1791,14 +1939,33 @@ def export_m4b(
         "mp3_path": mp3_path if mp3_produced else None,
         "audacity": True,
         "audacity_path": zip_path,
-        # Pause capability disclosure (Plan K, decision #13): honest by
-        # construction — the global pause values ride on every chunk but the
-        # engine never inserts audible silence into the merged audio
-        # (app/tts.py immutable; per-span pause_after not restorable — DD
-        # cannot-restore #5).
-        "pauses_applied": False,
-        "pauses_message": _PAUSES_MESSAGE,
     }
+    # P4-S2 truthful pause contract (supersedes the Plan K disclosure, decision
+    # #13): the resolved pause pair + override count ride on every export, and
+    # the tri-state truthfully reflects whether the canonical paused artifact
+    # was the source.  When it was, pauses_applied=true and a concise message is
+    # carried (the only case a message appears).  When it was not (assembly
+    # unavailable — the render completed without a paused artifact), the export
+    # falls back to the unpaused per-chunk concat and reports pauses_applied=
+    # false with pauses_state='failed' and a bounded pauses_error that leaks no
+    # filesystem paths.
+    pause_payload = _resolved_pause_metadata(storage, row["book_id"])
+    if paused_used:
+        response["pauses_applied"] = True
+        response["pauses_state"] = _PAUSES_STATE_APPLIED
+        response["pauses_error"] = None
+        response["pauses_message"] = (
+            "Pauses applied: the exported audio includes the resolved speaker "
+            "pauses between spans."
+        )
+    else:
+        response["pauses_applied"] = False
+        response["pauses_state"] = _PAUSES_STATE_FAILED
+        response["pauses_error"] = (
+            "Paused audio assembly artifact not found; exported the concatenated "
+            "source audio without inserted pauses."
+        )
+    response.update(pause_payload)
     if not _libmp3lame_available():
         response["message"] = (
             "MP3 export unavailable: the libmp3lame encoder was not found in "

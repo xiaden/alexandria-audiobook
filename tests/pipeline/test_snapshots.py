@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -136,8 +137,9 @@ class TestCreateSnapshot:
         assert data["size_bytes"] > 0
 
     def test_post_stores_current_spans_state(self, client, storage):
-        """snapshot_json captures spans (text/instruct/speaker), characters
-        (voice assignments), and the current book version."""
+        """snapshot_json captures spans (text/instruct/speaker + Plan L
+        pause_after_ms), characters (voice assignments), the current book
+        version, and the Plan L book-level pause override columns."""
         resp = client.post("/api/pipeline/projects", json={"book_id": "b1"})
         assert resp.status_code == 200
         name = resp.json()["name"]
@@ -155,11 +157,15 @@ class TestCreateSnapshot:
                 "speaker": "Alice",
                 "text": "Hello there!",
                 "instruct": "cheerfully",
+                "pause_after_ms": None,
             }
         ]
         assert manifest["characters"] == [
             {"id": "c1", "name": "Alice", "voice_assignment_id": "vc1"}
         ]
+        # Plan L: no book pause override → keys present with NULL (not 0).
+        assert manifest["pause_between_speakers_ms"] is None
+        assert manifest["pause_same_speaker_ms"] is None
 
     def test_post_unknown_book_404(self, client):
         """POST /projects for a nonexistent book returns 404."""
@@ -980,3 +986,139 @@ class TestLoadReRenderNotice:
         )
         assert resp.status_code == 200
         assert resp.json()["re_render_required"] is False
+
+
+class TestPauseRoundTrip:
+    """Plan L P1-S3: snapshots round-trip book pause overrides + span pause_after.
+
+    The manifest carries ``pause_between_speakers_ms`` / ``pause_same_speaker_ms``
+    at book level and ``pause_after_ms`` per span.  NULL (resolve default) and
+    0 (intentional no-gap) must survive a save → mutate → load round trip
+    without being coerced to each other; pre-pause snapshots (keys absent)
+    must leave current pause state untouched.
+    """
+
+    def test_save_captures_book_pause_and_span_pause_after(self, client, storage):
+        storage.execute_update(
+            "UPDATE book SET pause_between_speakers_ms = 700,"
+            " pause_same_speaker_ms = 0 WHERE id = 'b1'"
+        )
+        storage.execute_update("UPDATE span SET pause_after_ms = 120 WHERE id = 'sp1'")
+        created = client.post("/api/pipeline/projects", json={"book_id": "b1"}).json()
+        manifest = json.loads(storage.get_project_snapshot(created["name"])["snapshot_json"])
+        assert manifest["pause_between_speakers_ms"] == 700
+        assert manifest["pause_same_speaker_ms"] == 0  # 0 preserved, not coerced
+        span_entry = next(s for s in manifest["spans"] if s["id"] == "sp1")
+        assert span_entry["pause_after_ms"] == 120
+
+    def test_save_defaults_spans_with_null_pause_after(self, client, storage):
+        created = client.post("/api/pipeline/projects", json={"book_id": "b1"}).json()
+        manifest = json.loads(storage.get_project_snapshot(created["name"])["snapshot_json"])
+        span_entry = next(s for s in manifest["spans"] if s["id"] == "sp1")
+        assert span_entry["pause_after_ms"] is None
+        assert manifest["pause_between_speakers_ms"] is None
+        assert manifest["pause_same_speaker_ms"] is None
+
+    def test_load_round_trips_null_vs_zero(self, client, storage):
+        # Save with span pause_after=0 (no-gap) and book pauses 700/0.
+        storage.execute_update(
+            "UPDATE book SET pause_between_speakers_ms = 700,"
+            " pause_same_speaker_ms = 0 WHERE id = 'b1'"
+        )
+        storage.execute_update("UPDATE span SET pause_after_ms = 0 WHERE id = 'sp1'")
+        created = client.post("/api/pipeline/projects", json={"book_id": "b1"}).json()
+        # Mutate away.
+        storage.execute_update(
+            "UPDATE book SET pause_between_speakers_ms = NULL,"
+            " pause_same_speaker_ms = NULL WHERE id = 'b1'"
+        )
+        storage.execute_update("UPDATE span SET pause_after_ms = NULL WHERE id = 'sp1'")
+        # Load restores.
+        resp = client.post(
+            "/api/pipeline/projects/load",
+            json={"name": created["name"], "book_id": "b1"},
+        )
+        assert resp.status_code == 200
+        book_row = storage.execute_query(
+            "SELECT pause_between_speakers_ms, pause_same_speaker_ms"
+            " FROM book WHERE id = 'b1'"
+        )[0]
+        assert book_row["pause_between_speakers_ms"] == 700
+        assert book_row["pause_same_speaker_ms"] == 0  # 0 preserved, not NULL
+        span_row = storage.execute_query(
+            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
+        )[0]
+        assert span_row["pause_after_ms"] == 0  # 0 preserved, not coerced to NULL
+
+    def test_load_preserves_null_span_pause(self, client, storage):
+        storage.execute_update("UPDATE span SET pause_after_ms = NULL WHERE id = 'sp1'")
+        created = client.post("/api/pipeline/projects", json={"book_id": "b1"}).json()
+        storage.execute_update("UPDATE span SET pause_after_ms = 0 WHERE id = 'sp1'")
+        resp = client.post(
+            "/api/pipeline/projects/load",
+            json={"name": created["name"], "book_id": "b1"},
+        )
+        assert resp.status_code == 200
+        span_row = storage.execute_query(
+            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
+        )[0]
+        assert span_row["pause_after_ms"] is None  # NULL restored, not 0
+
+    def test_load_old_snapshot_without_pause_keys_leaves_pause_untouched(
+        self, client, storage
+    ):
+        created = client.post("/api/pipeline/projects", json={"book_id": "b1"}).json()
+        manifest = json.loads(storage.get_project_snapshot(created["name"])["snapshot_json"])
+        for span in manifest["spans"]:
+            span.pop("pause_after_ms", None)
+        manifest.pop("pause_between_speakers_ms", None)
+        manifest.pop("pause_same_speaker_ms", None)
+        storage.create_project_snapshot(
+            "old-snap",
+            "b1",
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+            int(time.time() * 1000),
+        )
+        storage.execute_update(
+            "UPDATE book SET pause_between_speakers_ms = 300 WHERE id = 'b1'"
+        )
+        storage.execute_update("UPDATE span SET pause_after_ms = 200 WHERE id = 'sp1'")
+        resp = client.post(
+            "/api/pipeline/projects/load",
+            json={"name": "old-snap", "book_id": "b1"},
+        )
+        assert resp.status_code == 200
+        book_row = storage.execute_query(
+            "SELECT pause_between_speakers_ms FROM book WHERE id = 'b1'"
+        )[0]
+        assert book_row["pause_between_speakers_ms"] == 300  # untouched
+        span_row = storage.execute_query(
+            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
+        )[0]
+        assert span_row["pause_after_ms"] == 200  # untouched
+
+    def test_load_drops_out_of_range_snapshot_pause(self, client, storage):
+        storage.execute_update("UPDATE span SET pause_after_ms = NULL WHERE id = 'sp1'")
+        created = client.post("/api/pipeline/projects", json={"book_id": "b1"}).json()
+        manifest = json.loads(storage.get_project_snapshot(created["name"])["snapshot_json"])
+        manifest["spans"][0]["pause_after_ms"] = 999999999
+        manifest["pause_between_speakers_ms"] = 999999999
+        storage.create_project_snapshot(
+            "corrupt-snap",
+            "b1",
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+            int(time.time() * 1000),
+        )
+        resp = client.post(
+            "/api/pipeline/projects/load",
+            json={"name": "corrupt-snap", "book_id": "b1"},
+        )
+        assert resp.status_code == 200
+        book_row = storage.execute_query(
+            "SELECT pause_between_speakers_ms FROM book WHERE id = 'b1'"
+        )[0]
+        assert book_row["pause_between_speakers_ms"] is None
+        span_row = storage.execute_query(
+            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
+        )[0]
+        assert span_row["pause_after_ms"] is None

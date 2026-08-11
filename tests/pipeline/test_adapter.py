@@ -1417,6 +1417,43 @@ class TestRebuildManifests:
         finally:
             adapter.close()
 
+    def test_rebuild_batch_excludes_paused_artifact(self, tmp_path):
+        """The canonical paused whole-book artifact (audiobook-paused.wav) is
+        NOT a per-chunk WAV — the startup batch rebuild must exclude it so it is
+        never mis-registered as a chunk (P4 stale-manifest fix)."""
+        root = str(tmp_path / "render_root")
+        run_dir = os.path.join(root, "book-b1", "job-bp")
+        os.makedirs(run_dir)
+        for name in ("temp_batch_0.wav", "temp_batch_1.wav"):
+            with open(os.path.join(run_dir, name), "wb") as f:
+                f.write(b"fake wav")
+        with open(os.path.join(run_dir, "audiobook-paused.wav"), "wb") as f:
+            f.write(b"fake wav")
+        db_path = str(tmp_path / "rebuild.db")
+        writer = SQLiteAdapter(db_path=db_path)
+        writer.init_db()
+        _insert_completed_render_job(
+            writer, "job-bp", mode="batch", output_dir=run_dir
+        )
+        writer.close()
+
+        adapter = self._reopen(db_path)
+        try:
+            counts = adapter.rebuild_manifests(root)
+            assert counts == {"manifests_rebuilt": 1, "jobs_marked_expired": 0}
+            manifest = self._manifest(root, "b1", "job-bp")
+            assert manifest["mode"] == "batch"
+            assert manifest["chunk_count"] == 2
+            assert [c["wav_path"] for c in manifest["chunks"]] == [
+                "temp_batch_0.wav",
+                "temp_batch_1.wav",
+            ]
+            assert "audiobook-paused.wav" not in [
+                c["wav_path"] for c in manifest["chunks"]
+            ]
+        finally:
+            adapter.close()
+
     def test_rebuild_derives_run_dir_from_render_root_when_output_dir_null(
         self, tmp_path
     ):
