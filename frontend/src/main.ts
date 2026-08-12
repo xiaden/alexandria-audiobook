@@ -83,6 +83,7 @@ import { initDatasetBuilder } from './tabs/dataset-builder';
 import { initTraining } from './tabs/training';
 import { initEditor } from './tabs/editor';
 import { initProjects } from './tabs/projects';
+import { initWorkbench } from './tabs/workbench';
 
 // Initialize all tabs after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
@@ -97,5 +98,6 @@ document.addEventListener('DOMContentLoaded', () => {
     initTraining();
     initEditor();
     initProjects();
+    initWorkbench();
     initTabNavigation();
 });

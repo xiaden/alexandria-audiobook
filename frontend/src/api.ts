@@ -99,6 +99,32 @@ export async function postWithRetryOnce<T = unknown>(
 }
 
 /**
+ * Shared single-retry body used by the one-retry PUT/DELETE helpers.
+ * Mirrors `postWithRetryOnce`: exactly ONE automatic retry when the server
+ * responds with a retryable status + Retry-After header; the integer-seconds
+ * delay is honored (fallback 1s), and any non-retryable response or a second
+ * retryable response surfaces via `handleError` exactly as the plain helper
+ * would. Never loops: at most 2 total attempts.
+ */
+async function withRetryOnce<T>(
+  endpoint: string,
+  init: RequestInit,
+  retryStatus: number,
+): Promise<T> {
+  let res = await fetch(endpoint, init);
+
+  if (res.status === retryStatus && res.headers.get('Retry-After') != null) {
+    const seconds = parseInt(res.headers.get('Retry-After') as string, 10);
+    const delayMs = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000;
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    res = await fetch(endpoint, init);
+  }
+
+  await handleError(res);
+  return res.json();
+}
+
+/**
  * Perform a PATCH request to the API
  * @param endpoint - API endpoint (e.g., '/api/pipeline/projects/{name}')
  * @param body - Request body (will be JSON.stringify'd)
@@ -141,4 +167,42 @@ export async function put<T = unknown>(endpoint: string, body: unknown): Promise
   });
   await handleError(res);
   return res.json();
+}
+
+/**
+ * PUT with exactly ONE automatic retry when the server replies with
+ * `retryStatus` (default 503, the pipeline concurrent-write contract) plus a
+ * Retry-After header. Honors the integer-second delay. Used by the workbench
+ * for writes that may contend with a concurrent pipeline storage write
+ * (presence, overrides, boundary-overrides). Never loops: at most 2 attempts.
+ */
+export async function putWithRetryOnce<T = unknown>(
+  endpoint: string,
+  body: unknown,
+  retryStatus: number = 503,
+): Promise<T> {
+  return withRetryOnce<T>(endpoint, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, retryStatus);
+}
+
+/**
+ * DELETE with exactly ONE automatic retry when the server replies with
+ * `retryStatus` (default 503, the pipeline concurrent-write contract) plus a
+ * Retry-After header. Honors the integer-second delay. Used by the workbench
+ * for deleting overrides / boundary overrides that may contend with a
+ * concurrent pipeline write. Never loops: at most 2 attempts.
+ */
+export async function delWithRetryOnce<T = unknown>(
+  endpoint: string,
+  body: unknown,
+  retryStatus: number = 503,
+): Promise<T> {
+  return withRetryOnce<T>(endpoint, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, retryStatus);
 }
