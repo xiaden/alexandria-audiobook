@@ -15,6 +15,7 @@ All DDL is issued by ``create_schema(connection)`` which is idempotent
 from __future__ import annotations
 
 import sqlite3
+import time
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +247,7 @@ CREATE TABLE IF NOT EXISTS walk_review_item (
     id TEXT PRIMARY KEY,
     book_id TEXT,
     run_id TEXT,
-    kind TEXT NOT NULL CHECK (kind IN ('voice_profile', 'voice_assignment', 'instruction')),
+    kind TEXT NOT NULL CHECK (kind IN ('voice_profile', 'voice_assignment', 'instruction', 'alias_merge')),
     target_table TEXT,
     target_id TEXT,
     prior_value TEXT,
@@ -272,6 +273,219 @@ CREATE TABLE IF NOT EXISTS project_snapshot (
     created_ms INTEGER
 );
 """
+
+
+# ---------------------------------------------------------------------------
+# Workbench — combined 2b/2c/2d workbench tables (DD-combined-walks-2b-2d)
+# ---------------------------------------------------------------------------
+# All workbench DDL is registered in CONTRACTS.md.  ``workbench_generation``
+# is the SOLE per-book revision allocator and intentionally has NO foreign key
+# to ``book`` — ``book.version`` is never read or incremented by the workbench.
+# Generated and manual presence projections live in separate tables with
+# independent target uniqueness; disagreement between them is a conflict, not
+# a duplicate insert.  ``source_run_id`` / ``generation_revision`` on generated
+# rows are provenance only and never participate in uniqueness.
+
+_WORKBENCH_DDL = """
+CREATE TABLE IF NOT EXISTS workbench_generation (
+    generation_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL UNIQUE,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    updated_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workbench_decision (
+    decision_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    target_kind TEXT NOT NULL
+        CHECK (target_kind IN ('presence', 'alias_merge', 'review', 'boundary')),
+    target_key TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('active', 'undone', 'superseded', 'conflict')),
+    source TEXT NOT NULL CHECK (source IN ('human', 'generated')),
+    created_ms INTEGER NOT NULL,
+    undone_by TEXT REFERENCES workbench_decision(decision_id),
+    supersedes_id TEXT REFERENCES workbench_decision(decision_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workbench_decision_book_status
+    ON workbench_decision (book_id, status);
+
+CREATE TABLE IF NOT EXISTS workbench_provenance (
+    provenance_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    target_kind TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    run_id TEXT REFERENCES walk_run(run_id),
+    generation_revision INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('walk', 'human', 'derived')),
+    created_ms INTEGER NOT NULL
+);
+
+-- Active tombstone: an absent character is never a NULL/deleted junction.
+CREATE TABLE IF NOT EXISTS character_scene_absence (
+    book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    scene_id TEXT NOT NULL REFERENCES scene(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+    decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY (book_id, scene_id, character_id)
+);
+
+-- Non-destructive convergent alias model: members remain addressable, the
+-- active relation projects them under the canonical character, and prior
+-- voice assignments + downstream impact are stored for reversible unmerge.
+CREATE TABLE IF NOT EXISTS character_alias_merge (
+    merge_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    canonical_id TEXT NOT NULL REFERENCES character(id),
+    member_id TEXT NOT NULL REFERENCES character(id),
+    merge_revision INTEGER NOT NULL CHECK (merge_revision >= 0),
+    decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id),
+    status TEXT NOT NULL CHECK (status IN ('active', 'undone')),
+    prior_member_name TEXT NOT NULL,
+    prior_member_aliases_json TEXT NOT NULL,
+    prior_member_voice_assignment_id TEXT REFERENCES voice_config(id),
+    consequence_json TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    UNIQUE (book_id, merge_id)
+);
+
+-- At most one ACTIVE merge per (book, member) — history is keyed by
+-- (merge_id, merge_revision), never by a UNIQUE(book_id, member_id, status).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_alias_active_member
+    ON character_alias_merge (book_id, member_id) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS boundary_override (
+    override_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    chapter_id TEXT REFERENCES chapter(id),
+    scene_id TEXT REFERENCES scene(id),
+    paragraph_id TEXT REFERENCES paragraph(id),
+    decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id),
+    payload_json TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_ms INTEGER NOT NULL,
+    CHECK (chapter_id IS NOT NULL OR scene_id IS NOT NULL OR paragraph_id IS NOT NULL)
+);
+
+-- Generated 2b/2d rows: unique by stable target key only, never source_run_id.
+CREATE TABLE IF NOT EXISTS character_scene_generated (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL REFERENCES character(id),
+    scene_id TEXT NOT NULL REFERENCES scene(id),
+    relation_type TEXT NOT NULL CHECK (relation_type IN ('present', 'speaker')),
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    generation_revision INTEGER NOT NULL,
+    source_run_id TEXT REFERENCES walk_run(run_id),
+    UNIQUE (book_id, character_id, scene_id, relation_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_scene_generated_book
+    ON character_scene_generated (book_id);
+
+-- Manual presence projection: separate rows, independent target uniqueness;
+-- ``absent`` coexists with present/speaker rows and is gated by the tombstone.
+CREATE TABLE IF NOT EXISTS character_scene_manual (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL REFERENCES character(id),
+    scene_id TEXT NOT NULL REFERENCES scene(id),
+    relation_type TEXT NOT NULL CHECK (relation_type IN ('present', 'speaker', 'absent')),
+    decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id),
+    UNIQUE (book_id, character_id, scene_id, relation_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_scene_manual_book
+    ON character_scene_manual (book_id);
+"""
+
+
+def _migrate_walk_review_item_kind(connection: sqlite3.Connection) -> None:
+    """Extend ``walk_review_item.kind`` CHECK to include ``alias_merge``.
+
+    Existing databases created the table with ``kind`` restricted to
+    ``('voice_profile', 'voice_assignment', 'instruction')``.  Alias-merge
+    review items need ``kind='alias_merge'`` (``target_id`` holds the merge
+    ID).  SQLite cannot alter a CHECK constraint in place, so the table is
+    rebuilt transactionally while preserving every row and the
+    ``idx_walk_review_item_book_status`` index.  Guarded by inspecting the
+    stored CREATE SQL so ``create_schema`` stays idempotent; no human data is
+    deleted or rewritten.
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master"
+        " WHERE type='table' AND name='walk_review_item'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return
+    if "alias_merge" in row[0]:
+        return
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.execute(
+            """CREATE TABLE walk_review_item_new (
+                id TEXT PRIMARY KEY,
+                book_id TEXT,
+                run_id TEXT,
+                kind TEXT NOT NULL CHECK (kind IN
+                    ('voice_profile', 'voice_assignment', 'instruction', 'alias_merge')),
+                target_table TEXT,
+                target_id TEXT,
+                prior_value TEXT,
+                status TEXT NOT NULL CHECK (status IN
+                    ('pending', 'resolved', 'superseded', 'stale')),
+                created_ms INTEGER
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO walk_review_item_new
+                 (id, book_id, run_id, kind, target_table, target_id,
+                  prior_value, status, created_ms)
+               SELECT id, book_id, run_id, kind, target_table, target_id,
+                      prior_value, status, created_ms
+                 FROM walk_review_item"""
+        )
+        connection.execute("DROP TABLE walk_review_item")
+        connection.execute(
+            "ALTER TABLE walk_review_item_new RENAME TO walk_review_item"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_walk_review_item_book_status"
+            " ON walk_review_item (book_id, status)"
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+
+def _backfill_workbench_generation(connection: sqlite3.Connection) -> None:
+    """Create one ``workbench_generation`` row per existing book at revision 0.
+
+    Additive, idempotent backfill so pre-existing books gain a workbench
+    revision allocator row.  The allocator has no FK to ``book`` (it is the
+    sole per-book revision owner), so this reads the ``book`` table directly.
+    Existing rows are never deleted or rewritten.
+    """
+    now = int(time.time() * 1000)
+    connection.execute(
+        """INSERT INTO workbench_generation (generation_id, book_id, revision, updated_ms)
+           SELECT 'wg-' || b.id, b.id, 0, ?
+             FROM book b
+            WHERE NOT EXISTS (
+                SELECT 1 FROM workbench_generation g WHERE g.book_id = b.id
+            )""",
+        (now,),
+    )
 
 
 def _ensure_book_single_speaker_column(connection: sqlite3.Connection) -> None:
@@ -351,7 +565,10 @@ def create_schema(connection: sqlite3.Connection) -> None:
         + _GRAPH2_JUNCTION_DDL
         + _SPAN_PRESENTATION_VIEW
         + _UNIVERSAL_UPGRADE_DDL
+        + _WORKBENCH_DDL
     )
     _ensure_book_single_speaker_column(connection)
     _ensure_book_pause_columns(connection)
     _ensure_span_pause_column(connection)
+    _migrate_walk_review_item_kind(connection)
+    _backfill_workbench_generation(connection)

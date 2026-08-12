@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-CoEHB2gz.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-CES4J2FO.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -107,6 +107,7 @@
                     <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="voices">3. Voices</a></li>
                     <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="editor">4. Editor</a></li>
                     <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="projects">5. Projects</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" href="#" role="button" data-tab="workbench">6. Workbench</a></li>
                     <li class="nav-item ms-3 border-start border-secondary ps-3"><a class="nav-link nav-advanced" href="#" role="button" data-tab="designer">Designer</a></li>
                     <li class="nav-item"><a class="nav-link nav-advanced" href="#" role="button" data-tab="preparer">Preparer</a></li>
                     <li class="nav-item"><a class="nav-link nav-advanced" href="#" role="button" data-tab="dataset-builder">Dataset</a></li>
@@ -1228,6 +1229,126 @@
                     <p class="text-muted">Save the current book as a snapshot. Snapshots are auto-named; load restores a snapshot into the current book (merge — characters are never deleted). If the snapshot's audio is missing, you will be prompted to re-render.</p>
                     <div id="projects-list">
                         <!-- ProjectSnapshot rows injected here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Workbench Tab (combined Characters & Scenes — walks 2b/2c/2d) -->
+        <div id="workbench-tab" class="tab-content" style="display:none;">
+            <div class="card mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h4 class="m-0"><span class="step-indicator step-active">6</span>Workbench</h4>
+                    <div id="workbench-actions" class="d-flex gap-2">
+                        <button type="button" class="btn btn-outline-secondary btn-sm" data-action="refresh-workbench" title="Reload workbench state">
+                            <i class="fas fa-sync-alt me-1"></i>Refresh
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary btn-sm" id="btn-workbench-undo" title="Undo the last decision">
+                            <i class="fas fa-undo me-1"></i>Undo
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted">Review, correct, and manage the generated Characters &amp; Scenes evidence: highlight spans, the character ledger, alias resolution, scene presence, per-walk configuration, conflicts, and reruns.</p>
+
+                    <!-- Journey A: scene navigator + highlighted evidence + ledger -->
+                    <div class="row mb-3">
+                        <div class="col-md-4">
+                            <h5>Scenes</h5>
+                            <div id="workbench-navigator" class="overflow-auto" style="max-height: 420px;">
+                                <!-- renderSceneNavigator -->
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <h5>Highlighted evidence</h5>
+                            <div id="workbench-span-evidence">
+                                <!-- renderSpanEvidence -->
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <h5>Character ledger</h5>
+                            <div id="workbench-ledger" class="overflow-auto" style="max-height: 420px;">
+                                <!-- renderCharacterLedger -->
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Review queue + conflicts + runs -->
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <h5>Conflicts</h5>
+                            <div id="workbench-conflicts">
+                                <!-- renderConflicts -->
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <h5>Recent runs</h5>
+                            <div id="workbench-runs">
+                                <!-- renderRuns -->
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Journey C: scene presence editing -->
+                    <div class="card mb-3">
+                        <div class="card-header"><h5 class="m-0">Scene presence</h5></div>
+                        <div class="card-body">
+                            <div id="workbench-presence">
+                                <!-- renderScenePresence -->
+                            </div>
+                            <div class="mt-2 d-flex gap-2">
+                                <button type="button" class="btn btn-outline-success btn-sm" data-action="rerun-selected-scene" data-walk="walk_2d_scene_presence">Rerun 2d for selected scene</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Journey B: alias resolution -->
+                    <div class="card mb-3" id="workbench-alias-panel">
+                        <div class="card-header"><h5 class="m-0">Alias resolution (2c)</h5></div>
+                        <div class="card-body">
+                            <div id="workbench-aliases">
+                                <!-- renderAliasLedger -->
+                            </div>
+                            <div class="row align-items-center mt-2">
+                                <div class="col-md-5">
+                                    <label class="form-label" for="alias-canonical">Canonical character</label>
+                                    <select class="form-select" id="alias-canonical">
+                                        <option value="">Select canonical…</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-5">
+                                    <label class="form-label" for="alias-members">Members to merge</label>
+                                    <select class="form-select" id="alias-members" multiple size="4">
+                                    </select>
+                                </div>
+                                <div class="col-md-2">
+                                    <button type="button" class="btn btn-primary btn-sm mt-4" data-action="alias-preview">Preview</button>
+                                </div>
+                            </div>
+                            <div class="mt-2">
+                                <div id="alias-preview-summary" class="text-muted small"></div>
+                                <button type="button" class="btn btn-success btn-sm mt-2" data-action="alias-commit">Confirm &amp; apply</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Journey D: per-walk setup / config -->
+                    <div class="card mb-3">
+                        <div class="card-header"><h5 class="m-0">Walk setup &amp; effective configuration</h5></div>
+                        <div class="card-body">
+                            <div id="workbench-setup">
+                                <!-- renderSetupPanel -->
+                            </div>
+                            <h6 class="mt-3">Effective config sources</h6>
+                            <div id="workbench-config-sources">
+                                <!-- renderAllConfigSources -->
+                            </div>
+                            <div class="mt-3 d-flex gap-2">
+                                <button type="button" class="btn btn-outline-primary btn-sm" data-action="rerun-book" data-walk="walk_2b_character_discovery">Rerun 2b (book)</button>
+                                <button type="button" class="btn btn-outline-primary btn-sm" data-action="rerun-book" data-walk="walk_2c_alias_resolution">Rerun 2c (book)</button>
+                                <button type="button" class="btn btn-outline-primary btn-sm" data-action="rerun-book" data-walk="walk_2d_scene_presence">Rerun 2d (book)</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>

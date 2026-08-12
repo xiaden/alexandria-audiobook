@@ -91,6 +91,15 @@ EXPECTED_TABLES = {
     "walk_review_item",
     "walk_override",
     "project_snapshot",
+    # Combined 2b/2c/2d Workbench (Plan A workbench layer)
+    "workbench_generation",
+    "workbench_decision",
+    "workbench_provenance",
+    "character_scene_absence",
+    "character_alias_merge",
+    "boundary_override",
+    "character_scene_generated",
+    "character_scene_manual",
 }
 
 
