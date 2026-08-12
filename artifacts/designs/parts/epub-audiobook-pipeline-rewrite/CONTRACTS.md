@@ -1065,3 +1065,54 @@ Decision status transitions are `active → undone|superseded|conflict`; `undone
 - Effective configuration reports field-specific precedence identically to the DD: `model_name`, `reasoning_effort`, and `temperature` use DB row → `llm.task_overrides[task]` → `llm` global → hardcoded fallback; `prompt` uses DB row → top-level `config.walk_override[task].prompt` → `llm.task_overrides[task].prompt` → `llm.prompt` → hardcoded fallback, with empty/non-string values falling through. Unknown keys and invalid values are rejected.
 - UI must provide keyboard-equivalent actions, non-color state encoding, confirmation for destructive changes, revision-aware undo, actionable errors, and no exposure of secrets, SQL, filesystem paths, or raw prompts.
 - New frontend assets update committed `app/static/dist/` and pass `npm run build && git diff --exit-code app/static/dist/`; the legacy guard remains 12/12.
+
+## Combined Workbench 2b–2d — DELIVERED (2026-08-12, S5 registration)
+
+> Appended confirmation that the schema/API/behavior registered above matches the shipped implementation. Route names, request DTOs, and status codes below are the exact delivered surface (verified against `app/pipeline/api_walks.py`, `api_review.py`, `api_characters.py`, `app/pipeline/workbench.py`, and `app/pipeline/schema.py`). No prior contract lines are amended.
+
+### Delivered routes (all under `/api/pipeline`)
+
+- `GET /workbench/{book_id}` → `WorkbenchStateDTO`: `{book_id,generation_revision,scenes,characters,aliases,presence,review_items,overrides,effective_config,conflicts,runs}`. `scenes` is the normalized chapter→scene→paragraph→span hierarchy; `characters` is `{id,name,aliases,voice_assignment_id,description}`; `effective_config[walk_name]` is the per-walk `resolve_effective_config` result.
+- `GET /workbench/{book_id}/config` → `{global: null, task_overrides: {}, top_level_walk_override: {}, db_overrides, effective: {walk_name: values}, source: {walk_name: sources}, validation_errors: []}`. DELIVERED DEVIATION: `global`, `task_overrides`, and `top_level_walk_override` are returned as `null`/empty and effective/source are split per-walk; the old shape is intentionally not populated because the domain resolves precedence directly.
+- `PUT /workbench/{book_id}/overrides` — request `WorkbenchOverrideWriteRequest{walk_name,key,value,base_revision}`; allowed keys are `model_name`, `reasoning_effort`, `temperature`, `prompt` (2b/2c/2d).
+- `DELETE /workbench/{book_id}/overrides` — request `WorkbenchOverrideDeleteRequest{walk_name,key,base_revision}`.
+- `POST /workbench/{book_id}/alias-conversions/preview` — request `AliasPreviewRequest{canonical_id,member_ids,base_revision}`.
+- `POST /workbench/{book_id}/alias-conversions/commit` — request `AliasCommitRequest{preview_token,base_revision,confirm_consequences=false}`.
+- `POST /workbench/{book_id}/reruns` — request `WorkbenchRerunRequest{walk_name,scope='book',scene_ids=null,preserve_manual_decisions=true,base_revision}`; 2c rejects `scenes` scope with 422; response `{run_id,status,scope,invalidated_walks,generation_revision}` with `invalidated_walks` from the invalidation DAG (2b→[2c,2d], 2c→[2d], 2d→[]).
+- `PUT /workbench/{book_id}/presence` — defined in `api_characters.py`; request `CharacterPresenceRequest{scene_id,character_id,relation_type,decision_id?,base_revision}`; response is the contracted `ActionResultDTO` plus `{scene_id,character_id,relation_type}`, with `item_id` = `presence:{scene_id}:{character_id}`.
+- `GET /workbench/{book_id}/boundary-overrides` → `list[BoundaryOverrideDTO]` (active rows only).
+- `PUT /workbench/{book_id}/boundary-overrides` — request `WorkbenchBoundaryOverrideWriteRequest{override_id?,anchor:{chapter_id?,scene_id?,paragraph_id?},payload:{operation,boundary_offsets,label?},base_revision}`.
+- `POST /workbench/{book_id}/boundary-overrides/{override_id}/apply` — applies an active override and records the effective decision.
+- `DELETE /workbench/{book_id}/boundary-overrides/{override_id}` — request `WorkbenchBoundaryDeleteRequest{base_revision}`; path id is authoritative; `active` set to 0; inverse decision retained.
+- `POST /workbench/{book_id}/decisions/{decision_id}/undo` — request `ReviewUndoRequest{base_revision}`; `alias_merge:merge` decisions delegate to the domain's reversible `unmerge_alias`; 409 when non-`active`.
+- `POST /review/accept|reject|override` — request `ReviewActionRequest{item_id,new_value?,base_revision?}`. DELIVERED DEVIATION: `base_revision` is optional and only enforced for `decision:`/`junction:` dispatch targets; legacy bare-junction and `walkitem:` ids keep their prior behavior. `decision:{uuid}` dispatches to `_resolve_decision_action`, `junction:{table}:{character_id}:{entity_id}` to `_resolve_junction_action`, otherwise `ReviewManager.resolve_review_action`.
+
+### Delivered request/DTO field notes
+
+- `WorkbenchOverrideWriteRequest.value` is typed `object` (unvalidated at the Pydantic boundary; validated by `Workbench._validate_override_value`).
+- `WorkbenchBoundaryAnchor` requires at least one non-null id; the route passes `model_dump(exclude_none=True)`. `WorkbenchBoundaryPayload.operation` is `split|merge|resegment`.
+- Presence `decision_id` is an optional client reference; the domain records the authoritative decision. `absent` creates/activates `character_scene_absence`; `present`/`speaker` deactivates the tombstone in the same transaction.
+- `Workbench` domain API (in `app/pipeline/workbench.py`): `require_book`, `get_generation`, `get_revision`, `allocate_revision` (BEGIN IMMEDIATE sole per-book revision allocator), `check_revision`, `get_stable_anchors`, `record_decision`, `record_provenance`, `list_decisions`, `get_generated_rows`, `get_manual_rows`, `set_presence`, `get_presence`, `get_conflicts`, `preview_alias_conversion`, `commit_alias_conversion`, `unmerge_alias`, `get_boundary_overrides`, `put_boundary_override`, `apply_boundary_override`, `deactivate_boundary_override`, `get_overrides`, `put_override`, `delete_override`, `resolve_effective_config`. Domain errors: `WorkbenchError` with subclasses `BookNotFoundError`, `ValidationError`, `StaleRevisionError`, `ConflictError`, `PreviewExpiredError`.
+- Contention/`base_revision`/preview-token failures map to 409 (stale) and 503 + `Retry-After: 5` (transaction contention) via the universal contract; unknown/cross-book ids map to 404; validation to 422.
+
+### Delivered tables (schema.py `_WORKBENCH_DDL`)
+
+- `workbench_generation(generation_id PK, book_id UNIQUE, revision>=0, updated_ms)` — sole allocator, no FK to `book`.
+- `workbench_decision(decision_id PK, book_id FK, target_kind CHECK(presence|alias_merge|review|boundary), target_key, decision_type, base_revision>=0, payload_json, status CHECK(active|undone|superseded|conflict), source CHECK(human|generated), created_ms, undone_by, supersedes_id)` with `idx_workbench_decision_book_status(book_id,status)`.
+- `workbench_provenance(provenance_id PK, book_id FK, target_kind, target_key, run_id FK walk_run, generation_revision, source CHECK(walk|human|derived), created_ms)`.
+- `character_scene_absence(book_id FK, scene_id FK, character_id FK, decision_id FK, active CHECK(0|1), created_ms, PK(book_id,scene_id,character_id))`.
+- `character_alias_merge(merge_id PK, book_id FK, canonical_id FK, member_id FK, merge_revision>=0, decision_id FK, status CHECK(active|undone), prior_member_name, prior_member_aliases_json, prior_member_voice_assignment_id FK voice_config, consequence_json, created_ms, UNIQUE(book_id,merge_id))` + partial unique index `ux_alias_active_member ON character_alias_merge(book_id,member_id) WHERE status='active'`.
+- `boundary_override(override_id PK, book_id FK, chapter_id?, scene_id?, paragraph_id?, decision_id FK, payload_json, active CHECK(0|1), created_ms, CHECK(at least one anchor non-null))`.
+- `character_scene_generated(id PK, book_id FK, character_id FK, scene_id FK, relation_type CHECK(present|speaker), confidence 0-1, generation_revision, source_run_id FK walk_run, UNIQUE(book_id,character_id,scene_id,relation_type))` + `idx_character_scene_generated_book`.
+- `character_scene_manual(id PK, book_id FK, character_id FK, scene_id FK, relation_type CHECK(present|speaker|absent), decision_id FK, UNIQUE(book_id,character_id,scene_id,relation_type))` + `idx_character_scene_manual_book`.
+- Migration `_migrate_walk_review_item_kind` rebuilds `walk_review_item` transactionally to extend `kind` CHECK to `('voice_profile','voice_assignment','instruction','alias_merge')`; `_backfill_workbench_generation` inserts one revision-0 row per book. Both idempotent; no human rows deleted.
+
+### Walk behavior (delivered)
+
+- Walk 2b (`walk_2b_character_discovery.py`) and 2d (`walk_2d_scene_presence.py`) both guard generated presence with `_active_absence(...)` (never re-add active human absence), record `workbench_provenance`, and upsert the generated projection by stable key `(book_id, character_id, scene_id, relation_type)`.
+- Walk 2c (`walk_2c_alias_resolution.py`) remains GLOBAL scope; confidence ≥0.7 auto-accept (merge applied), <0.5 auto-reject, 0.5–0.7 flagged for review. Tracked in `character_alias_merge` with `consequence_json` for reversible unmerge; review kind `alias_merge`.
+
+### Frontend delivery (confirmed)
+
+- `frontend/src/api.ts` adds `putWithRetryOnce` and `delWithRetryOnce` (exactly ONE retry on `retryStatus` default 503 with `Retry-After`); `postWithRetryOnce` (default 503, `retryStatus=409` for snapshot-load restore).
+- `frontend/src/tabs/workbench.ts` implements the workbench navigator/highlights/ledger/aliases/presence/setup/conflicts/rerun-protection; `frontend/src/main.ts` calls `initWorkbench()`. Built output committed in `app/static/dist/`.
