@@ -566,11 +566,19 @@ class TestMergeGroup:
         )
         assert len(rows) == 1
 
-        # Non-canonical deleted
+        # Non-destructive merge: member survives and stays addressable, and
+        # the merge relation is recorded for reversal.
         rows = storage.execute_query(
             "SELECT id FROM character WHERE id = ?", ("c2",)
         )
-        assert rows == []
+        assert len(rows) == 1
+        merges = storage.execute_query(
+            "SELECT canonical_id, member_id, status FROM character_alias_merge "
+            "WHERE book_id = 'b1' AND member_id = 'c2'"
+        )
+        assert len(merges) == 1
+        assert merges[0]["canonical_id"] == "c1"
+        assert merges[0]["status"] == "active"
 
     def test_fallback_first_character(self):
         """If canonical_name doesn't match any name, use the first character
@@ -738,9 +746,9 @@ class TestJunctionRedirection:
 
 
 class TestNonCanonicalDeletion:
-    def test_non_canonical_character_is_deleted_after_merge(self):
+    def test_non_canonical_character_survives_merge_as_member(self):
         """After junction redirection, the non-canonical character row is
-        deleted from the character table."""
+        retained (non-destructive) and recorded as a merge member for reversal."""
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
@@ -768,10 +776,18 @@ class TestNonCanonicalDeletion:
             is_review=False,
         )
 
+        # Member survives (non-destructive) and the merge relation is recorded.
         rows = storage.execute_query(
             "SELECT id FROM character WHERE id = ?", ("noncanon",)
         )
-        assert rows == []
+        assert len(rows) == 1
+        merges = storage.execute_query(
+            "SELECT canonical_id, member_id, status FROM character_alias_merge "
+            "WHERE book_id = 'b1' AND member_id = 'noncanon'"
+        )
+        assert len(merges) == 1
+        assert merges[0]["canonical_id"] == "canon"
+        assert merges[0]["status"] == "active"
 
     def test_canonical_character_survives(self):
         """The canonical character remains after the merge."""
@@ -1101,11 +1117,25 @@ class TestEndToEnd:
         assert "Alicia" in aliases
         assert "Ally" in aliases
 
-        # Non-canonical deleted
+        # Member retained (non-destructive) and merge relation recorded
         noncanon = storage.execute_query(
             "SELECT id FROM character WHERE id = ?", ("c-alicia",)
         )
-        assert noncanon == []
+        assert len(noncanon) == 1
+        merges = storage.execute_query(
+            "SELECT canonical_id, member_id, status FROM character_alias_merge "
+            "WHERE book_id = 'b1' AND member_id = 'c-alicia'"
+        )
+        assert len(merges) == 1
+        assert merges[0]["canonical_id"] == "c-alice"
+        assert merges[0]["status"] == "active"
+        decisions = storage.execute_query(
+            "SELECT target_kind, source, status FROM workbench_decision "
+            "WHERE book_id = 'b1' AND target_kind = 'alias_merge'"
+        )
+        assert decisions
+        assert decisions[0]["source"] == "generated"
+        assert decisions[0]["status"] == "active"
 
         # All junctions now point to c-alice
         book_rows = storage.execute_query(

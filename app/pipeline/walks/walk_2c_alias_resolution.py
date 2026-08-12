@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from ._llm_helpers import chat_completion, extract_json_from_llm_response
@@ -109,6 +110,10 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     if not characters:
         logger.info("No characters found for book %s — nothing to resolve", book_id)
         return result
+
+    # Invalidate downstream generated/review rows for this book's 2d runs
+    # (invalidation DAG: 2c -> 2d).  Marking stale is idempotent.
+    _invalidate_downstream(storage, book_id)
 
     # Build prompt with ALL character names and aliases
     prompt = _build_alias_resolution_prompt(characters)
@@ -309,8 +314,14 @@ def _merge_group(
     merged_ids: set[str],
     result: dict,
     is_review: bool,
+    book_id: str | None = None,
 ) -> None:
     """Merge a group of characters into one canonical character.
+
+    Non-destructive: junction rows are redirected to the canonical character
+    and the merge is recorded as a ``character_alias_merge`` relation (plus a
+    generated workbench decision and provenance) so it is fully reversible.
+    Member ``character`` rows are retained and remain addressable.
 
     Uses a SAVEPOINT for atomicity — if any junction update fails, the
     entire merge group is rolled back.
@@ -334,15 +345,34 @@ def _merge_group(
     if not non_canonical_ids:
         return
 
+    # Resolve book_id from an existing character_book junction when the caller
+    # did not supply it (keeps direct unit-test callers working).
+    if book_id is None:
+        cb = storage.execute_query(
+            "SELECT book_id FROM character_book WHERE character_id = ? LIMIT 1",
+            (canonical_id,),
+        )
+        book_id = cb[0]["book_id"] if cb else None
+
     conn = storage.get_connection()
     conn.execute("SAVEPOINT merge_group")
     try:
-        for nc_id in non_canonical_ids:
-            _redirect_junctions(storage, canonical_id, nc_id)
-            # Delete non-canonical character
-            storage.execute_delete(
-                "DELETE FROM character WHERE id = ?", (nc_id,)
+        decision_id = None
+        if book_id is not None:
+            decision_id = _record_merge_decision(
+                storage, book_id, canonical_id, non_canonical_ids, result
             )
+
+        for nc_id in non_canonical_ids:
+            # Non-destructive: keep the member character row addressable and
+            # record the merge relation (with prior state) for reversal.
+            # Record before junction redirect so member_scene consequences are
+            # captured from the member's own junctions.
+            if book_id is not None:
+                _record_member_merge(
+                    storage, book_id, canonical_id, nc_id, decision_id
+                )
+            _redirect_junctions(storage, canonical_id, nc_id)
             merged_ids.add(nc_id)
             result["characters_merged"] += 1
 
@@ -362,6 +392,121 @@ def _merge_group(
 
     if is_review:
         result["merges_for_review"] += 1
+
+
+# ---------------------------------------------------------------------------
+# Workbench-native merge recording helpers
+# ---------------------------------------------------------------------------
+
+
+# Invalidation DAG: 2c -> 2d.
+_DOWNSTREAM_WALKS = ("walk_2d_scene_presence",)
+
+
+def _generation_revision(storage, book_id):
+    """Read the current per-book workbench generation revision (0 when unset)."""
+    rows = storage.execute_query(
+        "SELECT revision FROM workbench_generation WHERE book_id = ?", (book_id,)
+    )
+    return rows[0]["revision"] if rows else 0
+
+
+def _now_ms():
+    import time
+
+    return int(time.time() * 1000)
+
+
+def _record_merge_decision(storage, book_id, canonical_id, member_ids, result):
+    """Record a generated workbench decision documenting the merge group.
+
+    Returns the decision_id so member merge relations can reference it.
+    """
+    decision_id = f"decision-{uuid.uuid4().hex}"
+    revision = _generation_revision(storage, book_id)
+    payload = {
+        "canonical_id": canonical_id,
+        "member_ids": sorted(member_ids),
+        "source": "walk_2c_alias_resolution",
+    }
+    storage.execute_insert(
+        "INSERT INTO workbench_decision "
+        "(decision_id, book_id, target_kind, target_key, decision_type, "
+        " base_revision, payload_json, status, source, created_ms, supersedes_id) "
+        "VALUES (?, ?, 'alias_merge', ?, 'alias_merge:merge', ?, ?, "
+        " 'active', 'generated', ?, NULL)",
+        (
+            decision_id,
+            book_id,
+            f"{canonical_id}:{','.join(sorted(member_ids))}",
+            revision,
+            json.dumps(payload),
+            _now_ms(),
+        ),
+    )
+    return decision_id
+
+
+def _record_member_merge(storage, book_id, canonical_id, member_id, decision_id):
+    """Record one ``character_alias_merge`` relation for a merged member.
+
+    Captures the member's prior name, aliases and voice assignment so the
+    merge is fully reversible, plus the downstream impact (member scenes are
+    invalidated for 2d re-runs).
+    """
+    char = storage.execute_query(
+        "SELECT id, name, aliases, voice_assignment_id FROM character WHERE id = ?",
+        (member_id,),
+    )
+    name = char[0]["name"] if char else ""
+    aliases_json = char[0]["aliases"] if char else "[]"
+    voice_id = char[0]["voice_assignment_id"] if char else None
+
+    member_scenes = storage.execute_query(
+        "SELECT scene_id FROM character_scene WHERE character_id = ?", (member_id,)
+    )
+    consequence_json = json.dumps(
+        {
+            "downstream_invalidations": {
+                "walk_2d_scene_presence": sorted(
+                    {r["scene_id"] for r in member_scenes}
+                )
+            }
+        }
+    )
+
+    revision = _generation_revision(storage, book_id)
+    storage.execute_insert(
+        "INSERT INTO character_alias_merge "
+        "(merge_id, book_id, canonical_id, member_id, merge_revision, decision_id, "
+        " status, prior_member_name, prior_member_aliases_json, "
+        " prior_member_voice_assignment_id, consequence_json, created_ms) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
+        (
+            f"merge-{uuid.uuid4().hex}",
+            book_id,
+            canonical_id,
+            member_id,
+            revision,
+            decision_id,
+            name,
+            aliases_json,
+            voice_id,
+            consequence_json,
+            _now_ms(),
+        ),
+    )
+
+
+def _invalidate_downstream(storage, book_id):
+    """Mark pending review items from downstream (2d) runs as stale."""
+    placeholders = ",".join("?" for _ in _DOWNSTREAM_WALKS)
+    storage.execute_update(
+        f"UPDATE walk_review_item SET status = 'stale' "
+        f"WHERE book_id = ? AND status = 'pending' AND run_id IN "
+        f"(SELECT run_id FROM walk_run WHERE walk_name IN ({placeholders}))",
+        (book_id, *_DOWNSTREAM_WALKS),
+    )
 
 
 def _redirect_junctions(

@@ -90,6 +90,10 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     # creation and redundant DB lookups within a single walk execution).
     name_to_id: dict[str, str] = _load_existing_characters(book_id, storage)
 
+    # Invalidate downstream generated/review rows for this book's 2c/2d runs
+    # (invalidation DAG: 2b → 2c + 2d).  Marking stale is idempotent.
+    _invalidate_downstream(storage, book_id)
+
     # Query scenes for this book (ordered by chapter, then position)
     scenes = storage.execute_query(
         """
@@ -128,6 +132,101 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
 
 
 # ---------------------------------------------------------------------------
+# Workbench-native helpers
+# ---------------------------------------------------------------------------
+
+
+# Invalidation DAG: 2b -> 2c + 2d.
+_DOWNSTREAM_WALKS = ("walk_2c_alias_resolution", "walk_2d_scene_presence")
+
+
+def _active_absence(storage, book_id, scene_id, character_id):
+    """True when an active human absence tombstone protects this pair."""
+    rows = storage.execute_query(
+        "SELECT 1 FROM character_scene_absence "
+        "WHERE book_id = ? AND scene_id = ? AND character_id = ? AND active = 1",
+        (book_id, scene_id, character_id),
+    )
+    return bool(rows)
+
+
+def _generation_revision(storage, book_id):
+    """Read the current per-book workbench generation revision (0 when unset)."""
+    rows = storage.execute_query(
+        "SELECT revision FROM workbench_generation WHERE book_id = ?", (book_id,)
+    )
+    return rows[0]["revision"] if rows else 0
+
+
+def _now_ms():
+    import time
+
+    return int(time.time() * 1000)
+
+
+def _record_provenance(storage, book_id, target_key, generation_revision, run_id):
+    """Append a provenance row for a generated presence target."""
+    storage.execute_insert(
+        "INSERT INTO workbench_provenance "
+        "(provenance_id, book_id, target_kind, target_key, run_id, "
+        " generation_revision, source, created_ms) "
+        "VALUES (?, ?, 'presence', ?, ?, ?, 'walk', ?)",
+        (
+            f"prov-{uuid.uuid4().hex}",
+            book_id,
+            target_key,
+            run_id,
+            generation_revision,
+            _now_ms(),
+        ),
+    )
+
+
+def _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence):
+    """Upsert the generated presence projection by stable target key."""
+    run_id = getattr(storage, "run_id", None)
+    generation_revision = _generation_revision(storage, book_id)
+    storage.execute_insert(
+        "INSERT INTO character_scene_generated "
+        "(id, book_id, character_id, scene_id, relation_type, confidence, "
+        " generation_revision, source_run_id) "
+        "VALUES (?, ?, ?, ?, 'present', ?, ?, ?) "
+        "ON CONFLICT(book_id, character_id, scene_id, relation_type) "
+        "DO UPDATE SET confidence = excluded.confidence, "
+        "              generation_revision = excluded.generation_revision, "
+        "              source_run_id = excluded.source_run_id",
+        (
+            f"csg-{uuid.uuid4().hex}",
+            book_id,
+            character_id,
+            scene_id,
+            confidence,
+            generation_revision,
+            run_id,
+        ),
+    )
+    _record_provenance(
+        storage, book_id, f"{scene_id}:{character_id}", generation_revision, run_id
+    )
+
+
+def _invalidate_downstream(storage, book_id):
+    """Mark pending review items from downstream (2c/2d) runs as stale.
+
+    Idempotent and safe on every execution: only pending walk_review_item rows
+    whose run belongs to a downstream walk are touched.  Manual rows are never
+    modified.
+    """
+    placeholders = ",".join("?" for _ in _DOWNSTREAM_WALKS)
+    storage.execute_update(
+        f"UPDATE walk_review_item SET status = 'stale' "
+        f"WHERE book_id = ? AND status = 'pending' AND run_id IN "
+        f"(SELECT run_id FROM walk_run WHERE walk_name IN ({placeholders}))",
+        (book_id, *_DOWNSTREAM_WALKS),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -135,7 +234,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
 def _load_existing_characters(
     book_id: str, storage: PipelineStorage
 ) -> dict[str, str]:
-    """Load existing character name → id mappings for this book."""
+    """Load existing character name -> id mappings for this book."""
     rows = storage.execute_query(
         """
         SELECT c.id, c.name
@@ -300,12 +399,28 @@ def _process_character(
         if is_review:
             result["characters_for_review"] += 1
 
-    # character_scene junction — ALWAYS relation_type='present' for walk 2b
-    storage.execute_insert(
-        "INSERT INTO character_scene "
-        "(character_id, scene_id, relation_type, source, confidence, human_override) "
-        "VALUES (?, ?, 'present', 'walk', ?, 0)",
-        (character_id, scene_id, confidence),
+    # Never re-add an active human absence as a generated presence.
+    if _active_absence(storage, book_id, scene_id, character_id):
+        return
+
+    # character_scene junction — ALWAYS relation_type='present' for walk 2b.
+    # Rerun-safe: only insert the legacy row when one does not already exist
+    # for this (character, scene) pair, and always reconcile the generated
+    # projection by stable key (book_id, character_id, scene_id, 'present').
+    existing = storage.execute_query(
+        "SELECT 1 FROM character_scene "
+        "WHERE character_id = ? AND scene_id = ? AND relation_type = 'present'",
+        (character_id, scene_id),
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO character_scene "
+            "(character_id, scene_id, relation_type, source, confidence, human_override) "
+            "VALUES (?, ?, 'present', 'walk', ?, 0)",
+            (character_id, scene_id, confidence),
+        )
+    _upsert_generated_presence(
+        storage, book_id, character_id, scene_id, confidence
     )
 
     # character_span junctions — seed based on role
@@ -314,6 +429,13 @@ def _process_character(
     # For 'present': insert all spans with relation_type='present'
     span_relation_type = role  # speaker, mentioned, or present
     for span_id in span_ids:
+        existing_span = storage.execute_query(
+            "SELECT 1 FROM character_span "
+            "WHERE character_id = ? AND span_id = ? AND relation_type = ?",
+            (character_id, span_id, span_relation_type),
+        )
+        if existing_span:
+            continue
         storage.execute_insert(
             "INSERT INTO character_span "
             "(character_id, span_id, relation_type, source, confidence, human_override) "
