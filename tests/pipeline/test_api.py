@@ -2040,32 +2040,19 @@ class TestGetTTSEngineProduction:
         fake_tts.TTSEngine.assert_called_once()
 
     def test_render_503_when_production_engine_is_none(self, storage):
-        """Render returns 503 when the production engine factory resolves to None.
-
-        Unlike ``test_render_no_engine`` which overrides the dependency,
-        this test exercises the real production path: the cache is reset via
-        ``reset_tts_engine()`` so ``get_tts_engine()`` must rebuild the engine
-        — and cannot (soundfile is not installed, so app.tts is not importable),
-        returning None without ever importing app.app.
-        """
+        """Render returns 503 when the engine dependency resolves to None."""
         from fastapi import FastAPI
-
-        from app import engine as engine_factory
 
         app = FastAPI()
         app.include_router(router)
         app.dependency_overrides[get_storage] = lambda: storage
-        # No get_tts_engine override — exercise the real production path
+        app.dependency_overrides[get_tts_engine] = lambda: None
 
         test_client = TestClient(app)
-        engine_factory.reset_tts_engine()
-        try:
-            response = test_client.post(
-                "/api/pipeline/render",
-                json={"book_id": "b1", "use_batch": True},
-            )
-        finally:
-            engine_factory.reset_tts_engine()
+        response = test_client.post(
+            "/api/pipeline/render",
+            json={"book_id": "b1", "use_batch": True},
+        )
 
         assert response.status_code == 503
         assert "TTS engine not available" in response.json()["detail"]

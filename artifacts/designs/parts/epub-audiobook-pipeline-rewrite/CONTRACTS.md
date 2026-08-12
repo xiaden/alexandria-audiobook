@@ -951,3 +951,117 @@ New:
 - GC: retention ≥7 days post-completion (env-tunable), hourly sweep, never on hot request path; eligibility union includes `project_snapshot` artifact refs; rows tombstoned (`evicted`/`expired`) in the same sweep as file deletion.
 - Frontend: committed dist/ + CI `git diff --exit-code app/static/dist/`; starlette>=0.49.1 CI pin (Range DoS GHSA-7f5h-v6xp-fcq8).
 - New endpoints must land in the correct `api_*` module and be registered here (this section) — future DD updates append, never rewrite.
+
+## Combined Walks 2b–2d Workbench (DD-combined-walks-2b-2d-workbench) — Schema & API Registration
+
+> Contract-gate registration for [DD-combined-walks-2b-2d-workbench](../../pending/DD-combined-walks-2b-2d-workbench.md) (2026-08-12). This is a pipeline-only frontend workbench; it does not alter `app/tts.py`, legacy routes, or walk ordering.
+
+### Schema additions
+
+- Stable workbench decision/provenance records keyed by `book_id`, target anchor, decision type, base generation revision, payload, status, and created time; records must preserve manual decisions and support reversible alias decisions.
+- The convergent character-alias representation is `character_alias_merge`, including voice-assignment consequence data; no destructive 2c merge may bypass it.
+- Explicit human scene-presence absence/tombstone state, so Walk 2d cannot re-add a user decision on rerun.
+- Human boundary-override records for stable chapter/scene/paragraph anchors are unconditionally in workbench scope; Walk 2a remains outside execution but every 2a rerun must consume active overrides or be rejected.
+- Generation/source-run provenance and any merge-review `walk_review_item` kind required to represent Walk 2c decisions; existing `walk_review_item` kinds remain compatible.
+
+#### Concrete workbench tables and invariants
+
+The following names are normative (SQLite INTEGER timestamps are unix milliseconds). `book`, `scene`, `chapter`, `paragraph`, `character`, `character_scene`, `character_span`, `walk_run`, and `walk_review_item` are existing tables and are not renamed.
+
+```sql
+workbench_generation(
+  generation_id TEXT PRIMARY KEY,
+  book_id TEXT NOT NULL UNIQUE,
+  revision INTEGER NOT NULL CHECK(revision >= 0),
+  updated_ms INTEGER NOT NULL
+);
+workbench_decision(
+  decision_id TEXT PRIMARY KEY, book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+  target_kind TEXT NOT NULL CHECK(target_kind IN ('presence','alias_merge','review','boundary')),
+  target_key TEXT NOT NULL, decision_type TEXT NOT NULL,
+  base_revision INTEGER NOT NULL CHECK(base_revision >= 0), payload_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('active','undone','superseded','conflict')),
+  source TEXT NOT NULL CHECK(source IN ('human','generated')), created_ms INTEGER NOT NULL,
+  undone_by TEXT REFERENCES workbench_decision(decision_id), supersedes_id TEXT REFERENCES workbench_decision(decision_id)
+);
+workbench_provenance(
+  provenance_id TEXT PRIMARY KEY, book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+  target_kind TEXT NOT NULL, target_key TEXT NOT NULL, run_id TEXT REFERENCES walk_run(run_id),
+  generation_revision INTEGER NOT NULL, source TEXT NOT NULL CHECK(source IN ('walk','human','derived')),
+  created_ms INTEGER NOT NULL
+);
+character_scene_absence(
+  book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE, scene_id TEXT NOT NULL REFERENCES scene(id) ON DELETE CASCADE,
+  character_id TEXT NOT NULL REFERENCES character(id) ON DELETE CASCADE, decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id),
+  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), created_ms INTEGER NOT NULL,
+  PRIMARY KEY(book_id, scene_id, character_id)
+);
+character_alias_merge(
+  merge_id TEXT PRIMARY KEY, book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+  canonical_id TEXT NOT NULL REFERENCES character(id), member_id TEXT NOT NULL REFERENCES character(id),
+  merge_revision INTEGER NOT NULL CHECK(merge_revision >= 0),
+  decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id), status TEXT NOT NULL CHECK(status IN ('active','undone')),
+  prior_member_name TEXT NOT NULL, prior_member_aliases_json TEXT NOT NULL,
+  prior_member_voice_assignment_id TEXT REFERENCES voice_config(id), consequence_json TEXT NOT NULL, created_ms INTEGER NOT NULL,
+  UNIQUE(book_id, merge_id)
+);
+boundary_override(
+  override_id TEXT PRIMARY KEY, book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE,
+  chapter_id TEXT REFERENCES chapter(id), scene_id TEXT REFERENCES scene(id), paragraph_id TEXT REFERENCES paragraph(id),
+  decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id), payload_json TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), created_ms INTEGER NOT NULL,
+  CHECK(chapter_id IS NOT NULL OR scene_id IS NOT NULL OR paragraph_id IS NOT NULL)
+);
+```
+
+`workbench_generation` is the sole revision allocator and has no foreign-key/reference dependency on `book`; `book.version` is never read or incremented for workbench writes. Allocation runs inside `BEGIN IMMEDIATE` using one atomic upsert: `INSERT INTO workbench_generation(generation_id,book_id,revision,updated_ms) VALUES(?,?,0,?) ON CONFLICT(book_id) DO UPDATE SET revision=revision+1,updated_ms=excluded.updated_ms RETURNING revision`; the returned integer is the new revision and commits with the associated write. The caller validates book scope separately.
+
+Generated/manual coexistence uses separate projections, not a shared uniqueness constraint: `character_scene_generated(id TEXT PRIMARY KEY, book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE, character_id TEXT NOT NULL REFERENCES character(id), scene_id TEXT NOT NULL REFERENCES scene(id), relation_type TEXT NOT NULL CHECK(relation_type IN ('present','speaker')), confidence REAL NOT NULL CHECK(confidence>=0 AND confidence<=1), generation_revision INTEGER NOT NULL, source_run_id TEXT REFERENCES walk_run(run_id), UNIQUE(book_id,character_id,scene_id,relation_type))` and `character_scene_manual(id TEXT PRIMARY KEY, book_id TEXT NOT NULL REFERENCES book(id) ON DELETE CASCADE, character_id TEXT NOT NULL REFERENCES character(id), scene_id TEXT NOT NULL REFERENCES scene(id), relation_type TEXT NOT NULL CHECK(relation_type IN ('present','speaker','absent')), decision_id TEXT NOT NULL REFERENCES workbench_decision(decision_id), UNIQUE(book_id,character_id,scene_id,relation_type))`. The read projection uses the manual row when present, otherwise generated; disagreement writes a conflict and manual remains effective. `source_run_id` and `generation_revision` are provenance, never uniqueness. Add partial unique index `ux_alias_active_member ON character_alias_merge(book_id,member_id) WHERE status='active'`; merge history identity is `(merge_id,merge_revision)`, so merge→unmerge→merge creates a new merge_id/revision and never uses `UNIQUE(book_id,member_id,status)`.
+
+Boundary DTOs are exact: `BoundaryAnchorDTO={chapter_id?,scene_id?,paragraph_id?}` with at least one non-null reachable ID; `BoundaryOverrideWriteDTO={override_id?,anchor,payload,base_revision}`; `BoundaryPayloadDTO={operation:'split'|'merge'|'resegment',boundary_offsets:[integer,...],label?:string}` with ordered, non-negative, reachable offsets; `BoundaryOverrideDTO={override_id,book_id,anchor,payload,decision_id,active,created_ms,generation_revision}`. GET returns active DTOs; PUT creates or replaces the addressed override atomically; apply validates anchor/payload and records the effective decision. DELETE is `DELETE /api/pipeline/workbench/{book_id}/boundary-overrides/{override_id}` with `{base_revision}`: the path identifier is authoritative, ownership/revision are checked, `active` is set to 0, inverse decision/provenance is retained, and the inactive DTO plus new revision is returned. No hard delete or silent 2a bypass is permitted.
+
+`walk_review_item` is migrated from its existing `kind CHECK(voice_profile|voice_assignment|instruction)` to `CHECK(voice_profile|voice_assignment|instruction|alias_merge)`; the migration rebuilds the table transactionally while preserving rows/indexes, and `target_id` for alias_merge is the merge ID. Existing junction IDs and `walkitem:` dispatch remain valid.
+
+Migrations are additive, transactional, and idempotent: create tables/indexes with `IF NOT EXISTS`, add columns only after `PRAGMA table_info`, add the generated-row uniqueness index only after deduplicating identical generated rows deterministically (lowest rowid retained), and backfill one generation row per book at revision 0. Reopening a partially migrated DB reruns safely; no migration deletes human rows. `human_override` remains the compatibility flag on live junctions, while `workbench_decision` is the durable history and `walk_review_item` is the actionable queue projection.
+
+### Endpoint changes
+
+New, all under `/api/pipeline` and registered in the existing `api_*` modules:
+
+- `GET /workbench/{book_id}` — normalized scenes, stable anchors, text/highlights, characters, aliases, presence, unified review state, conflicts, run summaries/results, overrides, and effective configuration.
+- `GET /workbench/{book_id}/config`, `PUT /workbench/{book_id}/overrides`, `DELETE /workbench/{book_id}/overrides` — typed per-book overrides with effective-value source reporting.
+- `POST /workbench/{book_id}/alias-conversions/preview` and `POST /workbench/{book_id}/alias-conversions/commit` — short-lived, book-scoped preview token; preview enumerates affected rows and consequences; commit requires matching revision and explicit confirmation.
+- `PUT /workbench/{book_id}/presence` — typed present/speaker/absent decision; removal must persist the selected human absence representation.
+- `POST /workbench/{book_id}/reruns` — explicit `book`- or `scenes`-scoped 2b/2c/2d rerun with `preserve_manual_decisions` defaulting true; no review action auto-runs a walk.
+- `GET|PUT /workbench/{book_id}/boundary-overrides`, `DELETE /workbench/{book_id}/boundary-overrides/{override_id}`, and `POST /workbench/{book_id}/boundary-overrides/{override_id}/apply` — unconditional boundary override read/write/delete/apply surface; 2a reruns consume active overrides or return 409.
+- `POST /workbench/{book_id}/decisions/{decision_id}/undo` — revision-checked reversible undo; returns `409` with `ConflictDTO` when a newer decision or assignment exists.
+
+Existing `GET /review/{book_id}` and review action routes remain the resolution authority; workbench clients use typed controls rather than free-form JSON prompts. Action bodies are `{item_id,base_revision}` for accept/reject and `{item_id,new_value,base_revision}` for override. `decision:{uuid}` targets an active workbench decision; `junction:{table}:{character_id}:{entity_id}` targets an allow-listed live junction; `walkitem:{id}` targets a book-scoped walk_review_item. Accept/reject/override respectively resolve the target, with walk-item reject restoring `prior_value`; every action writes a workbench decision in one transaction and returns `ActionResultDTO`. Undo is `POST /workbench/{book_id}/decisions/{decision_id}/undo` with `{base_revision}`, creates an inverse decision, and returns 409 if newer state exists. Malformed or cross-book IDs are 404/422.
+
+### Workbench DTOs and exact behavior
+
+`WorkbenchStateDTO` has `{book_id,generation_revision,scenes,characters,aliases,presence,review_items,overrides,effective_config,conflicts,runs}`. `StableAnchorDTO` has `{book_id,scene_id,chapter_id,paragraph_id,span_id,start_offset,end_offset}` with nullable fields only where the target type makes them inapplicable. `ReviewItemDTO` preserves the existing fields and adds `{item_id,kind,target_table,target_id,status,decision_id,source_run_id,anchor,neighbors}`; existing fields are not renamed. `ConflictDTO` is `{code,current_revision,current_value,requested_value,decision_id,item_id}`. `ActionResultDTO` is `{item_id,decision_id,status,generation_revision,superseded_item_ids,conflict}`.
+
+- `GET /workbench/{book_id}` returns the normalized DTO and never uses presentation index as identity.
+- `GET /workbench/{book_id}/config` returns `{global,task_overrides,top_level_walk_override,db_overrides,effective,source,validation_errors}`; secrets and raw prompts are omitted from non-owner views.
+- `PUT /workbench/{book_id}/overrides` request is `{walk_name,key,value,base_revision}`; allowed keys are `model_name`, `reasoning_effort`, `temperature`, and `prompt`, with `prompt` allowed for 2b/2c/2d. `DELETE` request is `{walk_name,key,base_revision}`.
+- Preview request is `{canonical_id,member_ids,base_revision}` and response is `{preview_token,expires_ms,base_revision,affected_rows,protected_decisions,voice_assignments,review_items,downstream_invalidations,conflicts}`. Commit request is `{preview_token,base_revision,confirm_consequences}`; response is `ActionResultDTO` plus `merge_id`. Preview tokens are random, single-use, book-scoped, bind the exact member set and revision, and expire after 10 minutes.
+- Presence request is `{scene_id,character_id,relation_type,decision_id,base_revision}` where `relation_type` is `present|speaker|absent`; response is `ActionResultDTO` plus `{scene_id,character_id,relation_type}`. `absent` creates/activates `character_scene_absence`; restoring presence deactivates it in the same transaction.
+- Boundary reads return `list[BoundaryOverrideDTO]` for active rows only. Writes use `BoundaryOverrideWriteDTO`; DELETE uses the URL `override_id` and `{base_revision}` and returns the retained inactive `BoundaryOverrideDTO` plus the new revision. Applying validates the stable anchor and payload, writes the decision and generation revision atomically, and makes it visible to the next 2a run; deletion records an inverse decision and never removes history.
+- Rerun request is `{walk_name,scope,scene_ids,preserve_manual_decisions,base_revision}` and response is `{run_id,status,scope,invalidated_walks,generation_revision}`. `scope` is exactly `book|scenes`; `scenes` requires a non-empty reachable scene list; 2c rejects `scenes` with 422 because alias resolution is book-global.
+
+Rerun reconciliation is exact: mark only affected generated provenance/review rows stale, execute one run, upsert by stable target key, preserve `human_override=1` and active absence, and supersede only prior generated `walk_review_item` rows for touched targets after successful commit. A failed/partial run leaves prior successful rows and revision live; its generated writes are rolled back when atomic, or tagged to the failed run and excluded from reads when a walk reports partial progress. 2b invalidates 2c+2d, 2c invalidates 2d, and 2d invalidates neither upstream walk. `walk_run` follows pending→running→completed|failed|interrupted|cancelled; cancellation sets `cancel_requested`, and stale running rows are reconciled at startup. `POST /cancel_walks` and all contention paths return 503 with `Retry-After: 5` where the universal contract requires it.
+
+Alias commit is reversible: it records both member voice assignments and all affected target keys in `consequence_json`; unmerge creates a new `workbench_decision` that changes the merge to `undone`, restores member projection and voice assignments only when no newer human assignment exists, reactivates affected review items, and returns 409 otherwise. Snapshot load/restore remains blocked during active workbench runs and uses existing `project_snapshot` schema/version validation. Frontend integration is `frontend/index.html`, `frontend/src/main.ts`, `frontend/src/api.ts`, `frontend/src/state.ts`, `frontend/src/tabs/workbench.ts`, and `frontend/tests/frontend/test_workbench.test.ts`; compiled output is committed in `app/static/dist/` and must pass the existing build/diff gate.
+
+Decision status transitions are `active → undone|superseded|conflict`; `undone` and `superseded` are terminal, while `conflict` is terminal until a new human decision is created. `walk_review_item` transitions remain `pending → resolved|superseded|stale`; generated items are superseded only after successful run commit, and existing human-overridden junctions remain live. `human_override=1` is never cleared by reconciliation. `workbench_provenance` and `walk_run` rows are retained for failed, partial, cancelled, and interrupted runs; only the successful generation is projected by default. The existing `GET /api/pipeline/walks/{book_id}/runs`, `POST /api/pipeline/cancel_walks`, review union/action routes, and `project_snapshot` load/save contracts are consumed unchanged by the workbench.
+
+### Behavioral contracts
+
+- Rows remain truth and manifests remain derived. Every workbench read returns durable scene/entity IDs and stable anchors; presentation indices are display metadata only.
+- Writes validate book scope and anchor reachability, use parameterized SQL and whitelisted fields, and reject stale `base_revision`/preview tokens with 409. Transaction contention follows the universal-upgrade contract: 503 plus `Retry-After: 5`.
+- Alias preview and commit must agree on the affected-row set. A merge cannot silently discard a member's voice assignment, protected decision, or reversible history.
+- Walk 2b/2d reruns reconcile generated rows idempotently, preserve human decisions, and never re-add explicit absence. Generated/manual disagreement becomes a visible conflict. Walk 2c merge review is persisted, not inferred from a discarded counter.
+- Effective configuration reports field-specific precedence identically to the DD: `model_name`, `reasoning_effort`, and `temperature` use DB row → `llm.task_overrides[task]` → `llm` global → hardcoded fallback; `prompt` uses DB row → top-level `config.walk_override[task].prompt` → `llm.task_overrides[task].prompt` → `llm.prompt` → hardcoded fallback, with empty/non-string values falling through. Unknown keys and invalid values are rejected.
+- UI must provide keyboard-equivalent actions, non-color state encoding, confirmation for destructive changes, revision-aware undo, actionable errors, and no exposure of secrets, SQL, filesystem paths, or raw prompts.
+- New frontend assets update committed `app/static/dist/` and pass `npm run build && git diff --exit-code app/static/dist/`; the legacy guard remains 12/12.

@@ -25,11 +25,9 @@ What the harness does
   - ``GET /api/pipeline/export/{book_id}`` — reachable (unknown book → 200 [])
   - ``POST /api/pipeline/render`` — reachable and 503 without a TTS engine
 
-The render 503 check uses the REAL dependency resolution: in this
-environment ``app.engine.get_tts_engine()`` cannot construct ``TTSEngine``
-(``app.tts`` is not importable — see ``app/engine.py``), so it returns
-``None`` and the endpoint maps that to 503. This is deterministic here and
-mirrors ``TestGetTTSEngineProduction`` in ``test_api.py``.
+The render 503 check overrides the engine dependency with ``None`` so the
+route's unavailable-engine response is tested deterministically regardless of
+whether optional TTS dependencies are installed.
 """
 
 from __future__ import annotations
@@ -69,7 +67,6 @@ for _name in ("utils", "hf_utils"):
 
 import app.app as app_module  # noqa: E402  (after harness import-path setup)
 
-from app import engine as engine_factory  # noqa: E402
 from app.pipeline.adapter import InMemorySQLiteAdapter  # noqa: E402
 from app.pipeline.api import get_storage, get_tts_engine  # noqa: E402
 
@@ -128,27 +125,20 @@ class TestPipelineRouteReachability:
         assert response.json() == []
 
     def test_render_route_returns_503_without_engine(self, smoke_client) -> None:
-        """POST /api/pipeline/render is wired and 503s without a TTS engine.
-
-        Uses the REAL dependency resolution: the stub override is removed and
-        ``app.engine.get_tts_engine()`` resolves to ``None`` because the
-        engine cannot be constructed in this environment (``app.tts`` is not
-        importable — soundfile/pydub chain incomplete), so the endpoint maps
-        that to 503. ``reset_tts_engine()`` before/after guarantees a
-        cache-miss regardless of other tests in the session.
-        """
+        """POST /api/pipeline/render maps a missing engine to HTTP 503."""
         app = smoke_client.app
-        stubbed = app.dependency_overrides.pop(get_tts_engine, None)
-        engine_factory.reset_tts_engine()
+        stubbed = app.dependency_overrides.get(get_tts_engine)
+        app.dependency_overrides[get_tts_engine] = lambda: None
         try:
             response = smoke_client.post(
                 "/api/pipeline/render",
                 json={"book_id": "b1", "use_batch": True},
             )
         finally:
-            engine_factory.reset_tts_engine()
             if stubbed is not None:
                 app.dependency_overrides[get_tts_engine] = stubbed
+            else:
+                app.dependency_overrides.pop(get_tts_engine, None)
 
         assert response.status_code == 503
         assert "TTS engine not available" in response.json()["detail"]
