@@ -1,7 +1,11 @@
 """Pipeline API — Character endpoints.
 
-Provides HTTP endpoints for managing character voice assignments:
-- PUT /api/pipeline/characters/{id}/voice — set or clear voice assignment
+Provides HTTP endpoints for managing character voice assignments and personas:
+- PUT  /api/pipeline/characters/{id}/voice — set or clear voice assignment
+- GET|PUT /api/pipeline/characters/{id}/persona — read / append persona revision
+- GET  /api/pipeline/characters/{id}/persona/revisions — revision history
+- POST /api/pipeline/characters/{id}/persona/validate — side-effect free check
+- POST /api/pipeline/characters/{id}/persona/rerun — explicit scoped rerun
 
 Uses dependency injection for storage so tests can inject InMemorySQLiteAdapter.
 """
@@ -16,6 +20,15 @@ from pydantic import BaseModel
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
 from app.pipeline.api_review import _guard, get_workbench
+from app.pipeline.persona import (
+    BookNotFoundError,
+    CharacterNotFoundError,
+    PersonaDomain,
+    PersonaError,
+    ProtectedRevisionError,
+    StaleRevisionError,
+    ValidationError,
+)
 from app.pipeline.workbench import Workbench
 
 
@@ -54,6 +67,70 @@ class CharacterPresenceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
+
+
+class PersonaWriteRequest(BaseModel):
+    """Request body for PUT .../persona and POST .../persona/validate.
+
+    ``base_revision`` is required for the PUT write (optimistic concurrency);
+    the validate endpoint ignores it and never persists.
+    """
+
+    base_revision: int
+    book_id: Optional[str] = None
+    fields: dict[str, str] = {}
+    evidence: list[dict] = []
+    aliases: list[str] = []
+    scene_scope: str = "book"
+    scene_ids: list[str] = []
+    review_state: str = "draft"
+    protected: bool = False
+
+
+class PersonaRerunRequest(BaseModel):
+    """Request body for POST .../persona/rerun.
+
+    A rerun is explicit and never implicit: it requires ``confirm=True`` plus a
+    ``revision_id`` (an existing persona revision to re-apply) and a ``scope``.
+    """
+
+    revision_id: str
+    scope: str = "book"
+    scene_ids: list[str] = []
+    confirm: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
+
+
+def _persona_http(exc: PersonaError) -> HTTPException:
+    """Map a persona domain error to the contracted HTTP status."""
+    if isinstance(exc, (CharacterNotFoundError, BookNotFoundError)):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, (StaleRevisionError, ProtectedRevisionError)):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ValidationError):
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _persona_guard(fn, *args, **kwargs):
+    """Invoke a persona domain method, translating PersonaError to HTTP."""
+    try:
+        return fn(*args, **kwargs)
+    except PersonaError as exc:
+        raise _persona_http(exc) from exc
+
+
+def get_persona_domain(
+    storage: PipelineStorage = Depends(get_storage),
+) -> PersonaDomain:
+    """Dependency that builds a persona domain over the shared storage."""
+    return PersonaDomain(storage)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +203,200 @@ async def update_character_voice(
         (character_id,),
     )
     return updated[0]
+
+
+# ---------------------------------------------------------------------------
+# GET|PUT /api/pipeline/characters/{id}/persona
+# ---------------------------------------------------------------------------
+
+
+def _persona_dto(domain: PersonaDomain, character_id: str) -> dict:
+    """Return the current persona head for *character_id* as a DTO."""
+    revisions = domain.list_revisions(character_id)
+    if not revisions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No persona revision for character '{character_id}'",
+        )
+    return revisions[0]
+
+
+def _write_dict(request: PersonaWriteRequest, character_id: str) -> dict:
+    """Normalize a PersonaWriteRequest into the persona domain write shape."""
+    return {
+        "character_id": character_id,
+        "book_id": request.book_id,
+        "fields": request.fields,
+        "evidence": request.evidence,
+        "aliases": request.aliases,
+        "scene_scope": request.scene_scope,
+        "scene_ids": request.scene_ids,
+        "review_state": request.review_state,
+        "protected": request.protected,
+    }
+
+
+@router.get("/characters/{character_id}/persona")
+async def get_persona(
+    character_id: str,
+    domain: PersonaDomain = Depends(get_persona_domain),
+) -> dict:
+    """Return the current persona revision for *character_id* as a PersonaDTO.
+
+    Returns ``404`` for an unknown character or when no persona exists yet.
+    """
+    _persona_guard(domain.require_character, character_id)
+    return _persona_dto(domain, character_id)
+
+
+@router.put("/characters/{character_id}/persona")
+async def put_persona(
+    character_id: str,
+    request: PersonaWriteRequest,
+    domain: PersonaDomain = Depends(get_persona_domain),
+) -> dict:
+    """Append a new persona revision for *character_id* (append-only).
+
+    Requires ``base_revision`` to equal the current head revision (``409`` on
+    staleness).  Persona writes never assign a resolved voice; ``validate``
+    is not invoked implicitly — the write itself is validated deterministically
+    (``422`` on failure).  Contention maps to ``503`` + ``Retry-After`` at the
+    app layer.
+    """
+    _persona_guard(domain.require_character, character_id)
+    return _persona_guard(
+        domain.save,
+        _write_dict(request, character_id),
+        base_revision=request.base_revision,
+        source="human",
+    )
+
+
+@router.get("/characters/{character_id}/persona/revisions")
+async def get_persona_revisions(
+    character_id: str,
+    domain: PersonaDomain = Depends(get_persona_domain),
+) -> dict:
+    """Return the full revision history for *character_id*, newest first."""
+    _persona_guard(domain.require_character, character_id)
+    return {
+        "character_id": character_id,
+        "revisions": domain.list_revisions(character_id),
+    }
+
+
+@router.post("/characters/{character_id}/persona/validate")
+async def validate_persona(
+    character_id: str,
+    request: PersonaWriteRequest,
+    domain: PersonaDomain = Depends(get_persona_domain),
+) -> dict:
+    """Side-effect-free validation of a persona write.
+
+    Returns ``{valid, errors, voice_consequences}`` and never persists a
+    revision.  ``base_revision`` is ignored for validation.
+    """
+    _persona_guard(domain.require_character, character_id)
+    return domain.validate(_write_dict(request, character_id))
+
+
+@router.post("/characters/{character_id}/persona/rerun")
+async def rerun_persona(
+    character_id: str,
+    request: PersonaRerunRequest,
+    domain: PersonaDomain = Depends(get_persona_domain),
+) -> dict:
+    """Explicit, confirmed, scoped persona rerun.
+
+    Re-applies the content of the referenced ``revision_id`` at the requested
+    ``scope`` as a new append-only revision.  Requires ``confirm=True`` (422
+    otherwise), a valid ``scope``, and (for ``scenes`` scope) reachable
+    ``scene_ids``.  A rerun of the same revision at the same scope that would
+    reproduce the current head is rejected ``409 already_ran``.  Reruns never
+    replace a protected head (``409``) and never assign a resolved voice.
+    """
+    _persona_guard(domain.require_character, character_id)
+    if not request.confirm:
+        raise HTTPException(
+            status_code=422,
+            detail="persona rerun requires confirm=true",
+        )
+    if request.scope not in ("book", "scenes"):
+        raise HTTPException(
+            status_code=422,
+            detail="scope must be exactly 'book' or 'scenes'",
+        )
+    # The rerun derives from an existing revision owned by this character.
+    base = domain.get_revision(request.revision_id)
+    if base is None or base["character_id"] != character_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown persona revision '{request.revision_id}'",
+        )
+    if base["book_id"]:
+        _persona_guard(domain.require_book, base["book_id"])
+
+    if request.scope == "scenes":
+        if not request.scene_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="scenes scope requires a non-empty scene_ids",
+            )
+        if base["book_id"]:
+            reachable = domain.get_reachable_scene_ids(base["book_id"])
+            missing = [s for s in request.scene_ids if s not in reachable]
+            if missing:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"scene_ids not reachable from book: {missing}",
+                )
+
+    write = {
+        "character_id": character_id,
+        "book_id": base["book_id"],
+        "fields": base["fields"],
+        "evidence": base["evidence"],
+        "aliases": base["aliases"],
+        "scene_scope": request.scope,
+        "scene_ids": request.scene_ids,
+        "review_state": base["review_state"],
+        "protected": False,
+    }
+
+    head = domain.list_revisions(character_id)
+    if head and head[0]["protected"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"protected persona revision '{head[0]['persona_id']}' cannot"
+                " be replaced by a rerun"
+            ),
+        )
+    # Dedupe: a rerun targets a revision that is the current head.  If the
+    # referenced revision has already been superseded, this exact rerun already
+    # ran — 409 already_ran, never duplicated silently.  The first rerun of a
+    # live head is legitimate and produces a new revision.
+    if head and head[0]["persona_id"] != base["persona_id"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"persona rerun already_ran: revision {request.revision_id} "
+                f"scope {request.scope} produced head '{head[0]['persona_id']}'"
+            ),
+        )
+
+    head_revision = head[0]["revision"] if head else 0
+    saved = _persona_guard(
+        domain.save,
+        write,
+        base_revision=head_revision,
+        source="rerun",
+    )
+    return {
+        "run_id": saved["persona_id"],
+        "revision_id": request.revision_id,
+        "scope": request.scope,
+    }
 
 
 # ---------------------------------------------------------------------------
