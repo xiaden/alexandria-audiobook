@@ -13,8 +13,9 @@
  */
 
 import * as API from '../api';
-import { showToast, escapeHtml } from '../utils';
+import { showToast, escapeHtml, showConfirm } from '../utils';
 import { state } from '../state';
+import type { CloneReference } from '../state';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -573,6 +574,9 @@ export async function loadVoices(): Promise<void> {
 
     renderNarratorSelector();
     renderVoiceCatalog(voices);
+    // Clone-reference panel populates its voice selector from the catalog
+    // (voiceRowsById), so it must render after registerVoiceCatalog above.
+    renderCloneReferencePanel();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     showToast('Failed to load voices: ' + msg, 'error');
@@ -787,6 +791,358 @@ export function previewVoiceFromForm(button: HTMLButtonElement): void {
     button,
     sampleText ? sampleText : DEFAULT_PREVIEW_SAMPLE_TEXT,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Clone-reference samples (PipelineVoiceCloneReferenceAPI.v1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounded upload limits surfaced to the user, matching the pipeline defaults
+ * (clone_reference_media._DEFAULT_MAX_BYTES = 100 MiB and
+ * _DEFAULT_MAX_DURATION_MS = 10 minutes). These are informational only — the
+ * server enforces the authoritative bounds via configured_max_bytes()/
+ * configured_max_duration_ms().
+ */
+export const CLONE_REF_MAX_BYTES = 100 * 1024 * 1024;
+export const CLONE_REF_MAX_DURATION_MS = 10 * 60 * 1000;
+
+/**
+ * Format a byte count for the reference list (e.g. 1.2 MB).
+ */
+export function formatCloneByteSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Format a duration in milliseconds for the reference list (e.g. "2m 05s").
+ */
+export function formatCloneDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const sec = seconds < 10 ? `0${seconds}` : String(seconds);
+  return minutes > 0 ? `${minutes}m ${sec}s` : `${sec}s`;
+}
+
+/**
+ * Current voice id whose clone references the panel is showing
+ * (null when the panel is closed / no voice selected).
+ */
+let cloneRefVoiceId: string | null = null;
+
+/**
+ * Build the clone-reference panel container (once) and attach its delegated
+ * event listeners. The panel is created programmatically because index.html
+ * has no clone-reference markup — the task scope is api.ts/state.ts/voices.ts
+ * only. Returns the container, or null when #pipeline-voices-section is absent.
+ */
+function ensureCloneReferencePanel(): HTMLElement | null {
+  const section = document.getElementById('pipeline-voices-section');
+  if (!section) return null;
+
+  let panel = document.getElementById('clone-reference-panel');
+  if (panel) return panel;
+
+  panel = document.createElement('div');
+  panel.id = 'clone-reference-panel';
+  panel.className = 'card mb-3';
+  panel.innerHTML = `
+    <div class="card-header"><h6 class="mb-0">Clone Reference Samples</h6></div>
+    <div class="card-body">
+      <div class="mb-3" style="max-width: 320px;">
+        <label for="clone-ref-voice-select" class="form-label fw-bold">Voice</label>
+        <select id="clone-ref-voice-select" class="form-select form-select-sm" aria-describedby="clone-ref-voice-help"></select>
+        <div id="clone-ref-voice-help" class="form-text">Select the clone voice whose reference samples to manage. Only non-narrator voices are offered; values are resolved voice ids.</div>
+      </div>
+      <div class="mb-2">
+        <label for="clone-ref-audio-file" class="form-label fw-bold">Reference Audio</label>
+        <input type="file" id="clone-ref-audio-file" class="form-control form-control-sm" accept="audio/*" aria-describedby="clone-ref-limits">
+        <div id="clone-ref-limits" class="form-text">WAV/MP3/OGG/FLAC/M4A/AAC up to ${formatCloneByteSize(CLONE_REF_MAX_BYTES)} and ${formatCloneDuration(CLONE_REF_MAX_DURATION_MS)}. Server-enforced bounds apply.</div>
+      </div>
+      <div class="mb-3">
+        <label for="clone-ref-text" class="form-label fw-bold">Reference Text <span class="text-muted fw-normal">(optional)</span></label>
+        <input type="text" id="clone-ref-text" class="form-control form-control-sm" placeholder="Aligned transcript of the reference audio">
+      </div>
+      <button type="button" class="btn btn-sm btn-primary" data-action="clone-ref-upload">Upload Reference</button>
+      <div id="clone-reference-list" class="mt-3"></div>
+    </div>
+  `;
+  section.appendChild(panel);
+
+  // Delegated click: upload / preview / download / delete.
+  panel.addEventListener('click', (e) => {
+    const target = e.target as HTMLElement;
+
+    const uploadBtn = target.closest('[data-action="clone-ref-upload"]') as HTMLButtonElement | null;
+    if (uploadBtn) {
+      void uploadCloneReferenceFromPanel(uploadBtn);
+      return;
+    }
+
+    const previewBtn = target.closest('[data-action="clone-ref-preview"]') as HTMLButtonElement | null;
+    if (previewBtn) {
+      const refId = previewBtn.dataset.referenceId;
+      if (refId && cloneRefVoiceId) void playCloneReference(cloneRefVoiceId, refId);
+      return;
+    }
+
+    const deleteBtn = target.closest('[data-action="clone-ref-delete"]') as HTMLButtonElement | null;
+    if (deleteBtn && cloneRefVoiceId) {
+      const refId = deleteBtn.dataset.referenceId;
+      if (refId) void deleteCloneReferenceConfirmed(cloneRefVoiceId, refId);
+      return;
+    }
+  });
+
+  // Changing the selected voice reloads its reference list.
+  const voiceSelect = document.getElementById('clone-ref-voice-select') as HTMLSelectElement | null;
+  if (voiceSelect) {
+    voiceSelect.addEventListener('change', () => {
+      cloneRefVoiceId = voiceSelect.value || null;
+      if (cloneRefVoiceId) void loadCloneReferences(cloneRefVoiceId);
+      else renderCloneReferenceList([]);
+    });
+  }
+
+  return panel;
+}
+
+/**
+  * Reset the clone-reference panel to no selected voice and an empty list.
+ * Used by tests (module state is otherwise sticky across cases) and when a
+ * caller needs a clean slate before selecting a voice.
+ */
+export function resetCloneReferencePanel(): void {
+  cloneRefVoiceId = null;
+  renderCloneReferenceList([]);
+}
+
+/**
+ * Render (or refresh) the clone-reference panel and populate the voice
+ * selector from the loaded catalog (values are resolved voice ids, labels are
+ * display names). Call after registerVoiceCatalog so the selector has voices.
+ */
+export function renderCloneReferencePanel(voiceId?: string | null): void {
+  const panel = ensureCloneReferencePanel();
+  if (!panel) return;
+
+  const voiceSelect = document.getElementById('clone-ref-voice-select') as HTMLSelectElement | null;
+  if (!voiceSelect) return;
+
+  const target = voiceId ?? cloneRefVoiceId;
+  const options = [...voiceRowsById.values()]
+    .filter(r => r.id !== 'NARRATOR')
+    .map(r =>
+      `<option value="${escapeHtml(r.id)}" ${r.id === target ? 'selected' : ''}>${escapeHtml(r.name)}</option>`
+    )
+    .join('');
+
+  voiceSelect.innerHTML =
+    '<option value="">— Select a voice —</option>' + options;
+
+  cloneRefVoiceId = target && voiceRowsById.has(target) ? target : null;
+  if (voiceSelect.value === '' && cloneRefVoiceId) {
+    voiceSelect.value = cloneRefVoiceId;
+  }
+
+  if (cloneRefVoiceId) {
+    void loadCloneReferences(cloneRefVoiceId);
+  } else {
+    renderCloneReferenceList([]);
+  }
+}
+
+/**
+ * Fetch and render the owner's clone references for *voiceId*.
+ * GET /api/pipeline/voices/{voice_id}/references
+ */
+export async function loadCloneReferences(voiceId: string): Promise<void> {
+  try {
+    const res = await API.listCloneReferences(voiceId);
+    renderCloneReferenceList(res.references ?? []);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to load clone references: ${msg}`, 'error');
+    renderCloneReferenceList([]);
+  }
+}
+
+/**
+ * Build one reference row (metadata, inline preview, download, delete).
+ * Exposes only the display-safe metadata (original filename, media type, byte
+ * size, duration) — never the contained filesystem ``relative_path``.
+ */
+export function createCloneReferenceRow(ref: CloneReference): string {
+  const previewUrl = API.cloneReferencePreviewUrl(ref.voice_id, ref.reference_id);
+  const downloadUrl = API.cloneReferenceDownloadUrl(ref.voice_id, ref.reference_id);
+  return `
+    <div class="border rounded p-2 mb-2 clone-reference-row" data-reference-id="${escapeHtml(ref.reference_id)}">
+      <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <div>
+          <span class="fw-semibold">${escapeHtml(ref.original_filename)}</span>
+          <span class="text-muted small ms-2">${escapeHtml(ref.media_type)} · ${formatCloneByteSize(ref.byte_size)} · ${formatCloneDuration(ref.duration_ms)}</span>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-action="clone-ref-preview" data-reference-id="${escapeHtml(ref.reference_id)}">Preview</button>
+          <a class="btn btn-sm btn-outline-primary" href="${escapeHtml(downloadUrl)}" download aria-label="Download ${escapeHtml(ref.original_filename)}"><i class="fas fa-download me-1"></i>Download</a>
+          <button type="button" class="btn btn-sm btn-outline-danger" data-action="clone-ref-delete" data-reference-id="${escapeHtml(ref.reference_id)}">Delete</button>
+        </div>
+      </div>
+      <audio id="clone-audio-${escapeHtml(ref.reference_id)}" controls preload="metadata" class="w-100 mt-2" src="${escapeHtml(previewUrl)}"></audio>
+    </div>
+  `;
+}
+
+/**
+ * Render the reference list into #clone-reference-list.
+ */
+export function renderCloneReferenceList(references: CloneReference[]): void {
+  const list = document.getElementById('clone-reference-list');
+  if (!list) return;
+  if (!references || references.length === 0) {
+    list.innerHTML = '<div class="text-muted small">No clone references uploaded yet for this voice.</div>';
+    return;
+  }
+  list.innerHTML = references.map(createCloneReferenceRow).join('');
+}
+
+/**
+ * Upload the selected file + optional ref_text for the currently selected
+ * clone voice. Bounded client-side guard (informational; server is authority).
+ */
+export async function uploadCloneReferenceFromPanel(button: HTMLButtonElement): Promise<void> {
+  const voiceId = cloneRefVoiceId;
+  if (!voiceId) {
+    showToast('Select a clone voice before uploading', 'warning');
+    return;
+  }
+
+  const fileInput = document.getElementById('clone-ref-audio-file') as HTMLInputElement | null;
+  const refTextInput = document.getElementById('clone-ref-text') as HTMLInputElement | null;
+  const file = fileInput?.files?.[0];
+  if (!file) {
+    showToast('Choose an audio file to upload', 'warning');
+    return;
+  }
+  if (file.size > CLONE_REF_MAX_BYTES) {
+    showToast(`Reference audio exceeds the ${formatCloneByteSize(CLONE_REF_MAX_BYTES)} limit`, 'error');
+    return;
+  }
+
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Uploading…';
+
+  try {
+    const refText = refTextInput?.value.trim() ?? undefined;
+    const res = await API.uploadCloneReference(voiceId, file, file.name, refText || undefined);
+    showToast(`Reference uploaded: ${res.reference.original_filename}`, 'success');
+    // The upload also selected this reference as the voice's ref_audio — refresh
+    // the catalog card and cached row so downstream assignment shows it.
+    if (res.voice) {
+      const row = getVoiceConfigRow(voiceId);
+      if (row) {
+        const updated: VoiceConfigRow = { ...row, ...res.voice };
+        voiceRowsById.set(voiceId, updated);
+        const card = Array.from(document.querySelectorAll<HTMLElement>('.voice-card'))
+          .find(el => el.dataset.voiceId === voiceId);
+        if (card) card.outerHTML = createVoiceCard(updated);
+      }
+    }
+    if (fileInput) fileInput.value = '';
+    if (refTextInput) refTextInput.value = '';
+    await loadCloneReferences(voiceId);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to upload reference: ${msg}`, 'error');
+  } finally {
+    button.disabled = false;
+    button.innerHTML = original;
+  }
+}
+
+/**
+ * Explicit destructive confirmation before DELETE of a clone reference.
+ * DELETE /api/pipeline/voices/{voice_id}/references/{reference_id} → 204.
+ */
+export async function deleteCloneReferenceConfirmed(voiceId: string, referenceId: string): Promise<void> {
+  const ok = await showConfirm(
+    `Delete clone reference sample? This permanently removes the reference and cannot be undone.`
+  );
+  if (!ok) return;
+  try {
+    await API.deleteCloneReference(voiceId, referenceId);
+    showToast('Clone reference deleted', 'success');
+    await loadCloneReferences(voiceId);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to delete reference: ${msg}`, 'error');
+  }
+}
+
+/**
+ * Play a clone reference inline with correct media seek ordering.
+ *
+ * The preview <audio> is given its preview URL (GET .../preview streams inline
+ * with Range support). Media seek ordering requires that load/loadedmetadata
+ * precede any currentTime write: we set src, wait for ``loadedmetadata``, and
+ * only then assign currentTime (replay from the start) before calling play().
+ * This avoids the race where currentTime is written before the media has loaded
+ * and the seek silently no-ops or throws. When metadata cannot be recovered we
+ * fall back to a plain play() so the sample still previews.
+ *
+ * @param voiceId - The clone voice id owning the reference
+ * @param referenceId - The reference to preview
+ */
+export async function playCloneReference(voiceId: string, referenceId: string): Promise<void> {
+  const audio = document.getElementById(
+    `clone-audio-${referenceId}`
+  ) as HTMLAudioElement | null;
+  if (!audio) return;
+
+  const url = API.cloneReferencePreviewUrl(voiceId, referenceId);
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      audio.removeEventListener('loadedmetadata', onLoaded);
+      audio.removeEventListener('error', onError);
+      resolve();
+    };
+    const onLoaded = (): void => {
+      // Metadata recovered — safe to seek (currentTime) before play.
+      try {
+        audio.currentTime = 0;
+      } catch { /* seek is best-effort */ }
+      finish();
+    };
+    const onError = (): void => {
+      finish();
+    };
+    audio.addEventListener('loadedmetadata', onLoaded);
+    audio.addEventListener('error', onError);
+    audio.src = url;
+    audio.load();
+    // Safety net: if neither event fires within a short window, resolve anyway
+    // so play() still runs (metadata-based seek is best-effort, not required).
+    setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        audio.removeEventListener('loadedmetadata', onLoaded);
+        audio.removeEventListener('error', onError);
+        resolve();
+      }
+    }, 4000);
+  });
+
+  try {
+    await audio.play();
+  } catch { /* play() rejection is surfaced via the native control UI */ }
 }
 
 // ---------------------------------------------------------------------------

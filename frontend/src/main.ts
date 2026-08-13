@@ -84,6 +84,7 @@ import { initTraining } from './tabs/training';
 import { initEditor } from './tabs/editor';
 import { initProjects } from './tabs/projects';
 import { initWorkbench } from './tabs/workbench';
+import { initPromptConfig } from './tabs/prompt-config';
 
 // Initialize all tabs after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
@@ -99,5 +100,6 @@ document.addEventListener('DOMContentLoaded', () => {
     initEditor();
     initProjects();
     initWorkbench();
+    initPromptConfig();
     initTabNavigation();
 });

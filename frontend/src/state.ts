@@ -495,3 +495,208 @@ export function sourceLabel(source: string | undefined | null): string {
   if (s === 'hardcoded' || s === 'builtin' || s === 'default') return 'default';
   return s;
 }
+
+// ---------------------------------------------------------------------------
+// Clone references (PipelineVoiceCloneReferenceAPI.v1)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single owner-scoped clone-reference row (contract v1).
+ * ``relative_path`` is the contained, application-relative path stored in
+ * ``clone_reference.relative_path`` — never an absolute filesystem path, and
+ * never surfaced to the user.
+ */
+export interface CloneReference {
+  reference_id: string;
+  voice_id: string;
+  owner_id: string;
+  /** Contained application-relative path (never exposed in the UI). */
+  relative_path: string;
+  original_filename: string;
+  media_type: string;
+  byte_size: number;
+  duration_ms: number;
+  sha256: string;
+  created_ms: number;
+  deleted_ms?: number | null;
+}
+
+/** Owner-scoped reference list response (contract v1). */
+export interface CloneReferenceListResponse {
+  references: CloneReference[];
+}
+
+/**
+ * Upload response (contract v1): the new reference plus the updated voice
+ * config (its ``ref_audio``/``ref_text`` now point at this reference).
+ */
+export interface CloneReferenceUploadResponse {
+  reference: CloneReference;
+  voice: VoiceConfig & { id: string };
+}
+
+// ---------------------------------------------------------------------------
+// Persona (PipelineCharacterPersonaAPI.v1)
+// ---------------------------------------------------------------------------
+
+/** Bounded persona profile field keys (identity/appearance/manner/speech/role). */
+export type PersonaFieldKey =
+  | 'identity'
+  | 'appearance'
+  | 'manner'
+  | 'speech'
+  | 'role';
+
+/** Persona review states (draft/needs_review/accepted/rejected). */
+export type PersonaReviewState =
+  | 'draft'
+  | 'needs_review'
+  | 'accepted'
+  | 'rejected';
+
+/** Persona scene scope: book-global or an explicit set of scenes. */
+export type PersonaSceneScope = 'book' | 'scenes';
+
+/** A single evidence citation/anchor with optional quote/source/confidence. */
+export interface PersonaEvidence {
+  anchor: string;
+  quote?: string | null;
+  source?: string | null;
+  confidence?: number | null;
+}
+
+/** Derived, explainable voice consequence — never an implicit assignment. */
+export interface VoiceConsequences {
+  assignment: string | null;
+  explanation: string;
+  style_hints: string[];
+}
+
+/**
+ * A persona revision (the head persona is the latest revision). Matches the
+ * decoded ``persona_revision`` row / PersonaDTO.
+ */
+export interface Persona {
+  persona_id: string;
+  character_id: string;
+  book_id?: string | null;
+  revision: number;
+  /** Bounded typed profile fields (identity/appearance/manner/speech/role). */
+  fields: Partial<Record<PersonaFieldKey, string>>;
+  evidence: PersonaEvidence[];
+  /** Normalized aliases with provenance. */
+  aliases: string[];
+  scene_scope: PersonaSceneScope;
+  scene_ids: string[];
+  review_state: PersonaReviewState;
+  protected: boolean;
+  voice_consequences: VoiceConsequences;
+  author_id: string;
+  created_ms: number;
+  superseded_by?: string | null;
+}
+
+/** A persona-revision entry (same shape as the head persona). */
+export type PersonaRevision = Persona;
+
+/** Revisioned persona write payload (PUT /persona, POST /persona/validate). */
+export interface PersonaWriteRequest {
+  base_revision: number;
+  book_id?: string | null;
+  fields: Partial<Record<PersonaFieldKey, string>>;
+  evidence: PersonaEvidence[];
+  aliases: string[];
+  scene_scope: PersonaSceneScope;
+  scene_ids: string[];
+  review_state: PersonaReviewState;
+  protected: boolean;
+}
+
+/** Side-effect-free persona validation result. */
+export interface PersonaValidationResponse {
+  valid: boolean;
+  errors: string[];
+  voice_consequences: VoiceConsequences;
+}
+
+/** Explicit scoped persona rerun request (confirm required). */
+export interface PersonaRerunRequest {
+  revision_id: string;
+  scope: PersonaSceneScope;
+  scene_ids: string[];
+  confirm: boolean;
+}
+
+/** Persona rerun result. */
+export interface PersonaRerunResult {
+  run_id: string;
+  revision_id: string;
+  scope: PersonaSceneScope;
+}
+
+// ---------------------------------------------------------------------------
+// Effective walk prompt config (PipelineWalkPromptConfigRevisionAPI.v1)
+// ---------------------------------------------------------------------------
+
+/** Per-task effective values and per-key provenance sources. */
+export interface EffectiveWalkTask {
+  values: Record<string, unknown>;
+  sources: Record<string, string>;
+}
+
+/**
+ * Effective walk prompt config (GET /walks/{book_id}/config).
+ * ``tasks`` maps the nine fixed task names to {values, sources}.
+ */
+export interface EffectiveWalkConfig {
+  book_id: string;
+  tasks: Record<string, EffectiveWalkTask>;
+}
+
+/** Prompt-config write payload (validate/save). */
+export interface PromptConfigWriteRequest {
+  task: string;
+  settings: Record<string, unknown>;
+  prompt?: string | null;
+  raw_json?: string | null;
+  base_revision?: string | null;
+}
+
+/** Side-effect-free prompt-config validation result. */
+export interface PromptConfigValidationResponse {
+  valid: boolean;
+  errors: string[];
+  task: string | null;
+}
+
+/** A persisted prompt-config revision DTO. */
+export interface PromptConfigRevision {
+  revision_id: string;
+  book_id: string;
+  task: string;
+  base_revision: string | null;
+  source_layers: Record<string, string>;
+  effective_prompt: string;
+  settings: Record<string, unknown>;
+  raw_json: string | null;
+  validation: { valid: boolean; errors: string[] };
+  author_id: string;
+  created_ms: number;
+  superseded_by?: string | null;
+}
+
+/** Explicit scoped walk rerun request (confirm required). */
+export interface ScopedWalkRerunRequest {
+  revision_id: string;
+  scope: PersonaSceneScope;
+  scene_ids: string[];
+  confirm: boolean;
+}
+
+/** Scoped walk rerun result. */
+export interface ScopedWalkRerunResult {
+  run_id: string;
+  revision_id: string;
+  scope: PersonaSceneScope;
+  invalidated_walks: string[];
+}

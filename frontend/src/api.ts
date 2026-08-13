@@ -3,6 +3,23 @@
  * Ported from app/static/index.html lines 1214-1249
  */
 
+import type {
+  CloneReferenceListResponse,
+  CloneReferenceUploadResponse,
+  EffectiveWalkConfig,
+  Persona,
+  PersonaRerunRequest,
+  PersonaRerunResult,
+  PersonaRevision,
+  PersonaValidationResponse,
+  PersonaWriteRequest,
+  PromptConfigRevision,
+  PromptConfigValidationResponse,
+  PromptConfigWriteRequest,
+  ScopedWalkRerunRequest,
+  ScopedWalkRerunResult,
+} from './state';
+
 /**
  * Handle HTTP error responses from the API
  */
@@ -205,4 +222,250 @@ export async function delWithRetryOnce<T = unknown>(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   }, retryStatus);
+}
+
+/**
+ * POST a multipart ``FormData`` body with exactly ONE automatic retry on a
+ * retryable status (default 503, the pipeline concurrent-write contract) plus
+ * Retry-After. Honors the integer-second delay. Used by the clone-reference
+ * upload (multipart ``audio`` part + optional ``ref_text``). Never loops.
+ */
+export async function postFormWithRetryOnce<T = unknown>(
+  endpoint: string,
+  form: FormData,
+  retryStatus: number = 503,
+): Promise<T> {
+  // Do NOT set Content-Type — the browser must set the multipart boundary.
+  const init: RequestInit = { method: 'POST', body: form };
+  let res = await fetch(endpoint, init);
+  if (res.status === retryStatus && res.headers.get('Retry-After') != null) {
+    const seconds = parseInt(res.headers.get('Retry-After') as string, 10);
+    const delayMs = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000;
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    res = await fetch(endpoint, init);
+  }
+  await handleError(res);
+  return res.json();
+}
+
+/**
+ * DELETE with one automatic retry on a retryable status (default 503) plus
+ * Retry-After, tolerating a 204 No Content response (no JSON body). Used by
+ * the clone-reference delete endpoint (DELETE returns 204 without a body).
+ * Never loops.
+ */
+export async function delNoContentWithRetryOnce(
+  endpoint: string,
+  retryStatus: number = 503,
+): Promise<void> {
+  let res = await fetch(endpoint, { method: 'DELETE' });
+  if (res.status === retryStatus && res.headers.get('Retry-After') != null) {
+    const seconds = parseInt(res.headers.get('Retry-After') as string, 10);
+    const delayMs = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000;
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    res = await fetch(endpoint, { method: 'DELETE' });
+  }
+  await handleError(res);
+}
+
+// ---------------------------------------------------------------------------
+// Clone references (PipelineVoiceCloneReferenceAPI.v1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Upload a validated clone-voice reference audio sample.
+ *
+ * POST /api/pipeline/voices/{voice_id}/references — multipart ``audio`` file
+ * plus optional ``ref_text``. Returns the new CloneReference and the updated
+ * VoiceConfig (its ref_audio/ref_text now point at this reference).
+ */
+export async function uploadCloneReference(
+  voiceId: string,
+  file: File | Blob,
+  filename: string,
+  refText?: string,
+): Promise<CloneReferenceUploadResponse> {
+  const form = new FormData();
+  form.append('audio', file, filename);
+  if (refText !== undefined && refText !== '') {
+    form.append('ref_text', refText);
+  }
+  return postFormWithRetryOnce<CloneReferenceUploadResponse>(
+    `/api/pipeline/voices/${encodeURIComponent(voiceId)}/references`,
+    form,
+  );
+}
+
+/**
+ * List the owner's clone references for a voice.
+ * GET /api/pipeline/voices/{voice_id}/references
+ */
+export async function listCloneReferences(
+  voiceId: string,
+): Promise<CloneReferenceListResponse> {
+  return get<CloneReferenceListResponse>(
+    `/api/pipeline/voices/${encodeURIComponent(voiceId)}/references`,
+  );
+}
+
+/**
+ * Inline preview URL for a clone reference (GET .../preview streams inline
+ * audio with Range support). Used directly as an <audio> src.
+ */
+export function cloneReferencePreviewUrl(voiceId: string, referenceId: string): string {
+  return (
+    `/api/pipeline/voices/${encodeURIComponent(voiceId)}` +
+    `/references/${encodeURIComponent(referenceId)}/preview`
+  );
+}
+
+/**
+ * Attachment download URL for a clone reference (GET .../download is
+ * attachment-only).
+ */
+export function cloneReferenceDownloadUrl(voiceId: string, referenceId: string): string {
+  return (
+    `/api/pipeline/voices/${encodeURIComponent(voiceId)}` +
+    `/references/${encodeURIComponent(referenceId)}/download`
+  );
+}
+
+/**
+ * Tombstone and delete an owned clone reference.
+ * DELETE /api/pipeline/voices/{voice_id}/references/{reference_id} → 204.
+ */
+export async function deleteCloneReference(
+  voiceId: string,
+  referenceId: string,
+): Promise<void> {
+  await delNoContentWithRetryOnce(
+    `/api/pipeline/voices/${encodeURIComponent(voiceId)}` +
+    `/references/${encodeURIComponent(referenceId)}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Persona (PipelineCharacterPersonaAPI.v1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the current head persona for a character.
+ * GET /api/pipeline/characters/{character_id}/persona (404 if none).
+ */
+export async function getPersona(characterId: string): Promise<Persona> {
+  return get<Persona>(
+    `/api/pipeline/characters/${encodeURIComponent(characterId)}/persona`,
+  );
+}
+
+/**
+ * Save a persona revision (PUT /persona) with one 503 retry.
+ */
+export async function savePersona(
+  characterId: string,
+  write: PersonaWriteRequest,
+): Promise<Persona> {
+  return putWithRetryOnce<Persona>(
+    `/api/pipeline/characters/${encodeURIComponent(characterId)}/persona`,
+    write,
+  );
+}
+
+/**
+ * List persona revisions for a character (newest first).
+ * GET /api/pipeline/characters/{character_id}/persona/revisions
+ */
+export async function listPersonaRevisions(
+  characterId: string,
+): Promise<PersonaRevision[]> {
+  const res = await get<{ character_id: string; revisions: PersonaRevision[] }>(
+    `/api/pipeline/characters/${encodeURIComponent(characterId)}/persona/revisions`,
+  );
+  return res.revisions;
+}
+
+/**
+ * Side-effect-free persona validation.
+ * POST /api/pipeline/characters/{character_id}/persona/validate
+ */
+export async function validatePersona(
+  characterId: string,
+  write: PersonaWriteRequest,
+): Promise<PersonaValidationResponse> {
+  return post<PersonaValidationResponse>(
+    `/api/pipeline/characters/${encodeURIComponent(characterId)}/persona/validate`,
+    write,
+  );
+}
+
+/**
+ * Explicit scoped persona rerun (confirm required).
+ * POST /api/pipeline/characters/{character_id}/persona/rerun
+ */
+export async function rerunPersona(
+  characterId: string,
+  rerun: PersonaRerunRequest,
+): Promise<PersonaRerunResult> {
+  return post<PersonaRerunResult>(
+    `/api/pipeline/characters/${encodeURIComponent(characterId)}/persona/rerun`,
+    rerun,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Effective walk prompt config (PipelineWalkPromptConfigRevisionAPI.v1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the effective prompt/settings config for a book's nine fixed walks.
+ * GET /api/pipeline/walks/{book_id}/config
+ */
+export async function getEffectiveWalkConfig(
+  bookId: string,
+): Promise<EffectiveWalkConfig> {
+  return get<EffectiveWalkConfig>(
+    `/api/pipeline/walks/${encodeURIComponent(bookId)}/config`,
+  );
+}
+
+/**
+ * Side-effect-free prompt-config validation.
+ * POST /api/pipeline/walks/{book_id}/config/validate
+ */
+export async function validatePromptConfig(
+  bookId: string,
+  write: PromptConfigWriteRequest,
+): Promise<PromptConfigValidationResponse> {
+  return post<PromptConfigValidationResponse>(
+    `/api/pipeline/walks/${encodeURIComponent(bookId)}/config/validate`,
+    write,
+  );
+}
+
+/**
+ * Save a prompt-config revision (201) with one 503 retry.
+ * POST /api/pipeline/walks/{book_id}/config/revisions
+ */
+export async function savePromptConfigRevision(
+  bookId: string,
+  write: PromptConfigWriteRequest,
+): Promise<PromptConfigRevision> {
+  return postWithRetryOnce<PromptConfigRevision>(
+    `/api/pipeline/walks/${encodeURIComponent(bookId)}/config/revisions`,
+    write,
+  );
+}
+
+/**
+ * Explicit scoped walk rerun (confirm required).
+ * POST /api/pipeline/walks/{book_id}/reruns
+ */
+export async function rerunScopedWalk(
+  bookId: string,
+  rerun: ScopedWalkRerunRequest,
+): Promise<ScopedWalkRerunResult> {
+  return post<ScopedWalkRerunResult>(
+    `/api/pipeline/walks/${encodeURIComponent(bookId)}/reruns`,
+    rerun,
+  );
 }

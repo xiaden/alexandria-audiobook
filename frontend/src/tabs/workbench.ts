@@ -41,6 +41,10 @@ import {
   selectActiveAliases,
   sourceLabel,
 } from '../state';
+import {
+  initPersonaEditor,
+  openPersonaEditor,
+} from './persona';
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -172,7 +176,7 @@ export function renderCharacterLedger(wb: WorkbenchState | null): string {
     return (
       `<li class="list-group-item d-flex justify-content-between align-items-start">` +
       `<div><div class="fw-semibold">${escapeHtml(c.name)}</div><div class="small">${aliasBadges}</div></div>` +
-      `<div class="text-end">${voice}</div></li>`
+      `<div class="text-end">${voice}<div class="mt-1"><button type="button" class="btn btn-sm btn-outline-primary" data-action="persona-open" data-character-id="${escapeHtml(c.id)}">Edit persona</button></div></div></li>`
     );
   });
   return `<ul class="list-group">${rows.join('')}</ul>`;
@@ -668,6 +672,9 @@ export async function unmergeAlias(mergeId: string): Promise<void> {
 export function initWorkbench(): void {
   if (_workbenchInitialized) return;
   _workbenchInitialized = true;
+  // Persona editor is a separately addressable capability wired on the same
+  // workbench tab (additive; does not alter protected combined-walks UX).
+  initPersonaEditor();
 
   document.addEventListener('DOMContentLoaded', () => {
     const nav = document.getElementById('workbench-navigator');
@@ -681,6 +688,16 @@ export function initWorkbench(): void {
         const navEl = document.getElementById('workbench-navigator');
         if (navEl) navEl.innerHTML = renderSceneNavigator(wb, _selectedSceneId);
         refreshSceneDetail(wb);
+      });
+    }
+
+    const ledger = document.getElementById('workbench-ledger');
+    if (ledger) {
+      ledger.addEventListener('click', (e) => {
+        const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-action="persona-open"]');
+        if (!btn) return;
+        const characterId = btn.getAttribute('data-character-id');
+        if (characterId) void openPersonaEditor(characterId);
       });
     }
 
