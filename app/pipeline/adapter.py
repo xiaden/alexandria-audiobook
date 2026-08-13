@@ -154,6 +154,82 @@ class PipelineStorage(ABC):
         existing name (PK UNIQUE constraint).
         """
 
+    @abstractmethod
+    def insert_clone_reference(
+        self, record: dict[str, object]
+    ) -> None:
+        """Insert a new ``clone_reference`` row.
+
+        *record* carries the full column set — ``reference_id``, ``voice_id``,
+        ``owner_id``, ``relative_path``, ``original_filename``,
+        ``media_type``, ``byte_size``, ``duration_ms``, ``sha256``,
+        ``created_ms`` — with ``deleted_ms`` defaulting to ``NULL`` (an active
+        reference) when absent.  Raises ``sqlite3.IntegrityError`` on a
+        duplicate ``reference_id`` (PK) or a ``voice_id`` that does not
+        reference an existing ``voice_config`` row (FK).
+        """
+
+    @abstractmethod
+    def list_clone_references(
+        self, voice_id: str, owner_id: str
+    ) -> list[dict]:
+        """Return the *owner_id*-owned ``clone_reference`` rows for *voice_id*.
+
+        Owner-scoped: only rows whose ``owner_id`` equals *owner_id* are
+        returned, so a caller can never observe another owner's references
+        (including their tombstones).  Each row is a dict carrying the full
+        column set in schema order.
+        """
+
+    @abstractmethod
+    def get_clone_reference(
+        self, reference_id: str, owner_id: str
+    ) -> dict | None:
+        """Return the *owner_id*-owned row for *reference_id*, or ``None``.
+
+        Owner-scoped: a row owned by a different principal is treated as
+        absent (``None``), so cross-owner reads are impossible.  Tombstoned
+        rows remain visible to their owner (``deleted_ms`` set) — the owner
+        may observe their own deletion history.
+        """
+
+    @abstractmethod
+    def tombstone_clone_reference(
+        self, reference_id: str, owner_id: str, now_ms: int
+    ) -> dict:
+        """Soft-delete the *owner_id*-owned row for *reference_id*.
+
+        Sets ``deleted_ms = now_ms`` on the owned row and returns the
+        updated row.  Idempotent for the owner's already-tombstoned
+        reference: re-tombstoning an owned row whose ``deleted_ms`` is
+        already set returns the existing row without error.  Raises
+        ``KeyError`` when no *owner_id*-owned row exists (unknown
+        reference, or cross-owner access).
+        """
+
+    @abstractmethod
+    def delete_clone_reference_row(self, reference_id: str) -> bool:
+        """Hard-delete the tombstoned ``clone_reference`` row for *reference_id*.
+
+        Cleanup path (post-retention): removes the metadata row backing an
+        already-removed file.  Idempotent — returns ``True`` when a row was
+        removed, ``False`` when no row exists.  Only tombstoned rows are
+        eligible; an active reference's metadata is never swept.
+        """
+
+    @abstractmethod
+    def get_tombstoned_references_unreferenced(
+        self, older_than_ms: int, now_ms: int
+    ) -> list[dict]:
+        """Return tombstoned rows whose ``deleted_ms`` predates the retention
+        window — candidates for post-retention cleanup.
+
+        Bounded, owner-agnostic sweep over the tombstone set only (an active
+        reference is never returned).  Each row is a dict carrying the full
+        column set; callers use ``relative_path`` to locate and remove the
+        file, then ``delete_clone_reference_row`` to clear the row.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Startup reconciliation (contract rule #5)
@@ -916,6 +992,124 @@ class SQLiteAdapter(PipelineStorage):
             > 0
         )
 
+    # -- clone_reference -----------------------------------------------------
+
+    def insert_clone_reference(
+        self, record: dict[str, object]
+    ) -> None:
+        """Insert a new ``clone_reference`` row (parameterized SQL).
+
+        Mirrors the ABC contract — see ``PipelineStorage.insert_clone_reference``.
+        """
+        self.execute_insert(
+            "INSERT INTO clone_reference (reference_id, voice_id, owner_id,"
+            " relative_path, original_filename, media_type, byte_size,"
+            " duration_ms, sha256, created_ms, deleted_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["reference_id"],
+                record["voice_id"],
+                record["owner_id"],
+                record["relative_path"],
+                record["original_filename"],
+                record["media_type"],
+                record["byte_size"],
+                record["duration_ms"],
+                record["sha256"],
+                record["created_ms"],
+                record.get("deleted_ms"),
+            ),
+        )
+
+    def list_clone_references(
+        self, voice_id: str, owner_id: str
+    ) -> list[dict]:
+        """Owner-scoped ``clone_reference`` rows for *voice_id*.
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.list_clone_references``.
+        """
+        return self.execute_query(
+            "SELECT reference_id, voice_id, owner_id, relative_path,"
+            " original_filename, media_type, byte_size, duration_ms, sha256,"
+            " created_ms, deleted_ms FROM clone_reference"
+            " WHERE voice_id = ? AND owner_id = ?"
+            " ORDER BY created_ms ASC, reference_id ASC",
+            (voice_id, owner_id),
+        )
+
+    def get_clone_reference(
+        self, reference_id: str, owner_id: str
+    ) -> dict | None:
+        """Owner-scoped ``clone_reference`` row for *reference_id*.
+
+        Mirrors the ABC contract — see ``PipelineStorage.get_clone_reference``.
+        """
+        rows = self.execute_query(
+            "SELECT reference_id, voice_id, owner_id, relative_path,"
+            " original_filename, media_type, byte_size, duration_ms, sha256,"
+            " created_ms, deleted_ms FROM clone_reference"
+            " WHERE reference_id = ? AND owner_id = ?",
+            (reference_id, owner_id),
+        )
+        return rows[0] if rows else None
+
+    def tombstone_clone_reference(
+        self, reference_id: str, owner_id: str, now_ms: int
+    ) -> dict:
+        """Soft-delete the *owner_id*-owned row for *reference_id*.
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.tombstone_clone_reference``.  Only the owner's row
+        is a candidate; re-tombstoning an already-deleted owned row is a
+        no-op that returns the existing (tombstoned) row.
+        """
+        self.execute_update(
+            "UPDATE clone_reference SET deleted_ms = ?"
+            " WHERE reference_id = ? AND owner_id = ? AND deleted_ms IS NULL",
+            (now_ms, reference_id, owner_id),
+        )
+        row = self.get_clone_reference(reference_id, owner_id)
+        if row is None:
+            raise KeyError(
+                f"clone_reference '{reference_id}' not owned by '{owner_id}'"
+            )
+        return row
+
+    def delete_clone_reference_row(self, reference_id: str) -> bool:
+        """Hard-delete the tombstoned ``clone_reference`` row (idempotent).
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.delete_clone_reference_row``.  Only rows that are
+        already tombstoned (``deleted_ms`` set) are eligible; an active
+        reference's metadata is never swept.
+        """
+        return (
+            self.execute_delete(
+                "DELETE FROM clone_reference"
+                " WHERE reference_id = ? AND deleted_ms IS NOT NULL",
+                (reference_id,),
+            )
+            > 0
+        )
+
+    def get_tombstoned_references_unreferenced(
+        self, older_than_ms: int, now_ms: int
+    ) -> list[dict]:
+        """Tombstoned rows past the retention window (cleanup candidates).
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.get_tombstoned_references_unreferenced``.
+        """
+        return self.execute_query(
+            "SELECT reference_id, voice_id, owner_id, relative_path,"
+            " original_filename, media_type, byte_size, duration_ms, sha256,"
+            " created_ms, deleted_ms FROM clone_reference"
+            " WHERE deleted_ms IS NOT NULL AND deleted_ms < ?"
+            " ORDER BY deleted_ms ASC, reference_id ASC",
+            (now_ms - older_than_ms,),
+        )
+
     def reconcile_stale_runs(self) -> dict[str, int]:
         """Startup-only: flip stale running rows to ``interrupted`` (one pass).
 
@@ -1205,6 +1399,122 @@ class InMemorySQLiteAdapter(PipelineStorage):
                 (new_name, name),
             )
             > 0
+        )
+
+    # -- clone_reference -----------------------------------------------------
+
+    def insert_clone_reference(
+        self, record: dict[str, object]
+    ) -> None:
+        """Insert a new ``clone_reference`` row (parameterized SQL).
+
+        Mirror of ``SQLiteAdapter.insert_clone_reference`` (same schema and
+        interface).
+        """
+        self.execute_insert(
+            "INSERT INTO clone_reference (reference_id, voice_id, owner_id,"
+            " relative_path, original_filename, media_type, byte_size,"
+            " duration_ms, sha256, created_ms, deleted_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["reference_id"],
+                record["voice_id"],
+                record["owner_id"],
+                record["relative_path"],
+                record["original_filename"],
+                record["media_type"],
+                record["byte_size"],
+                record["duration_ms"],
+                record["sha256"],
+                record["created_ms"],
+                record.get("deleted_ms"),
+            ),
+        )
+
+    def list_clone_references(
+        self, voice_id: str, owner_id: str
+    ) -> list[dict]:
+        """Owner-scoped ``clone_reference`` rows for *voice_id*.
+
+        Mirror of ``SQLiteAdapter.list_clone_references`` (same schema and
+        interface).
+        """
+        return self.execute_query(
+            "SELECT reference_id, voice_id, owner_id, relative_path,"
+            " original_filename, media_type, byte_size, duration_ms, sha256,"
+            " created_ms, deleted_ms FROM clone_reference"
+            " WHERE voice_id = ? AND owner_id = ?"
+            " ORDER BY created_ms ASC, reference_id ASC",
+            (voice_id, owner_id),
+        )
+
+    def get_clone_reference(
+        self, reference_id: str, owner_id: str
+    ) -> dict | None:
+        """Owner-scoped ``clone_reference`` row for *reference_id*.
+
+        Mirror of ``SQLiteAdapter.get_clone_reference`` (same schema and
+        interface).
+        """
+        rows = self.execute_query(
+            "SELECT reference_id, voice_id, owner_id, relative_path,"
+            " original_filename, media_type, byte_size, duration_ms, sha256,"
+            " created_ms, deleted_ms FROM clone_reference"
+            " WHERE reference_id = ? AND owner_id = ?",
+            (reference_id, owner_id),
+        )
+        return rows[0] if rows else None
+
+    def tombstone_clone_reference(
+        self, reference_id: str, owner_id: str, now_ms: int
+    ) -> dict:
+        """Soft-delete the *owner_id*-owned row for *reference_id*.
+
+        Mirror of ``SQLiteAdapter.tombstone_clone_reference`` (same schema
+        and interface).
+        """
+        self.execute_update(
+            "UPDATE clone_reference SET deleted_ms = ?"
+            " WHERE reference_id = ? AND owner_id = ? AND deleted_ms IS NULL",
+            (now_ms, reference_id, owner_id),
+        )
+        row = self.get_clone_reference(reference_id, owner_id)
+        if row is None:
+            raise KeyError(
+                f"clone_reference '{reference_id}' not owned by '{owner_id}'"
+            )
+        return row
+
+    def delete_clone_reference_row(self, reference_id: str) -> bool:
+        """Hard-delete the tombstoned ``clone_reference`` row (idempotent).
+
+        Mirror of ``SQLiteAdapter.delete_clone_reference_row`` (same schema
+        and interface).
+        """
+        return (
+            self.execute_delete(
+                "DELETE FROM clone_reference"
+                " WHERE reference_id = ? AND deleted_ms IS NOT NULL",
+                (reference_id,),
+            )
+            > 0
+        )
+
+    def get_tombstoned_references_unreferenced(
+        self, older_than_ms: int, now_ms: int
+    ) -> list[dict]:
+        """Tombstoned rows past the retention window (cleanup candidates).
+
+        Mirror of ``SQLiteAdapter.get_tombstoned_references_unreferenced``
+        (same schema and interface).
+        """
+        return self.execute_query(
+            "SELECT reference_id, voice_id, owner_id, relative_path,"
+            " original_filename, media_type, byte_size, duration_ms, sha256,"
+            " created_ms, deleted_ms FROM clone_reference"
+            " WHERE deleted_ms IS NOT NULL AND deleted_ms < ?"
+            " ORDER BY deleted_ms ASC, reference_id ASC",
+            (now_ms - older_than_ms,),
         )
 
     def reconcile_stale_runs(self) -> dict[str, int]:

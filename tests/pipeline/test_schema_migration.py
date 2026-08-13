@@ -397,3 +397,133 @@ class TestCreateSchemaPauseColumns:
         span_cols = [r[1] for r in conn.execute("PRAGMA table_info(span)").fetchall()]
         assert span_cols.count("pause_after_ms") == 1
         conn.close()
+
+
+class TestParityMigrationOnOldSchema:
+    """create_schema adds the three parity tables to a pre-parity DB idempotently.
+
+    The Voice / Persona / Prompt parity tables (``clone_reference``,
+    ``persona_revision``, ``prompt_config_revision``) are additive.  An
+    existing database created before the parity DDL existed must gain all
+    three tables plus their indexes on a single ``create_schema`` run,
+    without data loss, and a second run must add nothing twice.
+    """
+
+    PARITY_TABLES = {"clone_reference", "persona_revision", "prompt_config_revision"}
+
+    def _old_schema_db(self, tmp_path: Path, name: str) -> Path:
+        """A pre-parity DB: full old schema but without the three parity tables."""
+        db_path = tmp_path / name
+        conn = sqlite3.connect(str(db_path))
+        # Create the base tables (Graph1/Graph2 + universal upgrade + workbench)
+        # by running create_schema, then drop the three parity tables to emulate
+        # a database created before the parity DDL existed.
+        create_schema(conn)
+        for table in self.PARITY_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _parity_table_names(self, conn: sqlite3.Connection) -> set[str]:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _parity_index_names(self, conn: sqlite3.Connection) -> set[str]:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def test_old_schema_gains_parity_tables(self, tmp_path: Path) -> None:
+        db_path = self._old_schema_db(tmp_path, "old.db")
+
+        conn = sqlite3.connect(str(db_path))
+        assert self._parity_table_names(conn).isdisjoint(self.PARITY_TABLES)
+        conn.close()
+
+        # Run create_schema — the parity tables and indexes appear.
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        tables = self._parity_table_names(conn)
+        conn.close()
+        assert self.PARITY_TABLES <= tables
+
+        conn = sqlite3.connect(str(db_path))
+        indexes = self._parity_index_names(conn)
+        conn.close()
+        assert {
+            "idx_clone_reference_voice_owner",
+            "idx_persona_revision_character",
+            "idx_prompt_config_revision_book_task",
+        } <= indexes
+
+    def test_old_schema_parity_migration_preserves_data(self, tmp_path: Path) -> None:
+        """Existing rows in old tables survive the parity migration."""
+        db_path = tmp_path / "preserve.db"
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        for table in self.PARITY_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("INSERT INTO series VALUES ('s1')")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, position, single_speaker)"
+            " VALUES ('b1', 's1', 1, 1, 0)"
+        )
+        conn.execute(
+            "INSERT INTO voice_config (id, name) VALUES ('v1', 'Voice')"
+        )
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        row = conn.execute(
+            "SELECT id FROM book WHERE id='b1'"
+        ).fetchone()
+        voice = conn.execute(
+            "SELECT id FROM voice_config WHERE id='v1'"
+        ).fetchone()
+        conn.close()
+        assert row == ("b1",)
+        assert voice == ("v1",)
+
+    def test_parity_migration_idempotent(self, tmp_path: Path) -> None:
+        """Running create_schema twice on the migrated DB adds tables/indexes once."""
+        db_path = self._old_schema_db(tmp_path, "idem.db")
+
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        conn.close()
+
+        # Second run — no duplicate tables or indexes.
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        dup_tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name NOT LIKE 'sqlite_%' GROUP BY name HAVING COUNT(*) > 1"
+        ).fetchall()
+        dup_indexes = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name NOT LIKE 'sqlite_%' GROUP BY name HAVING COUNT(*) > 1"
+        ).fetchall()
+        conn.close()
+        assert dup_tables == []
+        assert dup_indexes == []
+
+    def test_new_schema_create_schema_runs_twice_clean(self, tmp_path: Path) -> None:
+        """Fresh full schema (incl. parity) tolerates repeated create_schema."""
+        db_path = tmp_path / "fresh.db"
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        conn.close()
+
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        tables = self._parity_table_names(conn)
+        conn.close()
+        assert self.PARITY_TABLES <= tables

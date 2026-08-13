@@ -100,6 +100,10 @@ EXPECTED_TABLES = {
     "boundary_override",
     "character_scene_generated",
     "character_scene_manual",
+    # Voice / Persona / Prompt Parity (clone/persona/prompt revisions)
+    "clone_reference",
+    "persona_revision",
+    "prompt_config_revision",
 }
 
 
@@ -1053,3 +1057,292 @@ class TestBookSingleSpeaker:
                 "INSERT INTO book (id, series_id, book_number, position, single_speaker) "
                 "VALUES ('b1', 's1', 1, 1, NULL)"
             )
+
+
+# ---------------------------------------------------------------------------
+# Voice / Persona / Prompt Parity — clone_reference, persona_revision,
+# prompt_config_revision (DD-voice-persona-prompt-parity-browser-external-validation)
+# ---------------------------------------------------------------------------
+
+
+def _seed_voice(conn: sqlite3.Connection, voice_id: str = "v1") -> None:
+    conn.execute(
+        "INSERT INTO voice_config (id, name) VALUES (?, ?)",
+        (voice_id, "Voice " + voice_id),
+    )
+
+
+def _seed_book(conn: sqlite3.Connection, book_id: str = "b1") -> None:
+    conn.execute("INSERT INTO series VALUES ('s1')")
+    conn.execute(
+        "INSERT INTO book (id, series_id, book_number, position, single_speaker) "
+        "VALUES (?, 's1', 1, 1, 0)",
+        (book_id,),
+    )
+
+
+def _seed_character(conn: sqlite3.Connection, character_id: str = "ch1") -> None:
+    conn.execute(
+        "INSERT INTO character VALUES (?, 'Alice', '[]', NULL, NULL)",
+        (character_id,),
+    )
+
+
+def _insert_clone_reference(
+    conn: sqlite3.Connection,
+    reference_id: str = "ref1",
+    voice_id: str = "v1",
+    byte_size: int = 100,
+    duration_ms: int = 200,
+    deleted_ms=None,
+) -> None:
+    conn.execute(
+        """INSERT INTO clone_reference (
+               reference_id, voice_id, owner_id, relative_path, original_filename,
+               media_type, byte_size, duration_ms, sha256, created_ms, deleted_ms
+           ) VALUES (?, ?, 'local', ?, ?, 'audio/mpeg', ?, ?, 'abc', 1000, ?)""",
+        (
+            reference_id,
+            voice_id,
+            f"refs/{reference_id}.mp3",
+            f"{reference_id}.mp3",
+            byte_size,
+            duration_ms,
+            deleted_ms,
+        ),
+    )
+
+
+def _insert_persona_revision(
+    conn: sqlite3.Connection,
+    persona_id: str = "per1",
+    character_id: str = "ch1",
+    scene_scope: str = "book",
+    review_state: str = "draft",
+    protected: int = 0,
+) -> None:
+    conn.execute(
+        """INSERT INTO persona_revision (
+               persona_id, character_id, book_id, revision, fields_json,
+               evidence_json, aliases_json, scene_scope, review_state,
+               protected, voice_consequences_json, author_id, created_ms,
+               superseded_by
+           ) VALUES (?, ?, NULL, 0, '{}', '[]', '[]', ?, ?, ?, '{}', 'local', 1000, NULL)""",
+        (persona_id, character_id, scene_scope, review_state, protected),
+    )
+
+
+def _insert_prompt_config_revision(
+    conn: sqlite3.Connection,
+    revision_id: str = "rev1",
+    book_id: str = "b1",
+    task: str = "character_discovery",
+) -> None:
+    conn.execute(
+        """INSERT INTO prompt_config_revision (
+               revision_id, book_id, task, base_revision, source_layers_json,
+               effective_prompt, settings_json, raw_json, validation_json,
+               author_id, created_ms, superseded_by
+           ) VALUES (?, ?, ?, NULL, '[]', 'prompt', '{}', NULL, '{}', 'local', 1000, NULL)""",
+        (revision_id, book_id, task),
+    )
+
+
+class TestParityTablePresence:
+    """The three parity tables exist on a fresh create_schema and are idempotent."""
+
+    def test_parity_tables_present(self, conn):
+        tables = _table_names(conn)
+        assert {"clone_reference", "persona_revision", "prompt_config_revision"} <= tables
+
+    def test_parity_tables_in_expected_set(self, conn):
+        assert "clone_reference" in EXPECTED_TABLES
+        assert "persona_revision" in EXPECTED_TABLES
+        assert "prompt_config_revision" in EXPECTED_TABLES
+
+    def test_parity_tables_idempotent(self, conn):
+        create_schema(conn)
+        assert _table_names(conn) == EXPECTED_TABLES
+
+
+class TestCloneReferenceColumns:
+    """clone_reference column set, types, and nullability."""
+
+    def test_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "clone_reference")}
+        assert set(cols.keys()) == {
+            "reference_id", "voice_id", "owner_id", "relative_path",
+            "original_filename", "media_type", "byte_size", "duration_ms",
+            "sha256", "created_ms", "deleted_ms",
+        }
+        assert cols["reference_id"][2] == "TEXT"
+        assert cols["byte_size"][2] == "INTEGER"
+        assert cols["duration_ms"][2] == "INTEGER"
+        assert cols["created_ms"][2] == "INTEGER"
+        # deleted_ms is the soft-tombstone marker; NULL means not deleted.
+        assert cols["deleted_ms"][3] == 0  # nullable
+
+    def test_insert_roundtrip(self, conn):
+        _seed_voice(conn)
+        _insert_clone_reference(conn)
+        row = conn.execute(
+            "SELECT reference_id, owner_id, media_type, deleted_ms"
+            " FROM clone_reference WHERE reference_id='ref1'"
+        ).fetchone()
+        assert row == ("ref1", "local", "audio/mpeg", None)
+
+
+class TestCloneReferenceConstraints:
+    """FK to voice_config, nonnegative byte/duration CHECK, PK, index."""
+
+    def test_voice_id_fk(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_clone_reference(conn, voice_id="missing")
+
+    def test_byte_size_nonnegative(self, conn):
+        _seed_voice(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_clone_reference(conn, byte_size=-1)
+
+    def test_duration_ms_nonnegative(self, conn):
+        _seed_voice(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_clone_reference(conn, duration_ms=-1)
+
+    def test_byte_size_zero_allowed(self, conn):
+        _seed_voice(conn)
+        _insert_clone_reference(conn, byte_size=0)
+        row = conn.execute(
+            "SELECT byte_size FROM clone_reference WHERE reference_id='ref1'"
+        ).fetchone()
+        assert row == (0,)
+
+    def test_reference_id_pk(self, conn):
+        _seed_voice(conn)
+        _insert_clone_reference(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_clone_reference(conn)
+
+    def test_voice_owner_index(self, conn):
+        names = {r[1] for r in _index_list(conn, "clone_reference")}
+        assert "idx_clone_reference_voice_owner" in names
+        cols = [r[2] for r in _index_info(conn, "idx_clone_reference_voice_owner")]
+        assert cols == ["voice_id", "owner_id"]
+
+
+class TestPersonaRevisionColumns:
+    """persona_revision column set, types, defaults, indexes."""
+
+    def test_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "persona_revision")}
+        assert set(cols.keys()) == {
+            "persona_id", "character_id", "book_id", "revision", "fields_json",
+            "evidence_json", "aliases_json", "scene_scope", "review_state",
+            "protected", "voice_consequences_json", "author_id", "created_ms",
+            "superseded_by",
+        }
+        # protected defaults to 0 (not protected).
+        assert cols["protected"][4] == "0"
+
+    def test_character_index(self, conn):
+        names = {r[1] for r in _index_list(conn, "persona_revision")}
+        assert "idx_persona_revision_character" in names
+        cols = [r[2] for r in _index_info(conn, "idx_persona_revision_character")]
+        assert cols == ["character_id"]
+
+
+class TestPersonaRevisionConstraints:
+    """CHECK enums (scene_scope, review_state, protected), FK, revision>=0."""
+
+    def test_scene_scope_book(self, conn):
+        _seed_character(conn)
+        _insert_persona_revision(conn, scene_scope="book")
+
+    def test_scene_scope_scenes(self, conn):
+        _seed_character(conn)
+        _insert_persona_revision(conn, scene_scope="scenes")
+
+    def test_scene_scope_invalid(self, conn):
+        _seed_character(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_persona_revision(conn, scene_scope="chapters")
+
+    @pytest.mark.parametrize(
+        "state", ["draft", "needs_review", "accepted", "rejected"]
+    )
+    def test_review_state_valid(self, conn, state):
+        _seed_character(conn)
+        _insert_persona_revision(conn, review_state=state)
+
+    def test_review_state_invalid(self, conn):
+        _seed_character(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_persona_revision(conn, review_state="approved")
+
+    def test_protected_check(self, conn):
+        _seed_character(conn)
+        _insert_persona_revision(conn, protected=1)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_persona_revision(conn, persona_id="per2", protected=2)
+
+    def test_character_id_fk(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_persona_revision(conn, character_id="missing")
+
+    def test_revision_nonnegative(self, conn):
+        _seed_character(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO persona_revision (
+                       persona_id, character_id, book_id, revision, fields_json,
+                       evidence_json, aliases_json, scene_scope, review_state,
+                       protected, voice_consequences_json, author_id, created_ms,
+                       superseded_by
+                   ) VALUES ('perX', 'ch1', NULL, -1, '{}', '[]', '[]',
+                             'book', 'draft', 0, '{}', 'local', 1000, NULL)"""
+            )
+
+
+class TestPromptConfigRevisionColumns:
+    """prompt_config_revision column set, nullables, indexes."""
+
+    def test_columns(self, conn):
+        cols = {row[1]: row for row in _column_info(conn, "prompt_config_revision")}
+        assert set(cols.keys()) == {
+            "revision_id", "book_id", "task", "base_revision",
+            "source_layers_json", "effective_prompt", "settings_json", "raw_json",
+            "validation_json", "author_id", "created_ms", "superseded_by",
+        }
+        # nullable columns
+        assert cols["base_revision"][3] == 0
+        assert cols["effective_prompt"][3] == 0
+        assert cols["raw_json"][3] == 0
+        assert cols["superseded_by"][3] == 0
+
+    def test_book_task_index(self, conn):
+        names = {r[1] for r in _index_list(conn, "prompt_config_revision")}
+        assert "idx_prompt_config_revision_book_task" in names
+        cols = [r[2] for r in _index_info(conn, "idx_prompt_config_revision_book_task")]
+        assert cols == ["book_id", "task"]
+
+
+class TestPromptConfigRevisionConstraints:
+    """FK to book and the prompt/config revision PK."""
+
+    def test_book_id_fk(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_prompt_config_revision(conn, book_id="missing")
+
+    def test_revision_id_pk(self, conn):
+        _seed_book(conn)
+        _insert_prompt_config_revision(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_prompt_config_revision(conn)
+
+    def test_roundtrip(self, conn):
+        _seed_book(conn)
+        _insert_prompt_config_revision(conn)
+        row = conn.execute(
+            "SELECT task, author_id FROM prompt_config_revision WHERE revision_id='rev1'"
+        ).fetchone()
+        assert row == ("character_discovery", "local")
