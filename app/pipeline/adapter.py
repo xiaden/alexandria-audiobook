@@ -230,6 +230,62 @@ class PipelineStorage(ABC):
         file, then ``delete_clone_reference_row`` to clear the row.
         """
 
+    @abstractmethod
+    def insert_persona_revision(self, record: dict[str, object]) -> None:
+        """Insert a new ``persona_revision`` row (parameterized SQL).
+
+        *record* must carry the full column set: ``persona_id``, ``character_id``,
+        ``book_id`` (nullable), ``revision``, ``fields_json``, ``evidence_json``,
+        ``aliases_json``, ``scene_scope``, ``review_state``, ``protected``,
+        ``voice_consequences_json``, ``author_id``, ``created_ms``, and
+        ``superseded_by`` (nullable).
+        """
+
+    @abstractmethod
+    def get_persona_revision(self, persona_id: str) -> dict | None:
+        """Return the ``persona_revision`` row for *persona_id* as a dict, or
+        ``None`` when no such revision exists."""
+
+    @abstractmethod
+    def list_persona_revisions(self, character_id: str) -> list[dict]:
+        """Return ``persona_revision`` rows for *character_id*, newest revision
+        first (``ORDER BY revision DESC``)."""
+
+    @abstractmethod
+    def supersede_persona_revision(self, persona_id: str, superseded_by: str) -> None:
+        """Mark the ``persona_revision`` row for *persona_id* as superseded by
+        *superseded_by* (append-only chaining; the prior row is preserved)."""
+
+    @abstractmethod
+    def insert_prompt_config_revision(self, record: dict[str, object]) -> None:
+        """Insert a new ``prompt_config_revision`` row (parameterized SQL).
+
+        *record* must carry the full column set: ``revision_id``, ``book_id``,
+        ``task``, ``base_revision`` (nullable), ``source_layers_json``,
+        ``effective_prompt`` (nullable), ``settings_json``, ``raw_json``
+        (nullable), ``validation_json``, ``author_id``, ``created_ms``, and
+        ``superseded_by`` (nullable).
+        """
+
+    @abstractmethod
+    def get_prompt_config_revision(self, revision_id: str) -> dict | None:
+        """Return the ``prompt_config_revision`` row for *revision_id* as a
+        dict, or ``None`` when no such revision exists."""
+
+    @abstractmethod
+    def list_prompt_config_revisions(
+        self, book_id: str, task: str
+    ) -> list[dict]:
+        """Return ``prompt_config_revision`` rows for ``(book_id, task)``,
+        newest first (``ORDER BY created_ms DESC, revision_id DESC``)."""
+
+    @abstractmethod
+    def supersede_prompt_config_revision(
+        self, revision_id: str, superseded_by: str
+    ) -> None:
+        """Mark the ``prompt_config_revision`` row for *revision_id* as
+        superseded by *superseded_by* (append-only chaining)."""
+
 
 # ---------------------------------------------------------------------------
 # Startup reconciliation (contract rule #5)
@@ -1110,6 +1166,166 @@ class SQLiteAdapter(PipelineStorage):
             (now_ms - older_than_ms,),
         )
 
+    # -- persona_revision --------------------------------------------------
+
+    def insert_persona_revision(
+        self, record: dict[str, object]
+    ) -> None:
+        """Insert a new ``persona_revision`` row (parameterized SQL).
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.insert_persona_revision``.
+        """
+        self.execute_insert(
+            "INSERT INTO persona_revision (persona_id, character_id, book_id,"
+            " revision, fields_json, evidence_json, aliases_json, scene_scope,"
+            " review_state, protected, voice_consequences_json, author_id,"
+            " created_ms, superseded_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["persona_id"],
+                record["character_id"],
+                record.get("book_id"),
+                record["revision"],
+                record["fields_json"],
+                record["evidence_json"],
+                record["aliases_json"],
+                record["scene_scope"],
+                record["review_state"],
+                record["protected"],
+                record["voice_consequences_json"],
+                record["author_id"],
+                record["created_ms"],
+                record.get("superseded_by"),
+            ),
+        )
+
+    def get_persona_revision(
+        self, persona_id: str
+    ) -> dict | None:
+        """Owner-agnostic ``persona_revision`` row for *persona_id*.
+
+        Mirrors the ABC contract — see ``PipelineStorage.get_persona_revision``.
+        """
+        rows = self.execute_query(
+            "SELECT persona_id, character_id, book_id, revision, fields_json,"
+            " evidence_json, aliases_json, scene_scope, review_state, protected,"
+            " voice_consequences_json, author_id, created_ms, superseded_by"
+            " FROM persona_revision WHERE persona_id = ?",
+            (persona_id,),
+        )
+        return rows[0] if rows else None
+
+    def list_persona_revisions(
+        self, character_id: str
+    ) -> list[dict]:
+        """``persona_revision`` rows for *character_id*, newest first.
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.list_persona_revisions``.
+        """
+        return self.execute_query(
+            "SELECT persona_id, character_id, book_id, revision, fields_json,"
+            " evidence_json, aliases_json, scene_scope, review_state, protected,"
+            " voice_consequences_json, author_id, created_ms, superseded_by"
+            " FROM persona_revision WHERE character_id = ?"
+            " ORDER BY revision DESC",
+            (character_id,),
+        )
+
+    def supersede_persona_revision(
+        self, persona_id: str, superseded_by: str
+    ) -> None:
+        """Mark the *persona_id* row as superseded by *superseded_by*.
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.supersede_persona_revision``.
+        """
+        self.execute_update(
+            "UPDATE persona_revision SET superseded_by = ?"
+            " WHERE persona_id = ?",
+            (superseded_by, persona_id),
+        )
+
+    # -- prompt_config_revision --------------------------------------------
+
+    def insert_prompt_config_revision(
+        self, record: dict[str, object]
+    ) -> None:
+        """Insert a new ``prompt_config_revision`` row (parameterized SQL).
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.insert_prompt_config_revision``.
+        """
+        self.execute_insert(
+            "INSERT INTO prompt_config_revision (revision_id, book_id, task,"
+            " base_revision, source_layers_json, effective_prompt, settings_json,"
+            " raw_json, validation_json, author_id, created_ms, superseded_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["revision_id"],
+                record["book_id"],
+                record["task"],
+                record.get("base_revision"),
+                record["source_layers_json"],
+                record.get("effective_prompt"),
+                record["settings_json"],
+                record.get("raw_json"),
+                record["validation_json"],
+                record["author_id"],
+                record["created_ms"],
+                record.get("superseded_by"),
+            ),
+        )
+
+    def get_prompt_config_revision(
+        self, revision_id: str
+    ) -> dict | None:
+        """``prompt_config_revision`` row for *revision_id*.
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.get_prompt_config_revision``.
+        """
+        rows = self.execute_query(
+            "SELECT revision_id, book_id, task, base_revision,"
+            " source_layers_json, effective_prompt, settings_json, raw_json,"
+            " validation_json, author_id, created_ms, superseded_by"
+            " FROM prompt_config_revision WHERE revision_id = ?",
+            (revision_id,),
+        )
+        return rows[0] if rows else None
+
+    def list_prompt_config_revisions(
+        self, book_id: str, task: str
+    ) -> list[dict]:
+        """``prompt_config_revision`` rows for ``(book_id, task)``, newest first.
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.list_prompt_config_revisions``.
+        """
+        return self.execute_query(
+            "SELECT revision_id, book_id, task, base_revision,"
+            " source_layers_json, effective_prompt, settings_json, raw_json,"
+            " validation_json, author_id, created_ms, superseded_by"
+            " FROM prompt_config_revision WHERE book_id = ? AND task = ?"
+            " ORDER BY created_ms DESC, revision_id DESC",
+            (book_id, task),
+        )
+
+    def supersede_prompt_config_revision(
+        self, revision_id: str, superseded_by: str
+    ) -> None:
+        """Mark the *revision_id* row as superseded by *superseded_by*.
+
+        Mirrors the ABC contract — see
+        ``PipelineStorage.supersede_prompt_config_revision``.
+        """
+        self.execute_update(
+            "UPDATE prompt_config_revision SET superseded_by = ?"
+            " WHERE revision_id = ?",
+            (superseded_by, revision_id),
+        )
+
     def reconcile_stale_runs(self) -> dict[str, int]:
         """Startup-only: flip stale running rows to ``interrupted`` (one pass).
 
@@ -1515,6 +1731,167 @@ class InMemorySQLiteAdapter(PipelineStorage):
             " WHERE deleted_ms IS NOT NULL AND deleted_ms < ?"
             " ORDER BY deleted_ms ASC, reference_id ASC",
             (now_ms - older_than_ms,),
+        )
+
+    # -- persona_revision ---------------------------------------------------
+
+    def insert_persona_revision(
+        self, record: dict[str, object]
+    ) -> None:
+        """Insert a new ``persona_revision`` row (parameterized SQL).
+
+        Mirror of ``SQLiteAdapter.insert_persona_revision`` (same schema and
+        interface).
+        """
+        self.execute_insert(
+            "INSERT INTO persona_revision (persona_id, character_id, book_id,"
+            " revision, fields_json, evidence_json, aliases_json, scene_scope,"
+            " review_state, protected, voice_consequences_json, author_id,"
+            " created_ms, superseded_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["persona_id"],
+                record["character_id"],
+                record.get("book_id"),
+                record["revision"],
+                record["fields_json"],
+                record["evidence_json"],
+                record["aliases_json"],
+                record["scene_scope"],
+                record["review_state"],
+                record["protected"],
+                record["voice_consequences_json"],
+                record["author_id"],
+                record["created_ms"],
+                record.get("superseded_by"),
+            ),
+        )
+
+    def get_persona_revision(
+        self, persona_id: str
+    ) -> dict | None:
+        """Owner-agnostic ``persona_revision`` row for *persona_id*.
+
+        Mirror of ``SQLiteAdapter.get_persona_revision`` (same schema and
+        interface).
+        """
+        rows = self.execute_query(
+            "SELECT persona_id, character_id, book_id, revision, fields_json,"
+            " evidence_json, aliases_json, scene_scope, review_state, protected,"
+            " voice_consequences_json, author_id, created_ms, superseded_by"
+            " FROM persona_revision WHERE persona_id = ?",
+            (persona_id,),
+        )
+        return rows[0] if rows else None
+
+    def list_persona_revisions(
+        self, character_id: str
+    ) -> list[dict]:
+        """``persona_revision`` rows for *character_id*, newest first.
+
+        Mirror of ``SQLiteAdapter.list_persona_revisions`` (same schema and
+        interface).
+        """
+        return self.execute_query(
+            "SELECT persona_id, character_id, book_id, revision, fields_json,"
+            " evidence_json, aliases_json, scene_scope, review_state, protected,"
+            " voice_consequences_json, author_id, created_ms, superseded_by"
+            " FROM persona_revision WHERE character_id = ?"
+            " ORDER BY revision DESC",
+            (character_id,),
+        )
+
+    def supersede_persona_revision(
+        self, persona_id: str, superseded_by: str
+    ) -> None:
+        """Mark the *persona_id* row as superseded by *superseded_by*.
+
+        Mirror of ``SQLiteAdapter.supersede_persona_revision`` (same schema and
+        interface).
+        """
+        self.execute_update(
+            "UPDATE persona_revision SET superseded_by = ?"
+            " WHERE persona_id = ?",
+            (superseded_by, persona_id),
+        )
+
+    # -- prompt_config_revision ---------------------------------------------
+
+    def insert_prompt_config_revision(
+        self, record: dict[str, object]
+    ) -> None:
+        """Insert a new ``prompt_config_revision`` row (parameterized SQL).
+
+        Mirror of ``SQLiteAdapter.insert_prompt_config_revision`` (same schema
+        and interface).
+        """
+        self.execute_insert(
+            "INSERT INTO prompt_config_revision (revision_id, book_id, task,"
+            " base_revision, source_layers_json, effective_prompt, settings_json,"
+            " raw_json, validation_json, author_id, created_ms, superseded_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["revision_id"],
+                record["book_id"],
+                record["task"],
+                record.get("base_revision"),
+                record["source_layers_json"],
+                record.get("effective_prompt"),
+                record["settings_json"],
+                record.get("raw_json"),
+                record["validation_json"],
+                record["author_id"],
+                record["created_ms"],
+                record.get("superseded_by"),
+            ),
+        )
+
+    def get_prompt_config_revision(
+        self, revision_id: str
+    ) -> dict | None:
+        """``prompt_config_revision`` row for *revision_id*.
+
+        Mirror of ``SQLiteAdapter.get_prompt_config_revision`` (same schema and
+        interface).
+        """
+        rows = self.execute_query(
+            "SELECT revision_id, book_id, task, base_revision,"
+            " source_layers_json, effective_prompt, settings_json, raw_json,"
+            " validation_json, author_id, created_ms, superseded_by"
+            " FROM prompt_config_revision WHERE revision_id = ?",
+            (revision_id,),
+        )
+        return rows[0] if rows else None
+
+    def list_prompt_config_revisions(
+        self, book_id: str, task: str
+    ) -> list[dict]:
+        """``prompt_config_revision`` rows for ``(book_id, task)``, newest first.
+
+        Mirror of ``SQLiteAdapter.list_prompt_config_revisions`` (same schema
+        and interface).
+        """
+        return self.execute_query(
+            "SELECT revision_id, book_id, task, base_revision,"
+            " source_layers_json, effective_prompt, settings_json, raw_json,"
+            " validation_json, author_id, created_ms, superseded_by"
+            " FROM prompt_config_revision WHERE book_id = ? AND task = ?"
+            " ORDER BY created_ms DESC, revision_id DESC",
+            (book_id, task),
+        )
+
+    def supersede_prompt_config_revision(
+        self, revision_id: str, superseded_by: str
+    ) -> None:
+        """Mark the *revision_id* row as superseded by *superseded_by*.
+
+        Mirror of ``SQLiteAdapter.supersede_prompt_config_revision`` (same
+        schema and interface).
+        """
+        self.execute_update(
+            "UPDATE prompt_config_revision SET superseded_by = ?"
+            " WHERE revision_id = ?",
+            (superseded_by, revision_id),
         )
 
     def reconcile_stale_runs(self) -> dict[str, int]:
