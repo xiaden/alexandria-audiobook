@@ -1116,3 +1116,25 @@ Decision status transitions are `active → undone|superseded|conflict`; `undone
 
 - `frontend/src/api.ts` adds `putWithRetryOnce` and `delWithRetryOnce` (exactly ONE retry on `retryStatus` default 503 with `Retry-After`); `postWithRetryOnce` (default 503, `retryStatus=409` for snapshot-load restore).
 - `frontend/src/tabs/workbench.ts` implements the workbench navigator/highlights/ledger/aliases/presence/setup/conflicts/rerun-protection; `frontend/src/main.ts` calls `initWorkbench()`. Built output committed in `app/static/dist/`.
+
+## Voice / Persona / Prompt Parity Contracts (DD-voice-persona-prompt-parity-browser-external-validation)
+
+> Design-time registration for [DD-voice-persona-prompt-parity-browser-external-validation](../../pending/DD-voice-persona-prompt-parity-browser-external-validation.md) (2026-08-13). These three entries are parity-owned append-only registrations. They do not register or duplicate any 2b–2d workbench contract owned by `DD-combined-walks-2b-2d-workbench.md`, and no prior contract lines above are amended.
+
+CONTRACT ID: PipelineVoiceCloneReferenceAPI.v1
+SCHEMAS: CloneReferenceDTO; CloneReferenceUploadRequest; CloneReferenceListResponse; CloneReferenceDeleteResponse
+REQUEST/RESPONSE: POST /api/pipeline/voices/{voice_id}/references (multipart audio + optional ref_text) -> 201 {reference: CloneReferenceDTO, voice: VoiceConfigDTO}; GET /api/pipeline/voices/{voice_id}/references -> 200 CloneReferenceListResponse; GET /api/pipeline/voices/{voice_id}/references/{reference_id}/preview -> inline audio; GET .../{reference_id}/download -> attachment audio; DELETE .../{reference_id} -> 204
+OWNER: endpoint/module app/pipeline/api_voices.py; persistence owner pipeline voice-reference storage adapter
+COMPATIBILITY: Pipeline-only, resolved voice_config IDs, existing five voice types and voice CRUD unchanged; ownership/path/content/size/duration checks and no filesystem-path exposure; no legacy manifest or route.
+
+CONTRACT ID: PipelineCharacterPersonaAPI.v1
+SCHEMAS: PersonaDTO; PersonaWriteRequest; PersonaValidationResponse; PersonaRevisionListResponse; PersonaRerunRequest; RevisionConflictDTO
+REQUEST/RESPONSE: GET|PUT /api/pipeline/characters/{character_id}/persona -> PersonaDTO; GET .../persona/revisions -> PersonaRevisionListResponse; POST .../persona/validate (PersonaWriteRequest) -> validation result, side-effect free; POST .../persona/rerun (PersonaRerunRequest) -> {run_id, revision_id, scope}
+OWNER: endpoint/module app/pipeline/api_characters.py and app/pipeline/api_review.py for validation/review integration; persistence owner character ledger/persona revision adapter
+COMPATIBILITY: Character ledger identity remains authoritative; manual persona is revisioned and separately addressable, preserves evidence/protection, never replaces discovery or 2b–2d workbench state, and never auto-cascades.
+
+CONTRACT ID: PipelineWalkPromptConfigRevisionAPI.v1
+SCHEMAS: EffectiveWalkConfigDTO; PromptConfigWriteRequest; PromptConfigValidationResponse; PromptConfigRevisionDTO; PromptConfigRevisionListResponse; ScopedWalkRerunRequest; RevisionConflictDTO
+REQUEST/RESPONSE: GET /api/pipeline/walks/{book_id}/config -> EffectiveWalkConfigDTO; POST .../config/validate (PromptConfigWriteRequest) -> PromptConfigValidationResponse; POST .../config/revisions (PromptConfigWriteRequest with base_revision) -> 201 PromptConfigRevisionDTO; POST /api/pipeline/walks/{book_id}/reruns (ScopedWalkRerunRequest) -> {run_id, revision_id, scope}
+OWNER: endpoint/module existing pipeline walk/config API module (app/pipeline/api_walks.py); persistence owner walk_override/config-revision adapter
+COMPATIBILITY: Fixed nine task names and `script_alias_resolution` alias resolution remain canonical; precedence is on-disk config -> llm.task_overrides -> DB walk_override (DB wins); exact allowed keys are model_name, reasoning_effort, temperature, prompt; validation is side-effect free; explicit rerun is revision/scope protected and never implicit. For 2b–2d, prompt/config writes and reruns delegate to the existing combined-walks workbench contracts and single writer; this record does not duplicate their registrations.
