@@ -9,6 +9,8 @@ Provides HTTP endpoints for running walks and querying walk/character status:
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -23,8 +25,10 @@ from app.pipeline.api_review import (
     get_workbench,
 )
 from app.pipeline.ledger import CharacterLedger
+from app.pipeline.prompt_config import PromptConfigDomain, TASK_NAMES
 from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import WalkRunner
+from app.pipeline.workbench import BookNotFoundError, StaleRevisionError, ValidationError
 
 
 # ---------------------------------------------------------------------------
@@ -740,3 +744,302 @@ async def deactivate_boundary_override(
         override_id=override_id,
         base_revision=request.base_revision,
     )
+
+
+# ---------------------------------------------------------------------------
+# Prompt/settings config (DD-voice-persona-prompt-parity, S3).
+# PipelineWalkPromptConfigRevisionAPI.v1 — do not conflate with the protected
+# /workbench/{book_id}/config combined-workbench route above.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Prompt config request DTOs
+# ---------------------------------------------------------------------------
+
+
+class PromptConfigWriteRequest(BaseModel):
+    """Request body for POST /walks/{book_id}/config/validate and /revisions."""
+
+    task: str
+    settings: dict = {}
+    prompt: str | None = None
+    raw_json: str | None = None
+    base_revision: str | None = None
+
+
+_prompt_domain: PromptConfigDomain | None = None
+
+
+def get_prompt_config_domain(
+    storage: PipelineStorage = Depends(get_storage),
+) -> PromptConfigDomain:
+    """FastAPI dependency: return the prompt-config domain facade.
+
+    Stateless over ``PipelineStorage``; constructed per-request so tests can
+    override ``get_storage`` directly.
+    """
+    global _prompt_domain
+    if _prompt_domain is None or _prompt_domain._storage is not storage:
+        _prompt_domain = PromptConfigDomain(storage)
+    return _prompt_domain
+
+
+def _prompt_http(exc) -> HTTPException:
+    """Map prompt-config domain errors to contracted HTTP statuses."""
+    if isinstance(exc, BookNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, (StaleRevisionError,)):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ValidationError):
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipeline/walks/{book_id}/config
+# ---------------------------------------------------------------------------
+
+
+@router.get("/walks/{book_id}/config")
+async def get_effective_walk_config(
+    book_id: str,
+    domain: PromptConfigDomain = Depends(get_prompt_config_domain),
+) -> dict:
+    """Return effective values + provenance for all nine walk tasks.
+
+    Precedence: on-disk config -> ``llm.task_overrides`` -> DB ``walk_override``
+    (DB wins).  DB prompt wins only when a non-empty string; temperature 0.0
+    is honored.  Unknown book -> 404.
+    """
+    try:
+        return domain.effective_config(book_id)
+    except BookNotFoundError as exc:
+        raise _prompt_http(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# POST /api/pipeline/walks/{book_id}/config/validate
+# ---------------------------------------------------------------------------
+
+
+@router.post("/walks/{book_id}/config/validate")
+async def validate_prompt_config(
+    book_id: str,
+    request: PromptConfigWriteRequest,
+    domain: PromptConfigDomain = Depends(get_prompt_config_domain),
+) -> dict:
+    """Side-effect-free validation of a prompt-config write."""
+    # Book ownership is checked for scope parity, but validation itself is
+    # a read-only no-op over the write.
+    try:
+        domain.require_book(book_id)
+    except BookNotFoundError as exc:
+        raise _prompt_http(exc) from exc
+    return domain.validate(request.model_dump())
+
+
+# ---------------------------------------------------------------------------
+# POST /api/pipeline/walks/{book_id}/config/revisions
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/walks/{book_id}/config/revisions", status_code=201
+)
+async def save_prompt_config_revision(
+    book_id: str,
+    request: PromptConfigWriteRequest,
+    domain: PromptConfigDomain = Depends(get_prompt_config_domain),
+) -> dict:
+    """Append a prompt-config revision, applying allowed overrides atomically.
+
+    Stale/cross-book base_revision -> 409; unknown book -> 404; invalid
+    task/key/value/raw_json -> 422; transaction contention -> 503 +
+    ``Retry-After`` (app-level handler).
+    """
+    try:
+        return domain.save(
+            book_id,
+            write=request.model_dump(),
+            base_revision=request.base_revision,
+        )
+    except (BookNotFoundError, StaleRevisionError, ValidationError) as exc:
+        raise _prompt_http(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# POST /api/pipeline/walks/{book_id}/reruns
+# (DD-voice-persona-prompt-parity, S4 — explicit scoped prompt rerun).
+# ---------------------------------------------------------------------------
+
+# Prompt task name -> workbench-native walk name for the combined-workbench
+# invalidation DAG reuse.  Only these three tasks are 2b/2c/2d workbench walks.
+_TASK_TO_WORKBENCH_WALK = {
+    "character_discovery": "walk_2b_character_discovery",
+    "script_alias_resolution": "walk_2c_alias_resolution",
+    "scene_presence": "walk_2d_scene_presence",
+}
+
+
+class ScopedWalkRerunRequest(BaseModel):
+    """Request body for POST /walks/{book_id}/reruns.
+
+    A rerun is explicit and never implicit: it requires ``confirm=True`` plus a
+    ``revision_id`` (an existing prompt-config revision to re-apply) and a
+    ``scope`` (``book`` or ``scenes`` with reachable ``scene_ids``).  The task
+    is derived from the referenced revision (a revision is per ``(book, task)``).
+    """
+
+    revision_id: str
+    scope: str = "book"
+    scene_ids: list[str] = []
+    confirm: bool = False
+
+
+def _prompt_override_value(
+    storage: PipelineStorage, book_id: str, task: str, key: str
+) -> object:
+    """Return the decoded ``walk_override`` value for ``(book_id, task, key)``."""
+    rows = storage.execute_query(
+        "SELECT value_json FROM walk_override"
+        " WHERE book_id = ? AND walk_name = ? AND key = ?",
+        (book_id, task, key),
+    )
+    if not rows:
+        return None
+    try:
+        return json.loads(rows[0]["value_json"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _reachable_scene_ids(
+    storage: PipelineStorage, book_id: str, scene_ids: list[str]
+) -> set[str]:
+    """Return the subset of *scene_ids* reachable from *book_id*."""
+    placeholders = ", ".join("?" for _ in scene_ids)
+    rows = storage.execute_query(
+        f"""SELECT cs.child_id AS scene_id
+            FROM chapter_scene cs
+            JOIN book_chapter bc ON bc.child_id = cs.parent_id
+            WHERE bc.parent_id = ? AND cs.child_id IN ({placeholders})""",
+        (book_id, *scene_ids),
+    )
+    return {r["scene_id"] for r in rows}
+
+
+@router.post("/walks/{book_id}/reruns")
+async def rerun_scoped_walk(
+    book_id: str,
+    request: ScopedWalkRerunRequest,
+    domain: PromptConfigDomain = Depends(get_prompt_config_domain),
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Explicit, confirmed, scoped re-application of a prompt-config revision.
+
+    Requires ``confirm=true``, an existing ``revision_id`` owned by
+    ``{book_id}``, and a valid ``scope``.  Scenes scope requires non-empty,
+    reachable ``scene_ids``; ``script_alias_resolution`` is book-global and
+    rejects scenes scope (reuses the combined-workbench 2c contract).  The
+    referenced revision's settings are re-applied through the existing
+    ``walk_override`` single-writer (via ``PromptConfigDomain.save``) as a new
+    head revision (the ``run``), so an identical revision+scope rerun is
+    rejected ``409 already_ran`` — never a silent duplicate.  Reruns never
+    auto-run a walk (no auto-cascade).  For the 2b/2c/2d tasks the
+    combined-workbench invalidation DAG is reused to report the downstream
+    walks a later run would invalidate.
+    """
+    # Book ownership (404).
+    try:
+        domain.require_book(book_id)
+    except BookNotFoundError as exc:
+        raise _prompt_http(exc) from exc
+
+    # Explicit confirmation + valid scope.
+    if not request.confirm:
+        raise HTTPException(status_code=422, detail="walk rerun requires confirm=true")
+    if request.scope not in ("book", "scenes"):
+        raise HTTPException(
+            status_code=422, detail="scope must be exactly 'book' or 'scenes'"
+        )
+
+    # The rerun derives from an existing prompt-config revision owned by this book.
+    row = storage.get_prompt_config_revision(request.revision_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown prompt-config revision '{request.revision_id}'",
+        )
+    if row["book_id"] != book_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"prompt-config revision '{request.revision_id}' belongs to book"
+                f" '{row['book_id']}', not '{book_id}'"
+            ),
+        )
+    task = row["task"]
+    # Valid nine-task scope (a revision is per (book, task)).
+    if task not in TASK_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown task: {task}; must be one of {sorted(TASK_NAMES)}",
+        )
+
+    # Scenes scope: non-empty reachable scene ids; 2c (alias resolution) is
+    # book-global.
+    if request.scope == "scenes":
+        if not request.scene_ids:
+            raise HTTPException(
+                status_code=422, detail="scenes scope requires a non-empty scene_ids"
+            )
+        if task == "script_alias_resolution":
+            raise HTTPException(
+                status_code=422,
+                detail="script_alias_resolution is book-global and rejects scenes scope",
+            )
+        reachable = _reachable_scene_ids(storage, book_id, request.scene_ids)
+        missing = [s for s in request.scene_ids if s not in reachable]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"scene_ids not reachable from book: {missing}",
+            )
+
+    # Dedupe: re-applying a revision that is no longer the (book, task) head
+    # means this exact revision+scope already ran — 409 already_ran, never a
+    # silent duplicate.  The first rerun of a live head is legitimate and
+    # produces a new head revision.
+    head = domain.list_revisions(book_id, task)
+    if head and head[0]["revision_id"] != request.revision_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"walk rerun already_ran: revision {request.revision_id} scope"
+                f" {request.scope} produced head '{head[0]['revision_id']}'"
+            ),
+        )
+
+    # Re-apply the referenced revision's settings through the existing
+    # walk_override single-writer, creating a new head revision (the run).
+    settings = json.loads(row["settings_json"] or "{}")
+    write = {
+        "task": task,
+        "settings": settings,
+        "prompt": _prompt_override_value(storage, book_id, task, "prompt"),
+    }
+    try:
+        saved = domain.save(book_id, write=write, base_revision=request.revision_id)
+    except (BookNotFoundError, StaleRevisionError, ValidationError) as exc:
+        raise _prompt_http(exc) from exc
+
+    # Reuse the combined-workbench invalidation DAG for 2b/2c/2d targets.
+    walk_name = _TASK_TO_WORKBENCH_WALK.get(task)
+    invalidated = _RERUN_INVALIDATION.get(walk_name, []) if walk_name else []
+
+    return {
+        "run_id": saved["revision_id"],
+        "revision_id": request.revision_id,
+        "scope": request.scope,
+        "invalidated_walks": invalidated,
+    }
