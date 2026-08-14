@@ -31,6 +31,8 @@ import {
   renderTaskRow,
   buildWriteRequest,
   savePromptConfigChecked,
+  readPromptError,
+  savePromptWrite,
   recordRevision,
   recordRerunHead,
   rerunPromptConfirmed,
@@ -365,6 +367,89 @@ describe('savePromptConfigChecked', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     vi.unstubAllGlobals();
   });
+
+  it('parses the structured STALE_BASE_REVISION 409 body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'STALE_BASE_REVISION',
+          message: 'base_revision 2 does not match head revision 3',
+          detail: null,
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await savePromptConfigChecked('book-123', {
+      task: 'scene_segmentation',
+      settings: {},
+      prompt: null,
+      raw_json: null,
+      base_revision: '2',
+    });
+    expect(res.status).toBe(409);
+    expect(res.revision).toBeNull();
+    expect(res.error?.code).toBe('STALE_BASE_REVISION');
+    expect(res.error?.message).toContain('head revision 3');
+    vi.unstubAllGlobals();
+  });
+
+  it('parses a plain detail string (422) with no structured code', async () => {
+    const res = await readPromptError(
+      new Response(JSON.stringify({ detail: 'invalid temperature' }), { status: 422 }),
+    );
+    expect(res?.code).toBeUndefined();
+    expect(res?.message).toBe('invalid temperature');
+  });
+
+  it('parses a FastAPI field-error detail array', async () => {
+    const res = await readPromptError(
+      new Response(
+        JSON.stringify({ detail: [{ msg: 'field A bad' }, { msg: 'field B bad' }] }),
+        { status: 422 },
+      ),
+    );
+    expect(res?.message).toBe('field A bad; field B bad');
+  });
+
+  it('returns null when the error body is not JSON', async () => {
+    const res = await readPromptError(new Response('upstream down', { status: 503 }));
+    expect(res).toBeNull();
+  });
+
+  it('surfaces a structured CROSS_BOOK save conflict', async () => {
+    mountTab();
+    setPipelineBookId('book-123');
+    state.workbench = MOCK_WB;
+    const el = document.getElementById(PROMPT_CONFIG_TAB_ID)!;
+    el.innerHTML = renderTaskEditor('scene_segmentation', TASK_CFG, 'prompt-abc', []);
+    vi.mocked(API.getEffectiveWalkConfig).mockResolvedValue({
+      book_id: 'book-123',
+      tasks: { scene_segmentation: TASK_CFG },
+    });
+    await loadPromptConfig();
+    el.innerHTML = renderTaskEditor('scene_segmentation', TASK_CFG, 'prompt-abc', []);
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'CROSS_BOOK',
+          message: "revision 'prompt-abc' belongs to another book",
+          detail: {},
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    await savePromptWrite();
+    expect(el.textContent).toContain('CROSS_BOOK');
+    expect(el.textContent).not.toContain('[object Object]');
+    document.getElementById(PROMPT_CONFIG_TAB_ID)?.remove();
+    state.workbench = null;
+    setPipelineBookId(null);
+    vi.unstubAllGlobals();
+  });
 });
 
 describe('rerunPromptConfirmed', () => {
@@ -389,12 +474,18 @@ describe('rerunPromptConfirmed', () => {
   });
 
   it('requires explicit confirmation before rerunning with confirm:true', async () => {
-    vi.mocked(API.rerunScopedWalk).mockResolvedValue({
-      run_id: 'prompt-run',
-      revision_id: 'prompt-abc',
-      scope: 'book',
-      invalidated_walks: [],
-    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          run_id: 'prompt-run',
+          revision_id: 'prompt-abc',
+          scope: 'book',
+          invalidated_walks: [],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
     vi.mocked(API.getEffectiveWalkConfig).mockResolvedValue({
       book_id: 'book-123',
       tasks: { scene_segmentation: TASK_CFG },
@@ -402,29 +493,43 @@ describe('rerunPromptConfirmed', () => {
     const confirmSpy = vi.mocked(showConfirm).mockResolvedValue(true);
     await rerunPromptConfirmed();
     expect(confirmSpy).toHaveBeenCalled();
-    expect(API.rerunScopedWalk).toHaveBeenCalledWith('book-123', {
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain('/reruns');
+    expect((init as RequestInit).method).toBe('POST');
+    const sent = JSON.parse((init as RequestInit).body as string);
+    expect(sent).toEqual({
       revision_id: 'prompt-abc',
       scope: 'book',
       scene_ids: [],
       confirm: true,
     });
-    // Rerun never auto-runs a walk by itself: no run endpoint is touched.
-    expect(vi.mocked(API.rerunScopedWalk).mock.calls[0][1]).not.toHaveProperty('auto_run');
+    // Rerun never auto-runs a walk by itself: no auto_run flag is sent.
+    expect(sent).not.toHaveProperty('auto_run');
+    vi.unstubAllGlobals();
   });
 
   it('does not rerun when confirmation is declined', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
     vi.mocked(showConfirm).mockResolvedValue(false);
     await rerunPromptConfirmed();
-    expect(API.rerunScopedWalk).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 
   it('advances base_revision via the run head on success', async () => {
-    vi.mocked(API.rerunScopedWalk).mockResolvedValue({
-      run_id: 'prompt-run',
-      revision_id: 'prompt-abc',
-      scope: 'book',
-      invalidated_walks: [],
-    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          run_id: 'prompt-run',
+          revision_id: 'prompt-abc',
+          scope: 'book',
+          invalidated_walks: [],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
     vi.mocked(API.getEffectiveWalkConfig).mockResolvedValue({
       book_id: 'book-123',
       tasks: { scene_segmentation: TASK_CFG },
@@ -434,17 +539,66 @@ describe('rerunPromptConfirmed', () => {
     // The module head advanced to the run head; a subsequent rerun would guard
     // on the new head (no already_ran against the stale revision).
     recordRerunHead('scene_segmentation', 'prompt-run');
-    expect(API.rerunScopedWalk).toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 
-  it('surfaces a 409 already_ran rejection', async () => {
-    vi.mocked(API.rerunScopedWalk).mockRejectedValue(
-      new Error('409: walk rerun already_ran: revision prompt-abc scope book produced head prompt-x'),
+  it('surfaces a structured 409 ALREADY_RAN rejection', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'ALREADY_RAN',
+          message: 'walk rerun already_ran: revision prompt-abc scope book produced head prompt-x',
+          detail: { head_revision_id: 'prompt-x' },
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
     );
+    vi.stubGlobal('fetch', fetchMock);
     vi.mocked(showConfirm).mockResolvedValue(true);
     await rerunPromptConfirmed();
     const el = document.getElementById(PROMPT_CONFIG_TAB_ID)!;
-    expect(el.textContent).toContain('already_ran');
+    // The structured code + message surface; no '[object Object]' degradation.
+    expect(el.textContent).toContain('ALREADY_RAN');
+    expect(el.textContent).toContain('already_ran: revision prompt-abc scope book produced head prompt-x');
+    expect(el.textContent).not.toContain('[object Object]');
     expect(showToast).toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('surfaces a structured 409 CROSS_BOOK rejection', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'CROSS_BOOK',
+          message: "prompt-config revision 'prompt-abc' belongs to book 'other', not 'book-123'",
+          detail: { revision_book_id: 'other' },
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    await rerunPromptConfirmed();
+    const el = document.getElementById(PROMPT_CONFIG_TAB_ID)!;
+    expect(el.textContent).toContain('CROSS_BOOK');
+    expect(el.textContent).toContain("belongs to book 'other'");
+    expect(el.textContent).not.toContain('[object Object]');
+    vi.unstubAllGlobals();
+  });
+
+  it('surfaces a generic 409 conflict without auto-retry', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'conflict' }), { status: 409 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    await rerunPromptConfirmed();
+    const el = document.getElementById(PROMPT_CONFIG_TAB_ID)!;
+    expect(el.textContent).toContain('Rerun conflict');
+    expect(fetchMock).toHaveBeenCalledTimes(1); // never auto-retries a conflict
+    vi.unstubAllGlobals();
   });
 });

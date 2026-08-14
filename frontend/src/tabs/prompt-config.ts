@@ -33,6 +33,8 @@ import {
   PersonaSceneScope,
   PromptConfigRevision,
   PromptConfigWriteRequest,
+  ScopedWalkRerunRequest,
+  ScopedWalkRerunResult,
 } from '../state';
 import { WALK_ORDER, WALK_TASK_NAMES, WALK_DISPLAY_NAMES } from '../pipeline/walks';
 import { sceneOptionsFromWorkbench } from './persona';
@@ -467,6 +469,48 @@ export function renderPromptConfig(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Structured error parsing (RevisionConflictDTO {error, code, message, detail})
+// ---------------------------------------------------------------------------
+
+/** Parsed structured error body from a failed prompt-config response. */
+export interface PromptConflict {
+  code?: string;
+  message: string;
+}
+
+/**
+ * Read the structured error body from a failed prompt-config Response. Prefers
+ * the ``RevisionConflictDTO`` shape ``{error, code, message, detail}``, falls
+ * back to a plain ``detail`` string (422 validation) or the FastAPI field-error
+ * array, then to null. Mirrors the persona editor's ``readPersonaError``.
+ */
+export async function readPromptError(res: Response): Promise<PromptConflict | null> {
+  try {
+    const body = (await res.json()) as {
+      code?: unknown;
+      message?: unknown;
+      detail?: unknown;
+    };
+    if (body && typeof body === 'object') {
+      if (typeof body.code === 'string' && typeof body.message === 'string') {
+        return { code: body.code, message: body.message };
+      }
+      if (typeof body.detail === 'string') return { message: body.detail };
+      if (Array.isArray(body.detail)) {
+        const msgs = (body.detail as { msg?: string }[])
+          .map((d) => d?.msg ?? '')
+          .filter(Boolean)
+          .join('; ');
+        if (msgs) return { message: msgs };
+      }
+    }
+  } catch {
+    /* no parseable JSON body */
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Build the write request from the form (guarded, no side effects)
 // ---------------------------------------------------------------------------
 
@@ -586,7 +630,11 @@ export function recordRerunHead(task: string, newHeadId: string): void {
 export async function savePromptConfigChecked(
   bookId: string,
   write: PromptConfigWriteRequest,
-): Promise<{ status: number; revision: PromptConfigRevision | null }> {
+): Promise<{
+  status: number;
+  revision: PromptConfigRevision | null;
+  error: PromptConflict | null;
+}> {
   const endpoint = `/api/pipeline/walks/${encodeURIComponent(bookId)}/config/revisions`;
   const init: RequestInit = {
     method: 'POST',
@@ -599,8 +647,8 @@ export async function savePromptConfigChecked(
     if (seconds > 0) await new Promise((r) => setTimeout(r, seconds * 1000));
     res = await fetch(endpoint, init);
   }
-  if (!res.ok) return { status: res.status, revision: null };
-  return { status: res.status, revision: (await res.json()) as PromptConfigRevision };
+  if (!res.ok) return { status: res.status, revision: null, error: await readPromptError(res) };
+  return { status: res.status, revision: (await res.json()) as PromptConfigRevision, error: null };
 }
 
 /** Client-side guard before any save: reject non-allow-listed raw JSON. */
@@ -666,10 +714,25 @@ export async function savePromptWrite(): Promise<void> {
   const write = buildWriteRequest();
   const res = await savePromptConfigChecked(bookId, write);
   if (res.status === 409) {
-    renderErrors(
-      'Conflict: this revision is stale (base_revision no longer matches the head). Reload the config and re-apply your edit.',
-    );
-    showToast('Save conflicted (stale base_revision)', 'warning');
+    const code = res.error?.code;
+    if (code === 'CROSS_BOOK') {
+      renderErrors(
+        `Save conflicted (CROSS_BOOK): ${res.error?.message ?? 'the base_revision belongs to a different book.'}`,
+      );
+      showToast('Save conflicted (CROSS_BOOK)', 'warning');
+    } else if (code === 'ALREADY_RAN') {
+      renderErrors(
+        `Save conflicted (ALREADY_RAN): ${res.error?.message ?? 'this revision+scope already produced the head.'}`,
+      );
+      showToast('Save conflicted (ALREADY_RAN)', 'warning');
+    } else {
+      // STALE_BASE_REVISION (or an unrecognized structured code) — default.
+      renderErrors(
+        'Conflict (STALE_BASE_REVISION): base_revision no longer matches the head. Reload the config and re-apply your edit.' +
+          (res.error?.message ? ` ${res.error.message}` : ''),
+      );
+      showToast('Save conflicted (stale base_revision)', 'warning');
+    }
     return;
   }
   if (res.status === 422) {
@@ -690,6 +753,33 @@ export async function savePromptWrite(): Promise<void> {
   renderErrors('');
   showToast('Prompt config revision saved', 'success');
   await loadPromptConfig();
+}
+
+/**
+ * POST a confirmed scoped prompt rerun, returning the HTTP status plus any
+ * parsed structured error body. The rerun route rejects already-applied
+ * (ALREADY_RAN) and cross-book (CROSS_BOOK) reruns with the structured
+ * ``RevisionConflictDTO`` — surfaced here instead of degrading to
+ * ``[object Object]`` via the shared ``post`` helper (which reads ``detail``
+ * and sees an object). Mirrors the persona editor's ``rerunPersonaChecked``.
+ */
+export async function rerunScopedWalkChecked(
+  bookId: string,
+  rerun: ScopedWalkRerunRequest,
+): Promise<{
+  status: number;
+  result: ScopedWalkRerunResult | null;
+  error: PromptConflict | null;
+}> {
+  const endpoint = `/api/pipeline/walks/${encodeURIComponent(bookId)}/reruns`;
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rerun),
+  };
+  const res = await fetch(endpoint, init);
+  if (!res.ok) return { status: res.status, result: null, error: await readPromptError(res) };
+  return { status: res.status, result: (await res.json()) as ScopedWalkRerunResult, error: null };
 }
 
 /**
@@ -739,27 +829,50 @@ export async function rerunPromptConfirmed(): Promise<void> {
   );
   if (!ok) return;
   try {
-    const result = await API.rerunScopedWalk(bookId, {
+    const res = await rerunScopedWalkChecked(bookId, {
       revision_id: revisionId,
       scope,
       scene_ids: scope === 'scenes' ? sceneIds : [],
       confirm: true,
     });
+    if (res.status === 409) {
+      const code = res.error?.code;
+      if (code === 'ALREADY_RAN') {
+        renderErrors(
+          `Rerun already ran for this revision+scope (409 ALREADY_RAN): ${res.error?.message ?? 'save a new revision to rerun again.'}`,
+        );
+        showToast('Rerun already ran — no duplicate', 'warning');
+      } else if (code === 'CROSS_BOOK') {
+        renderErrors(
+          `Rerun conflicted (CROSS_BOOK): ${res.error?.message ?? 'the revision belongs to a different book.'}`,
+        );
+        showToast('Rerun conflicted (CROSS_BOOK)', 'warning');
+      } else {
+        renderErrors(
+          `Rerun conflict (409): ${res.error?.message ?? 'the head changed; refresh and retry.'}`,
+        );
+        showToast('Rerun conflict', 'warning');
+      }
+      return;
+    }
+    if (res.status !== 200 && res.status !== 201) {
+      renderErrors(`Rerun failed (HTTP ${res.status}): ${res.error?.message ?? 'try again shortly.'}`);
+      showToast(`Rerun failed (HTTP ${res.status})`, 'error');
+      return;
+    }
+    if (!res.result) {
+      renderErrors('Rerun started but returned no result.');
+      return;
+    }
     // The rerun creates a new head revision (run_id) by re-applying the source
     // revision; advance base_revision so the next save does not 409.
-    recordRerunHead(task, result.run_id);
+    recordRerunHead(task, res.result.run_id);
     renderErrors('');
-    showToast(`Rerun started (${result.run_id})`, 'success');
+    showToast(`Rerun started (${res.result.run_id})`, 'success');
     await loadPromptConfig();
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const alreadyRan = msg.includes('already_ran');
-    renderErrors(
-      alreadyRan
-        ? `Rerun already ran for this revision+scope (409 already_ran). Save a new revision to rerun again.`
-        : `Rerun rejected: ${msg}`,
-    );
-    showToast(alreadyRan ? 'Rerun already ran' : 'Rerun rejected', 'error');
+    renderErrors(`Rerun rejected: ${err instanceof Error ? err.message : String(err)}`);
+    showToast('Rerun rejected', 'error');
   }
 }
 
