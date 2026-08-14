@@ -98,6 +98,22 @@ def _rerun(revision_id, *, scope="book", confirm=True, scene_ids=None):
     return body
 
 
+def _assert_conflict(resp, code: str) -> dict:
+    """Assert *resp* is a 409 carrying a structured ``RevisionConflictDTO``.
+
+    Verifies the ``detail`` payload (FastAPI error body) has the exact shape
+    ``{error, code, message, detail}`` and the conflict ``code`` (P6 amendment).
+    """
+    assert resp.status_code == 409
+    dto = resp.json()["detail"]
+    assert set(dto) == {"error", "code", "message", "detail"}
+    assert dto["error"] == "revision_conflict"
+    assert dto["code"] == code
+    assert isinstance(dto["message"], str) and dto["message"]
+    assert dto["detail"] is None or isinstance(dto["detail"], dict)
+    return dto
+
+
 # ---------------------------------------------------------------------------
 # Confirmation / scope / ownership requirements
 # ---------------------------------------------------------------------------
@@ -141,6 +157,10 @@ def test_rerun_cross_book_revision_returns_409(client):
     rid = _save(client, book_id="b2")
     resp = client.post("/api/pipeline/walks/b1/reruns", json=_rerun(rid))
     assert resp.status_code == 409
+    body = _assert_conflict(resp, "CROSS_BOOK")
+    assert body["detail"]["revision_id"] == rid
+    assert body["detail"]["revision_book_id"] == "b2"
+    assert body["detail"]["requested_book_id"] == "b1"
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +271,14 @@ def test_dedupe_same_revision_and_scope(client):
     assert first.status_code == 200
     second = client.post("/api/pipeline/walks/b1/reruns", json=_rerun(rid))
     assert second.status_code == 409
-    assert "already_ran" in second.json()["detail"]
+    body = _assert_conflict(second, "ALREADY_RAN")
+    assert body["detail"]["revision_id"] == rid
+    assert body["detail"]["scope"] == "book"
+    assert body["detail"]["task"] == "scene_segmentation"
+    assert body["detail"]["book_id"] == "b1"
+    # The head produced by the earlier rerun differs from the referenced id.
+    assert body["detail"]["head_revision_id"]
+    assert body["detail"]["head_revision_id"] != rid
 
 
 def test_dedupe_differs_across_tasks(client):

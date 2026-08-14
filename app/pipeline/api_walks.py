@@ -26,6 +26,12 @@ from app.pipeline.api_review import (
 )
 from app.pipeline.ledger import CharacterLedger
 from app.pipeline.prompt_config import PromptConfigDomain, TASK_NAMES
+from app.pipeline.revision_conflict import (
+    CODE_ALREADY_RAN,
+    CODE_CROSS_BOOK,
+    CODE_STALE,
+    revision_conflict_http,
+)
 from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import WalkRunner
 from app.pipeline.workbench import BookNotFoundError, StaleRevisionError, ValidationError
@@ -785,11 +791,19 @@ def get_prompt_config_domain(
 
 
 def _prompt_http(exc) -> HTTPException:
-    """Map prompt-config domain errors to contracted HTTP statuses."""
+    """Map prompt-config domain errors to contracted HTTP statuses.
+
+    The 409 stale ``base_revision`` branch returns the structured
+    ``RevisionConflictDTO`` body (P6 amendment); ``Retry-After`` stays
+    503-contention only.
+    """
     if isinstance(exc, BookNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
-    if isinstance(exc, (StaleRevisionError,)):
-        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, StaleRevisionError):
+        return revision_conflict_http(
+            code=CODE_STALE,
+            message=str(exc),
+        )
     if isinstance(exc, ValidationError):
         return HTTPException(status_code=422, detail=str(exc))
     return HTTPException(status_code=422, detail=str(exc))
@@ -971,12 +985,17 @@ async def rerun_scoped_walk(
             detail=f"Unknown prompt-config revision '{request.revision_id}'",
         )
     if row["book_id"] != book_id:
-        raise HTTPException(
-            status_code=409,
-            detail=(
+        raise revision_conflict_http(
+            code=CODE_CROSS_BOOK,
+            message=(
                 f"prompt-config revision '{request.revision_id}' belongs to book"
                 f" '{row['book_id']}', not '{book_id}'"
             ),
+            detail={
+                "revision_id": request.revision_id,
+                "revision_book_id": row["book_id"],
+                "requested_book_id": book_id,
+            },
         )
     task = row["task"]
     # Valid nine-task scope (a revision is per (book, task)).
@@ -1012,12 +1031,19 @@ async def rerun_scoped_walk(
     # produces a new head revision.
     head = domain.list_revisions(book_id, task)
     if head and head[0]["revision_id"] != request.revision_id:
-        raise HTTPException(
-            status_code=409,
-            detail=(
+        raise revision_conflict_http(
+            code=CODE_ALREADY_RAN,
+            message=(
                 f"walk rerun already_ran: revision {request.revision_id} scope"
                 f" {request.scope} produced head '{head[0]['revision_id']}'"
             ),
+            detail={
+                "book_id": book_id,
+                "task": task,
+                "revision_id": request.revision_id,
+                "scope": request.scope,
+                "head_revision_id": head[0]["revision_id"],
+            },
         )
 
     # Re-apply the referenced revision's settings through the existing

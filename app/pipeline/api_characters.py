@@ -29,6 +29,12 @@ from app.pipeline.persona import (
     StaleRevisionError,
     ValidationError,
 )
+from app.pipeline.revision_conflict import (
+    CODE_ALREADY_RAN,
+    CODE_PROTECTED,
+    CODE_STALE,
+    revision_conflict_http,
+)
 from app.pipeline.workbench import Workbench
 
 
@@ -108,11 +114,23 @@ router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 
 
 def _persona_http(exc: PersonaError) -> HTTPException:
-    """Map a persona domain error to the contracted HTTP status."""
+    """Map a persona domain error to the contracted HTTP status.
+
+    The 409 conflict branches (stale ``base_revision`` and protected-current-
+    revision) return the structured ``RevisionConflictDTO`` body (P6 amendment).
+    """
     if isinstance(exc, (CharacterNotFoundError, BookNotFoundError)):
         return HTTPException(status_code=404, detail=str(exc))
-    if isinstance(exc, (StaleRevisionError, ProtectedRevisionError)):
-        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, StaleRevisionError):
+        return revision_conflict_http(
+            code=CODE_STALE,
+            message=str(exc),
+        )
+    if isinstance(exc, ProtectedRevisionError):
+        return revision_conflict_http(
+            code=CODE_PROTECTED,
+            message=str(exc),
+        )
     if isinstance(exc, ValidationError):
         return HTTPException(status_code=422, detail=str(exc))
     return HTTPException(status_code=422, detail=str(exc))
@@ -365,24 +383,34 @@ async def rerun_persona(
 
     head = domain.list_revisions(character_id)
     if head and head[0]["protected"]:
-        raise HTTPException(
-            status_code=409,
-            detail=(
+        raise revision_conflict_http(
+            code=CODE_PROTECTED,
+            message=(
                 f"protected persona revision '{head[0]['persona_id']}' cannot"
                 " be replaced by a rerun"
             ),
+            detail={
+                "character_id": character_id,
+                "head_persona_id": head[0]["persona_id"],
+            },
         )
     # Dedupe: a rerun targets a revision that is the current head.  If the
     # referenced revision has already been superseded, this exact rerun already
     # ran — 409 already_ran, never duplicated silently.  The first rerun of a
     # live head is legitimate and produces a new revision.
     if head and head[0]["persona_id"] != base["persona_id"]:
-        raise HTTPException(
-            status_code=409,
-            detail=(
+        raise revision_conflict_http(
+            code=CODE_ALREADY_RAN,
+            message=(
                 f"persona rerun already_ran: revision {request.revision_id} "
                 f"scope {request.scope} produced head '{head[0]['persona_id']}'"
             ),
+            detail={
+                "character_id": character_id,
+                "revision_id": request.revision_id,
+                "scope": request.scope,
+                "head_persona_id": head[0]["persona_id"],
+            },
         )
 
     head_revision = head[0]["revision"] if head else 0

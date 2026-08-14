@@ -82,9 +82,27 @@ def _client():
 
 
 @pytest.fixture
+
 def client():
     """Router-only TestClient over a seeded in-memory adapter."""
     return _client()[0]
+
+
+def _assert_conflict(resp, code: str) -> dict:
+    """Assert *resp* is a 409 carrying a structured ``RevisionConflictDTO``.
+
+    Verifies the ``detail`` payload (FastAPI error body) has the exact shape
+    ``{error, code, message, detail}`` and the conflict ``code`` (P6 amendment:
+    ``PipelineWalkPromptConfigRevisionAPI.v1`` advertises ``RevisionConflictDTO``).
+    """
+    assert resp.status_code == 409
+    dto = resp.json()["detail"]
+    assert set(dto) == {"error", "code", "message", "detail"}
+    assert dto["error"] == "revision_conflict"
+    assert dto["code"] == code
+    assert isinstance(dto["message"], str) and dto["message"]
+    assert dto["detail"] is None or isinstance(dto["detail"], dict)
+    return dto
 
 
 NINE = [
@@ -280,6 +298,7 @@ def test_revisions_stale_base_revision_409(client):
         },
     )
     assert third.status_code == 409
+    _assert_conflict(third, "STALE_BASE_REVISION")
 
 
 def test_revisions_unknown_task_422(client):
@@ -317,6 +336,8 @@ def test_revisions_cross_book_base_revision_409(client):
         },
     )
     assert b2.status_code == 409
+    # The save path treats a foreign base_revision as stale (head mismatch).
+    _assert_conflict(b2, "STALE_BASE_REVISION")
 
 
 def test_revisions_invalid_override_value_422(client):

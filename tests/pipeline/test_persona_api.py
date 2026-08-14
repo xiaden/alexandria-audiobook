@@ -123,6 +123,24 @@ def _pd(storage):
     return PersonaDomain(storage)
 
 
+def _assert_conflict(resp, code: str) -> dict:
+    """Assert *resp* is a 409 carrying a structured ``RevisionConflictDTO``.
+
+    Verifies the ``detail`` payload (FastAPI error body) has the exact shape
+    ``{error, code, message, detail}`` and the conflict ``code`` (P6 amendment:
+    both parity contracts advertise ``RevisionConflictDTO``).  Returns the DTO
+    for further ``detail`` checks.
+    """
+    assert resp.status_code == 409
+    dto = resp.json()["detail"]
+    assert set(dto) == {"error", "code", "message", "detail"}
+    assert dto["error"] == "revision_conflict"
+    assert dto["code"] == code
+    assert isinstance(dto["message"], str) and dto["message"]
+    assert dto["detail"] is None or isinstance(dto["detail"], dict)
+    return dto
+
+
 # ---------------------------------------------------------------------------
 # GET /api/pipeline/characters/{character_id}/persona
 # ---------------------------------------------------------------------------
@@ -189,6 +207,9 @@ class TestPutPersona:
             json=_write(base_revision=0),  # head is now revision 1
         )
         assert r.status_code == 409
+        body = _assert_conflict(r, "STALE_BASE_REVISION")
+        # Stale detail is derived from the domain message only (null is valid).
+        assert body["detail"] is None
 
     def test_unknown_character_returns_404(self, client):
         r = client.put(
@@ -387,8 +408,13 @@ class TestPostRerun:
             "/api/pipeline/characters/c1/persona/rerun",
             json=_rerun(first["persona_id"]),
         )
-        assert r.status_code == 409
-        assert "already_ran" in r.json()["detail"]
+        body = _assert_conflict(r, "ALREADY_RAN")
+        assert body["detail"]["character_id"] == "c1"
+        assert body["detail"]["revision_id"] == first["persona_id"]
+        assert body["detail"]["scope"] == "book"
+        # The head produced by the earlier rerun is a different persona revision.
+        assert body["detail"]["head_persona_id"]
+        assert body["detail"]["head_persona_id"] != first["persona_id"]
 
     def test_rerun_against_protected_head_returns_409(self, client):
         client.put(
@@ -400,7 +426,9 @@ class TestPostRerun:
             "/api/pipeline/characters/c1/persona/rerun",
             json=_rerun(first["persona_id"]),
         )
-        assert r.status_code == 409
+        body = _assert_conflict(r, "PROTECTED_REVISION")
+        assert body["detail"]["character_id"] == "c1"
+        assert body["detail"]["head_persona_id"] == first["persona_id"]
 
     def test_rerun_unknown_revision_returns_404(self, client):
         r = client.post(
