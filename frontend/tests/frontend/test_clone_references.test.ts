@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   formatCloneByteSize,
   formatCloneDuration,
+  formatCloneCreated,
   createCloneReferenceRow,
   renderCloneReferenceList,
   renderCloneReferencePanel,
@@ -107,6 +108,14 @@ describe('formatCloneDuration', () => {
   });
 });
 
+describe('formatCloneCreated', () => {
+  it('formats a valid epoch-ms created timestamp and tolerates absent values', () => {
+    expect(formatCloneCreated(MOCK_REF.created_ms)).toMatch(/2023/);
+    expect(formatCloneCreated(0)).toBe('');
+    expect(formatCloneCreated(NaN)).toBe('');
+  });
+});
+
 describe('createCloneReferenceRow', () => {
   it('exposes display-safe metadata and never the filesystem path', () => {
     const html = createCloneReferenceRow(MOCK_REF);
@@ -138,6 +147,23 @@ describe('renderCloneReferencePanel', () => {
   it('no-ops when #pipeline-voices-section is absent', () => {
     document.body.innerHTML = '';
     expect(() => renderCloneReferencePanel()).not.toThrow();
+  });
+
+  it('renders native keyboard-reachable controls (no tabindex traps)', () => {
+    renderCloneReferencePanel('voice-1');
+    const fileInput = document.getElementById('clone-ref-audio-file') as HTMLInputElement | null;
+    const textInput = document.getElementById('clone-ref-text') as HTMLInputElement | null;
+    const select = document.getElementById('clone-ref-voice-select') as HTMLSelectElement | null;
+    const uploadBtn = document.querySelector<HTMLButtonElement>('[data-action="clone-ref-upload"]');
+    expect(fileInput?.tagName).toBe('INPUT');
+    expect(fileInput?.type).toBe('file');
+    expect(fileInput?.getAttribute('tabindex')).not.toBe('-1');
+    expect(textInput?.tagName).toBe('INPUT');
+    expect(textInput?.getAttribute('tabindex')).not.toBe('-1');
+    expect(select?.tagName).toBe('SELECT');
+    expect(select?.getAttribute('tabindex')).not.toBe('-1');
+    expect(uploadBtn?.tagName).toBe('BUTTON');
+    expect(uploadBtn?.getAttribute('tabindex')).not.toBe('-1');
   });
 });
 
@@ -262,6 +288,15 @@ describe('deleteCloneReferenceConfirmed', () => {
     vi.mocked(showConfirm).mockResolvedValue(false);
     await deleteCloneReferenceConfirmed('voice-1', 'ref-1');
     expect(API.deleteCloneReference).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a cross-owner/not-found error accessibly', async () => {
+    vi.mocked(API.deleteCloneReference).mockRejectedValue(new Error('Clone reference not found'));
+    await deleteCloneReferenceConfirmed('voice-1', 'ref-1');
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Clone reference not found'),
+      'error',
+    );
   });
 });
 

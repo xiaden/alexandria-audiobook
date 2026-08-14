@@ -828,6 +828,16 @@ export function formatCloneDuration(ms: number): string {
 }
 
 /**
+ * Format the reference created timestamp (epoch ms) for the reference list
+ * (e.g. "6/14/2026, 9:15:00 AM"). Returns '' for absent/invalid values so the
+ * metadata line stays clean.
+ */
+export function formatCloneCreated(ms: number): string {
+  if (!ms || !Number.isFinite(ms)) return '';
+  return new Date(ms).toLocaleString();
+}
+
+/**
  * Current voice id whose clone references the panel is showing
  * (null when the panel is closed / no voice selected).
  */
@@ -983,7 +993,7 @@ export function createCloneReferenceRow(ref: CloneReference): string {
       <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
         <div>
           <span class="fw-semibold">${escapeHtml(ref.original_filename)}</span>
-          <span class="text-muted small ms-2">${escapeHtml(ref.media_type)} · ${formatCloneByteSize(ref.byte_size)} · ${formatCloneDuration(ref.duration_ms)}</span>
+          <span class="text-muted small ms-2">${escapeHtml(ref.media_type)} · ${formatCloneByteSize(ref.byte_size)} · ${formatCloneDuration(ref.duration_ms)} · ${formatCloneCreated(ref.created_ms)}</span>
         </div>
         <div class="d-flex align-items-center gap-2">
           <button type="button" class="btn btn-sm btn-outline-secondary" data-action="clone-ref-preview" data-reference-id="${escapeHtml(ref.reference_id)}">Preview</button>
