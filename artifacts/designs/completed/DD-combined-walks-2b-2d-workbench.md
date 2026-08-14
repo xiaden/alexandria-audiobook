@@ -1,6 +1,6 @@
 # Combined Frontend Workbench for Walks 2b–2d — Design Document
 
-**Status:** Pending  
+**Status:** Completed  
 **Author:** rnd-dd-author  
 **Date:** 2026-08-12  
 **Consistency gates:** all schema/API changes are registered in [CONTRACTS.md](../parts/epub-audiobook-pipeline-rewrite/CONTRACTS.md); active pipeline contract is [DD-epub-audiobook-pipeline-rewrite-v3.md](../completed/DD-epub-audiobook-pipeline-rewrite-v3.md).  

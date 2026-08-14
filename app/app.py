@@ -1,5 +1,28 @@
 import os
 import sys
+
+# ---------------------------------------------------------------------------
+# Import-path bootstrap.
+#
+# app/app.py mixes two import styles at module level:
+#   - bare-name: ``from utils import ...`` / ``from hf_utils import ...``
+#     (app-local modules; they resolve in script launches because the app dir
+#     is sys.path[0] -- ``python app.py`` from app/, ``python app/app.py``
+#     from the repo root)
+#   - package: ``from app.pipeline.api import ...`` / ``from app.engine
+#     import ...`` (resolved from the repo root, which is NOT on sys.path in
+#     those script launches)
+# Put the repo root on sys.path so the package-style imports resolve in every
+# launch mode. Do NOT add the app dir itself: under ``import app.app`` (the
+# test harness), an app/ entry would shadow the ``app`` package with the
+# top-level app/app.py module ("'app' is not a package"). The app dir is
+# already sys.path[0] for script launches, and the harness preloads
+# utils/hf_utils into sys.modules for the package-import case.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import json
 import shutil
 import logging

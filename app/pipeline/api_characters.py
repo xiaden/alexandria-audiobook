@@ -106,13 +106,6 @@ class PersonaRerunRequest(BaseModel):
     confirm: bool = False
 
 
-# ---------------------------------------------------------------------------
-# Router
-# ---------------------------------------------------------------------------
-
-router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
-
-
 def _persona_http(exc: PersonaError) -> HTTPException:
     """Map a persona domain error to the contracted HTTP status.
 

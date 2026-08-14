@@ -264,12 +264,7 @@ class PersonaDomain:
         }
 
     def _current_head(self, character_id: str) -> dict | None:
-        rows = self._storage.execute_query(
-            "SELECT persona_id, revision, protected FROM persona_revision"
-            " WHERE character_id = ? AND superseded_by IS NULL"
-            " ORDER BY revision DESC LIMIT 1",
-            (character_id,),
-        )
+        rows = self._storage.list_persona_revisions(character_id)
         return rows[0] if rows else None
 
     # ------------------------------------------------------------------
@@ -299,25 +294,12 @@ class PersonaDomain:
 
     def get_revision(self, persona_id: str) -> dict | None:
         """Return a decoded persona revision, or ``None``."""
-        rows = self._storage.execute_query(
-            "SELECT persona_id, character_id, book_id, revision, fields_json,"
-            " evidence_json, aliases_json, scene_scope, review_state, protected,"
-            " voice_consequences_json, author_id, created_ms, superseded_by"
-            " FROM persona_revision WHERE persona_id = ?",
-            (persona_id,),
-        )
-        return self._decode(rows[0]) if rows else None
+        row = self._storage.get_persona_revision(persona_id)
+        return self._decode(row) if row else None
 
     def list_revisions(self, character_id: str) -> list[dict]:
         """Return all revisions for *character_id*, newest first."""
-        rows = self._storage.execute_query(
-            "SELECT persona_id, character_id, book_id, revision, fields_json,"
-            " evidence_json, aliases_json, scene_scope, review_state, protected,"
-            " voice_consequences_json, author_id, created_ms, superseded_by"
-            " FROM persona_revision WHERE character_id = ?"
-            " ORDER BY revision DESC",
-            (character_id,),
-        )
+        rows = self._storage.list_persona_revisions(character_id)
         return [self._decode(row) for row in rows]
 
     # ------------------------------------------------------------------
@@ -384,33 +366,28 @@ class PersonaDomain:
         now = _now_ms()
 
         with self._storage.transaction():
-            self._storage.execute_insert(
-                "INSERT INTO persona_revision (persona_id, character_id, book_id,"
-                " revision, fields_json, evidence_json, aliases_json, scene_scope,"
-                " review_state, protected, voice_consequences_json, author_id,"
-                " created_ms, superseded_by)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    persona_id,
-                    character_id,
-                    book_id,
-                    next_revision,
-                    json.dumps(fields_json),
-                    json.dumps(evidence),
-                    json.dumps(write.get("aliases", [])),
-                    scene_scope,
-                    write.get("review_state", "draft"),
-                    1 if protected else 0,
-                    json.dumps(self._derive_voice_consequences(fields)),
-                    author_id,
-                    now,
-                    None,
-                ),
+            self._storage.insert_persona_revision(
+                {
+                    "persona_id": persona_id,
+                    "character_id": character_id,
+                    "book_id": book_id,
+                    "revision": next_revision,
+                    "fields_json": json.dumps(fields_json),
+                    "evidence_json": json.dumps(evidence),
+                    "aliases_json": json.dumps(write.get("aliases", [])),
+                    "scene_scope": scene_scope,
+                    "review_state": write.get("review_state", "draft"),
+                    "protected": 1 if protected else 0,
+                    "voice_consequences_json": json.dumps(
+                        self._derive_voice_consequences(fields)
+                    ),
+                    "author_id": author_id,
+                    "created_ms": now,
+                    "superseded_by": None,
+                }
             )
             if head:
-                self._storage.execute_update(
-                    "UPDATE persona_revision SET superseded_by = ?"
-                    " WHERE persona_id = ?",
-                    (persona_id, head["persona_id"]),
+                self._storage.supersede_persona_revision(
+                    head["persona_id"], persona_id
                 )
         return self.get_revision(persona_id)

@@ -773,21 +773,16 @@ class PromptConfigWriteRequest(BaseModel):
     base_revision: str | None = None
 
 
-_prompt_domain: PromptConfigDomain | None = None
-
-
 def get_prompt_config_domain(
     storage: PipelineStorage = Depends(get_storage),
 ) -> PromptConfigDomain:
     """FastAPI dependency: return the prompt-config domain facade.
 
-    Stateless over ``PipelineStorage``; constructed per-request so tests can
-    override ``get_storage`` directly.
+    Stateless over ``PipelineStorage``; constructed fresh per request (matching
+    ``get_persona_domain``) so there is no cross-request module state, and
+    tests can override ``get_storage`` directly.
     """
-    global _prompt_domain
-    if _prompt_domain is None or _prompt_domain._storage is not storage:
-        _prompt_domain = PromptConfigDomain(storage)
-    return _prompt_domain
+    return PromptConfigDomain(storage)
 
 
 def _prompt_http(exc) -> HTTPException:
