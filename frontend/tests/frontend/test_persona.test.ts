@@ -22,6 +22,7 @@ import {
   sceneOptionsFromWorkbench,
   buildWriteRequest,
   savePersonaChecked,
+  rerunPersonaChecked,
   openPersonaEditor,
   rerunPersonaConfirmed,
   initPersonaEditor,
@@ -257,8 +258,18 @@ describe('savePersonaChecked', () => {
     vi.unstubAllGlobals();
   });
 
-  it('surfaces 409 (stale) as a distinct status', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: 'stale' }), { status: 409 }));
+  it('surfaces 409 (stale) as a distinct status and parses the structured conflict', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'STALE_BASE_REVISION',
+          message: 'stale base_revision 3 for character char-1; current revision 5',
+          detail: null,
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
     vi.stubGlobal('fetch', fetchMock);
     const res = await savePersonaChecked('char-1', {
       base_revision: 3,
@@ -272,7 +283,38 @@ describe('savePersonaChecked', () => {
     });
     expect(res.status).toBe(409);
     expect(res.persona).toBeNull();
+    expect(res.error?.code).toBe('STALE_BASE_REVISION');
+    expect(res.error?.message).toContain('current revision 5');
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
+  });
+
+  it('parses the structured PROTECTED_REVISION 409 conflict', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'PROTECTED_REVISION',
+          message: "protected persona revision 'pers-1' cannot be replaced by an edit",
+          detail: { character_id: 'char-1', head_persona_id: 'pers-1' },
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await savePersonaChecked('char-1', {
+      base_revision: 3,
+      fields: {},
+      evidence: [],
+      aliases: [],
+      scene_scope: 'book',
+      scene_ids: [],
+      review_state: 'draft',
+      protected: true,
+    });
+    expect(res.status).toBe(409);
+    expect(res.error?.code).toBe('PROTECTED_REVISION');
+    expect(res.error?.detail).toEqual({ character_id: 'char-1', head_persona_id: 'pers-1' });
     vi.unstubAllGlobals();
   });
 
@@ -369,32 +411,86 @@ describe('rerunPersonaConfirmed', () => {
   });
 
   it('requires explicit confirmation before rerunning', async () => {
-    vi.mocked(API.rerunPersona).mockResolvedValue({ run_id: 'run-1', revision_id: 'pers-1', scope: 'book' });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ run_id: 'run-1', revision_id: 'pers-1', scope: 'book' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
     const confirmSpy = vi.mocked(showConfirm).mockResolvedValue(true);
     await rerunPersonaConfirmed();
     expect(confirmSpy).toHaveBeenCalled();
-    expect(API.rerunPersona).toHaveBeenCalledWith('char-1', {
-      revision_id: 'pers-1',
-      scope: 'book',
-      scene_ids: [],
-      confirm: true,
-    });
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init as RequestInit).method).toBe('POST');
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body).toEqual({ revision_id: 'pers-1', scope: 'book', scene_ids: [], confirm: true });
     // No voice-assignment write is performed by rerun.
-    expect(vi.mocked(API.rerunPersona).mock.calls[0][1]).not.toHaveProperty('voice_assignment_id');
+    expect(body).not.toHaveProperty('voice_assignment_id');
+    vi.unstubAllGlobals();
   });
 
   it('does not rerun when confirmation is declined', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
     vi.mocked(showConfirm).mockResolvedValue(false);
     await rerunPersonaConfirmed();
-    expect(API.rerunPersona).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 
-  it('rejects a rerun of a protected head', async () => {
+  it('rejects a rerun of a protected head before any request', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
     vi.mocked(API.getPersona).mockResolvedValue({ ...MOCK_PERSONA, protected: true });
     await rerunPersonaConfirmed();
-    expect(API.rerunPersona).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
     const el = document.getElementById(PERSONA_EDITOR_ID)!;
     expect(el.textContent).toContain('protected');
+    vi.unstubAllGlobals();
+  });
+
+  it('surfaces the structured ALREADY_RAN conflict instead of degrading to [object Object]', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'ALREADY_RAN',
+          message: 'persona rerun already_ran: revision pers-1 scope book produced head pers-2',
+          detail: { character_id: 'char-1', revision_id: 'pers-1', scope: 'book', head_persona_id: 'pers-2' },
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    await rerunPersonaConfirmed();
+    const el = document.getElementById(PERSONA_EDITOR_ID)!;
+    expect(el.textContent).toContain('Rerun already applied');
+    expect(el.textContent).toContain('already_ran');
+    expect(el.textContent).not.toContain('[object Object]');
+    vi.unstubAllGlobals();
+  });
+
+  it('surfaces the structured PROTECTED_REVISION conflict from a rerun write', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'revision_conflict',
+          code: 'PROTECTED_REVISION',
+          message: "protected persona revision 'pers-1' cannot be replaced by a rerun",
+          detail: { character_id: 'char-1', head_persona_id: 'pers-1' },
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    await rerunPersonaConfirmed();
+    const el = document.getElementById(PERSONA_EDITOR_ID)!;
+    expect(el.textContent).toContain('Protected persona — rerun blocked');
+    expect(el.textContent).not.toContain('[object Object]');
+    vi.unstubAllGlobals();
   });
 });
 

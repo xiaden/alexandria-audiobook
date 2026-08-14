@@ -27,6 +27,8 @@ import type {
   Persona,
   PersonaRevision,
   PersonaWriteRequest,
+  PersonaRerunRequest,
+  PersonaRerunResult,
   PersonaFieldKey,
   PersonaEvidence,
   PersonaReviewState,
@@ -281,14 +283,54 @@ export function buildWriteRequest(): PersonaWriteRequest {
 // ---------------------------------------------------------------------------
 
 /**
+ * Shape of the backend 409 conflict body (``RevisionConflictDTO``):
+ * ``{error, code, message, detail}`` where ``code`` discriminates
+ * STALE_BASE_REVISION / PROTECTED_REVISION / ALREADY_RAN / CROSS_BOOK and
+ * ``message`` carries the human-readable description. ``detail`` may be null.
+ */
+export interface PersonaConflict {
+  error?: string;
+  code?: string;
+  message?: string;
+  detail?: unknown;
+}
+
+/**
+ * Read the structured error body from a failed persona Response. Prefers the
+ * ``RevisionConflictDTO`` shape (``{error, code, message, detail}``), falls
+ * back to a plain ``detail`` string (422 validation) or the FastAPI field-error
+ * array, then to statusText. Returns null when no JSON body is present.
+ */
+async function readPersonaError(res: Response): Promise<PersonaConflict | null> {
+  try {
+    const body = (await res.json()) as PersonaConflict;
+    if (body && typeof body === 'object') {
+      if (typeof body.code === 'string' && typeof body.message === 'string') return body;
+      if (typeof body.detail === 'string') return { message: body.detail };
+      if (Array.isArray(body.detail)) {
+        const msgs = (body.detail as { msg?: string }[])
+          .map((d) => d?.msg ?? '')
+          .filter(Boolean)
+          .join('; ');
+        if (msgs) return { message: msgs };
+      }
+    }
+  } catch {
+    /* no parseable JSON body */
+  }
+  return null;
+}
+
+/**
  * PUT a persona write with exactly ONE 503 retry (honoring Retry-After) and
- * return the HTTP status so the caller can distinguish 409 (stale/protected)
- * from 422 (validation) from 503. Mirrors the shared one-retry convention.
+ * return the HTTP status plus any parsed error body so the caller can
+ * distinguish 409 (stale/protected, structured ``code``+``message``) from 422
+ * (validation) from 503. Mirrors the shared one-retry convention.
  */
 export async function savePersonaChecked(
   characterId: string,
   write: PersonaWriteRequest,
-): Promise<{ status: number; persona: Persona | null }> {
+): Promise<{ status: number; persona: Persona | null; error: PersonaConflict | null }> {
   const endpoint = `/api/pipeline/characters/${encodeURIComponent(characterId)}/persona`;
   const init: RequestInit = {
     method: 'PUT',
@@ -302,22 +344,30 @@ export async function savePersonaChecked(
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     res = await fetch(endpoint, init);
   }
-  if (!res.ok) return { status: res.status, persona: null };
-  return { status: res.status, persona: (await res.json()) as Persona };
+  if (!res.ok) return { status: res.status, persona: null, error: await readPersonaError(res) };
+  return { status: res.status, persona: (await res.json()) as Persona, error: null };
 }
 
-/** Read the backend error detail from a failed Response. */
-async function errorDetail(res: Response): Promise<string> {
-  try {
-    const body = await res.json();
-    if (body && typeof body.detail === 'string') return body.detail;
-    if (body && typeof body.detail === 'object' && body.detail?.length) {
-      return body.detail.map((d: { msg?: string }) => d.msg ?? '').filter(Boolean).join('; ');
-    }
-  } catch {
-    /* no JSON body */
-  }
-  return res.statusText;
+/**
+ * POST a confirmed scoped persona rerun and return the HTTP status plus any
+ * parsed error body. The rerun route rejects already-applied / protected
+ * reruns with the structured ``RevisionConflictDTO`` (ALREADY_RAN /
+ * PROTECTED_REVISION / CROSS_BOOK) — surfaced here instead of degrading to a
+ * ``[object Object]`` via the shared ``post`` helper.
+ */
+export async function rerunPersonaChecked(
+  characterId: string,
+  rerun: PersonaRerunRequest,
+): Promise<{ status: number; result: PersonaRerunResult | null; error: PersonaConflict | null }> {
+  const endpoint = `/api/pipeline/characters/${encodeURIComponent(characterId)}/persona/rerun`;
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rerun),
+  };
+  const res = await fetch(endpoint, init);
+  if (!res.ok) return { status: res.status, result: null, error: await readPersonaError(res) };
+  return { status: res.status, result: (await res.json()) as PersonaRerunResult, error: null };
 }
 
 /** Load a persona head + revision history for a character into the editor. */
@@ -406,14 +456,21 @@ export async function savePersonaWrite(): Promise<void> {
   const write = buildWriteRequest();
   const res = await savePersonaChecked(characterId, write);
   if (res.status === 409) {
-    renderErrors(
-      'Stale revision (conflict): the persona changed since you loaded it. Refresh to load the latest head, then re-apply your changes, or merge manually.',
-    );
-    showToast('Conflict — persona changed; refresh to re-apply', 'warning');
+    const code = res.error?.code;
+    const conflictMsg =
+      res.error?.message ??
+      'Stale revision (conflict): the persona changed since you loaded it. Refresh to load the latest head, then re-apply your changes, or merge manually.';
+    if (code === 'PROTECTED_REVISION') {
+      renderErrors('Protected persona — this revision cannot be replaced by an edit. ' + conflictMsg);
+      showToast('Protected persona — save rejected', 'error');
+    } else {
+      renderErrors(conflictMsg);
+      showToast('Conflict — persona changed; refresh to re-apply', 'warning');
+    }
     return;
   }
   if (res.status === 422) {
-    renderErrors('Validation rejected the save. Fix the highlighted issues and retry.');
+    renderErrors('Validation rejected the save: ' + (res.error?.message ?? 'fix the highlighted issues and retry.'));
     showToast('Persona save rejected (422)', 'error');
     return;
   }
@@ -478,13 +535,32 @@ export async function rerunPersonaConfirmed(): Promise<void> {
   if (!ok) return;
 
   try {
-    const result = await API.rerunPersona(characterId, {
+    const res = await rerunPersonaChecked(characterId, {
       revision_id: head.persona_id,
       scope,
       scene_ids: scope === 'scenes' ? sceneIds : [],
       confirm: true,
     });
-    showToast(`Persona rerun started (${result.run_id})`, 'success');
+    if (res.status === 409) {
+      const code = res.error?.code;
+      if (code === 'PROTECTED_REVISION') {
+        renderErrors('Protected persona — rerun blocked: ' + (res.error?.message ?? 'cannot replace a protected head.'));
+        showToast('Protected persona — rerun blocked', 'error');
+      } else if (code === 'ALREADY_RAN') {
+        renderErrors('Rerun already applied: ' + (res.error?.message ?? 'this revision+scope already produced the current head.'));
+        showToast('Rerun already ran — no duplicate', 'warning');
+      } else {
+        renderErrors('Rerun conflict: ' + (res.error?.message ?? 'the head changed; refresh and retry.'));
+        showToast('Rerun conflict', 'warning');
+      }
+      return;
+    }
+    if (res.status !== 200 && res.status !== 201) {
+      renderErrors(`Rerun failed with status ${res.status}: ${res.error?.message ?? 'try again shortly.'}`);
+      showToast(`Persona rerun failed (${res.status})`, 'error');
+      return;
+    }
+    showToast(`Persona rerun started (${res.result?.run_id})`, 'success');
     await openPersonaEditor(characterId);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
