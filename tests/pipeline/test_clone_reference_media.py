@@ -13,9 +13,11 @@ import struct
 
 import pytest
 
+from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.clone_reference_media import (
     CloneReferenceMediaError,
     canonical_contain,
+    cleanup_expired_references,
     compute_sha256,
     media_type_from_path,
     probe_duration_ms,
@@ -215,3 +217,135 @@ class TestValidateAndCopy:
     def test_reference_root_defaults_under_repo(self):
         root = reference_root()
         assert root.endswith(os.path.join("designed_voices", "references"))
+
+
+# ---------------------------------------------------------------------------
+# cleanup_expired_references (bounded post-retention sweep)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupExpiredReferences:
+    """Bounded cleanup sweep for tombstoned, unreferenced reference files."""
+
+    def _seed_voice(self, storage: InMemorySQLiteAdapter) -> None:
+        storage.execute_insert(
+            "INSERT INTO voice_config (id, name, type, voice) "
+            "VALUES ('vc', 'Clone', 'clone', 'c')"
+        )
+
+    def _add_reference(
+        self,
+        storage: InMemorySQLiteAdapter,
+        reference_id: str,
+        relative_path: str,
+        *,
+        deleted_ms: int | None = None,
+    ) -> None:
+        """Insert a clone_reference row, optionally tombstoned at *deleted_ms*."""
+        storage.insert_clone_reference(
+            {
+                "reference_id": reference_id,
+                "voice_id": "vc",
+                "owner_id": "local",
+                "relative_path": relative_path,
+                "original_filename": relative_path,
+                "media_type": "audio/wav",
+                "byte_size": 100,
+                "duration_ms": 1000,
+                "sha256": "a" * 64,
+                "created_ms": 0,
+            }
+        )
+        if deleted_ms is not None:
+            storage.tombstone_clone_reference(
+                reference_id, "local", deleted_ms
+            )
+
+    def test_only_old_tombstoned_files_removed_and_rows_hard_deleted(
+        self, tmp_path
+    ):
+        # now=2_000_000, retention=100_000 -> threshold 1_900_000.  Only rows
+        # tombstoned strictly before the threshold are cleanup candidates.
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        self._seed_voice(storage)
+        root = str(tmp_path)
+
+        (tmp_path / "old.wav").write_bytes(b"data")
+        self._add_reference(storage, "old", "old.wav", deleted_ms=1_000_000)
+
+        # Fresh tombstone still inside the retention window: kept.
+        (tmp_path / "fresh.wav").write_bytes(b"data")
+        self._add_reference(storage, "fresh", "fresh.wav", deleted_ms=1_950_000)
+
+        removed = cleanup_expired_references(
+            storage, root, older_than_ms=100_000, now_ms=2_000_000
+        )
+
+        assert removed == ["old"]
+        assert not (tmp_path / "old.wav").exists()
+        # Row hard-deleted after the file is removed.
+        assert storage.get_clone_reference("old", "local") is None
+        # Fresh tombstone untouched, file + row preserved.
+        assert (tmp_path / "fresh.wav").exists()
+        assert storage.get_clone_reference("fresh", "local") is not None
+
+    def test_active_reference_never_swept(self, tmp_path):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        self._seed_voice(storage)
+        root = str(tmp_path)
+
+        # Active (non-tombstoned) reference with an old created_ms: the sweep
+        # must not touch it even though the row is old.
+        (tmp_path / "active.wav").write_bytes(b"data")
+        self._add_reference(storage, "active", "active.wav", deleted_ms=None)
+
+        removed = cleanup_expired_references(
+            storage, root, older_than_ms=0, now_ms=2_000_000
+        )
+
+        assert removed == []
+        assert (tmp_path / "active.wav").exists()
+        assert storage.get_clone_reference("active", "local") is not None
+
+    def test_symlink_never_followed_or_removed(self, tmp_path):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        self._seed_voice(storage)
+        root = str(tmp_path)
+
+        # A real victim file just outside the reference root.
+        victim = tmp_path.parent / "victim.wav"
+        victim.write_bytes(b"victim-data")
+        # A tombstoned row whose relative_path is a symlink pointing outside
+        # the root — the canonical escape path.
+        link = tmp_path / "link.wav"
+        link.symlink_to(victim)
+        self._add_reference(storage, "link", "link.wav", deleted_ms=0)
+
+        removed = cleanup_expired_references(
+            storage, root, older_than_ms=0, now_ms=2_000_000
+        )
+
+        assert removed == []
+        assert victim.exists()          # link target never followed/removed
+        assert link.is_symlink()        # the link itself never removed
+        assert storage.get_clone_reference("link", "local") is not None
+
+    def test_row_kept_when_backing_file_missing(self, tmp_path):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        self._seed_voice(storage)
+        root = str(tmp_path)
+
+        # Tombstoned well past retention, but no backing file exists (already
+        # gone).  Sweep skips it: no file to remove means the row stays.
+        self._add_reference(storage, "gone", "gone.wav", deleted_ms=0)
+
+        removed = cleanup_expired_references(
+            storage, root, older_than_ms=0, now_ms=2_000_000
+        )
+
+        assert removed == []
+        assert storage.get_clone_reference("gone", "local") is not None
