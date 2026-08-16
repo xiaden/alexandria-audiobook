@@ -3,15 +3,21 @@
 Provides HTTP endpoints for running walks and querying walk/character status:
 - POST /api/pipeline/run_walk — run a single walk for a book
 - POST /api/pipeline/run_all_walks — run all 9 walks serially for a book
+- GET /api/pipeline/walks/log/{run_id} — stream a walk run's JSONL log as SSE
 - GET /api/pipeline/walk_status/{book_id} — per-walk status for a book
 - GET /api/pipeline/characters/{book_id} — character ledger for a book
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import uuid
+from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.pipeline.adapter import PipelineStorage
@@ -25,21 +31,33 @@ from app.pipeline.api_review import (
     get_workbench,
 )
 from app.pipeline.ledger import CharacterLedger
-from app.pipeline.prompt_config import PromptConfigDomain, TASK_NAMES
+from app.pipeline.prompt_config import TASK_NAMES, PromptConfigDomain
 from app.pipeline.revision_conflict import (
     CODE_ALREADY_RAN,
     CODE_CROSS_BOOK,
     CODE_STALE,
     revision_conflict_http,
 )
+from app.pipeline.walks import runner as walk_runner_mod
+from app.pipeline.walks.log_service import (
+    WalkLogService,
+    WalkLogSubscription,
+    _is_valid_uuid,
+)
 from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import WalkRunner
-from app.pipeline.workbench import BookNotFoundError, StaleRevisionError, ValidationError
-
+from app.pipeline.workbench import (
+    BookNotFoundError,
+    StaleRevisionError,
+    ValidationError,
+)
 
 # ---------------------------------------------------------------------------
 # Pydantic request models
 # ---------------------------------------------------------------------------
+
+
+logger = logging.getLogger(__name__)
 
 
 class RunWalkRequest(BaseModel):
@@ -70,11 +88,32 @@ class CancelWalksRequest(BaseModel):
 _walk_runner: WalkRunner | None = None
 
 
-def get_walk_runner(storage: PipelineStorage = Depends(get_storage)) -> WalkRunner:
-    """FastAPI dependency: return the WalkRunner singleton."""
+def get_walk_runner(
+    request: Request,
+    storage: PipelineStorage = Depends(get_storage),
+) -> WalkRunner:
+    """FastAPI dependency: return the WalkRunner singleton.
+
+    Production wiring (CONTRACTS.md line 75): the singleton is constructed
+    with the process-owned Part A service via
+    ``getattr(request.app.state, 'walk_log_service', None)`` -- the SAME
+    access path the ``get_walk_log_service`` dependency uses -- so
+    API-started runs (``run_walk``/``run_all_walks`` through the reserved
+    runner) perform sink operations and the SSE route has records to stream.
+    The ``getattr`` None fallback preserves the pre-existing
+    ``WalkRunner(storage)`` default (``log_service=None`` -> no sink ops) for
+    any context where the lifespan has not run (e.g. router-only TestClients),
+    and never constructs a second WalkLogService or broker. The module-level
+    singleton caches the first resolution; FastAPI runs the lifespan before
+    the first request, so ``app.state.walk_log_service`` is bound in
+    production.
+    """
     global _walk_runner
     if _walk_runner is None:
-        _walk_runner = WalkRunner(storage)
+        _walk_runner = WalkRunner(
+            storage,
+            log_service=getattr(request.app.state, "walk_log_service", None),
+        )
     return _walk_runner
 
 
@@ -83,6 +122,20 @@ def get_character_ledger(
 ) -> CharacterLedger:
     """FastAPI dependency: return a CharacterLedger."""
     return CharacterLedger(storage)
+
+
+def get_walk_log_service(request: Request) -> WalkLogService:
+    """FastAPI dependency: return the process-owned Part A WalkLogService.
+
+    The service is created and owned by the ``app.app`` lifespan, which sets
+    ``app.state.walk_log_service``. Reading ``request.app.state`` avoids a
+    circular import with ``app.app`` (which imports this router) while sharing
+    the single process-owned instance -- never constructing a second service
+    or broker. Tests override this dependency directly via
+    ``app.dependency_overrides[get_walk_log_service]``.
+    """
+    service: WalkLogService = request.app.state.walk_log_service
+    return service
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +155,18 @@ async def run_walk(
     request: RunWalkRequest,
     background_tasks: BackgroundTasks,
     runner: WalkRunner = Depends(get_walk_runner),
+    storage: PipelineStorage = Depends(get_storage),
 ) -> dict:
     """Run a single walk for a book in the background.
 
-    Returns immediately with ``{status: 'started', walk_name: ...}``.
-    The walk runs asynchronously; poll ``GET /walk_status/{book_id}``
-    for progress.
+    The API owns identity and reservation (Part B contract): it generates ONE
+    canonical UUID, persists the exact ``pending`` ``walk_run`` row via
+    ``reserve_walk_run``, then schedules the reserved runner method
+    ``run_walk_reserved`` through ``BackgroundTasks`` so the response returns
+    before the walk starts. Invalid walk names are rejected with 400 BEFORE any
+    reservation (no pending row). Returns immediately with
+    ``{status: 'started', started: true, walk_name: ..., run_id: ...}``; poll
+    ``GET /walk_status/{book_id}`` for progress.
     """
     if request.walk_name not in WALK_ORDER:
         raise HTTPException(
@@ -115,12 +174,38 @@ async def run_walk(
             detail=f"Unknown walk: {request.walk_name}. "
             f"Must be one of {WALK_ORDER}",
         )
-    # Clear any previous cancellation flag
+    # One canonical run UUID per request, generated before reservation.
+    run_id = str(uuid.uuid4())
+    # Clear any previous cancellation flag (existing boundary, unchanged).
     runner.clear_cancel(request.book_id)
+    # Reserve the pending row (may raise -> mark pending failed, never execute).
+    try:
+        walk_runner_mod.reserve_walk_run(
+            storage, run_id, request.book_id, request.walk_name
+        )
+    except Exception as exc:
+        try:
+            walk_runner_mod.mark_reserved_runs_failed(storage, [run_id], str(exc))
+        except Exception:
+            # Best-effort cleanup: a write-broken storage must not mask the
+            # contracted 500 error shape (CONTRACTS: allocation failure returns
+            # the existing API error shape).
+            logger.warning(
+                "mark_reserved_runs_failed failed for run %s", run_id, exc_info=True
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reserve walk run: {exc}",
+        ) from exc
     background_tasks.add_task(
-        runner.run_walk, request.walk_name, request.book_id, request.config
+        runner.run_walk_reserved, run_id, request.walk_name, request.book_id, request.config
     )
-    return {"status": "started", "walk_name": request.walk_name}
+    return {
+        "status": "started",
+        "started": True,
+        "walk_name": request.walk_name,
+        "run_id": run_id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -133,18 +218,66 @@ async def run_all_walks(
     request: RunAllWalksRequest,
     background_tasks: BackgroundTasks,
     runner: WalkRunner = Depends(get_walk_runner),
+    storage: PipelineStorage = Depends(get_storage),
 ) -> dict:
     """Run all 9 walks serially for a book in the background.
 
-    Returns immediately with ``{status: 'started'}``.
-    Poll ``GET /walk_status/{book_id}`` for progress.
+    The API owns identity and reservation (Part B contract): it generates ONE
+    canonical ``batch_id`` (correlation-only, no parent row) plus nine canonical
+    child UUIDs in ``WALK_ORDER``, persists all nine ``pending`` rows via
+    ``reserve_all_walk_runs``, then schedules the reserved runner method
+    ``run_all_walks_reserved`` through ``BackgroundTasks`` so the response
+    returns before the batch starts. Returns immediately with
+    ``{status: 'started', started: true, batch_id: ..., run_ids: [...], runs: [...]}``;
+    poll ``GET /walk_status/{book_id}`` for progress.
     """
-    # Clear any previous cancellation flag
-    runner.clear_cancel(request.book_id)
-    background_tasks.add_task(
-        runner.run_all_walks, request.book_id, request.config
+    # One canonical batch_id + nine canonical child UUIDs in WALK_ORDER.
+    batch_id = str(uuid.uuid4())
+    reservations = tuple(
+        (walk_name, str(uuid.uuid4())) for walk_name in WALK_ORDER
     )
-    return {"status": "started"}
+    # Clear any previous cancellation flag (existing boundary, unchanged).
+    runner.clear_cancel(request.book_id)
+    # Reserve all pending rows (may raise -> mark pending failed, never execute).
+    try:
+        walk_runner_mod.reserve_all_walk_runs(
+            storage, request.book_id, reservations
+        )
+    except Exception as exc:
+        try:
+            walk_runner_mod.mark_reserved_runs_failed(
+                storage, [rid for _, rid in reservations], str(exc)
+            )
+        except Exception:
+            # Best-effort cleanup: a write-broken storage must not mask the
+            # contracted 500 error shape (CONTRACTS: allocation failure returns
+            # the existing API error shape).
+            logger.warning(
+                "mark_reserved_runs_failed failed for run_ids %s",
+                [rid for _, rid in reservations],
+                exc_info=True,
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reserve walk runs: {exc}",
+        ) from exc
+    background_tasks.add_task(
+        runner.run_all_walks_reserved,
+        batch_id,
+        reservations,
+        request.book_id,
+        request.config,
+    )
+    return {
+        "status": "started",
+        "started": True,
+        "batch_id": batch_id,
+        "run_ids": [rid for _, rid in reservations],
+        "runs": [
+            {"walk_name": walk_name, "run_id": rid}
+            for walk_name, rid in reservations
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +326,175 @@ async def get_walk_runs(
         (book_id,),
     )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipeline/walks/log/{run_id} (Per-walk log streaming, Part C SSE)
+#
+# Consumes the Part A WalkLogService contracts: the authoritative JSONL file is
+# the replay source for BOTH active and completed runs; the subscription bridges
+# only broker records after the file tail. No Part A replay/broker/terminal logic
+# is reimplemented here -- open_subscription owns replay capture + live
+# registration atomically, and its subscription semantics deliver terminal
+# completion and future-event waiting for a cursor beyond the file tail.
+# ---------------------------------------------------------------------------
+
+
+_MAX_LAST_EVENT_ID = 2**63 - 1
+
+
+def _parse_last_event_id(request: Request, run_id: str) -> int:
+    """Parse ``Last-Event-ID`` (empty or ``{run_id}:{non-negative integer}``).
+
+    Returns the sequence to pass as ``after_seq``, or raises 400 for malformed,
+    foreign-run, negative, non-integer, or impossible (``> 2**63 - 1``) values.
+    This runs BEFORE ``open_subscription`` is called.
+    """
+    value = request.headers.get("last-event-id") or ""
+    if not value:
+        return -1
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise HTTPException(
+            status_code=400, detail=f"Malformed Last-Event-ID: {value!r}"
+        )
+    rid, seq_str = parts
+    if rid != run_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Last-Event-ID names a different run than the path: {rid!r}",
+        )
+    if not seq_str or not seq_str.isascii() or not seq_str.isdigit():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Last-Event-ID sequence must be a non-negative integer: {seq_str!r}",
+        )
+    seq = int(seq_str)
+    if seq > _MAX_LAST_EVENT_ID:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Last-Event-ID sequence out of range: {seq_str!r}",
+        )
+    return seq
+
+
+async def _event_stream(
+    subscription: WalkLogSubscription,
+    run_id: str,
+    db_status: str,
+    after_seq: int = -1,
+) -> AsyncIterator[str]:
+    """Emit each ``WalkLogRecord`` as SSE framing, then ``event: complete``.
+
+    Each record is ``id: {run_id}:{seq}`` / ``event: log`` / one JSON ``data:``
+    line / blank line. Records with ``seq <= after_seq`` (already consumed by the
+    client's ``Last-Event-ID`` cursor) are suppressed so the stream strictly
+    resumes after the cursor for both file replay and live records. After the
+    terminal record the stream emits ``complete`` with ``{run_id, status}`` and
+    stops. The ``finally`` closes the subscription on normal completion,
+    cancellation, or client disconnect (non-blocking).
+    """
+    try:
+        terminal_status: str | None = None
+        async for rec in subscription:
+            if rec.seq <= after_seq:
+                continue
+            yield (
+                f"id: {rec.id}\n"
+                f"event: log\n"
+                f"data: {json.dumps(dict(rec.data), ensure_ascii=False)}\n\n"
+            )
+            if rec.terminal:
+                terminal_status = (rec.data or {}).get("status")
+        # Terminal status is authoritative from the streamed terminal record; when
+        # no terminal record was streamed (e.g. a cursor beyond the tail of an
+        # already-terminal run), fall back to the walk_run row's status.
+        status = terminal_status if terminal_status is not None else db_status
+        yield (
+            f"event: complete\n"
+            f"data: {json.dumps({'run_id': run_id, 'status': status}, ensure_ascii=False)}\n\n"
+        )
+    finally:
+        subscription.close()
+
+
+@router.get("/walks/log/{run_id}")
+async def stream_walk_log(
+    run_id: str,
+    request: Request,
+    storage: PipelineStorage = Depends(get_storage),
+    service: WalkLogService = Depends(get_walk_log_service),
+) -> StreamingResponse:
+    """Stream the per-walk JSONL log for ``run_id`` as SSE.
+
+    Enforces a canonical UUID (400) before any DB lookup, returns 404 for an
+    unknown run, 410 for a known run whose ephemeral ``{root}/{run_id}.log`` is
+    absent, rejects symlink escapes, parses ``Last-Event-ID`` (400 before opening
+    a subscription), and opens exactly one subscription whose authoritative-file
+    replay + live registration are atomic (Part A). The DB row/status is never
+    changed by a missing-file response.
+    """
+    # (a) canonical UUID syntax validation BEFORE any DB lookup or subscription.
+    if not _is_valid_uuid(run_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid run id (must be a canonical UUID): {run_id!r}",
+        )
+    # (b) parameterized walk_run lookup -> 404 for an unknown run.
+    rows = storage.execute_query(
+        "SELECT run_id, status FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Unknown walk run: {run_id}")
+    db_status = rows[0]["status"]
+    # (d) symlink escape: derive the path only from the validated canonical UUID
+    # and reject a symlinked log path so the target is never read into the body.
+    if (service._root_dir / f"{run_id}.log").is_symlink():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Refusing symlinked log path for run: {run_id}",
+        )
+    # (P2-S3) parse Last-Event-ID before opening any subscription (400 on error).
+    after_seq = _parse_last_event_id(request, run_id)
+    # (P2-S4) open exactly once after validation: file replay + live registration
+    # are atomic. KeyError means the known run's ephemeral file is absent -> 410
+    # (the DB row is left untouched).
+    try:
+        subscription = service.open_subscription(
+            run_id, after_seq=after_seq, loop=asyncio.get_running_loop()
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=410,
+            detail=f"Walk log file not available for run: {run_id}",
+        ) from None
+    return StreamingResponse(
+        _event_stream(subscription, run_id, db_status, after_seq),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/walks/log/{rest:path}")
+async def stream_walk_log_reject_path(
+    rest: str,
+) -> StreamingResponse:
+    """Reject any non-canonical path under ``/walks/log/`` with 400.
+
+    The primary ``{run_id}`` route only matches a single path segment, so a
+    traversal-encoded ``run_id`` (e.g. ``..%2F..%2Fetc%2Fpasswd``, which Starlette
+    decodes into a multi-segment path) falls through to this catch-all. Such a
+    path can never be a canonical UUID, so it is rejected 400 before any DB
+    lookup or file access -- never a 200 file read.
+    """
+    raise HTTPException(
+        status_code=400,
+        detail=f"Invalid run id (must be a canonical UUID): {rest!r}",
+    )
 
 
 # ---------------------------------------------------------------------------

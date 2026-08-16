@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import uuid as _uuid
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
@@ -42,7 +43,6 @@ from app.pipeline.operations import OperationExecutor
 from app.pipeline.review import ReviewManager
 from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import WalkRunner
-
 
 # -- Test-harness import path setup (mirrors test_legacy_removed.py) ----------
 # app/app.py imports app-local bare modules (``utils``, ``hf_utils``) at module
@@ -139,6 +139,73 @@ def _populate_storage(storage: InMemorySQLiteAdapter) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Part C reservation test doubles (per-walk-log-streaming P1-S1/S2/S3)
+# ---------------------------------------------------------------------------
+
+
+def _is_canonical_uuid(value: str) -> bool:
+    """True only for a strictly canonical lowercase-dashed UUID string."""
+    try:
+        return str(_uuid.UUID(value)) == value
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+class _RecordingRunner:
+    """Runner test double that records reserved/legacy invocations.
+
+    Used to prove Part C's reservation handoff: the API layer must schedule
+    ``run_walk_reserved`` / ``run_all_walks_reserved`` (never the legacy
+    ``run_walk`` / ``run_all_walks``) and must not run a reserved runner when
+    allocation fails.
+    """
+
+    def __init__(self) -> None:
+        self.clear_cancel_calls: list[str] = []
+        self.reserved_walk_calls: list[tuple] = []
+        self.reserved_batch_calls: list[tuple] = []
+        self.legacy_walk_calls: list[tuple] = []
+        self.legacy_batch_calls: list[tuple] = []
+
+    def clear_cancel(self, book_id: str) -> None:
+        self.clear_cancel_calls.append(book_id)
+
+    def run_walk_reserved(self, run_id, walk_name, book_id, config):
+        self.reserved_walk_calls.append((run_id, walk_name, book_id, config))
+        return {"status": "completed"}
+
+    def run_all_walks_reserved(self, batch_id, reservations, book_id, config):
+        self.reserved_batch_calls.append((batch_id, reservations, book_id, config))
+        return {"status": "completed"}
+
+    def run_walk(self, walk_name, book_id, config):
+        self.legacy_walk_calls.append((walk_name, book_id, config))
+        return {"status": "started"}
+
+    def run_all_walks(self, book_id, config):
+        self.legacy_batch_calls.append((book_id, config))
+        return {"status": "started"}
+
+
+class _FailingReserveStorage:
+    """Storage double whose reservation INSERT raises (allocation failure)."""
+
+    def execute_insert(self, sql, params=()):
+        raise RuntimeError("simulated reservation allocation failure")
+
+
+def _reservation_client(storage, runner) -> TestClient:
+    """TestClient over the combined pipeline router with storage+runner doubles."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_storage] = lambda: storage
+    app.dependency_overrides[get_walk_runner] = lambda: runner
+    return TestClient(app)
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -187,7 +254,6 @@ def tts_engine():
         # returns (Plan C phase 1 fsync discipline depends on it).
         with open(output_path, "wb") as f:
             f.write(b"fake wav data\n")
-        return None
 
     engine.generate_voice = MagicMock(side_effect=fake_generate_voice)
     return engine
@@ -224,8 +290,16 @@ def real_client(
     does NOT see the ConcurrentTransactionError -> 503 handler registered on
     ``app.app``.  This fixture overrides the same dependencies on the real
     application so request-path writes can exercise the live 503 mapping.
+
+    The overrides are restored in teardown so the shared app object never
+    leaks them into later-collected tests (the mounted-app production-wiring
+    test needs the REAL ``get_walk_runner`` uncompromised).
     """
     import app.app as real_app
+
+    # Snapshot pre-test overrides; restored verbatim after the test so the
+    # shared app is left exactly as found (clean_overrides convention).
+    before = dict(real_app.app.dependency_overrides)
 
     real_app.app.dependency_overrides[get_storage] = lambda: storage
     real_app.app.dependency_overrides[get_walk_runner] = lambda: walk_runner
@@ -234,7 +308,10 @@ def real_client(
     real_app.app.dependency_overrides[get_character_ledger] = lambda: character_ledger
     real_app.app.dependency_overrides[get_tts_engine] = lambda: tts_engine
 
-    return TestClient(real_app.app)
+    yield TestClient(real_app.app)
+
+    real_app.app.dependency_overrides.clear()
+    real_app.app.dependency_overrides.update(before)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +429,9 @@ class TestRunWalkEndpoint:
             # Background execution returns immediately with 'started'
             assert result["status"] == "started"
             assert result["walk_name"] == "walk_2a_scene_segmentation"
+            # Part C response contract: started flag + canonical run_id
+            assert result["started"] is True
+            assert _is_canonical_uuid(result["run_id"])
 
     def test_run_walk_execution_failure(self, client, walk_runner):
         """Background walk failures are reflected in status, not in response."""
@@ -375,6 +455,8 @@ class TestRunWalkEndpoint:
             result = response.json()
             # Response is always 'started' for background execution
             assert result["status"] == "started"
+            assert result["started"] is True
+            assert _is_canonical_uuid(result["run_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +483,173 @@ class TestRunAllWalksEndpoint:
             result = response.json()
             # Background execution returns immediately
             assert result["status"] == "started"
+            # Part C response contract: started flag + canonical batch/child ids
+            assert result["started"] is True
+            assert _is_canonical_uuid(result["batch_id"])
+            assert len(result["run_ids"]) == len(WALK_ORDER)
+            for rid in result["run_ids"]:
+                assert _is_canonical_uuid(rid)
+            assert [r["walk_name"] for r in result["runs"]] == WALK_ORDER
+            for r in result["runs"]:
+                assert _is_canonical_uuid(r["run_id"])
+
+
+# ---------------------------------------------------------------------------
+# P1-S1: run_walk reservation contract (per-walk-log-streaming Part C)
+# ---------------------------------------------------------------------------
+
+
+class TestRunWalkReservationContract:
+    def test_run_walk_reserves_pending_row_and_schedules_reserved(self, storage):
+        """run_walk returns status/started/walk_name/run_id, reserves the exact
+        pending walk_run row BEFORE scheduling, and schedules
+        run_walk_reserved(run_id, walk_name, book_id, config) with the same ID
+        and request values (never the legacy run_walk)."""
+        runner = _RecordingRunner()
+        client = _reservation_client(storage, runner)
+        resp = client.post(
+            "/api/pipeline/run_walk",
+            json={
+                "walk_name": "walk_2a_scene_segmentation",
+                "book_id": "b1",
+                "config": {"temperature": 0.1},
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Compatibility fields preserved + Part C identifiers added.
+        assert data["status"] == "started"
+        assert data["started"] is True
+        assert data["walk_name"] == "walk_2a_scene_segmentation"
+        assert _is_canonical_uuid(data["run_id"])
+        run_id = data["run_id"]
+        # The exact pending row is reserved before scheduling.
+        rows = storage.execute_query(
+            "SELECT run_id, book_id, walk_name, status, cancel_requested, "
+            "heartbeat_ms FROM walk_run WHERE run_id = ?",
+            (run_id,),
+        )
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["status"] == "pending"
+        assert row["book_id"] == "b1"
+        assert row["walk_name"] == "walk_2a_scene_segmentation"
+        assert row["cancel_requested"] == 0
+        assert row["heartbeat_ms"] is not None
+        # The reserved runner is scheduled with the SAME run_id + request values.
+        assert runner.reserved_walk_calls == [
+            (run_id, "walk_2a_scene_segmentation", "b1", {"temperature": 0.1})
+        ]
+        assert runner.legacy_walk_calls == []
+
+
+# ---------------------------------------------------------------------------
+# P1-S2: run_all_walks batch-reservation contract
+# ---------------------------------------------------------------------------
+
+
+class TestRunAllWalksReservationContract:
+    def test_run_all_walks_reserves_batch_and_schedules_reserved(self, storage):
+        """run_all_walks returns started/batch_id/ordered run_ids/ordered runs,
+        inserts nine pending rows, and schedules run_all_walks_reserved with the
+        complete ordered reservation (never the legacy run_all_walks)."""
+        runner = _RecordingRunner()
+        client = _reservation_client(storage, runner)
+        resp = client.post(
+            "/api/pipeline/run_all_walks",
+            json={"book_id": "b1", "config": {"mode": "fast"}},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "started"
+        assert data["started"] is True
+        assert _is_canonical_uuid(data["batch_id"])
+        assert len(data["run_ids"]) == len(WALK_ORDER) == 9
+        for rid in data["run_ids"]:
+            assert _is_canonical_uuid(rid)
+        # Ordered runs in WALK_ORDER; run_ids align with runs.
+        assert [r["walk_name"] for r in data["runs"]] == WALK_ORDER
+        assert [r["run_id"] for r in data["runs"]] == data["run_ids"]
+        for r in data["runs"]:
+            assert _is_canonical_uuid(r["run_id"])
+        # The reserved batch runner is scheduled with the complete reservation.
+        assert len(runner.reserved_batch_calls) == 1
+        batch_id, reservations, book_id, config = runner.reserved_batch_calls[0]
+        assert batch_id == data["batch_id"]
+        assert book_id == "b1"
+        assert config == {"mode": "fast"}
+        assert [w for w, _ in reservations] == WALK_ORDER
+        assert len(reservations) == 9
+        # Nine pending walk_run rows inserted.
+        placeholders = ", ".join("?" for _ in data["run_ids"])
+        rows = storage.execute_query(
+            f"SELECT walk_name, status FROM walk_run WHERE run_id IN ({placeholders})",
+            tuple(data["run_ids"]),
+        )
+        assert len(rows) == 9
+        assert all(row["status"] == "pending" for row in rows)
+        assert runner.legacy_batch_calls == []
+
+
+# ---------------------------------------------------------------------------
+# P1-S3: reservation/scheduling failure contract
+# ---------------------------------------------------------------------------
+
+
+class TestReservationFailureContract:
+    """Allocation/insertion failure marks the affected pending run(s) failed,
+    never executes a reserved runner, and returns the existing error shape."""
+
+    def test_run_walk_allocation_failure_marks_failed_and_no_execute(
+        self, monkeypatch
+    ):
+        from app.pipeline.walks import runner as _runner_mod
+
+        runner = _RecordingRunner()
+        mark_failed = MagicMock()
+        monkeypatch.setattr(_runner_mod, "mark_reserved_runs_failed", mark_failed)
+        client = _reservation_client(_FailingReserveStorage(), runner)
+
+        resp = client.post(
+            "/api/pipeline/run_walk",
+            json={
+                "walk_name": "walk_2a_scene_segmentation",
+                "book_id": "b1",
+                "config": {},
+            },
+        )
+        # Existing API error shape (HTTPException JSON detail), not 200 started.
+        assert resp.status_code >= 400
+        assert "detail" in resp.json()
+        # The affected pending run is marked failed.
+        assert mark_failed.called
+        run_ids = mark_failed.call_args[0][1]
+        assert len(run_ids) == 1
+        assert _is_canonical_uuid(run_ids[0])
+        # No reserved runner executes.
+        assert runner.reserved_walk_calls == []
+
+    def test_run_all_walks_allocation_failure_marks_all_pending_failed(
+        self, monkeypatch
+    ):
+        from app.pipeline.walks import runner as _runner_mod
+
+        runner = _RecordingRunner()
+        mark_failed = MagicMock()
+        monkeypatch.setattr(_runner_mod, "mark_reserved_runs_failed", mark_failed)
+        client = _reservation_client(_FailingReserveStorage(), runner)
+
+        resp = client.post(
+            "/api/pipeline/run_all_walks",
+            json={"book_id": "b1", "config": {}},
+        )
+        assert resp.status_code >= 400
+        assert "detail" in resp.json()
+        assert mark_failed.called
+        run_ids = mark_failed.call_args[0][1]
+        assert len(run_ids) == 9  # all affected pending children
+        assert all(_is_canonical_uuid(x) for x in run_ids)
+        assert runner.reserved_batch_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -2123,6 +2372,7 @@ class TestMergeEndpoint:
     def test_merge_success(self, client, tmp_path):
         """Merge with valid WAV chunks produces M4B file."""
         import subprocess
+
         from app.pipeline import api_export
 
         # Create output directory with WAV chunks

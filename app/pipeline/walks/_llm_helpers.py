@@ -9,9 +9,33 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+import time
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.pipeline.walks.log_service import WalkLogSink
 
 logger = logging.getLogger(__name__)
+
+#: Thread-local sink seam (Part B). The runner sets the current run's walk-log
+#: sink on this variable immediately before ``walk_module.execute(...)`` and
+#: resets it in ``finally`` on every terminal path. Helpers read it to emit
+#: ``llm``/``parse`` records; they never mutate it and never import a walk
+#: module. Walk modules themselves never touch the seam (static-audit enforced).
+WALK_LOG_SINK: ContextVar[WalkLogSink | None] = ContextVar(
+    "walk_log_sink", default=None
+)
+
+
+def get_walk_log_sink() -> WalkLogSink | None:
+    """Return the current thread's walk-log sink, or ``None`` when none is set.
+
+    The runner sets the sink for the duration of a reserved walk's execution.
+    Outside a running walk (or when the runner has no ``log_service``) this
+    returns ``None``.
+    """
+    return WALK_LOG_SINK.get()
 
 
 def chat_completion(
@@ -61,7 +85,63 @@ def chat_completion(
         extra_body=extra_body if extra_body else None,
     )
 
-    return response.choices[0].message.content.strip()
+    text = response.choices[0].message.content.strip()
+
+    # Optional per-run capture (Part B): emit an ``llm`` record when the runner
+    # has attached a walk-log sink. Metadata the SDK omits is null (not dropped
+    # keys); temperature/reasoning_effort come from the arguments and are null
+    # only when the argument was null. The helper's return value is authoritative:
+    # any sink failure is logged and swallowed, never propagated.
+    sink = get_walk_log_sink()
+    if sink is not None:
+        try:
+            first_choice = response.choices[0] if response.choices else None
+            usage = getattr(response, "usage", None)
+            usage_payload = None
+            if usage is not None:
+                usage_payload = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                }
+            sink.append(
+                "llm",
+                {
+                    "timestamp": int(time.time() * 1000),
+                    "model": getattr(response, "model", None),
+                    "temperature": temperature,
+                    "reasoning_effort": reasoning_effort,
+                    "prompts": {"system": system_prompt, "user": user_prompt},
+                    "response": text,
+                    "finish_reason": (
+                        getattr(first_choice, "finish_reason", None)
+                        if first_choice is not None
+                        else None
+                    ),
+                    "usage": usage_payload,
+                },
+            )
+        except Exception:
+            logger.warning("failed to emit llm record", exc_info=True)
+
+    return text
+
+
+def _emit_parse_record(success: bool, expected_type: str, **extra: Any) -> None:
+    """Emit an optional ``parse`` sink record for one parser outcome.
+
+    Best-effort: a missing sink means no record; a raising sink is logged and
+    swallowed so the parser's decision/return is never altered.
+    """
+    sink = get_walk_log_sink()
+    if sink is None:
+        return
+    try:
+        payload: dict[str, Any] = {"success": success, "expected_type": expected_type}
+        payload.update(extra)
+        sink.append("parse", payload)
+    except Exception:
+        logger.warning("failed to emit parse record", exc_info=True)
 
 
 def extract_json_from_llm_response(
@@ -106,6 +186,7 @@ def extract_json_from_llm_response(
     """
     if expected_type not in ("auto", "dict", "list"):
         logger.error(f"Invalid expected_type: {expected_type}")
+        _emit_parse_record(False, expected_type, error="invalid_expected_type")
         return None
 
     # Step 1: Try direct JSON parsing
@@ -116,13 +197,16 @@ def extract_json_from_llm_response(
             logger.error(
                 f"Expected dict but got {type(result).__name__}: {response_text[:200]}"
             )
+            _emit_parse_record(False, expected_type, error="type_mismatch")
             return None
         if expected_type == "list" and not isinstance(result, list):
             logger.error(
                 f"Expected list but got {type(result).__name__}: {response_text[:200]}"
             )
+            _emit_parse_record(False, expected_type, error="type_mismatch")
             return None
         # For "auto", accept either dict or list
+        _emit_parse_record(True, expected_type)
         return result
     except json.JSONDecodeError:
         # Step 2: Try regex fallback based on expected_type
@@ -149,6 +233,7 @@ def extract_json_from_llm_response(
                     continue
                 if expected_type == "list" and not isinstance(result, list):
                     continue
+                _emit_parse_record(True, expected_type)
                 return result
             except json.JSONDecodeError:
                 # This regex match wasn't valid JSON, try next pattern
@@ -156,4 +241,5 @@ def extract_json_from_llm_response(
 
     # All attempts failed
     logger.error(f"Failed to extract JSON from LLM response: {response_text[:200]}")
+    _emit_parse_record(False, expected_type, error="malformed")
     return None

@@ -65,9 +65,21 @@ from app.engine import get_tts_engine, reset_tts_engine
 # via app.pipeline.api, so this import adds no cycle.
 from app.pipeline.tts_integration import validate_pause_ms
 
+# Per-walk ephemeral JSONL log service (Part A of per-walk log streaming).
+# The process-owned service owns startup cleanup and shutdown closure; wiring
+# it into the lifespan below lets every run's sink/broker be released on
+# shutdown without touching runner/API/helper/walk-module code.
+from app.pipeline.walks.log_service import WalkLogService
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AlexandriaUI")
+
+#: Process-owned per-walk log service (Part A). ``start()`` is called by the
+#: lifespan on startup; ``shutdown()`` on shutdown. Exposed to the running
+#: app via ``app.state.walk_log_service`` so API/runner wiring (Parts B/C) can
+#: share this single instance.
+walk_log_service = WalkLogService()
 
 
 @asynccontextmanager
@@ -81,10 +93,19 @@ async def lifespan(app: FastAPI):
     manager, so the lifespan — and therefore the thread — never runs under
     ``pytest tests/pipeline``.  The scheduler defers its first sweep one full
     interval and honors the ``PIPELINE_GC_SCHEDULER=0`` opt-out.
+
+    Startup also initialises the per-walk walk-log service: ``start()``
+    creates ``/tmp/alexandria-walks`` (0700) and cleans stale UUID-named
+    logs.  Shutdown calls ``shutdown()`` to close any remaining open sinks as
+    ``partial``/``aborted`` and release all brokers/subscribers — after the
+    GC scheduler is stopped, preserving existing shutdown semantics.
     """
     start_gc_scheduler()
+    app.state.walk_log_service = walk_log_service
+    walk_log_service.start()
     yield
     stop_gc_scheduler()
+    walk_log_service.shutdown()
 
 
 app = FastAPI(title="Alexandria Audiobook", lifespan=lifespan)

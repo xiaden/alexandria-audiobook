@@ -17,8 +17,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import types
+import uuid
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,7 +29,6 @@ import pytest
 from app.pipeline.adapter import ConcurrentTransactionError, InMemorySQLiteAdapter
 from app.pipeline.walks.order import WALK_ORDER
 from app.pipeline.walks.runner import HeartbeatStorage, WalkRunner
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -504,7 +506,7 @@ class TestCancellation:
         runner.cancel_walks("book-1")
         results = runner.run_all_walks("book-1", {})
         # All walks should be cancelled
-        for walk_name, result in results.items():
+        for result in results.values():
             assert result["status"] == "cancelled"
 
 
@@ -514,10 +516,8 @@ class TestCancellation:
 
 
 class TestWalkRunPersistence:
-    """Spec-first tests: run_walk/run_all_walks write walk_run rows.
-
-    P2-S1 (RED): these fail against the in-memory-only implementation.
-    """
+    """Spec-first tests: run_walk/run_all_walks write walk_run rows
+    (rows = truth)."""
 
     def test_run_walk_creates_running_row_at_start(self, runner):
         """A walk_run row (status running, created_ms) exists while executing."""
@@ -906,3 +906,1092 @@ class TestConcurrentTransactionRetry:
         result = self._run_walk(runner, execute_fn)
         assert result["status"] == "completed"
         assert flaky._walk_write_attempts == 1
+
+
+# ===========================================================================
+# Part B (per-walk log streaming) — runner/reservation contract tests.
+#
+# These classes lock the Part B runner/reservation contracts from
+# artifacts/designs/parts/per-walk-log-streaming/CONTRACTS.md (§ Part B runner
+# integration) and the amended DD: reservation helpers, the reserved runner
+# lifecycle (run_walk_reserved / run_all_walks_reserved), the WALK_LOG_SINK
+# ContextVar reset on every terminal path, and the static/import audit of the
+# nine immutable walk modules. All tests below are green.
+# ===========================================================================
+
+
+class _FakeSink:
+    """Minimal stand-in for a WalkLogSink capturing appended records."""
+
+    def __init__(self):
+        self.records = []
+        self.terminal = None
+
+    def append(self, event, payload=None, *, terminal=False):
+        self.records.append({"event": event, "data": payload, "terminal": terminal})
+
+    def append_terminal(self, status, payload=None):
+        self.terminal = {"status": status, "data": payload}
+
+    def close_partial(self, status="aborted"):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeLogService:
+    """Process-owned-service stand-in keyed by run_id.
+
+    The Part B runner obtains its per-run sink from ``WalkLogService.open_run``.
+    This stub supplies ``_FakeSink`` instances so the ContextVar-reset tests can
+    observe the sink the runner attaches, without touching the real filesystem.
+    """
+
+    def __init__(self):
+        self.sinks = {}
+        #: Ordered log of every close_run call, for terminal-ordering asserts:
+        #: (run_id, status, payload). The runner calls close_run BEFORE
+        #: _finalize_run on every terminal path, so the last close_calls entry's
+        #: status must match the DB row's final status.
+        self.close_calls: list[tuple[str, str, object]] = []
+        #: run_ids whose close_run has been called (sentinel for ordering).
+        self.closed_ids: set[str] = set()
+
+    def open_run(self, run_id, book_id, walk_name, started_ms=None):
+        sink = _FakeSink()
+        self.sinks[run_id] = sink
+        return sink
+
+    def get_run(self, run_id):
+        return self.sinks.get(run_id)
+
+    def close_run(self, run_id, status, payload=None):
+        self.close_calls.append((run_id, status, payload))
+        self.closed_ids.add(run_id)
+
+
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content, finish_reason):
+        self.message = _FakeMessage(content)
+        self.finish_reason = finish_reason
+
+
+class _FakeResponse:
+    def __init__(self, model, choice, usage):
+        self.model = model
+        self.choices = [choice]
+        self.usage = usage
+
+
+class _FakeCompletions:
+    def __init__(self, response):
+        self._response = response
+
+    def create(self, **kwargs):
+        return self._response
+
+
+class _FakeChat:
+    def __init__(self, response):
+        self.completions = _FakeCompletions(response)
+
+
+class _FakeClient:
+    def __init__(self, response):
+        self.chat = _FakeChat(response)
+
+
+def _insert_pending_row(storage, run_id, book_id, walk_name, cancel_requested=0):
+    """Insert one exact pending walk_run row (the reservation shape)."""
+    storage.execute_insert(
+        "INSERT INTO walk_run (run_id, book_id, walk_name, status, cancel_requested, heartbeat_ms) "
+        "VALUES (?, ?, ?, 'pending', ?, ?)",
+        (run_id, book_id, walk_name, cancel_requested, 100),
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1-S1 — caller-supplied canonical UUID reservations
+# ---------------------------------------------------------------------------
+
+
+class TestReservationHelpers:
+    """Locks the caller-supplied-canonical-UUID reservation contract.
+
+    ``reserve_walk_run`` / ``reserve_all_walk_runs`` insert exact ``pending``
+    rows and validate canonical UUIDs, allowed walk names, uniqueness, and
+    ``WALK_ORDER`` coverage; ``mark_reserved_runs_failed`` marks only still-
+    pending rows failed without executing a reservation.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    WALK = "walk_2a_scene_segmentation"
+
+    def _reservations(self):
+        return {w: str(uuid.uuid4()) for w in WALK_ORDER}
+
+    def _run_id(self):
+        return str(uuid.uuid4())
+
+    def test_reserve_walk_run_returns_same_run_id(self, storage):
+        from app.pipeline.walks.runner import reserve_walk_run
+
+        run_id = self._run_id()
+        returned = reserve_walk_run(storage, run_id, self.BOOK, self.WALK, created_ms=1000)
+        assert returned == run_id
+
+    def test_reserve_walk_run_inserts_exact_pending_row(self, storage):
+        from app.pipeline.walks.runner import reserve_walk_run
+
+        run_id = self._run_id()
+        reserve_walk_run(storage, run_id, self.BOOK, self.WALK, created_ms=1234)
+        rows = storage.execute_query(
+            "SELECT run_id, book_id, walk_name, status, cancel_requested, "
+            "heartbeat_ms, result_json, error, finished_ms "
+            "FROM walk_run WHERE run_id = ?",
+            (run_id,),
+        )
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["run_id"] == run_id
+        assert row["book_id"] == self.BOOK
+        assert row["walk_name"] == self.WALK
+        assert row["status"] == "pending"
+        assert row["cancel_requested"] == 0
+        assert row["heartbeat_ms"] == 1234
+        assert row["result_json"] is None
+        assert row["error"] is None
+        assert row["finished_ms"] is None
+
+    def test_reserve_walk_run_default_heartbeat_is_created_ms(self, storage):
+        from app.pipeline.walks.runner import reserve_walk_run
+
+        run_id = self._run_id()
+        reserve_walk_run(storage, run_id, self.BOOK, self.WALK)
+        rows = storage.execute_query(
+            "SELECT heartbeat_ms FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["heartbeat_ms"] is not None
+
+    def test_reserve_walk_run_invalid_uuid_raises(self, storage):
+        from app.pipeline.walks.runner import reserve_walk_run
+
+        with pytest.raises(ValueError):
+            reserve_walk_run(storage, "not-a-uuid", self.BOOK, self.WALK)
+
+    def test_reserve_walk_run_unknown_walk_raises(self, storage):
+        from app.pipeline.walks.runner import reserve_walk_run
+
+        with pytest.raises(ValueError):
+            reserve_walk_run(storage, self._run_id(), self.BOOK, "walk_nope")
+
+    def test_reserve_all_walk_runs_returns_normalized_order(self, storage):
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = self._reservations()
+        items = list(reservations.items())
+        items.reverse()  # scramble input order to prove normalization
+        result = reserve_all_walk_runs(storage, self.BOOK, items, created_ms=1)
+        expected = tuple((w, reservations[w]) for w in WALK_ORDER)
+        assert result == expected
+
+    def test_reserve_all_walk_runs_inserts_nine_pending_rows(self, storage):
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = self._reservations()
+        reserve_all_walk_runs(storage, self.BOOK, list(reservations.items()))
+        rows = storage.execute_query(
+            "SELECT walk_name, status FROM walk_run WHERE book_id = ?",
+            (self.BOOK,),
+        )
+        assert len(rows) == len(WALK_ORDER)
+        by_name = {r["walk_name"]: r["status"] for r in rows}
+        for w in WALK_ORDER:
+            assert by_name[w] == "pending"
+
+    def test_reserve_all_walk_runs_rejects_missing_walk(self, storage):
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = self._reservations()
+        del reservations[WALK_ORDER[0]]
+        with pytest.raises(ValueError):
+            reserve_all_walk_runs(storage, self.BOOK, list(reservations.items()))
+
+    def test_reserve_all_walk_runs_rejects_extra_walk(self, storage):
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = self._reservations()
+        reservations["walk_extra"] = str(uuid.uuid4())
+        with pytest.raises(ValueError):
+            reserve_all_walk_runs(storage, self.BOOK, list(reservations.items()))
+
+    def test_reserve_all_walk_runs_rejects_duplicate_walk(self, storage):
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = self._reservations()
+        items = list(reservations.items())
+        items.append((WALK_ORDER[0], str(uuid.uuid4())))
+        with pytest.raises(ValueError):
+            reserve_all_walk_runs(storage, self.BOOK, items)
+
+    def test_reserve_all_walk_runs_rejects_duplicate_run_id(self, storage):
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        shared = str(uuid.uuid4())
+        items = [(WALK_ORDER[0], shared), (WALK_ORDER[1], shared)]
+        for w in WALK_ORDER[2:]:
+            items.append((w, str(uuid.uuid4())))
+        with pytest.raises(ValueError):
+            reserve_all_walk_runs(storage, self.BOOK, items)
+
+    def test_reserve_all_walk_runs_rejects_invalid_uuid(self, storage):
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = self._reservations()
+        reservations[WALK_ORDER[0]] = "bad-uuid"
+        with pytest.raises(ValueError):
+            reserve_all_walk_runs(storage, self.BOOK, list(reservations.items()))
+
+    def test_mark_reserved_runs_failed_marks_pending_failed(self, storage):
+        from app.pipeline.walks.runner import (
+            mark_reserved_runs_failed,
+            reserve_walk_run,
+        )
+
+        run_id = self._run_id()
+        reserve_walk_run(storage, run_id, self.BOOK, self.WALK)
+        mark_reserved_runs_failed(storage, [run_id], "scheduling error")
+        rows = storage.execute_query(
+            "SELECT status, error FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["error"] == "scheduling error"
+
+    def test_mark_reserved_runs_failed_ignores_non_pending(self, storage):
+        from app.pipeline.walks.runner import (
+            mark_reserved_runs_failed,
+            reserve_walk_run,
+        )
+
+        run_id = self._run_id()
+        reserve_walk_run(storage, run_id, self.BOOK, self.WALK)
+        storage.execute_update(
+            "UPDATE walk_run SET status = 'completed' WHERE run_id = ?", (run_id,)
+        )
+        mark_reserved_runs_failed(storage, [run_id], "err")
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# P1-S2 — reserved single-run lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestRunWalkReserved:
+    """Locks ``WalkRunner.run_walk_reserved``: verifies the existing ``pending``
+    row, transitions it to ``running``, executes with ``HeartbeatStorage``,
+    never allocates a replacement run ID, preserves all terminal outcomes
+    (completed / exception→failed / import-error→failed /
+    verification-failure→failed / cancelled-before-start→cancelled), and writes
+    the result_json on completion.
+
+    Sink wiring: the runner opens its per-run sink via a ``WalkLogService``.
+    These tests inject a ``_FakeLogService`` through the runner constructor so
+    the reserved-run lifecycle is exercised independently of the real service.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    WALK = "walk_2a_scene_segmentation"
+
+    def _runner(self, storage):
+        return WalkRunner(storage, log_service=_FakeLogService())
+
+    def test_run_walk_reserved_verifies_pending_and_transitions_running(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        seen = {}
+
+        def execute_fn(book_id, hbs, config):
+            rows = storage.execute_query(
+                "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+            )
+            seen["status_during"] = rows[0]["status"]
+            return {"status": "completed", "scenes": 3}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert seen["status_during"] == "running"
+        assert result == {"status": "completed", "scenes": 3}
+
+    def test_run_walk_reserved_returns_original_walk_result(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        expected = {"status": "completed", "chapters": 2}
+        mock_module = _make_mock_walk_module(MagicMock(return_value=expected))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result == expected
+
+    def test_run_walk_reserved_executes_with_heartbeat_storage_run_id(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        captured = {}
+
+        def execute_fn(book_id, hbs, config):
+            captured["is_hbs"] = isinstance(hbs, HeartbeatStorage)
+            captured["hbs_run_id"] = hbs.run_id
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert captured["is_hbs"]
+        assert captured["hbs_run_id"] == run_id
+
+    def test_run_walk_reserved_never_allocates_replacement_id(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        rows = storage.execute_query(
+            "SELECT run_id, status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        assert len(rows) == 1
+        assert rows[0]["run_id"] == run_id
+        assert rows[0]["status"] == "completed"
+
+    def test_run_walk_reserved_completes_row_with_result_json(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        expected = {"status": "completed", "n": 1}
+        mock_module = _make_mock_walk_module(MagicMock(return_value=expected))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        rows = storage.execute_query(
+            "SELECT status, result_json FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+        assert json.loads(rows[0]["result_json"]) == expected
+
+    def test_run_walk_reserved_exception_marks_failed(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(MagicMock(side_effect=RuntimeError("boom")))
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert "boom" in result["error"]
+        rows = storage.execute_query(
+            "SELECT status, error FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "failed"
+        assert "boom" in rows[0]["error"]
+
+    def test_run_walk_reserved_import_error_marks_failed(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        result = runner.run_walk_reserved(run_id, "walk_does_not_exist", self.BOOK, {})
+        assert result["status"] == "failed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "failed"
+
+    def test_run_walk_reserved_verification_failure_marks_failed(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=False),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert "Verification failed" in result["error"]
+
+    def test_run_walk_reserved_cancelled_before_start(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        runner.cancel_walks(self.BOOK)
+        result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "cancelled"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "cancelled"
+
+    # -- reservation verification guard (missing / non-pending row) ---------
+
+    def test_run_walk_reserved_missing_row_fails_without_executing(self, storage):
+        """A missing pending row must fail fast (no execution, no row created)."""
+        run_id = str(uuid.uuid4())
+        runner = self._runner(storage)
+        execute_fn = MagicMock(return_value={"status": "completed"})
+        mock_module = _make_mock_walk_module(execute_fn)
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert "Reservation" in result["error"]
+        assert "pending" in result["error"]
+        execute_fn.assert_not_called()
+        rows = storage.execute_query(
+            "SELECT run_id FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows == []
+
+    def test_run_walk_reserved_non_pending_row_fails_without_executing(self, storage):
+        """A row that is no longer pending must fail fast without executing."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        storage.execute_update(
+            "UPDATE walk_run SET status = 'completed' WHERE run_id = ?", (run_id,)
+        )
+        runner = self._runner(storage)
+        execute_fn = MagicMock(return_value={"status": "completed"})
+        mock_module = _make_mock_walk_module(execute_fn)
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert "Reservation" in result["error"]
+        assert "pending" in result["error"]
+        execute_fn.assert_not_called()
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+    # -- log_service=None contract (legacy callers: NO sink operations) ----
+
+    def test_run_walk_reserved_without_log_service_completes_normally(self, storage):
+        """WalkRunner(storage) with no log_service must complete the run with no
+        sink operations (the default construction used by all legacy callers)."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = WalkRunner(storage)
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "completed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+    def test_run_walk_reserved_close_run_raising_does_not_alter_db(self, storage):
+        """A close_run that raises must not change the DB outcome (row = truth)
+        nor leak the sink ContextVar."""
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+
+        class _RaisingCloseService(_FakeLogService):
+            def close_run(self, run_id, status, payload=None):
+                raise OSError("cannot write log file")
+
+        runner = WalkRunner(storage, log_service=_RaisingCloseService())
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "completed"
+        rows = storage.execute_query(
+            "SELECT status, result_json, error FROM walk_run WHERE run_id = ?",
+            (run_id,),
+        )
+        assert rows[0]["status"] == "completed"
+        assert json.loads(rows[0]["result_json"]) == {"status": "completed"}
+        assert rows[0]["error"] is None
+        assert get_walk_log_sink() is None
+
+    # -- terminal-ordering invariant: close_run precedes _finalize_run ------
+
+    def test_run_walk_reserved_close_run_precedes_db_finalize_on_complete(self, storage):
+        """On completion, close_run must fire BEFORE the DB row is finalized
+        (terminal record before the row = truth). During execute the sink is
+        still open and no close has happened."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        captured = {}
+
+        def execute_fn(book_id, hbs, config):
+            captured["sink_open"] = service.get_run(run_id) is not None
+            captured["closed_during_exec"] = run_id in service.closed_ids
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "completed"
+        assert captured["sink_open"] is True
+        assert captured["closed_during_exec"] is False
+        assert len(service.close_calls) == 1
+        assert service.close_calls[0][0] == run_id
+
+    def test_run_walk_reserved_completion_emits_one_terminal_matching_row(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert len(service.close_calls) == 1
+        assert service.close_calls[0][0] == run_id
+        assert service.close_calls[0][1] == "completed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert service.close_calls[0][1] == rows[0]["status"]
+
+    def test_run_walk_reserved_exception_emits_one_terminal_matching_row(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        mock_module = _make_mock_walk_module(
+            MagicMock(side_effect=RuntimeError("boom"))
+        )
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert len(service.close_calls) == 1
+        assert service.close_calls[0][0] == run_id
+        assert service.close_calls[0][1] == "failed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert service.close_calls[0][1] == rows[0]["status"]
+
+    def test_run_walk_reserved_verification_failure_emits_one_terminal(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=False),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert len(service.close_calls) == 1
+        assert service.close_calls[0][1] == "failed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert service.close_calls[0][1] == rows[0]["status"]
+
+    def test_run_walk_reserved_import_error_emits_one_terminal_matching_row(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        result = runner.run_walk_reserved(
+            run_id, "walk_does_not_exist", self.BOOK, {}
+        )
+        assert result["status"] == "failed"
+        assert len(service.close_calls) == 1
+        assert service.close_calls[0][0] == run_id
+        assert service.close_calls[0][1] == "failed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert service.close_calls[0][1] == rows[0]["status"]
+
+    def test_run_walk_reserved_cancelled_before_start_emits_no_terminal(self, storage):
+        """Cancelled-before-start opens no sink, so no close/terminal record is
+        emitted (DB-only terminal status) — the invariant Part C's SSE depends on."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        runner.cancel_walks(self.BOOK)
+        result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "cancelled"
+        assert len(service.close_calls) == 0
+        assert run_id not in service.closed_ids
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# P1-S3 — reserved batch lifecycle (run_all_walks_reserved)
+# ---------------------------------------------------------------------------
+
+
+class TestRunAllWalksReserved:
+    """Locks ``WalkRunner.run_all_walks_reserved``: consumes the complete
+    ordered nine-child reservation serially in ``WALK_ORDER`` (results keyed by
+    walk_name), keeps ``batch_id`` correlation-only (no parent row), and
+    terminalizes not-yet-started children without executing them on abort or
+    cancellation."""
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+
+    def _reservations(self):
+        return [(w, str(uuid.uuid4())) for w in WALK_ORDER]
+
+    def _insert_reserved_rows(self, storage, reservations):
+        for walk_name, run_id in reservations:
+            _insert_pending_row(storage, run_id, self.BOOK, walk_name)
+
+    def _runner(self, storage):
+        return WalkRunner(storage, log_service=_FakeLogService())
+
+    def test_run_all_walks_reserved_executes_all_in_order(self, storage):
+        reservations = self._reservations()
+        self._insert_reserved_rows(storage, reservations)
+        runner = self._runner(storage)
+        call_log = []
+
+        def execute_fn(book_id, hbs, config):
+            call_log.append(book_id)
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        batch_id = str(uuid.uuid4())
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            results = runner.run_all_walks_reserved(
+                batch_id, reservations, self.BOOK, {}
+            )
+        assert len(call_log) == len(WALK_ORDER)
+        assert isinstance(results, dict)
+        for w in WALK_ORDER:
+            assert results[w]["status"] == "completed"
+        rows = storage.execute_query(
+            "SELECT walk_name, status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        by_name = {r["walk_name"]: r["status"] for r in rows}
+        for w in WALK_ORDER:
+            assert by_name[w] == "completed"
+
+    def test_run_all_walks_reserved_batch_id_has_no_parent_row(self, storage):
+        reservations = self._reservations()
+        self._insert_reserved_rows(storage, reservations)
+        runner = self._runner(storage)
+        batch_id = str(uuid.uuid4())
+        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_all_walks_reserved(batch_id, reservations, self.BOOK, {})
+        rows = storage.execute_query(
+            "SELECT run_id FROM walk_run WHERE run_id = ?", (batch_id,)
+        )
+        assert rows == []
+
+    def test_run_all_walks_reserved_terminalizes_unstarted_children_on_abort(self, storage):
+        reservations = self._reservations()
+        self._insert_reserved_rows(storage, reservations)
+        runner = self._runner(storage)
+        call_count = [0]
+
+        def execute_fn(book_id, hbs, config):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("boom")
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        batch_id = str(uuid.uuid4())
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            results = runner.run_all_walks_reserved(
+                batch_id, reservations, self.BOOK, {}
+            )
+        assert results[WALK_ORDER[0]]["status"] == "failed"
+        assert call_count[0] == 1  # only the first child executed
+        rows = storage.execute_query(
+            "SELECT walk_name, status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        for row in rows:
+            if row["walk_name"] != WALK_ORDER[0]:
+                assert row["status"] in ("cancelled", "failed", "interrupted")
+
+    def test_run_all_walks_reserved_cancellation_terminalizes_all(self, storage):
+        reservations = self._reservations()
+        self._insert_reserved_rows(storage, reservations)
+        runner = self._runner(storage)
+        runner.cancel_walks(self.BOOK)
+        batch_id = str(uuid.uuid4())
+        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_all_walks_reserved(batch_id, reservations, self.BOOK, {})
+        rows = storage.execute_query(
+            "SELECT walk_name, status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        assert len(rows) == len(WALK_ORDER)
+        for row in rows:
+            assert row["status"] in ("cancelled", "failed", "interrupted")
+
+
+# ---------------------------------------------------------------------------
+# P1-S4 — ContextVar seam + sink reset on every terminal path
+# ---------------------------------------------------------------------------
+
+
+class TestWalkLogSinkContextVar:
+    """Locks the ``WALK_LOG_SINK`` ContextVar seam contract: it defaults to
+    None and round-trips set/reset while restoring the prior value; the runner
+    sets it before execute and resets it in ``finally`` on every terminal path
+    (success, exception, import failure, verification failure, cancellation); a
+    sink-open failure never alters the DB status/result/error; concurrent runs
+    do not leak sinks across contexts."""
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    WALK = "walk_2a_scene_segmentation"
+
+    def _runner(self, storage):
+        return WalkRunner(storage, log_service=_FakeLogService())
+
+    # -- pure seam shape ------------------------------------------------
+
+    def test_walk_log_sink_defaults_to_none(self):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        assert get_walk_log_sink() is None
+
+    def test_set_and_get_walk_log_sink(self):
+        from app.pipeline.walks._llm_helpers import WALK_LOG_SINK, get_walk_log_sink
+
+        sink = _FakeSink()
+        token = WALK_LOG_SINK.set(sink)
+        try:
+            assert get_walk_log_sink() is sink
+        finally:
+            WALK_LOG_SINK.reset(token)
+        assert get_walk_log_sink() is None
+
+    def test_reset_restores_prior_value(self):
+        from app.pipeline.walks._llm_helpers import WALK_LOG_SINK, get_walk_log_sink
+
+        prior = _FakeSink()
+        token0 = WALK_LOG_SINK.set(prior)
+        try:
+            inner = _FakeSink()
+            token1 = WALK_LOG_SINK.set(inner)
+            assert get_walk_log_sink() is inner
+            WALK_LOG_SINK.reset(token1)
+            assert get_walk_log_sink() is prior
+        finally:
+            WALK_LOG_SINK.reset(token0)
+        assert get_walk_log_sink() is None
+
+    # -- runner sets before execute, resets in finally -------------------
+
+    def test_runner_sets_sink_before_execute_and_resets_after(self, storage):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        seen = {}
+
+        def execute_fn(book_id, hbs, config):
+            seen["sink_during"] = get_walk_log_sink()
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert seen["sink_during"] is service.sinks.get(run_id)
+        assert get_walk_log_sink() is None
+
+    def test_runner_resets_sink_on_exception(self, storage):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(MagicMock(side_effect=RuntimeError("boom")))
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert get_walk_log_sink() is None
+
+    def test_runner_resets_sink_on_import_failure(self, storage):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        result = runner.run_walk_reserved(run_id, "walk_missing_xyz", self.BOOK, {})
+        assert result["status"] == "failed"
+        assert get_walk_log_sink() is None
+
+    def test_runner_resets_sink_on_verification_failure(self, storage):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=False),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert get_walk_log_sink() is None
+
+    def test_runner_resets_sink_on_cancellation(self, storage):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        runner.cancel_walks(self.BOOK)
+        result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "cancelled"
+        assert get_walk_log_sink() is None
+
+    def test_sink_open_failure_does_not_alter_db_result(self, storage):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+
+        class _FailingService(_FakeLogService):
+            def open_run(self, run_id, book_id, walk_name, started_ms=None):
+                raise OSError("no space left on device")
+
+        runner = WalkRunner(storage, log_service=_FailingService())
+        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        # Sink failure must not change the DB outcome (row = truth).
+        assert result["status"] == "completed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+        assert get_walk_log_sink() is None
+
+    def test_concurrent_runs_do_not_leak_sinks(self, storage):
+        from app.pipeline.walks._llm_helpers import get_walk_log_sink
+
+        # Each thread gets its OWN adapter (one sqlite3 connection each) so the
+        # two threads never share a single connection concurrently. The test's
+        # intent is ContextVar isolation under concurrency, not adapter
+        # thread-safety — the shared `storage` fixture must NOT be used here.
+        storage_a = InMemorySQLiteAdapter()
+        storage_a.init_db()
+        storage_b = InMemorySQLiteAdapter()
+        storage_b.init_db()
+        run_id_a = str(uuid.uuid4())
+        run_id_b = str(uuid.uuid4())
+        book_a = "aaaaaaaa-1111-1111-1111-111111111111"
+        book_b = "bbbbbbbb-1111-1111-1111-111111111111"
+        _insert_pending_row(storage_a, run_id_a, book_a, self.WALK)
+        _insert_pending_row(storage_b, run_id_b, book_b, self.WALK)
+        service_a = _FakeLogService()
+        service_b = _FakeLogService()
+        runner_a = WalkRunner(storage_a, log_service=service_a)
+        runner_b = WalkRunner(storage_b, log_service=service_b)
+        captured_a = {}
+        captured_b = {}
+
+        def execute_a(book_id, hbs, config):
+            captured_a["sink"] = get_walk_log_sink()
+            return {"status": "completed"}
+
+        def execute_b(book_id, hbs, config):
+            captured_b["sink"] = get_walk_log_sink()
+            return {"status": "completed"}
+
+        mock_a = _make_mock_walk_module(execute_a)
+        mock_b = _make_mock_walk_module(execute_b)
+        # Per-instance method shadowing (thread-safe; no shared class attribute is
+        # mutated, so the two threads cannot cross-contaminate each other's sinks
+        # or race the patch exit-stack restore).
+        runner_a._load_walk_module = lambda walk_name: mock_a
+        runner_a._run_verification = lambda walk_name, book_id: True
+        runner_b._load_walk_module = lambda walk_name: mock_b
+        runner_b._run_verification = lambda walk_name, book_id: True
+        results = {}
+
+        def target(runner, rid, book):
+            results[rid] = runner.run_walk_reserved(rid, self.WALK, book, {})
+
+        t1 = threading.Thread(target=target, args=(runner_a, run_id_a, book_a))
+        t2 = threading.Thread(target=target, args=(runner_b, run_id_b, book_b))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert captured_a["sink"] is service_a.sinks.get(run_id_a)
+        assert captured_b["sink"] is service_b.sinks.get(run_id_b)
+        assert results[run_id_a]["status"] == "completed"
+        assert results[run_id_b]["status"] == "completed"
+        assert get_walk_log_sink() is None
+
+
+# ---------------------------------------------------------------------------
+# P1-S7 — static/import audit + representative instrumented execution
+# ---------------------------------------------------------------------------
+
+
+class TestWalkModuleStaticAudit:
+    """Static/import audit: the nine ``walk_2*.py`` modules remain
+    byte-identical to git HEAD (no edits) and never import the Part B seam
+    (implementation imports forbidden). The final representative-execution test
+    drives a helper-instrumented walk through the reserved runner seam and
+    asserts the run's sink receives both ``llm`` and ``parse`` records."""
+
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+    _WALK_DIR = _REPO_ROOT / "app/pipeline/walks"
+    #: The shared seam symbols a walk module must never import (implementation
+    #: imports). Walk modules may legitimately import chat_completion /
+    #: extract_json_from_llm_response from _llm_helpers, but never the sink
+    #: ContextVar or the log service.
+    FORBIDDEN_IMPORTS = (
+        "WALK_LOG_SINK",
+        "get_walk_log_sink",
+        "WalkLogService",
+        "WalkLogSink",
+        "log_service",
+    )
+
+    def _walk_files(self):
+        return sorted(self._WALK_DIR.glob("walk_2*.py"))
+
+    def test_walk_modules_byte_identical_to_git_head(self):
+        import subprocess
+
+        for path in self._walk_files():
+            rel = path.relative_to(self._REPO_ROOT)
+            proc = subprocess.run(
+                ["git", "show", f"HEAD:{rel.as_posix()}"],
+                capture_output=True,
+                check=False,
+                cwd=self._REPO_ROOT,
+            )
+            assert proc.returncode == 0, f"{rel} not tracked in git HEAD"
+            assert path.read_bytes() == proc.stdout, (
+                f"{rel} modified from git HEAD — the nine walk modules must remain "
+                "byte-identical"
+            )
+
+    def test_walk_modules_have_no_implementation_imports(self):
+        for path in self._walk_files():
+            source = path.read_text(encoding="utf-8")
+            for sym in self.FORBIDDEN_IMPORTS:
+                assert sym not in source, (
+                    f"{path.name} references {sym} — walk modules must not import "
+                    "the log-streaming seam"
+                )
+
+    def test_representative_instrumented_walk_through_runner_seam(self, storage):
+        """Drive a helper-instrumented walk through the reserved runner seam.
+
+        The walk's ``execute`` calls ``chat_completion`` then
+        ``extract_json_from_llm_response``; with a sink attached by the runner
+        (via the ContextVar), both helper seams must emit ``llm`` and ``parse``
+        records on the run's sink."""
+        from app.pipeline.walks._llm_helpers import (
+            chat_completion,
+            extract_json_from_llm_response,
+        )
+
+        run_id = str(uuid.uuid4())
+        book_id = "11111111-2222-3333-4444-555555555555"
+        walk_name = "walk_2a_scene_segmentation"
+        _insert_pending_row(storage, run_id, book_id, walk_name)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        usage = types.SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3)
+        response = _FakeResponse("gpt-4o", _FakeChoice('{"a": 1}', "stop"), usage)
+        client = _FakeClient(response)
+
+        def execute_fn(book_id, hbs, config):
+            text = chat_completion(client, "gpt-4o", 0.1, "low", "sys", "usr")
+            parsed = extract_json_from_llm_response(text, expected_type="dict")
+            assert parsed == {"a": 1}
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk_reserved(run_id, walk_name, book_id, {})
+        sink = service.sinks.get(run_id)
+        assert sink is not None
+        events = [r["event"] for r in sink.records]
+        assert "llm" in events
+        assert "parse" in events

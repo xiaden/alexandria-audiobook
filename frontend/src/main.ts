@@ -1,6 +1,6 @@
 /**
  * Alexandria Audiobook — Main entry point
- * Imports all tab modules and initializes them on DOMContentLoaded.
+ * Imports all tab modules and initializes them at module scope.
  */
 
 // Import shared modules to ensure they're included in the build
@@ -86,20 +86,31 @@ import { initProjects } from './tabs/projects';
 import { initWorkbench } from './tabs/workbench';
 import { initPromptConfig } from './tabs/prompt-config';
 
-// Initialize all tabs after DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
-    initState();
-    initTheme();
-    initSetup();
-    initScript();
-    initVoices();
-    initDesigner();
-    initPreparer();
-    initDatasetBuilder();
-    initTraining();
-    initEditor();
-    initProjects();
-    initWorkbench();
-    initPromptConfig();
-    initTabNavigation();
-});
+// Initialize all tabs at MODULE SCOPE, not inside a DOMContentLoaded handler.
+//
+// This entry script is a module (`<script type="module">`), so it executes
+// after the HTML is parsed but BEFORE DOMContentLoaded fires. Each tab init
+// registers its OWN `document.addEventListener('DOMContentLoaded', ...)`
+// listener; calling the inits here registers those listeners in time for the
+// event, so every tab's wiring runs normally.
+//
+// Previously these calls were wrapped in a DOMContentLoaded handler, which
+// made the inits run DURING dispatch — their nested listeners were therefore
+// registered mid-dispatch and per the DOM spec are never invoked for the
+// current event. The result: initScript()'s reveal of #pipeline-section never
+// ran, so the Script tab showed only its static (and since the old pipeline
+// was deleted, empty) "Generation Logs" card.
+initState();
+initTheme();
+initSetup();
+initScript();
+initVoices();
+initDesigner();
+initPreparer();
+initDatasetBuilder();
+initTraining();
+initEditor();
+initProjects();
+initWorkbench();
+initPromptConfig();
+initTabNavigation();
