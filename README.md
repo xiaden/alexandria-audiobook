@@ -55,7 +55,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ## Requirements
 
-- [Pinokio](https://pinokio.computer/)
+- Docker with Compose, or a local Python environment
 - LLM server (one of the following):
   - [LM Studio](https://lmstudio.ai/) (local) - recommended: Qwen3 or similar
   - [Ollama](https://ollama.ai/) (local)
@@ -82,35 +82,42 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 > **Documentation:** For in-depth guidance on voice types, LoRA training, batch generation, and more, see the [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki).
 
-## Installation
+## Running Alexandria
 
-### Option A: Pinokio (Recommended)
+This fork is currently intended to run locally or in Docker. The legacy
+Pinokio and Google Colab workflows are not maintained deployment paths for this
+repository.
 
-1. Install [Pinokio](https://pinokio.computer/) if you haven't already
-2. Open Alexandria on Pinokio: **[Install via Pinokio](https://beta.pinokio.co/apps/github-com-finrandojin-alexandria-audiobook)**
-   - Or manually: in Pinokio, click **Download** and paste `https://github.com/Finrandojin/alexandria-audiobook`
-3. Click **Install** to set up dependencies
-4. Click **Start** to launch the web interface
+### Docker Compose (recommended)
 
-### Option B: Google Colab (No Install Required)
-
-No GPU or wrong OS? Run Alexandria on a free T4 GPU in your browser:
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Finrandojin/alexandria-audiobook/blob/main/alexandria_colab.ipynb)
-
-Requires a free [ngrok account](https://dashboard.ngrok.com/signup) for the web UI tunnel. See the notebook for full instructions.
-
-### Option C: Docker (NVIDIA GPU)
-
-For integration into automated pipelines or server deployments:
+For NVIDIA GPU deployments:
 
 ```bash
-git clone https://github.com/Finrandojin/alexandria-audiobook.git
+git clone https://github.com/xiaden/alexandria-audiobook.git
 cd alexandria-audiobook
 docker compose up --build
 ```
 
-Requires [Docker](https://docs.docker.com/get-docker/) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). The web UI is available at `http://localhost:4200`. TTS models download on first use and are cached in a Docker volume. User data (uploads, voice configs, trained LoRA adapters, audio output) persists via bind mounts to the project directory.
+This requires [Docker](https://docs.docker.com/get-docker/) with the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+The web UI is available at `http://localhost:4200`. TTS models download on
+first use and are cached in a Docker volume. User data (uploads, voice
+configs, trained LoRA adapters, and audio output) persists through the mounted
+project directories.
+
+### Local development
+
+```bash
+git clone https://github.com/xiaden/alexandria-audiobook.git
+cd alexandria-audiobook
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r app/requirements.txt
+pip install qwen-tts==0.1.1
+python app/app.py
+```
+
+The web UI is available at `http://localhost:4200`.
 
 ## First Launch — What to Expect
 
@@ -126,7 +133,8 @@ Alexandria does **not** include an LLM — it connects to one over an API. Befor
 | [Ollama](https://ollama.ai/) | `http://localhost:11434/v1` | `ollama run qwen3` |
 | [OpenAI API](https://platform.openai.com/) | `https://api.openai.com/v1` | Get an API key |
 
-If the LLM server isn't running when you start the annotation walks, the generation will fail. Check the Pinokio terminal for error details.
+If the LLM server isn't running when you start the annotation walks, the
+generation will fail. Check the application terminal for error details.
 
 ### 2. First TTS Generation Downloads ~3.5 GB
 
@@ -134,7 +142,7 @@ The TTS models are **not** included in the install. They download automatically 
 
 - **Each model variant is ~3.5 GB** (CustomVoice, Base/Clone, VoiceDesign)
 - Only the variant you use gets downloaded (most users start with CustomVoice)
-- Downloads happen in the background — **check the Pinokio terminal** for progress
+- Downloads happen in the background — check the application terminal for progress
 - The web UI may appear frozen during this time. It is not — it's waiting for the download to finish
 - After the first download, models are cached locally and load in seconds
 
@@ -162,9 +170,10 @@ The very first batch generation in a session takes longer than subsequent ones:
 
 ### 5. Where to Look When Something Goes Wrong
 
-The web UI shows high-level status, but **detailed logs are in the Pinokio terminal**:
+The web UI shows high-level status, but detailed logs are in the application
+terminal:
 
-- Click **Terminal** in the Pinokio sidebar to see real-time output
+- Check the terminal where `python app/app.py` or `docker compose up` is running
 - Model loading, download progress, VRAM estimates, and errors all appear here
 - If generation fails silently in the UI, the terminal will show why
 
