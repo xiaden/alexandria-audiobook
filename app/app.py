@@ -1708,19 +1708,26 @@ async def preparer_start(
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Invalid config: {e}")
 
-    has_space, free_gb = check_disk_space(ROOT_DIR, 2.0)
-    if not has_space:
-        raise HTTPException(status_code=400, detail=f"Insufficient disk space ({free_gb} GB free, 2 GB required).")
+    if not _claim_process("preparer"):
+        raise HTTPException(status_code=400, detail="Preparer is already running.")
+    process_state["preparer"]["cancel"] = False
 
-    audio_path = os.path.join(UPLOADS_DIR, config.audio_filename)
-    async with aiofiles.open(audio_path, "wb") as f:
-        while chunk := await audio_file.read(1024 * 1024):
-            await f.write(chunk)
+    try:
+        has_space, free_gb = check_disk_space(ROOT_DIR, 2.0)
+        if not has_space:
+            raise HTTPException(status_code=400, detail=f"Insufficient disk space ({free_gb} GB free, 2 GB required).")
+
+        audio_path = os.path.join(UPLOADS_DIR, config.audio_filename)
+        async with aiofiles.open(audio_path, "wb") as f:
+            while chunk := await audio_file.read(1024 * 1024):
+                await f.write(chunk)
+    except Exception:
+        process_state["preparer"]["running"] = False
+        raise
 
     def _run():
         state = process_state["preparer"]
         state["logs"] = []
-        state["cancel"] = False
         state["status"] = "running"
         state["output_file"] = None
         state["process"] = None
@@ -1732,24 +1739,27 @@ async def preparer_start(
                "--min-confidence", str(config.min_confidence),
                "--min-snr", str(config.min_snr)]
 
-        rc = _stream_subprocess_to_logs(cmd, BASE_DIR, state)
+        try:
+            rc = _stream_subprocess_to_logs(cmd, BASE_DIR, state)
 
-        if state.get("cancel"):
-            state["status"] = "cancelled"
-            state["logs"].append("Preparer cancelled.")
-        elif rc == 0:
-            state["status"] = "done"
-            state["output_file"] = config.output_filename
-            state["logs"].append("Preparer completed successfully.")
-        else:
+            if state.get("cancel"):
+                state["status"] = "cancelled"
+                state["logs"].append("Preparer cancelled.")
+            elif rc == 0:
+                state["status"] = "done"
+                state["output_file"] = config.output_filename
+                state["logs"].append("Preparer completed successfully.")
+            else:
+                state["status"] = "failed"
+                state["logs"].append(f"Preparer failed (exit code {rc}).")
+        except Exception as e:
             state["status"] = "failed"
-            state["logs"].append(f"Preparer failed (exit code {rc}).")
+            state["logs"].append(f"Preparer failed: {e}")
+            logger.exception("Preparer failed")
+        finally:
+            state["running"] = False
+            state["process"] = None
 
-        state["running"] = False
-        state["process"] = None
-
-    if not _claim_process("preparer"):
-        raise HTTPException(status_code=400, detail="Preparer is already running.")
     background_tasks.add_task(_run)
     return {"status": "started"}
 
@@ -1813,51 +1823,55 @@ async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: 
 
     def _run():
         state = process_state["batch_preparer"]
-        state["cancel"] = False
         state["logs"] = [f"Starting batch of {len(request.tasks)} tasks..."]
         state["tasks"] = [{"audio": t.audio_filename, "status": "pending"} for t in request.tasks]
         state["current_task_idx"] = -1
 
-        for i, task in enumerate(request.tasks):
-            if state["cancel"]:
-                state["logs"].append("Batch cancelled.")
-                break
+        try:
+            for i, task in enumerate(request.tasks):
+                if state["cancel"]:
+                    state["logs"].append("Batch cancelled.")
+                    break
 
-            state["current_task_idx"] = i
-            state["tasks"][i]["status"] = "running"
+                state["current_task_idx"] = i
+                state["tasks"][i]["status"] = "running"
 
-            audio_path = os.path.join(UPLOADS_DIR, task.audio_filename)
-            if not os.path.exists(audio_path):
-                state["logs"].append(f"[{i+1}/{len(request.tasks)}] Skipping — audio not found: {task.audio_filename}")
-                state["tasks"][i]["status"] = "failed"
-                continue
+                audio_path = os.path.join(UPLOADS_DIR, task.audio_filename)
+                if not os.path.exists(audio_path):
+                    state["logs"].append(f"[{i+1}/{len(request.tasks)}] Skipping — audio not found: {task.audio_filename}")
+                    state["tasks"][i]["status"] = "failed"
+                    continue
 
-            state["logs"].append(f"--- [{i+1}/{len(request.tasks)}] {task.audio_filename} ---")
+                state["logs"].append(f"--- [{i+1}/{len(request.tasks)}] {task.audio_filename} ---")
 
-            cmd = [sys.executable, "-u", PREPARER_SCRIPT_PATH,
-                   "--audio", audio_path,
-                   "--output", os.path.join(PREPARER_OUTPUT_DIR, task.output_filename),
-                   "--lang", request.lang,
-                   "--min-confidence", str(request.min_confidence),
-                   "--min-snr", str(request.min_snr)]
+                cmd = [sys.executable, "-u", PREPARER_SCRIPT_PATH,
+                       "--audio", audio_path,
+                       "--output", os.path.join(PREPARER_OUTPUT_DIR, task.output_filename),
+                       "--lang", request.lang,
+                       "--min-confidence", str(request.min_confidence),
+                       "--min-snr", str(request.min_snr)]
 
-            rc = _stream_subprocess_to_logs(cmd, BASE_DIR, state, log_prefix=f"[{i+1}] ")
+                rc = _stream_subprocess_to_logs(cmd, BASE_DIR, state, log_prefix=f"[{i+1}] ")
 
-            if state.get("cancel"):
-                state["tasks"][i]["status"] = "cancelled"
-                break
-            elif rc == 0:
-                state["tasks"][i]["status"] = "done"
-                state["logs"].append(f"[{i+1}] Done: {task.audio_filename}")
-            else:
-                state["tasks"][i]["status"] = "failed"
-                state["logs"].append(f"[{i+1}] Failed (exit {rc}): {task.audio_filename}")
-
-        state["running"] = False
-        state["logs"].append("Batch processing finished.")
+                if state.get("cancel"):
+                    state["tasks"][i]["status"] = "cancelled"
+                    break
+                elif rc == 0:
+                    state["tasks"][i]["status"] = "done"
+                    state["logs"].append(f"[{i+1}] Done: {task.audio_filename}")
+                else:
+                    state["tasks"][i]["status"] = "failed"
+                    state["logs"].append(f"[{i+1}] Failed (exit {rc}): {task.audio_filename}")
+        except Exception as e:
+            state["logs"].append(f"Batch preparer failed: {e}")
+            logger.exception("Batch preparer failed")
+        finally:
+            state["running"] = False
+            state["logs"].append("Batch processing finished.")
 
     if not _claim_process("batch_preparer"):
         raise HTTPException(status_code=400, detail="Batch preparer is already running.")
+    process_state["batch_preparer"]["cancel"] = False
     background_tasks.add_task(_run)
     return {"status": "started", "task_count": len(request.tasks)}
 
