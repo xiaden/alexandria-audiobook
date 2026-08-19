@@ -192,7 +192,7 @@ export function renderAliasLedger(wb: WorkbenchState | null): string {
   const rows = active.map((a) => (
     `<li class="list-group-item d-flex justify-content-between align-items-center">` +
     `<span>${escapeHtml(a.member_name)} → <strong>${escapeHtml(a.canonical_name)}</strong></span>` +
-    `<button type="button" class="btn btn-sm btn-outline-secondary" data-action="alias-unmerge" data-merge-id="${escapeHtml(a.merge_id)}" data-decision-label="${escapeHtml(a.member_name)} → ${escapeHtml(a.canonical_name)}">Unmerge</button>` +
+    `<button type="button" class="btn btn-sm btn-outline-secondary" data-action="alias-unmerge" data-decision-id="${escapeHtml(a.decision_id)}" data-decision-label="${escapeHtml(a.member_name)} → ${escapeHtml(a.canonical_name)}">Unmerge</button>` +
     `</li>`
   ));
   return `<ul class="list-group">${rows.join('')}</ul>`;
@@ -642,15 +642,15 @@ export async function undoDecision(decisionId: string): Promise<void> {
   }
 }
 
-/** Unmerge an alias member (delegates to the undo route for alias-merge decisions). */
-export async function unmergeAlias(mergeId: string): Promise<void> {
+/** Unmerge an alias member via its owning alias-merge decision. */
+export async function unmergeAlias(decisionId: string): Promise<void> {
   const bookId = requireBookId();
   const wb = state.workbench;
   if (!wb) return;
   const ok = await showConfirm('Unmerge this alias? This reverses the alias conversion.');
   if (!ok) return;
   try {
-    const res = await API.post<{ decision_id?: string }>(`/api/pipeline/workbench/${bookId}/decisions/${encodeURIComponent(mergeId)}/undo`, {
+    const res = await API.post<{ decision_id?: string }>(`/api/pipeline/workbench/${bookId}/decisions/${encodeURIComponent(decisionId)}/undo`, {
       base_revision: wb.generation_revision,
     });
     showToast('Alias unmerged', 'success');
@@ -809,8 +809,8 @@ export function initWorkbench(): void {
           const ok = await showConfirm(_aliasPreview.summary + ' — apply this alias conversion?');
           if (ok) await commitAliasConversion(true);
         } else if (action === 'alias-unmerge') {
-          const mergeId = btn.getAttribute('data-merge-id');
-          if (mergeId) await unmergeAlias(mergeId);
+          const decisionId = btn.getAttribute('data-decision-id');
+          if (decisionId) await unmergeAlias(decisionId);
         }
       });
     }

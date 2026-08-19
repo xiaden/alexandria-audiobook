@@ -34,6 +34,7 @@ def _seed(storage) -> None:
     c.execute("INSERT INTO book (id, series_id, book_number, version, position)"
               " VALUES ('b1', 's1', 1, 0, 0)")
     c.execute("INSERT INTO character (id, name, aliases) VALUES ('c1', 'Alice', '[]')")
+    c.execute("INSERT INTO character (id, name, aliases) VALUES ('canon', 'Canon', '[]')")
     c.execute("INSERT INTO scene (id) VALUES ('sc1')")
     c.execute("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
     c.execute("INSERT INTO paragraph (id) VALUES ('p1')")
@@ -244,3 +245,29 @@ def test_undo_terminal_decision_409(client):
         "/api/pipeline/workbench/b1/decisions/dec-1/undo", json={"base_revision": 2}
     )
     assert second.status_code == 409
+
+
+def test_alias_unmerge_uses_merge_decision_id(client):
+    workbench = client.app.dependency_overrides[_rv_workbench]()
+    preview = workbench.preview_alias_conversion(
+        book_id="b1", canonical_id="canon", member_ids=["c1"], base_revision=1,
+    )
+    commit = workbench.commit_alias_conversion(
+        book_id="b1", preview_token=preview["preview_token"],
+        base_revision=1, confirm_consequences=True,
+    )
+    merge_id = commit["merge_ids"][0]
+    decision_id = commit["decision_id"]
+
+    wrong_id = client.post(
+        f"/api/pipeline/workbench/b1/decisions/{merge_id}/undo",
+        json={"base_revision": 2},
+    )
+    assert wrong_id.status_code == 404
+
+    response = client.post(
+        f"/api/pipeline/workbench/b1/decisions/{decision_id}/undo",
+        json={"base_revision": 2},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "undone"

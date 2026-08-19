@@ -710,7 +710,7 @@ def _build_scene_hierarchy(storage: PipelineStorage, book_id: str) -> list[dict]
 def _build_aliases(storage: PipelineStorage, book_id: str) -> list[dict]:
     """Active alias merges for *book_id* (projected with canonical/member names)."""
     rows = storage.execute_query(
-        """SELECT m.merge_id, m.canonical_id, m.member_id, m.status,
+        """SELECT m.merge_id, m.decision_id, m.canonical_id, m.member_id, m.status,
                   m.merge_revision, m.created_ms,
                   cc.name AS canonical_name, mc.name AS member_name
            FROM character_alias_merge m

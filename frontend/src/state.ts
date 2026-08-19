@@ -275,6 +275,7 @@ export interface WorkbenchCharacter {
 /** An alias-merge row from the 2c alias resolution ledger. */
 export interface WorkbenchAliasMerge {
   merge_id: string;
+  decision_id: string;
   canonical_id: string;
   member_id: string;
   status: 'active' | string;
