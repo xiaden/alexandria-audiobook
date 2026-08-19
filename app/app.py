@@ -457,11 +457,21 @@ process_state = {
     "preparer": {"running": False, "logs": [], "cancel": False, "process": None, "status": "idle", "output_file": None},
     "batch_preparer": {"running": False, "logs": [], "cancel": False, "tasks": [], "current_task_idx": -1},
 }
+process_state_lock = threading.Lock()
+
+
+def _claim_process(task_name: str) -> bool:
+    """Atomically claim a process slot before scheduling its worker."""
+    with process_state_lock:
+        state = process_state[task_name]
+        if state["running"]:
+            return False
+        state["running"] = True
+        return True
 
 def run_process(command: List[str], task_name: str):
     """Run a subprocess and stream its output into process_state logs."""
     state = process_state[task_name]
-    state["running"] = True
     state["logs"] = []
 
     logger.info(f"Starting task {task_name}: {' '.join(command)}")
@@ -912,9 +922,6 @@ async def lora_generate_dataset(request: LoraGenerateDatasetRequest, background_
     Generates multiple audio samples with the same voice description,
     saving them as a ready-to-train dataset.
     """
-    if process_state["dataset_gen"]["running"]:
-        raise HTTPException(status_code=400, detail="Dataset generation already running")
-
     # Build unified sample list from either format
     sample_list = []
     if request.samples:
@@ -941,7 +948,6 @@ async def lora_generate_dataset(request: LoraGenerateDatasetRequest, background_
     root_description = request.description.strip()
 
     def task():
-        process_state["dataset_gen"]["running"] = True
         process_state["dataset_gen"]["logs"] = [
             f"Generating {total} samples with VoiceDesign..."
         ]
@@ -1012,6 +1018,8 @@ async def lora_generate_dataset(request: LoraGenerateDatasetRequest, background_
         finally:
             process_state["dataset_gen"]["running"] = False
 
+    if not _claim_process("dataset_gen"):
+        raise HTTPException(status_code=400, detail="Dataset generation already running")
     background_tasks.add_task(task)
     return {"status": "started", "dataset_id": safe_name, "total": total}
 
@@ -1050,9 +1058,6 @@ async def lora_delete_dataset(dataset_id: str):
 @app.post("/api/lora/train")
 async def lora_start_training(request: LoraTrainingRequest, background_tasks: BackgroundTasks):
     """Start LoRA training as a subprocess."""
-    if process_state["lora_training"]["running"]:
-        raise HTTPException(status_code=400, detail="LoRA training already running")
-
     # Validate dataset exists
     dataset_dir = os.path.join(LORA_DATASETS_DIR, request.dataset_id)
     if not os.path.isdir(dataset_dir):
@@ -1065,11 +1070,6 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
 
     adapter_id = f"{safe_name}_{int(time.time())}"
     output_dir = os.path.join(LORA_MODELS_DIR, adapter_id)
-
-    # Unload TTS engine to free GPU
-    reset_tts_engine()
-    from utils import clear_gpu_cache
-    clear_gpu_cache()
 
     # Build subprocess command
     command = [
@@ -1084,6 +1084,18 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
         "--gradient_accumulation_steps", str(request.gradient_accumulation_steps),
         "--language", request.language,
     ]
+
+    if not _claim_process("lora_training"):
+        raise HTTPException(status_code=400, detail="LoRA training already running")
+
+    # Unload TTS engine to free GPU only after claiming the training slot.
+    try:
+        reset_tts_engine()
+        from utils import clear_gpu_cache
+        clear_gpu_cache()
+    except Exception:
+        process_state["lora_training"]["running"] = False
+        raise
 
     def on_training_complete():
         """After training subprocess finishes, update manifest if adapter was saved."""
@@ -1463,9 +1475,6 @@ async def dataset_builder_generate_sample(request: DatasetSampleGenRequest):
 @app.post("/api/dataset_builder/generate_batch")
 async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
     """Batch generate dataset samples as a background task."""
-    if process_state["dataset_builder"]["running"]:
-        raise HTTPException(status_code=400, detail="Dataset generation already running")
-
     if not request.samples or len(request.samples) == 0:
         raise HTTPException(status_code=400, detail="No samples provided")
 
@@ -1491,80 +1500,85 @@ async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
     per_seeds = request.seeds
 
     def task():
-        process_state["dataset_builder"]["running"] = True
         process_state["dataset_builder"]["logs"] = []
-        process_state["dataset_builder"]["cancel"] = False
 
-        engine = get_tts_engine()
-        if not engine:
-            process_state["dataset_builder"]["logs"].append("[ERROR] Failed to initialize TTS engine")
-            process_state["dataset_builder"]["running"] = False
-            return
+        try:
+            engine = get_tts_engine()
+            if not engine:
+                process_state["dataset_builder"]["logs"].append("[ERROR] Failed to initialize TTS engine")
+                return
 
-        state = _load_builder_state(safe_name)
-        samples_state = state.get("samples", [])
-        # Ensure list is large enough for all samples
-        while len(samples_state) < len(samples_snapshot):
-            samples_state.append({"status": "pending"})
+            state = _load_builder_state(safe_name)
+            samples_state = state.get("samples", [])
+            # Ensure list is large enough for all samples
+            while len(samples_state) < len(samples_snapshot):
+                samples_state.append({"status": "pending"})
 
-        completed = 0
-        for i, idx in enumerate(to_generate):
-            if process_state["dataset_builder"]["cancel"]:
-                process_state["dataset_builder"]["logs"].append(f"[CANCEL] Stopped at {completed}/{total}")
-                break
+            completed = 0
+            for i, idx in enumerate(to_generate):
+                if process_state["dataset_builder"]["cancel"]:
+                    process_state["dataset_builder"]["logs"].append(f"[CANCEL] Stopped at {completed}/{total}")
+                    break
 
-            emotion, text = samples_snapshot[idx]
-            description = f"{root_desc}, {emotion}" if emotion else root_desc
+                emotion, text = samples_snapshot[idx]
+                description = f"{root_desc}, {emotion}" if emotion else root_desc
 
-            # Mark as generating (preserve existing fields like emotion, seed)
-            existing_s = samples_state[idx] if idx < len(samples_state) else {}
-            samples_state[idx] = {**existing_s, "status": "generating", "text": text, "emotion": emotion, "description": description}
-            state["samples"] = samples_state
-            _save_builder_state(safe_name, state)
+                # Mark as generating (preserve existing fields like emotion, seed)
+                existing_s = samples_state[idx] if idx < len(samples_state) else {}
+                samples_state[idx] = {**existing_s, "status": "generating", "text": text, "emotion": emotion, "description": description}
+                state["samples"] = samples_state
+                _save_builder_state(safe_name, state)
+
+                process_state["dataset_builder"]["logs"].append(
+                    f"[{i+1}/{total}] {('[' + emotion + '] ' if emotion else '')}\"{text[:60]}{'...' if len(text) > 60 else ''}\""
+                )
+
+                try:
+                    # Resolve seed: per-line > global > random
+                    seed = -1
+                    if per_seeds and idx < len(per_seeds) and per_seeds[idx] >= 0:
+                        seed = per_seeds[idx]
+                    elif global_seed >= 0:
+                        seed = global_seed
+
+                    wav_path, sr = engine.generate_voice_design(
+                        description=description,
+                        sample_text=text,
+                        seed=seed,
+                    )
+                    dest_filename = f"sample_{idx:03d}.wav"
+                    dest_path = os.path.join(work_dir, dest_filename)
+                    shutil.copy2(wav_path, dest_path)
+
+                    samples_state[idx] = {
+                        **samples_state[idx],
+                        "status": "done",
+                        "audio_url": f"/dataset_builder/{safe_name}/{dest_filename}?t={int(time.time())}",
+                        "text": text,
+                        "emotion": emotion,
+                        "description": description,
+                    }
+                    completed += 1
+                except Exception as e:
+                    logger.error(f"Dataset builder sample {idx} failed: {e}")
+                    process_state["dataset_builder"]["logs"].append(f"  Error: {e}")
+                    samples_state[idx] = {**samples_state[idx], "status": "error", "error": str(e), "text": text, "emotion": emotion}
+
+                state["samples"] = samples_state
+                _save_builder_state(safe_name, state)
 
             process_state["dataset_builder"]["logs"].append(
-                f"[{i+1}/{total}] {('[' + emotion + '] ' if emotion else '')}\"{text[:60]}{'...' if len(text) > 60 else ''}\""
+                f"[DONE] Generated {completed}/{total} samples"
             )
+        except Exception as e:
+            logger.exception("Dataset builder batch failed")
+            process_state["dataset_builder"]["logs"].append(f"[ERROR] Batch generation failed: {e}")
+        finally:
+            process_state["dataset_builder"]["running"] = False
 
-            try:
-                # Resolve seed: per-line > global > random
-                seed = -1
-                if per_seeds and idx < len(per_seeds) and per_seeds[idx] >= 0:
-                    seed = per_seeds[idx]
-                elif global_seed >= 0:
-                    seed = global_seed
-
-                wav_path, sr = engine.generate_voice_design(
-                    description=description,
-                    sample_text=text,
-                    seed=seed,
-                )
-                dest_filename = f"sample_{idx:03d}.wav"
-                dest_path = os.path.join(work_dir, dest_filename)
-                shutil.copy2(wav_path, dest_path)
-
-                samples_state[idx] = {
-                    **samples_state[idx],
-                    "status": "done",
-                    "audio_url": f"/dataset_builder/{safe_name}/{dest_filename}?t={int(time.time())}",
-                    "text": text,
-                    "emotion": emotion,
-                    "description": description,
-                }
-                completed += 1
-            except Exception as e:
-                logger.error(f"Dataset builder sample {idx} failed: {e}")
-                process_state["dataset_builder"]["logs"].append(f"  Error: {e}")
-                samples_state[idx] = {**samples_state[idx], "status": "error", "error": str(e), "text": text, "emotion": emotion}
-
-            state["samples"] = samples_state
-            _save_builder_state(safe_name, state)
-
-        process_state["dataset_builder"]["logs"].append(
-            f"[DONE] Generated {completed}/{total} samples"
-        )
-        process_state["dataset_builder"]["running"] = False
-
+    if not _claim_process("dataset_builder"):
+        raise HTTPException(status_code=400, detail="Dataset generation already running")
+    process_state["dataset_builder"]["cancel"] = False
     threading.Thread(target=task, daemon=True).start()
     return {"status": "started", "dataset_name": safe_name, "total": total}
 
@@ -1689,9 +1703,6 @@ async def preparer_start(
             status_code=503,
             detail="Preparer script not installed. Add app/alexandria_preparer.py to enable this feature.",
         )
-    if process_state["preparer"]["running"]:
-        raise HTTPException(status_code=400, detail="Preparer is already running.")
-
     try:
         config = PreparerConfig(**json.loads(config_json))
     except Exception as e:
@@ -1708,7 +1719,6 @@ async def preparer_start(
 
     def _run():
         state = process_state["preparer"]
-        state["running"] = True
         state["logs"] = []
         state["cancel"] = False
         state["status"] = "running"
@@ -1738,6 +1748,8 @@ async def preparer_start(
         state["running"] = False
         state["process"] = None
 
+    if not _claim_process("preparer"):
+        raise HTTPException(status_code=400, detail="Preparer is already running.")
     background_tasks.add_task(_run)
     return {"status": "started"}
 
@@ -1795,16 +1807,12 @@ async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: 
             status_code=503,
             detail="Preparer script not installed. Add app/alexandria_preparer.py to enable this feature.",
         )
-    if process_state["batch_preparer"]["running"]:
-        raise HTTPException(status_code=400, detail="Batch preparer is already running.")
-
     has_space, free_gb = check_disk_space(ROOT_DIR, 5.0)
     if not has_space:
         raise HTTPException(status_code=400, detail=f"Insufficient disk space ({free_gb} GB free, 5 GB recommended).")
 
     def _run():
         state = process_state["batch_preparer"]
-        state["running"] = True
         state["cancel"] = False
         state["logs"] = [f"Starting batch of {len(request.tasks)} tasks..."]
         state["tasks"] = [{"audio": t.audio_filename, "status": "pending"} for t in request.tasks]
@@ -1848,6 +1856,8 @@ async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: 
         state["running"] = False
         state["logs"].append("Batch processing finished.")
 
+    if not _claim_process("batch_preparer"):
+        raise HTTPException(status_code=400, detail="Batch preparer is already running.")
     background_tasks.add_task(_run)
     return {"status": "started", "task_count": len(request.tasks)}
 
