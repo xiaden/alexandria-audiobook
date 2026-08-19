@@ -134,6 +134,28 @@ class TestDownloadRender:
         assert resp.headers["content-disposition"] == 'attachment; filename="audiobook.m4b"'
         assert resp.content == b"FAKE-M4B-CONTENT"
 
+    def test_present_wav_artifact_returns_200_audio_wav(self, client, storage, tmp_path):
+        """A recorded paused WAV is downloaded with its native type and name."""
+        output_dir = tmp_path / "out-wav"
+        output_dir.mkdir()
+        wav_path = output_dir / "audiobook-paused.wav"
+        wav_path.write_bytes(b"FAKE-WAV-CONTENT")
+
+        job_id = "job-wav-present"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir, "
+            "output_artifact_path) VALUES (?, 'b1', 'batch', 'completed', ?, ?)",
+            (job_id, str(output_dir), str(wav_path)),
+        )
+
+        resp = client.get(f"/api/pipeline/download/{job_id}")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/wav"
+        assert resp.headers["content-disposition"] == (
+            'attachment; filename="audiobook-paused.wav"'
+        )
+        assert resp.content == b"FAKE-WAV-CONTENT"
+
     def test_zip_fallback_when_no_m4b(self, client, storage, tmp_path):
         """A completed job row with audio chunks but no m4b yields audiobook.zip
         (application/zip) containing exactly the wav/mp3/m4a/flac files."""

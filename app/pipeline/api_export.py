@@ -1251,17 +1251,19 @@ async def download_render(
 
     artifact_path = row["output_artifact_path"]
 
-    # Serve the recorded artifact (the audiobook.m4b written by POST /merge)
+    # Serve the recorded artifact (which may be the canonical paused WAV or
+    # the merged M4B) with a response contract matching its extension.
     # through FileResponse404: it streams the file when present and sends a
     # JSON 404 when the file is missing — a completed row whose artifact
     # vanished must not degrade to a broken 200 (or an empty zip).  Rows
     # completed without an m4b record the output dir instead and fall
     # through to the zip fallback below.
     if artifact_path and not os.path.isdir(artifact_path):
+        artifact_name = os.path.basename(artifact_path)
         return FileResponse404(
             artifact_path,
-            media_type="audio/mp4",
-            filename="audiobook.m4b",
+            media_type=_media_type_for_artifact(artifact_path),
+            filename=artifact_name,
             detail="Audio file not found",
         )
 
