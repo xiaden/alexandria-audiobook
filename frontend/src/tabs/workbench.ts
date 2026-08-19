@@ -135,7 +135,7 @@ export function renderSceneNavigator(wb: WorkbenchState | null, selectedSceneId:
 
 /**
  * Render span evidence for the selected scene. Spans carry their immutable
- * `id` as data attributes so the anchor rendering is stable (never a
+ * `span_id` as data attributes so the anchor rendering is stable (never a
  * presentation index).
  */
 export function renderSpanEvidence(wb: WorkbenchState | null, sceneId: string | null): string {
@@ -153,7 +153,7 @@ export function renderSpanEvidence(wb: WorkbenchState | null, sceneId: string | 
       const instruct = span.instruct ? `<span class="text-muted small">— ${escapeHtml(span.instruct)}</span>` : '';
       return (
         `<span class="badge bg-light text-dark border me-1 mb-1 p-2 text-start"` +
-        ` data-span-id="${escapeHtml(span.id)}" data-paragraph-id="${escapeHtml(para.paragraph_id)}"` +
+        ` data-span-id="${escapeHtml(span.span_id)}" data-paragraph-id="${escapeHtml(para.paragraph_id)}"` +
         ` data-chapter-id="${escapeHtml(chapterId)}">${typeLabel}${escapeHtml(span.text)} ${instruct}</span>`
       );
     });

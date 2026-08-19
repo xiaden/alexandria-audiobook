@@ -131,6 +131,11 @@ def test_workbench_state_read_model(client):
     assert body["generation_revision"] == 1
     assert body["scenes"][0]["chapter_id"] == "ch1"
     assert body["scenes"][0]["scenes"][0]["scene_id"] == "sc1"
+    span = body["scenes"][0]["scenes"][0]["paragraphs"][0]["spans"][0]
+    assert span["span_id"] == "sp1"
+    assert span["span_position"] == 0
+    assert "id" not in span
+    assert "position" not in span
     assert body["presence"][0]["source"] == "walk"
     assert body["conflicts"] == []
     assert body["runs"] == []

@@ -253,13 +253,13 @@ export interface WorkbenchParagraph {
   spans: WorkbenchSpan[];
 }
 
-/** A span of evidence text. `id` is the durable identity; `position` display-only. */
+/** A span of evidence text. `span_id` is durable identity; `span_position` display-only. */
 export interface WorkbenchSpan {
-  id: string;
+  span_id: string;
   span_type: string;
   text: string;
   instruct: string;
-  position: number;
+  span_position: number;
 }
 
 /** A character from the workbench character ledger. */

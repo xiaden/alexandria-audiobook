@@ -110,8 +110,8 @@ const MOCK_WB: WorkbenchState = {
               paragraph_id: 'para-1',
               position: 1,
               spans: [
-                { id: 'span-1', span_type: 'narrator', text: 'Alice walked in.', instruct: '', position: 1 },
-                { id: 'span-2', span_type: 'dialogue', text: 'Hello, Bob said.', instruct: '', position: 2 },
+                { span_id: 'span-1', span_type: 'narrator', text: 'Alice walked in.', instruct: '', span_position: 1 },
+                { span_id: 'span-2', span_type: 'dialogue', text: 'Hello, Bob said.', instruct: '', span_position: 2 },
               ],
             },
           ],
@@ -124,7 +124,7 @@ const MOCK_WB: WorkbenchState = {
     { id: 'char-2', name: 'Bob', aliases: '[]', voice_assignment_id: null, description: null },
   ],
   aliases: [
-    { merge_id: 'merge-1', canonical_id: 'char-1', member_id: 'char-2', status: 'active', merge_revision: 40, created_ms: 1750000000000, canonical_name: 'Alice', member_name: 'Bobby' },
+    { merge_id: 'merge-1', decision_id: 'decision-merge-1', canonical_id: 'char-1', member_id: 'char-2', status: 'active', merge_revision: 40, created_ms: 1750000000000, canonical_name: 'Alice', member_name: 'Bobby' },
   ],
   presence: [
     { scene_id: 'scene-1', character_id: 'char-1', relation_type: 'present', source: 'generated', confidence: 0.95, human_override: false, revision: 41 },
@@ -227,7 +227,7 @@ describe('renderSpanEvidence', () => {
   it('escapes span text and returns empty when no scene selected', () => {
     const hostile: WorkbenchState = {
       ...MOCK_WB,
-      scenes: [{ chapter_id: 'ch-1', position: 1, scenes: [{ scene_id: 's', position: 1, paragraphs: [{ paragraph_id: 'p', position: 1, spans: [{ id: 'sp', span_type: 'x', text: '<script>evil</script>', instruct: '', position: 1 }] }] }] }],
+      scenes: [{ chapter_id: 'ch-1', position: 1, scenes: [{ scene_id: 's', position: 1, paragraphs: [{ paragraph_id: 'p', position: 1, spans: [{ span_id: 'sp', span_type: 'x', text: '<script>evil</script>', instruct: '', span_position: 1 }] }] }] }],
     };
     const html = renderSpanEvidence(hostile, 's');
     expect(html).not.toContain('<script>');
@@ -256,7 +256,7 @@ describe('renderAliasLedger', () => {
     expect(html).toContain('Bobby');
     expect(html).toContain('Alice');
     expect(html).toContain('data-action="alias-unmerge"');
-    expect(html).toContain('data-merge-id="merge-1"');
+    expect(html).toContain('data-decision-id="decision-merge-1"');
   });
 });
 
