@@ -1124,8 +1124,8 @@ function updateRenderProgress(status: RenderStatus): void {
       status.status === 'interrupted' ||
       status.status === 'expired'
     ) {
-       bar.style.width = '100%';
-       bar.innerText = status.status.charAt(0).toUpperCase() + status.status.slice(1);
+      bar.style.width = '100%';
+      bar.innerText = status.status.charAt(0).toUpperCase() + status.status.slice(1);
     } else {
       // running / pending — indeterminate animated striped bar
       bar.classList.add('progress-bar-animated');
