@@ -1014,8 +1014,10 @@ def render_audiobook(
                 pause_same_speaker_ms=pause_same_ms,
             )
             result = tts_engine.generate_batch(
-                chunks, voice_config, resolved_dir, batch_seed
+                chunks, voice_config, resolved_dir, batch_seed, cancel_check
             )
+            if result and result.get("cancelled"):
+                raise CancelledError("Render cancelled during batch dispatch")
             # Batch mode persists job-level rows only (no per-chunk rows), so
             # interpret the engine's report at job level.  A ``None`` result
             # (some engines / test doubles) reports no failures — treat as

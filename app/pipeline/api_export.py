@@ -1450,9 +1450,13 @@ async def merge_audiobook(
         chunk_files = [PAUSED_ARTIFACT_NAME]
     else:
         chunk_files = sorted(
-            f
-            for f in names
-            if f.endswith(".wav") and f.startswith("chunk_")
+            (
+                f
+                for f in names
+                if f.endswith(".wav")
+                and (f.startswith("chunk_") or f.startswith("temp_batch_"))
+            ),
+            key=_natural_filename_key,
         )
 
     if not chunk_files:
@@ -1495,6 +1499,10 @@ async def merge_audiobook(
                 status_code=500,
                 detail=f"ffmpeg failed: {result.stderr[-500:] if result.stderr else 'unknown error'}",
             )
+        storage.execute_update(
+            "UPDATE render_job SET output_artifact_path = ? WHERE job_id = ?",
+            (m4b_path, request.job_id),
+        )
 
     except FileNotFoundError:
         raise HTTPException(

@@ -7,6 +7,8 @@ import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
 
+from app.pipeline.clone_reference_media import reference_root
+
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
 
@@ -15,6 +17,23 @@ def sanitize_filename(name):
     """Make a string safe for use in filenames"""
     name = re.sub(r'[^\w\-]', '_', name)
     return name.lower()
+
+
+def _resolve_clone_reference_path(ref_audio_path):
+    """Resolve clone references using the canonical storage root.
+
+    Uploaded pipeline references are stored as bare filenames relative to
+    ``designed_voices/references``. Keep the project-root fallback for older
+    voice configurations that stored paths relative to the repository root.
+    """
+    if os.path.isabs(ref_audio_path):
+        return ref_audio_path
+
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    canonical_path = os.path.join(reference_root(), ref_audio_path)
+    if os.path.exists(canonical_path):
+        return canonical_path
+    return os.path.join(root_dir, ref_audio_path)
 
 
 def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_MS,
@@ -619,10 +638,7 @@ class TTSEngine:
 
         if not ref_audio_path or not ref_text:
             raise ValueError(f"Clone voice for '{speaker}' missing ref_audio or ref_text")
-        # Resolve relative paths against project root (parent of app/)
-        if not os.path.isabs(ref_audio_path):
-            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            ref_audio_path = os.path.join(root_dir, ref_audio_path)
+        ref_audio_path = _resolve_clone_reference_path(ref_audio_path)
         if not os.path.exists(ref_audio_path):
             raise FileNotFoundError(f"Reference audio not found for '{speaker}': {ref_audio_path}")
 
@@ -886,7 +902,7 @@ class TTSEngine:
 
     # ── Batch generation ─────────────────────────────────────────
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Generate multiple audio files.
 
         Local mode: uses native list-based batch API for custom voices.
@@ -899,11 +915,20 @@ class TTSEngine:
             batch_seed: Single seed for all generations (-1 for random)
 
         Returns:
-            dict with 'completed' (list of indices) and 'failed' (list of (index, error) tuples)
+            dict with completed/failed lists and a cancelled flag.
         """
-        results = {"completed": [], "failed": []}
+        results = {"completed": [], "failed": [], "cancelled": False}
+
+        def cancelled():
+            if cancel_check is not None and cancel_check():
+                results["cancelled"] = True
+                return True
+            return False
 
         if not chunks:
+            return results
+
+        if cancelled():
             return results
 
         # Reset torch.compile state to prevent progressive slowdown
@@ -933,21 +958,30 @@ class TTSEngine:
 
         # Process custom voice chunks
         if custom_chunks:
+            if cancelled():
+                return results
             if self._mode == "local":
-                batch_results = self._local_batch_custom(custom_chunks, voice_config, output_dir, batch_seed)
+                batch_results = self._local_batch_custom(custom_chunks, voice_config, output_dir, batch_seed, cancel_check)
             else:
                 batch_results = self._sequential_custom(custom_chunks, voice_config, output_dir, batch_seed)
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
+            if batch_results.get("cancelled"):
+                results["cancelled"] = True
+                return results
             self._clear_gpu_cache()
 
         # Process clone voice chunks (batched by speaker in local mode)
         if clone_chunks:
+            if cancelled():
+                return results
             if self._mode == "local":
-                batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir)
+                batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir, cancel_check)
             else:
                 batch_results = {"completed": [], "failed": []}
                 for chunk in clone_chunks:
+                    if cancelled():
+                        return results
                     idx = chunk["index"]
                     output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                     try:
@@ -962,15 +996,22 @@ class TTSEngine:
                         batch_results["failed"].append((idx, str(e)))
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
+            if batch_results.get("cancelled"):
+                results["cancelled"] = True
+                return results
             self._clear_gpu_cache()
 
         # Process LoRA voice chunks (batched by adapter in local mode)
         if lora_chunks:
+            if cancelled():
+                return results
             if self._mode == "local":
-                batch_results = self._local_batch_lora(lora_chunks, voice_config, output_dir)
+                batch_results = self._local_batch_lora(lora_chunks, voice_config, output_dir, cancel_check)
             else:
                 batch_results = {"completed": [], "failed": []}
                 for chunk in lora_chunks:
+                    if cancelled():
+                        return results
                     idx = chunk["index"]
                     output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                     speaker = chunk.get("speaker")
@@ -990,11 +1031,16 @@ class TTSEngine:
                         batch_results["failed"].append((idx, str(e)))
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
+            if batch_results.get("cancelled"):
+                results["cancelled"] = True
+                return results
             self._clear_gpu_cache()
 
         # Process design voice chunks (sequential — each line has unique description)
         if design_chunks:
             for chunk in design_chunks:
+                if cancelled():
+                    return results
                 idx = chunk["index"]
                 output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                 speaker = chunk.get("speaker")
@@ -1121,7 +1167,7 @@ class TTSEngine:
             traceback.print_exc()
             return False
 
-    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Batch generate custom voice using native list API with sub-batching.
 
         Autoregressive batch generation runs for as long as the longest sequence.
@@ -1196,6 +1242,9 @@ class TTSEngine:
         total_audio_duration = 0.0
 
         for sb_idx, (start, end) in enumerate(sub_batches):
+            if cancel_check is not None and cancel_check():
+                results["cancelled"] = True
+                return results
             sb_texts = texts[start:end]
             sb_speakers = speakers[start:end]
             sb_instructs = instructs[start:end]
@@ -1259,7 +1308,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_clone(self, chunks, voice_config, output_dir):
+    def _local_batch_clone(self, chunks, voice_config, output_dir, cancel_check=None):
         """Batch generate clone voices, grouped by speaker.
 
         Chunks sharing the same speaker (same reference audio) are batched
@@ -1295,6 +1344,9 @@ class TTSEngine:
         total_audio_duration = 0.0
 
         for speaker, group in speaker_groups.items():
+            if cancel_check is not None and cancel_check():
+                results["cancelled"] = True
+                return results
             try:
                 prompt = self._get_clone_prompt(speaker, voice_config)
             except Exception as e:
@@ -1323,6 +1375,9 @@ class TTSEngine:
                   f"in {len(sub_batches)} sub-batch(es)")
 
             for sb_idx, (start, end) in enumerate(sub_batches):
+                if cancel_check is not None and cancel_check():
+                    results["cancelled"] = True
+                    return results
                 sb_texts = texts[start:end]
                 sb_indices = indices[start:end]
 
@@ -1376,7 +1431,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_lora(self, chunks, voice_config, output_dir):
+    def _local_batch_lora(self, chunks, voice_config, output_dir, cancel_check=None):
         """Batch generate LoRA voices, grouped by adapter.
 
         Chunks sharing the same adapter are batched together through
@@ -1423,6 +1478,9 @@ class TTSEngine:
         total_audio_duration = 0.0
 
         for adapter_path, (voice_data, group) in adapter_groups.items():
+            if cancel_check is not None and cancel_check():
+                results["cancelled"] = True
+                return results
             if not os.path.isdir(adapter_path):
                 print(f"  Error: adapter path not found: {adapter_path}")
                 for chunk in group:
@@ -1488,6 +1546,9 @@ class TTSEngine:
                   f"in {len(sub_batches)} sub-batch(es)")
 
             for sb_idx, (start, end) in enumerate(sub_batches):
+                if cancel_check is not None and cancel_check():
+                    results["cancelled"] = True
+                    return results
                 sb_texts = texts[start:end]
                 sb_instructs = instructs_raw[start:end]
                 sb_indices = indices[start:end]
@@ -1625,10 +1686,7 @@ class TTSEngine:
                 print(f"Warning: Clone voice for '{speaker}' missing ref_audio or ref_text. Skipping.")
                 return False
 
-            # Resolve relative paths against project root
-            if not os.path.isabs(ref_audio):
-                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                ref_audio = os.path.join(root_dir, ref_audio)
+            ref_audio = _resolve_clone_reference_path(ref_audio)
 
             if not os.path.exists(ref_audio):
                 print(f"Warning: Reference audio not found for '{speaker}': {ref_audio}")
