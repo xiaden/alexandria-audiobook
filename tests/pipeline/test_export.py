@@ -186,6 +186,28 @@ class TestDownloadRender:
         assert zf.testzip() is None
         assert zf.getinfo("chunk_0000.wav").file_size == len(b"audio-data-chunk_0000.wav")
 
+    def test_zip_fallback_natural_chunk_order(self, client, storage, tmp_path):
+        """The on-demand ZIP preserves numeric batch chunk order."""
+        output_dir = tmp_path / "out-zip-natural"
+        output_dir.mkdir()
+        for index in (10, 2, 0):
+            (output_dir / f"temp_batch_{index}.wav").write_bytes(str(index).encode())
+        job_id = "job-zip-natural"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir, "
+            "output_artifact_path) VALUES (?, 'b1', 'batch', 'completed', ?, ?)",
+            (job_id, str(output_dir), str(output_dir)),
+        )
+
+        resp = client.get(f"/api/pipeline/download/{job_id}")
+        assert resp.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            assert zf.namelist() == [
+                "temp_batch_0.wav",
+                "temp_batch_2.wav",
+                "temp_batch_10.wav",
+            ]
+
     def test_unknown_job_returns_404(self, client):
         """No render_job row for the job_id → 404 with the job_id in the detail."""
         resp = client.get("/api/pipeline/download/does-not-exist")
@@ -923,6 +945,23 @@ class TestExportAudioWholeBook:
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "audio/wav"
         assert resp.content == _make_wav(b"AAAA" + b"BBBB")
+
+    def test_batch_mode_whole_book_natural_chunk_order(self, client, storage, tmp_path):
+        """Batch chunks remain in numeric order once the batch has 10+ files."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for index in (10, 2, 0):
+            (run_dir / f"temp_batch_{index}.wav").write_bytes(
+                _make_wav(str(index).encode())
+            )
+        self._seed_job(
+            storage, "job-batch-natural", mode="batch", status="completed",
+            output_dir=str(run_dir), artifact=str(run_dir),
+        )
+
+        resp = client.get("/api/pipeline/export/audio/job-batch-natural")
+        assert resp.status_code == 200
+        assert resp.content == _make_wav(b"02" + b"10")
 
     def test_batch_no_wavs_404(self, client, storage, tmp_path):
         """A completed batch job whose run dir holds no WAVs -> 404."""
