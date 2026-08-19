@@ -1060,8 +1060,8 @@ function resetRenderProgress(): void {
  * truth) — width = completed/total, label `${completed}/${total} chunks`,
  * and a red failure badge (count + job error text as title) when chunks
  * failed. Batch mode has NO per-chunk counts — job-level progress only:
- * running/pending → indeterminate animated striped bar ("Rendering..."),
- * completed → 100%, failed/cancelled → status label. A mode-less legacy
+   * running/pending → indeterminate animated striped bar ("Rendering..."),
+   * completed → 100%, failed/cancelled/interrupted/expired → status label. A mode-less legacy
  * payload falls back to the job-level branch.
  */
 function updateRenderProgress(status: RenderStatus): void {
@@ -1118,9 +1118,14 @@ function updateRenderProgress(status: RenderStatus): void {
     if (status.status === 'completed') {
       bar.style.width = '100%';
       bar.innerText = '100%';
-    } else if (status.status === 'failed' || status.status === 'cancelled') {
-      bar.style.width = '100%';
-      bar.innerText = status.status === 'failed' ? 'Failed' : 'Cancelled';
+     } else if (
+       status.status === 'failed' ||
+       status.status === 'cancelled' ||
+       status.status === 'interrupted' ||
+       status.status === 'expired'
+     ) {
+       bar.style.width = '100%';
+       bar.innerText = status.status.charAt(0).toUpperCase() + status.status.slice(1);
     } else {
       // running / pending — indeterminate animated striped bar
       bar.classList.add('progress-bar-animated');
@@ -1136,8 +1141,8 @@ function updateRenderProgress(status: RenderStatus): void {
  * The backend executes the render as a background job and returns
  * immediately with a job_id.  This function polls
  * ``GET /api/pipeline/render_status/{job_id}`` every 2 seconds until
- * the job reaches a terminal state (``completed``, ``failed``, or
- * ``cancelled``).
+ * the job reaches a terminal state (``completed``, ``failed``, ``cancelled``,
+ * ``interrupted``, or ``expired``).
  */
 export async function pipelineRenderAll(): Promise<void> {
   if (!state.pipelineBookId) {
@@ -1179,23 +1184,27 @@ export async function pipelineRenderAll(): Promise<void> {
           return;
         }
         try {
-           const status = await pipelineRenderStatus(_currentRenderJobId);
-           updateRenderProgress(status);
-           if (status.status === 'completed') {
-             if (_renderPollTimer) clearInterval(_renderPollTimer);
-             _renderPollTimer = null;
-             // Store job_id in global state for merge/download
-             state.pipelineRenderJobId = _currentRenderJobId;
-             showToast('Render complete', 'success');
-             resolve();
+          const status = await pipelineRenderStatus(_currentRenderJobId);
+          updateRenderProgress(status);
+          if (status.status === 'completed') {
+            if (_renderPollTimer) clearInterval(_renderPollTimer);
+            _renderPollTimer = null;
+            // Store job_id in global state for merge/download
+            state.pipelineRenderJobId = _currentRenderJobId;
+            showToast('Render complete', 'success');
+            resolve();
           } else if (status.status === 'failed') {
             if (_renderPollTimer) clearInterval(_renderPollTimer);
             _renderPollTimer = null;
             reject(new Error(status.error || 'Render failed'));
-          } else if (status.status === 'cancelled') {
+          } else if (
+            status.status === 'cancelled' ||
+            status.status === 'interrupted' ||
+            status.status === 'expired'
+          ) {
             if (_renderPollTimer) clearInterval(_renderPollTimer);
             _renderPollTimer = null;
-            reject(new Error('Render cancelled'));
+            reject(new Error(status.error || `Render ${status.status}`));
           }
           // else: still running — keep polling
         } catch (e) {

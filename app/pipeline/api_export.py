@@ -25,6 +25,7 @@ Provides HTTP endpoints for exporting annotated scripts and rendering audiobooks
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import struct
@@ -119,6 +120,16 @@ class MergeRequest(BaseModel):
 _PAUSES_STATE_PENDING = "pending"
 _PAUSES_STATE_APPLIED = "applied"
 _PAUSES_STATE_FAILED = "failed"
+
+
+def _natural_filename_key(name: str) -> tuple[tuple[int, str | int], ...]:
+    """Sort filenames by embedded numbers instead of their digit strings."""
+    return tuple(
+        (1, int(part))
+        if part.isascii() and part.isdigit()
+        else (0, part.casefold())
+        for part in re.split(r"(\d+)", name)
+    )
 
 
 def _resolved_pause_metadata(storage: PipelineStorage, book_id: str) -> dict:
@@ -1169,11 +1180,14 @@ async def export_audio(
         except OSError:
             raise HTTPException(status_code=404, detail="Output directory not found")
         candidates = sorted(
-            os.path.join(run_dir, name)
-            for name in names
-            if name.endswith(".wav")
-            and name != PAUSED_ARTIFACT_NAME
-            and os.path.isfile(os.path.join(run_dir, name))
+            (
+                os.path.join(run_dir, name)
+                for name in names
+                if name.endswith(".wav")
+                and name != PAUSED_ARTIFACT_NAME
+                and os.path.isfile(os.path.join(run_dir, name))
+            ),
+            key=lambda path: _natural_filename_key(os.path.basename(path)),
         )
         if not candidates:
             raise HTTPException(
@@ -1282,7 +1296,7 @@ async def download_render(
     zip_path = os.path.join(output_dir, "audiobook.zip")
     if not os.path.isfile(zip_path):
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-            for name in sorted(os.listdir(output_dir)):
+            for name in sorted(os.listdir(output_dir), key=_natural_filename_key):
                 if name.endswith((".wav", ".mp3", ".m4a", ".flac")):
                     zf.write(os.path.join(output_dir, name), arcname=name)
     if os.path.isfile(zip_path):
@@ -1393,7 +1407,10 @@ async def export_audacity_artifact(
 
 
 @router.post("/merge")
-async def merge_audiobook(request: MergeRequest) -> dict:
+async def merge_audiobook(
+    request: MergeRequest,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
     """Merge rendered audio chunks into a single M4B file.
 
     Locates WAV chunks in the render job's output directory and uses ffmpeg
@@ -1402,16 +1419,22 @@ async def merge_audiobook(request: MergeRequest) -> dict:
     """
     import subprocess
 
-    job = _render_jobs.get(request.job_id)
-    if job is None:
+    rows = storage.execute_query(
+        "SELECT book_id, status, output_dir FROM render_job WHERE job_id = ?",
+        (request.job_id,),
+    )
+    if not rows:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {request.job_id}")
-    if job["status"] != "completed":
+    row = rows[0]
+    if row["status"] != "completed":
         raise HTTPException(
             status_code=400,
-            detail=f"Job not completed (status: {job['status']})",
+            detail=f"Job not completed (status: {row['status']})",
         )
 
-    output_dir = job.get("output_dir")
+    output_dir = row["output_dir"] or os.path.join(
+        get_render_root(), f"book-{row['book_id']}", request.job_id
+    )
     if not output_dir or not os.path.isdir(output_dir):
         raise HTTPException(status_code=404, detail="Output directory not found")
 
@@ -1779,11 +1802,14 @@ def export_m4b(
         except OSError:
             raise HTTPException(status_code=404, detail="Output directory not found")
         candidates = sorted(
-            os.path.join(run_dir, name)
-            for name in names
-            if name.endswith(".wav")
-            and name != PAUSED_ARTIFACT_NAME
-            and os.path.isfile(os.path.join(run_dir, name))
+            (
+                os.path.join(run_dir, name)
+                for name in names
+                if name.endswith(".wav")
+                and name != PAUSED_ARTIFACT_NAME
+                and os.path.isfile(os.path.join(run_dir, name))
+            ),
+            key=lambda path: _natural_filename_key(os.path.basename(path)),
         )
         if not candidates:
             raise HTTPException(status_code=400, detail="No audio files found in output directory")

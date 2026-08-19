@@ -2324,56 +2324,42 @@ class TestMergeEndpoint:
         assert response.status_code == 404
         assert "Unknown job_id" in response.json()["detail"]
 
-    def test_merge_job_not_completed(self, client):
+    def test_merge_job_not_completed(self, client, storage):
         """Merge with job not in completed status returns 400."""
-        from app.pipeline import api_export
-
-        # Inject a job with status 'running'
         job_id = "test-job-running"
-        api_export._render_jobs[job_id] = {
-            "status": "running",
-            "output_dir": "/tmp/test-output",
-        }
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status) VALUES (?, ?, ?, ?)",
+            (job_id, "b1", "batch", "running"),
+        )
+        response = client.post(
+            "/api/pipeline/merge",
+            json={"book_id": "b1", "job_id": job_id},
+        )
+        assert response.status_code == 400
+        assert "not completed" in response.json()["detail"]
 
-        try:
-            response = client.post(
-                "/api/pipeline/merge",
-                json={"book_id": "b1", "job_id": job_id},
-            )
-            assert response.status_code == 400
-            assert "not completed" in response.json()["detail"]
-        finally:
-            del api_export._render_jobs[job_id]
-
-    def test_merge_no_chunks_found(self, client, tmp_path):
+    def test_merge_no_chunks_found(self, client, storage, tmp_path):
         """Merge with no WAV chunks in output_dir returns 400."""
-        from app.pipeline import api_export
-
         # Create empty output directory
         output_dir = tmp_path / "empty-output"
         output_dir.mkdir()
 
         job_id = "test-job-no-chunks"
-        api_export._render_jobs[job_id] = {
-            "status": "completed",
-            "output_dir": str(output_dir),
-        }
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (job_id, "b1", "batch", "completed", str(output_dir)),
+        )
+        response = client.post(
+            "/api/pipeline/merge",
+            json={"book_id": "b1", "job_id": job_id},
+        )
+        assert response.status_code == 400
+        assert "No audio chunks found" in response.json()["detail"]
 
-        try:
-            response = client.post(
-                "/api/pipeline/merge",
-                json={"book_id": "b1", "job_id": job_id},
-            )
-            assert response.status_code == 400
-            assert "No audio chunks found" in response.json()["detail"]
-        finally:
-            del api_export._render_jobs[job_id]
-
-    def test_merge_success(self, client, tmp_path):
+    def test_merge_success(self, client, storage, tmp_path):
         """Merge with valid WAV chunks produces M4B file."""
         import subprocess
-
-        from app.pipeline import api_export
 
         # Create output directory with WAV chunks
         output_dir = tmp_path / "render-output"
@@ -2396,28 +2382,57 @@ class TestMergeEndpoint:
             )
 
         job_id = "test-job-success"
-        api_export._render_jobs[job_id] = {
-            "status": "completed",
-            "output_dir": str(output_dir),
-        }
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (job_id, "b1", "batch", "completed", str(output_dir)),
+        )
+        response = client.post(
+            "/api/pipeline/merge",
+            json={"book_id": "b1", "job_id": job_id},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "ok"
+        assert "output_path" in result
+        assert result["output_path"].endswith("audiobook.m4b")
 
-        try:
-            response = client.post(
-                "/api/pipeline/merge",
-                json={"book_id": "b1", "job_id": job_id},
-            )
-            assert response.status_code == 200
-            result = response.json()
-            assert result["status"] == "ok"
-            assert "output_path" in result
-            assert result["output_path"].endswith("audiobook.m4b")
+        # Verify the M4B file was created
+        import os
+        assert os.path.exists(result["output_path"])
+        assert os.path.getsize(result["output_path"]) > 0
 
-            # Verify the M4B file was created
-            import os
-            assert os.path.exists(result["output_path"])
-            assert os.path.getsize(result["output_path"]) > 0
-        finally:
-            del api_export._render_jobs[job_id]
+    def test_merge_uses_derived_run_dir_when_output_dir_is_null(
+        self, client, storage, tmp_path, monkeypatch
+    ):
+        """A persisted completed job remains mergeable after restart."""
+        import wave
+
+        from app.pipeline.tts_integration import get_render_root
+
+        render_root = tmp_path / "renders"
+        output_dir = render_root / "book-b1" / "test-job-derived"
+        output_dir.mkdir(parents=True)
+        with wave.open(str(output_dir / "chunk_0000.wav"), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(22050)
+            wav_file.writeframes(b"\x00\x00" * 2205)
+        monkeypatch.setenv("RENDER_ROOT", str(render_root))
+
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("test-job-derived", "b1", "batch", "completed", None),
+        )
+
+        assert get_render_root() == str(render_root)
+        response = client.post(
+            "/api/pipeline/merge",
+            json={"book_id": "b1", "job_id": "test-job-derived"},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------
