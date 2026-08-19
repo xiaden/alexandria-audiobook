@@ -1052,6 +1052,25 @@ describe('Editor Tab — TTS Rendering (Pipeline Mode)', () => {
 
       expect(showToast).toHaveBeenCalledWith('Render failed: Render failed', 'error');
     });
+
+    it.each(['interrupted', 'expired'])('should stop polling when render is %s', async (status) => {
+      vi.useFakeTimers();
+      vi.mocked(API.post).mockResolvedValue({ job_id: 'job-terminal' });
+      vi.mocked(API.get).mockResolvedValue({
+        job_id: 'job-terminal',
+        status,
+        output_dir: null,
+        error: null,
+      });
+      const { showToast } = await import('../../src/utils');
+
+      const promise = pipelineRenderAll();
+      await vi.advanceTimersByTimeAsync(2000);
+      await promise;
+      expect(API.get).toHaveBeenCalledTimes(1);
+      expect(showToast).toHaveBeenCalledWith(`Render failed: Render ${status}`, 'error');
+      vi.useRealTimers();
+    });
   });
 });
 
