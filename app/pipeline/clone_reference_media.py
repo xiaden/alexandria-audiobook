@@ -2,8 +2,8 @@
 
 Narrowly scoped upload validation and persistence for clone-voice reference
 audio.  Independent of the legacy manifest / ``CLONE_VOICES_DIR`` machinery:
-only contained, application-relative paths are ever stored or returned, and
-``app/tts.py`` is never touched.
+only contained, application-relative paths are ever stored or returned.
+``app/tts.py`` consumes ``reference_root`` for clone-reference resolution.
 
 Duration probing is a *bounded media probe* — a single ffprobe pass with a
 hard timeout, the pipeline's established media probe seam — with an optional
