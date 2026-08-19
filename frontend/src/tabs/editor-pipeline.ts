@@ -1060,8 +1060,8 @@ function resetRenderProgress(): void {
  * truth) — width = completed/total, label `${completed}/${total} chunks`,
  * and a red failure badge (count + job error text as title) when chunks
  * failed. Batch mode has NO per-chunk counts — job-level progress only:
-   * running/pending → indeterminate animated striped bar ("Rendering..."),
-   * completed → 100%, failed/cancelled/interrupted/expired → status label. A mode-less legacy
+ * running/pending → indeterminate animated striped bar ("Rendering..."),
+ * completed → 100%, failed/cancelled/interrupted/expired → status label. A mode-less legacy
  * payload falls back to the job-level branch.
  */
 function updateRenderProgress(status: RenderStatus): void {
@@ -1118,12 +1118,12 @@ function updateRenderProgress(status: RenderStatus): void {
     if (status.status === 'completed') {
       bar.style.width = '100%';
       bar.innerText = '100%';
-     } else if (
-       status.status === 'failed' ||
-       status.status === 'cancelled' ||
-       status.status === 'interrupted' ||
-       status.status === 'expired'
-     ) {
+    } else if (
+      status.status === 'failed' ||
+      status.status === 'cancelled' ||
+      status.status === 'interrupted' ||
+      status.status === 'expired'
+    ) {
        bar.style.width = '100%';
        bar.innerText = status.status.charAt(0).toUpperCase() + status.status.slice(1);
     } else {
