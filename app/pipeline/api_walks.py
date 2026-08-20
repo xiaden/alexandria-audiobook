@@ -960,6 +960,9 @@ async def rerun_workbench_walk(
     generation_revision = _guard(workbench.allocate_revision, book_id)
 
     # --- execute the run -----------------------------------------------------
+    # An explicit rerun is fresh user intent; do not inherit the prior
+    # book-level cancellation latch.
+    runner.clear_cancel(book_id)
     config: dict = {
         "preserve_manual_decisions": request.preserve_manual_decisions,
         "scope": request.scope,

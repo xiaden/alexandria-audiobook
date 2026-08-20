@@ -500,6 +500,14 @@ class TestCancellation:
         assert result["status"] == "cancelled"
         assert runner.get_walk_status("book-1", "walk_test") == "cancelled"
 
+    def test_cleared_cancel_allows_rerun(self, runner):
+        """A rerun after cancellation is allowed once the latch is cleared."""
+        runner.cancel_walks("book-1")
+        runner.clear_cancel("book-1")
+        with patch.object(WalkRunner, "_load_walk_module", return_value=_make_mock_walk_module()):
+            result = runner.run_walk("walk_test", "book-1", {})
+        assert result["status"] == "completed"
+
     def test_run_all_walks_stops_on_cancel(self, runner):
         """run_all_walks checks cancel flag before each walk."""
         # Cancel before starting

@@ -82,10 +82,18 @@ class _FakeRunner:
         self.storage = storage
         self.calls = []
         self.last_thread_id = None
+        self.cancelled = False
+        self.clear_cancel_calls = []
+
+    def clear_cancel(self, book_id):
+        self.clear_cancel_calls.append(book_id)
+        self.cancelled = False
 
     def run_walk(self, walk_name, book_id, config):
         self.calls.append((walk_name, book_id, config))
         self.last_thread_id = threading.get_ident()
+        if self.cancelled:
+            return {"status": "cancelled"}
         self.storage.execute_insert(
             "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms,"
             " heartbeat_ms) VALUES (?, ?, ?, 'completed', 0, 0)",
@@ -418,6 +426,21 @@ def test_rerun_book_scope(client):
     assert set(body["invalidated_walks"]) == {
         "walk_2c_alias_resolution", "walk_2d_scene_presence"
     }
+
+
+def test_rerun_clears_prior_cancellation(client):
+    runner = client.app.dependency_overrides[pipeline_api.get_walk_runner]()
+    runner.cancelled = True
+
+    response = client.post(
+        "/api/pipeline/workbench/b1/reruns",
+        json={"walk_name": "walk_2b_character_discovery", "scope": "book",
+              "preserve_manual_decisions": True, "base_revision": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert runner.clear_cancel_calls == ["b1"]
 
 
 def test_rerun_scenes_scope_and_rejection(client):
