@@ -416,6 +416,40 @@ class TestPostRerun:
         assert body["detail"]["head_persona_id"]
         assert body["detail"]["head_persona_id"] != first["persona_id"]
 
+    def test_rerun_older_revision_after_later_head_is_allowed(self, client):
+        first = client.put(
+            "/api/pipeline/characters/c1/persona", json=_write(base_revision=0)
+        ).json()
+        second = client.post(
+            "/api/pipeline/characters/c1/persona/rerun",
+            json=_rerun(first["persona_id"]),
+        ).json()
+        third = client.post(
+            "/api/pipeline/characters/c1/persona/rerun",
+            json=_rerun(second["run_id"]),
+        )
+        assert third.status_code == 200
+
+        direct_producer = client.post(
+            "/api/pipeline/characters/c1/persona/rerun",
+            json=_rerun(second["run_id"]),
+        )
+        assert direct_producer.status_code == 409
+        _assert_conflict(direct_producer, "ALREADY_RAN")
+
+        # The first revision did not directly produce the current head, so it
+        # is a valid source for another rerun.
+        rerun_first = client.post(
+            "/api/pipeline/characters/c1/persona/rerun",
+            json=_rerun(first["persona_id"]),
+        )
+        assert rerun_first.status_code == 200
+        assert rerun_first.json()["run_id"] not in {
+            first["persona_id"],
+            second["run_id"],
+            third.json()["run_id"],
+        }
+
     def test_rerun_against_protected_head_returns_409(self, client):
         client.put(
             "/api/pipeline/characters/c1/persona",
