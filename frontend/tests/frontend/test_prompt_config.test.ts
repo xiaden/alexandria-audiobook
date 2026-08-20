@@ -37,6 +37,7 @@ import {
   recordRerunHead,
   rerunPromptConfirmed,
   loadPromptConfig,
+  selectTask,
   PROMPT_CONFIG_TAB_ID,
 } from '../../src/tabs/prompt-config';
 import { state, setPipelineBookId } from '../../src/state';
@@ -274,6 +275,7 @@ describe('buildWriteRequest (structured)', () => {
       book_id: 'book-123',
       tasks: { scene_segmentation: TASK_CFG },
     });
+    vi.mocked(API.listPromptConfigRevisions).mockResolvedValue([]);
     await loadPromptConfig();
     const el = document.getElementById(PROMPT_CONFIG_TAB_ID)!;
     el.innerHTML = renderTaskEditor('scene_segmentation', TASK_CFG, 'prompt-abc', []);
@@ -305,6 +307,22 @@ describe('buildWriteRequest (structured)', () => {
       'scene_segmentation',
     );
     expect(write.base_revision).toBe('prompt-new');
+  });
+
+  it('seeds heads for tasks selected after reload', async () => {
+    const deliveryRevision = { ...REV, task: 'delivery', revision_id: 'prompt-delivery' };
+    vi.mocked(API.getEffectiveWalkConfig).mockResolvedValue({
+      book_id: 'book-123',
+      tasks: { scene_segmentation: TASK_CFG, delivery: TASK_CFG },
+    });
+    vi.mocked(API.listPromptConfigRevisions).mockImplementation(async (_book, task) =>
+      task === 'delivery' ? [deliveryRevision] : [],
+    );
+
+    await loadPromptConfig();
+    await selectTask('delivery');
+
+    expect(buildWriteRequest().base_revision).toBe('prompt-delivery');
   });
 });
 

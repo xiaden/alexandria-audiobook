@@ -586,13 +586,19 @@ export async function loadPromptConfig(): Promise<void> {
     }
     // Seed the session cache from server truth so edits after reload use the
     // actual head revision instead of incorrectly sending null.
-    try {
-      const revisions = await API.listPromptConfigRevisions(bookId, _activeTask);
-      _sessionHistory[_activeTask] = revisions;
-      _sessionHead[_activeTask] = revisions[0]?.revision_id ?? null;
-    } catch {
-      // Preserve session state if the history endpoint is temporarily unavailable.
-    }
+    await Promise.all(
+      PROMPT_TASK_ORDER.map(async (task) => {
+        try {
+          const revisions = await API.listPromptConfigRevisions(bookId, task);
+          if (revisions.length > 0) {
+            _sessionHistory[task] = revisions;
+            _sessionHead[task] = revisions[0].revision_id;
+          }
+        } catch (err) {
+          console.warn(`Failed to load prompt revisions for ${task}`, err);
+        }
+      }),
+    );
     syncFromSession(_activeTask);
     container.innerHTML = renderPromptConfig();
   } catch (err) {

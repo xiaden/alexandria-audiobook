@@ -317,6 +317,22 @@ def test_revisions_list_returns_current_head_after_reload(client):
     )
 
 
+def test_revisions_list_unknown_task_returns_422(client):
+    client, storage = _client()
+    response = client.get(
+        "/api/pipeline/walks/b1/config/revisions?task=unknown_task"
+    )
+    assert response.status_code == 422
+
+
+def test_revisions_list_unknown_book_returns_404(client):
+    client, storage = _client()
+    response = client.get(
+        "/api/pipeline/walks/unknown-book/config/revisions?task=scene_segmentation"
+    )
+    assert response.status_code == 404
+
+
 def test_revisions_unknown_task_422(client):
     client, storage = _client()
     resp = client.post(
