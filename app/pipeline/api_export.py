@@ -1420,7 +1420,8 @@ async def merge_audiobook(
     import subprocess
 
     rows = storage.execute_query(
-        "SELECT book_id, status, output_dir FROM render_job WHERE job_id = ?",
+        "SELECT book_id, status, output_dir, output_artifact_path "
+        "FROM render_job WHERE job_id = ?",
         (request.job_id,),
     )
     if not rows:
@@ -1474,6 +1475,11 @@ async def merge_audiobook(
             f.write(f"file '{chunk_path}'\n")
 
     m4b_path = os.path.join(output_dir, "audiobook.m4b")
+    temp_m4b_path = f"{m4b_path}.tmp"
+    # Remove an orphan left by the pre-atomic implementation, but preserve a
+    # previously published artifact so a failed re-merge cannot break downloads.
+    if os.path.exists(m4b_path) and row["output_artifact_path"] != m4b_path:
+        os.remove(m4b_path)
 
     try:
         # Use ffmpeg concat demuxer to join WAV chunks into M4B
@@ -1487,7 +1493,7 @@ async def merge_audiobook(
                 "-c:a", "aac",
                 "-b:a", "128k",
                 "-f", "ipod",  # M4B container
-                m4b_path,
+                temp_m4b_path,
             ],
             capture_output=True,
             text=True,
@@ -1499,6 +1505,7 @@ async def merge_audiobook(
                 status_code=500,
                 detail=f"ffmpeg failed: {result.stderr[-500:] if result.stderr else 'unknown error'}",
             )
+        os.replace(temp_m4b_path, m4b_path)
         storage.execute_update(
             "UPDATE render_job SET output_artifact_path = ? WHERE job_id = ?",
             (m4b_path, request.job_id),
@@ -1515,6 +1522,8 @@ async def merge_audiobook(
             detail="ffmpeg timed out",
         )
     finally:
+        if os.path.exists(temp_m4b_path):
+            os.remove(temp_m4b_path)
         # Clean up concat list file
         if os.path.exists(concat_list_path):
             os.remove(concat_list_path)

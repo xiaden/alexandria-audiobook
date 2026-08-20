@@ -2402,6 +2402,68 @@ class TestMergeEndpoint:
         assert os.path.exists(result["output_path"])
         assert os.path.getsize(result["output_path"]) > 0
 
+    def test_merge_timeout_removes_partial_artifacts(
+        self, client, storage, tmp_path, monkeypatch
+    ):
+        """A timed-out merge cannot leave a downloadable partial M4B."""
+        import subprocess
+
+        output_dir = tmp_path / "timeout-output"
+        output_dir.mkdir()
+        (output_dir / "chunk_0000.wav").write_bytes(b"fake wav")
+        job_id = "test-job-timeout"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (job_id, "b1", "batch", "completed", str(output_dir)),
+        )
+
+        def timed_out(args, **_kwargs):
+            Path(args[-1]).write_bytes(b"partial temp m4b")
+            raise subprocess.TimeoutExpired(args, 300)
+
+        monkeypatch.setattr(subprocess, "run", timed_out)
+        response = client.post(
+            "/api/pipeline/merge", json={"book_id": "b1", "job_id": job_id}
+        )
+
+        assert response.status_code == 500
+        assert not (output_dir / "audiobook.m4b").exists()
+        assert not (output_dir / "audiobook.m4b.tmp").exists()
+        assert not (output_dir / "concat_list.txt").exists()
+
+    def test_merge_timeout_preserves_published_m4b(
+        self, client, storage, tmp_path, monkeypatch
+    ):
+        """A failed re-merge preserves the last atomically published M4B."""
+        import subprocess
+
+        output_dir = tmp_path / "preserve-output"
+        output_dir.mkdir()
+        (output_dir / "chunk_0000.wav").write_bytes(b"fake wav")
+        m4b_path = output_dir / "audiobook.m4b"
+        original = b"previously published audiobook"
+        m4b_path.write_bytes(original)
+        job_id = "test-job-preserve"
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, output_dir, "
+            "output_artifact_path) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, "b1", "batch", "completed", str(output_dir), str(m4b_path)),
+        )
+
+        def timed_out(args, **_kwargs):
+            Path(args[-1]).write_bytes(b"partial temp m4b")
+            raise subprocess.TimeoutExpired(args, 300)
+
+        monkeypatch.setattr(subprocess, "run", timed_out)
+        response = client.post(
+            "/api/pipeline/merge", json={"book_id": "b1", "job_id": job_id}
+        )
+
+        assert response.status_code == 500
+        assert m4b_path.read_bytes() == original
+        assert not (output_dir / "audiobook.m4b.tmp").exists()
+
     def test_merge_uses_derived_run_dir_when_output_dir_is_null(
         self, client, storage, tmp_path, monkeypatch
     ):
@@ -2505,7 +2567,6 @@ class TestCancelRenderPersistence:
             assert api_export._render_jobs[job_id]["status"] == "cancelled"
         finally:
             del api_export._render_jobs[job_id]
-
 
 class TestCancelWalksPersistence:
     """POST /cancel_walks persists walk_run.cancel_requested=1 on active rows."""
