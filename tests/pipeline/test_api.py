@@ -2428,6 +2428,8 @@ class TestMergeEndpoint:
         )
 
         assert response.status_code == 500
+        # The mocked ffmpeg writes only to the temporary output argument; this
+        # assertion guards against regressing to direct writes to the final path.
         assert not (output_dir / "audiobook.m4b").exists()
         assert not (output_dir / "audiobook.m4b.tmp").exists()
         assert not (output_dir / "concat_list.txt").exists()
