@@ -891,7 +891,7 @@ def _safe_extract_zip(zf, destination):
                     os.makedirs(parent, exist_ok=True)
                 with zf.open(member) as source, open(target_path, "wb") as target:
                     shutil.copyfileobj(source, target)
-        except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        except (OSError, RuntimeError, ValueError, NotImplementedError, zipfile.BadZipFile) as exc:
             raise HTTPException(status_code=400, detail="ZIP contains an invalid member") from exc
 
 def _load_builtin_lora_manifest():
