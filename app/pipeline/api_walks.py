@@ -966,7 +966,13 @@ async def rerun_workbench_walk(
     }
     if request.scene_ids:
         config["scene_ids"] = request.scene_ids
-    result = runner.run_walk(request.walk_name, book_id, config)
+    # run_walk executes a whole walk and can take minutes; run it on a worker
+    # thread so this endpoint does not block FastAPI's event loop. The result
+    # and any exception are awaited identically, preserving the contracted
+    # synchronous response (run_id/status/generation_revision).
+    result = await asyncio.to_thread(
+        runner.run_walk, request.walk_name, book_id, config
+    )
     status = result.get("status", "failed") if isinstance(result, dict) else "failed"
 
     # Resolve the run_id from the most recent walk_run row for this book/walk.

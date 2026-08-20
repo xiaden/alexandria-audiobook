@@ -13,6 +13,8 @@ Covers the S2 acceptance criteria:
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from contextlib import contextmanager
 
 import pytest
@@ -21,6 +23,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 import app.pipeline.api as pipeline_api
+from app.pipeline import api_walks
 from app.pipeline.adapter import (
     ConcurrentTransactionError,
     InMemorySQLiteAdapter,
@@ -78,9 +81,11 @@ class _FakeRunner:
     def __init__(self, storage):
         self.storage = storage
         self.calls = []
+        self.last_thread_id = None
 
     def run_walk(self, walk_name, book_id, config):
         self.calls.append((walk_name, book_id, config))
+        self.last_thread_id = threading.get_ident()
         self.storage.execute_insert(
             "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms,"
             " heartbeat_ms) VALUES (?, ?, ?, 'completed', 0, 0)",
@@ -373,6 +378,29 @@ def test_presence_put(client):
 # ---------------------------------------------------------------------------
 # Reruns
 # ---------------------------------------------------------------------------
+
+
+def test_rerun_run_walk_off_event_loop(client, monkeypatch):
+    """Reruns execute synchronous walks on a worker thread."""
+    loop_thread_id: dict[str, int] = {}
+    real_to_thread = asyncio.to_thread
+
+    async def _spy_to_thread(fn, *args, **kwargs):
+        loop_thread_id["id"] = threading.get_ident()
+        return await real_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr(api_walks.asyncio, "to_thread", _spy_to_thread)
+
+    response = client.post(
+        "/api/pipeline/workbench/b1/reruns",
+        json={"walk_name": "walk_2b_character_discovery", "scope": "book",
+              "preserve_manual_decisions": True, "base_revision": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    runner = client.app.dependency_overrides[pipeline_api.get_walk_runner]()
+    assert loop_thread_id["id"] != runner.last_thread_id
 
 
 def test_rerun_book_scope(client):
