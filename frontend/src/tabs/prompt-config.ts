@@ -6,6 +6,8 @@
  *            -> EffectiveWalkConfigDTO {book_id, tasks:{task:{values,sources}}}
  *   - POST   /api/pipeline/walks/{book_id}/config/validate
  *            (PromptConfigWriteRequest) -> PromptConfigValidationResponse
+ *   - GET    /api/pipeline/walks/{book_id}/config/revisions?task={task}
+ *            -> {book_id, task, revisions: PromptConfigRevisionDTO[]}
  *   - POST   /api/pipeline/walks/{book_id}/config/revisions
  *            (PromptConfigWriteRequest with base_revision) -> 201 PromptConfigRevisionDTO
  *   - POST   /api/pipeline/walks/{book_id}/reruns
@@ -109,10 +111,8 @@ let _headRevisionId: string | null = null;
 let _revisions: PromptConfigRevision[] = [];
 
 /**
- * Per-task session revision history and head (base_revision source). The
- * backend exposes no list route, so the current head is tracked from the
- * revisions/run ids this session's saves and reruns return; base_revision
- * stays null until the first confirmed write.
+ * Per-task revision history and head (base_revision source). These are seeded
+ * from the server on load and updated from this session's saves and reruns.
  */
 const _sessionHistory: Record<string, PromptConfigRevision[]> = {};
 const _sessionHead: Record<string, string | null> = {};
@@ -584,11 +584,15 @@ export async function loadPromptConfig(): Promise<void> {
     if (!_activeTask || !cfg.tasks[_activeTask]) {
       _activeTask = PROMPT_TASK_ORDER[0] ?? null;
     }
-    // The backend exposes no GET list-revisions route for prompt-config, so
-    // revision history and the current head are tracked client-side from the
-    // revisions this session's save/rerun calls return. base_revision therefore
-    // starts as null and advances only after a confirmed write; a stale server
-    // head surfaces as a 409 conflict.
+    // Seed the session cache from server truth so edits after reload use the
+    // actual head revision instead of incorrectly sending null.
+    try {
+      const revisions = await API.listPromptConfigRevisions(bookId, _activeTask);
+      _sessionHistory[_activeTask] = revisions;
+      _sessionHead[_activeTask] = revisions[0]?.revision_id ?? null;
+    } catch {
+      // Preserve session state if the history endpoint is temporarily unavailable.
+    }
     syncFromSession(_activeTask);
     container.innerHTML = renderPromptConfig();
   } catch (err) {
@@ -934,8 +938,6 @@ function wirePromptEvents(): void {
 export async function selectTask(task: string): Promise<void> {
   if (!_activeConfig || !_activeConfig.tasks[task]) return;
   _activeTask = task;
-  // No list route: show the session-tracked history/head for this task (or none
-  // if nothing was saved this session).
   syncFromSession(task);
   const container = editorContainer();
   if (container) container.innerHTML = renderPromptConfig();

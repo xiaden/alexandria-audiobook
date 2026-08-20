@@ -1184,6 +1184,25 @@ async def save_prompt_config_revision(
         raise _prompt_http(exc) from exc
 
 
+@router.get("/walks/{book_id}/config/revisions")
+async def list_prompt_config_revisions(
+    book_id: str,
+    task: str,
+    domain: PromptConfigDomain = Depends(get_prompt_config_domain),
+) -> dict:
+    """Return persisted prompt-config revisions, newest first."""
+    if task not in TASK_NAMES:
+        raise HTTPException(status_code=422, detail=f"unknown task: {task}")
+    try:
+        return {
+            "book_id": book_id,
+            "task": task,
+            "revisions": domain.list_revisions(book_id, task),
+        }
+    except BookNotFoundError as exc:
+        raise _prompt_http(exc) from exc
+
+
 # ---------------------------------------------------------------------------
 # POST /api/pipeline/walks/{book_id}/reruns
 # (DD-voice-persona-prompt-parity, S4 — explicit scoped prompt rerun).

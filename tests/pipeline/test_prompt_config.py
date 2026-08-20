@@ -301,6 +301,22 @@ def test_revisions_stale_base_revision_409(client):
     _assert_conflict(third, "STALE_BASE_REVISION")
 
 
+def test_revisions_list_returns_current_head_after_reload(client):
+    created = client.post(
+        "/api/pipeline/walks/b1/config/revisions",
+        json={"task": "scene_segmentation", "settings": {"temperature": 0.1}},
+    )
+    assert created.status_code == 201
+    response = client.get(
+        "/api/pipeline/walks/b1/config/revisions?task=scene_segmentation"
+    )
+    assert response.status_code == 200
+    assert (
+        response.json()["revisions"][0]["revision_id"]
+        == created.json()["revision_id"]
+    )
+
+
 def test_revisions_unknown_task_422(client):
     client, storage = _client()
     resp = client.post(

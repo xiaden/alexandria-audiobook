@@ -456,6 +456,21 @@ export async function savePromptConfigRevision(
   );
 }
 
+/** List prompt-config revisions for a book and task, newest first. */
+export async function listPromptConfigRevisions(
+  bookId: string,
+  task: string,
+): Promise<PromptConfigRevision[]> {
+  const response = await get<{
+    book_id: string;
+    task: string;
+    revisions: PromptConfigRevision[];
+  }>(
+    `/api/pipeline/walks/${encodeURIComponent(bookId)}/config/revisions?task=${encodeURIComponent(task)}`,
+  );
+  return response.revisions;
+}
+
 /**
  * Explicit scoped walk rerun (confirm required).
  * POST /api/pipeline/walks/{book_id}/reruns

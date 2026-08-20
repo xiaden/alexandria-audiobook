@@ -53,6 +53,7 @@ vi.mock('../../src/api', async (importOriginal) => {
   return {
     ...actual,
     getEffectiveWalkConfig: vi.fn(),
+    listPromptConfigRevisions: vi.fn(),
     validatePromptConfig: vi.fn(),
     rerunScopedWalk: vi.fn(),
   };
@@ -259,6 +260,7 @@ describe('buildWriteRequest (structured)', () => {
     el.innerHTML = renderTaskEditor('scene_segmentation', TASK_CFG, 'prompt-abc', []);
   });
   afterEach(() => {
+    vi.mocked(API.listPromptConfigRevisions).mockReset();
     document.getElementById(PROMPT_CONFIG_TAB_ID)?.remove();
     state.workbench = null;
     setPipelineBookId(null);
@@ -284,6 +286,25 @@ describe('buildWriteRequest (structured)', () => {
     expect(write.settings['temperature']).toBe(0);
     expect(write.prompt).toBe('Segment the scenes.');
     expect(write.base_revision).toBe('prompt-abc');
+  });
+
+  it('seeds base_revision from the server head after a cold reload', async () => {
+    const oldRevision = { ...REV, superseded_by: 'prompt-new' };
+    const newRevision = { ...REV, revision_id: 'prompt-new', base_revision: 'prompt-abc' };
+    vi.mocked(API.getEffectiveWalkConfig).mockResolvedValue({
+      book_id: 'book-123',
+      tasks: { scene_segmentation: TASK_CFG },
+    });
+    vi.mocked(API.listPromptConfigRevisions).mockResolvedValue([newRevision, oldRevision]);
+
+    await loadPromptConfig();
+
+    const write = buildWriteRequest();
+    expect(API.listPromptConfigRevisions).toHaveBeenCalledWith(
+      'book-123',
+      'scene_segmentation',
+    );
+    expect(write.base_revision).toBe('prompt-new');
   });
 });
 
