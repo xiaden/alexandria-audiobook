@@ -4,7 +4,8 @@ This module is the single access point for the production TTS engine,
 replacing ``ProjectManager.get_engine()`` (``app/project.py`` was deleted
 in Plan Q).  Every consumer — pipeline render (``api_export``),
 voice_design preview, lora, dataset_builder — calls
-``get_tts_engine()`` / ``reset_tts_engine()`` from here.
+``get_tts_engine()`` / ``reset_tts_engine()`` / ``unload_tts_engine_models()``
+from here.
 
 Config path resolution is identical to the legacy ``ProjectManager``:
 ``ALEXANDRIA_CONFIG_PATH`` env var, else ``app/config.json`` (relative to
@@ -69,3 +70,25 @@ def reset_tts_engine() -> None:
     """Drop the cached engine (matches legacy ``ProjectManager.engine = None``)."""
     global _tts_engine
     _tts_engine = None
+
+
+def unload_tts_engine_models() -> None:
+    """Unload the shared engine's cached models WITHOUT dropping the singleton.
+
+    Unlike ``reset_tts_engine()`` (which sets the global to ``None``), this
+    keeps ``_tts_engine`` in place so a concurrent ``get_tts_engine()`` call
+    cannot build a SECOND engine instance while another thread is still using
+    the first.  Two live instances each hold a copy of the Qwen3-TTS weights
+    in VRAM, which OOMs whichever job generates next (e.g. a running
+    ``dataset_gen``/``dataset_builder`` worker when a render or preview
+    request lands after the reset).
+
+    Used by ``lora_start_training`` to free VRAM for the training subprocess:
+    unloading the models in place releases the GPU memory while preserving the
+    engine object every concurrent consumer already holds.  In-flight
+    generation is unaffected: consumers hold local model references and model
+    loads/teardown are serialized by ``TTSEngine._model_lock``.
+    """
+    engine = _tts_engine
+    if engine is not None:
+        engine.unload_models()

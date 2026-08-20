@@ -58,7 +58,7 @@ from app.pipeline.adapter import (
 )
 
 # TTS engine factory (replaces legacy project engine access)
-from app.engine import get_tts_engine, reset_tts_engine
+from app.engine import get_tts_engine, reset_tts_engine, unload_tts_engine_models
 
 # Shared bounded pause validation (Plan L) — the single source of truth for
 # the pause bound (0..PAUSE_MAX_MS) used by config saves and the pipeline
@@ -1094,11 +1094,16 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
     if not _claim_process("lora_training"):
         raise HTTPException(status_code=400, detail="LoRA training already running")
 
-    # Unload TTS engine to free GPU only after claiming the training slot.
+    # Free cached TTS models in place so concurrent consumers retain the
+    # shared engine singleton and cannot construct a second GPU model.
     try:
-        reset_tts_engine()
+        unload_tts_engine_models()
         from utils import clear_gpu_cache
         clear_gpu_cache()
+        logger.info(
+            "Shared TTS engine models unloaded in place; LoRA training starts "
+            "asynchronously and VRAM release is best-effort"
+        )
     except Exception:
         process_state["lora_training"]["running"] = False
         raise
@@ -1886,7 +1891,9 @@ async def preparer_download(filename: str):
         raise HTTPException(status_code=400, detail="Invalid filename.")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
-    return FileResponse(file_path,@app.post("/api/preparer/batch/start")
+    return FileResponse(file_path)
+
+@app.post("/api/preparer/batch/start")
 async def preparer_batch_start(request: Request, background_tasks: BackgroundTasks):
     """Process multiple audio files sequentially through the preparer script."""
     if not _claim_process("batch_preparer"):
@@ -1984,10 +1991,6 @@ async def preparer_batch_start(request: Request, background_tasks: BackgroundTas
 
     background_tasks.add_task(_run)
     return {"status": "started", "task_count": len(batch_request.tasks)}
-un)
-    return {"status": "started", "task_count": len(request.tasks)}
-
-
 @app.post("/api/preparer/batch/cancel")
 async def preparer_batch_cancel():
     process_state["batch_preparer"]["cancel"] = True
