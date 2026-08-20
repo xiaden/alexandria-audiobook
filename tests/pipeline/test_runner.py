@@ -670,6 +670,27 @@ class TestWalkRunPersistence:
         assert len(rows) == 2
         assert rows[0]["run_id"] != rows[1]["run_id"]
 
+    def test_run_walk_opens_and_closes_log_sink(self, storage):
+        """Direct callers, including Workbench reruns, persist a run log."""
+        log_service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=log_service)
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+
+        assert result["status"] == "completed"
+        rows = storage.execute_query(
+            "SELECT run_id, status FROM walk_run WHERE book_id = ?", ("book-1",)
+        )
+        assert len(rows) == 1
+        assert rows[0]["status"] == "completed"
+        assert log_service.close_calls[0][0] == rows[0]["run_id"]
+
 
 # ---------------------------------------------------------------------------
 # Test is_cancel_requested dispatcher (Phase 2: persisted cancel)

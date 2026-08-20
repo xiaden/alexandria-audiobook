@@ -570,11 +570,11 @@ class WalkRunner:
     ) -> dict:
         """Execute a single walk by name.
 
-        Records a fresh ``walk_run`` row (status running) before the walk
-        module runs; on success flips the row to completed with
-        ``result_json``; on exception flips it to failed with the error
-        text. The row carries ``created_ms`` and ``heartbeat_ms`` at start
-        and ``finished_ms``/``heartbeat_ms`` at the final transition.
+        Allocates a fresh ``walk_run`` row and executes it through the same
+        reserved-run path used by API-started runs. This is important for
+        synchronous callers such as Workbench reruns: when a log service is
+        configured, the reserved path opens and closes the per-run log sink
+        before finalizing the database row.
 
         Parameters
         ----------
@@ -602,64 +602,19 @@ class WalkRunner:
                 "error": f"Walk '{walk_name}' is already running for book '{book_id}'",
             }
         run_id = str(uuid.uuid4())
-        now = _now_ms()
-        self._storage.execute_insert(
-            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms, heartbeat_ms) "
-            "VALUES (?, ?, ?, 'running', ?, ?)",
-            (run_id, book_id, walk_name, now, now),
-        )
-        # Single cancellation dispatcher — honored before walk execution.
-        if self.is_cancel_requested(run_id):
-            self._finalize_run(run_id, "cancelled", error="Walk cancelled by user")
-            self._set_status(book_id, walk_name, "cancelled")
-            logger.info(
-                "Walk '%s' cancelled before start for book '%s'",
-                walk_name,
-                book_id,
+        if walk_name in WALK_ORDER:
+            reserve_walk_run(self._storage, run_id, book_id, walk_name)
+        else:
+            # Keep the runner's historical direct-call behavior for test and
+            # extension walk names; API-owned reservations remain restricted
+            # to the canonical production order.
+            now = _now_ms()
+            self._storage.execute_insert(
+                "INSERT INTO walk_run (run_id, book_id, walk_name, status, "
+                "created_ms, heartbeat_ms) VALUES (?, ?, ?, 'pending', ?, ?)",
+                (run_id, book_id, walk_name, now, now),
             )
-            return {"status": "cancelled", "error": "Walk cancelled by user"}
-        self._set_status(book_id, walk_name, "running")
-        logger.info("Starting walk '%s' for book '%s'", walk_name, book_id)
-        try:
-            walk_module = self._load_walk_module(walk_name)
-        except ImportError as exc:
-            self._finalize_run(run_id, "failed", error=str(exc))
-            self._set_status(book_id, walk_name, "failed")
-            logger.error("Failed to import walk '%s': %s", walk_name, exc)
-            return {"status": "failed", "error": str(exc)}
-        try:
-            result = walk_module.execute(
-                book_id, HeartbeatStorage(self._storage, run_id), config
-            )
-        except Exception as exc:  # noqa: BLE001 — walk boundary: record any failure
-            self._finalize_run(run_id, "failed", error=str(exc))
-            self._set_status(book_id, walk_name, "failed")
-            logger.error(
-                "Walk '%s' raised exception for book '%s': %s",
-                walk_name,
-                book_id,
-                exc,
-            )
-            return {"status": "failed", "error": str(exc)}
-        if not self._run_verification(walk_name, book_id):
-            self._finalize_run(
-                run_id, "failed", error=f"Verification failed for walk '{walk_name}'"
-            )
-            self._set_status(book_id, walk_name, "failed")
-            logger.error(
-                "Walk '%s' verification failed for book '%s'",
-                walk_name,
-                book_id,
-            )
-            return {
-                "status": "failed",
-                "error": f"Verification failed for walk '{walk_name}'",
-                "result": result,
-            }
-        self._finalize_run(run_id, "completed", result=result)
-        self._set_status(book_id, walk_name, "completed")
-        logger.info("Completed walk '%s' for book '%s'", walk_name, book_id)
-        return result
+        return self.run_walk_reserved(run_id, walk_name, book_id, config)
 
     def run_all_walks(self, book_id: str, config: dict) -> dict:
         """Execute all walks in canonical order for a book.
