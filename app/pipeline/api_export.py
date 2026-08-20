@@ -227,6 +227,7 @@ def _pause_contract_placeholder() -> dict:
 
 # Each entry:
 #   {
+#     "mode": "batch" | "individual",
 #     "status": "running" | "completed" | "failed" | "cancelled",
 #     "output_dir": str | None,
 #     "error": str | None,
@@ -387,6 +388,7 @@ async def render(
         (job_id, request.book_id, mode, request.output_dir, now, now),
     )
     _render_jobs[job_id] = {
+        "mode": mode,
         "status": "running",
         "output_dir": None,
         "error": None,
@@ -469,6 +471,7 @@ async def render_status(
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
     return {
         "job_id": job_id,
+        "mode": job["mode"],
         "status": job["status"],
         "output_dir": job["output_dir"],
         "error": job["error"],

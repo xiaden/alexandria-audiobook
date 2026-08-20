@@ -1959,6 +1959,27 @@ class TestRenderEndpoint:
 
 
 class TestBackgroundRender:
+    def test_legacy_status_fallback_includes_mode(self, client):
+        """Row-less legacy tracker responses retain the render mode."""
+        import threading
+
+        from app.pipeline import api_export
+
+        job_id = "legacy-status-mode"
+        api_export._render_jobs[job_id] = {
+            "mode": "individual",
+            "status": "running",
+            "output_dir": None,
+            "error": None,
+            "cancel_event": threading.Event(),
+        }
+        try:
+            response = client.get(f"/api/pipeline/render_status/{job_id}")
+            assert response.status_code == 200
+            assert response.json()["mode"] == "individual"
+        finally:
+            del api_export._render_jobs[job_id]
+
     def test_render_returns_immediately(self, client, tts_engine):
         """POST /render returns immediately with job_id and status='started'."""
         import time
