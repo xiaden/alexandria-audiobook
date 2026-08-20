@@ -529,8 +529,10 @@ function dsbStopBatch(): void {
  * Cancel the current dataset builder operation.
  */
 async function dsbCancel(): Promise<void> {
+  const name = state.dsbCurrentProject;
+  if (!name) return;
   try {
-    await API.post('/api/dataset_builder/cancel', {});
+    await API.post('/api/dataset_builder/cancel', { name });
   } catch (e) {
     console.error('Cancel error:', e);
   }

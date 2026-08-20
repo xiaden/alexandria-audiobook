@@ -530,7 +530,7 @@ def test_dataset_builder_status():
 
 
 def test_dataset_builder_cancel():
-    r = post("/api/dataset_builder/cancel")
+    r = post("/api/dataset_builder/cancel", json={"name": f"{TEST_PREFIX}builder_proj"})
     assert_status(r, 200)
     data = r.json()
     if data.get("status") not in ("not_running", "cancelling"):

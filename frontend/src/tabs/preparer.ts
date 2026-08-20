@@ -8,7 +8,7 @@ import * as API from '../api';
 import { showToast } from '../utils';
 
 /** Module-level state for preparer tab */
-let prepBatchQueue: Array<{ audio: string }> = [];
+let prepBatchQueue: Array<{ audio: string; file: File }> = [];
 let prepPoller: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -51,7 +51,7 @@ function onPrepBatchFilesChange(): void {
       <td id="prep-batch-status-${i}"><span class="badge bg-secondary">Pending</span></td>
     `;
     tbody.appendChild(row);
-    prepBatchQueue.push({ audio: file.name });
+    prepBatchQueue.push({ audio: file.name, file });
   }
 }
 
@@ -149,15 +149,19 @@ async function startBatchPreparer(): Promise<void> {
     audio_filename: t.audio,
     output_filename: `voice_dataset_${t.audio.replace(/\.[^.]+$/, '')}.zip`,
   }));
-  const body = {
-    tasks,
-    lang: (document.getElementById('prep-lang') as HTMLSelectElement)?.value || 'en',
-    min_confidence: parseFloat((document.getElementById('prep-confidence') as HTMLInputElement)?.value || '0.85'),
-    min_snr: parseInt((document.getElementById('prep-snr') as HTMLInputElement)?.value || '25', 10),
-  };
+  const body = new FormData();
+  body.append('tasks', JSON.stringify(tasks));
+  body.append('lang', (document.getElementById('prep-lang') as HTMLSelectElement)?.value || 'en');
+  body.append('min_confidence', (document.getElementById('prep-confidence') as HTMLInputElement)?.value || '0.85');
+  body.append('min_snr', (document.getElementById('prep-snr') as HTMLInputElement)?.value || '25');
+  prepBatchQueue.forEach(t => body.append('audio_files', t.file, t.audio));
 
   try {
-    await API.post('/api/preparer/batch/start', body);
+    const res = await fetch('/api/preparer/batch/start', { method: 'POST', body });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
     pollPreparerLogs('batch_preparer');
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

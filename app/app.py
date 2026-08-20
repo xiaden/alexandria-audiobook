@@ -31,6 +31,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTa
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, ConfigDict, field_validator
 from typing import List, Optional
 import re
@@ -430,6 +431,9 @@ class DatasetBuilderUpdateRowsRequest(BaseModel):
     name: str
     rows: List[dict]  # [{emotion, text, seed}]
 
+class DatasetBuilderCancelRequest(BaseModel):
+    name: str
+
 class PreparerConfig(BaseModel):
     audio_filename: str
     output_filename: str = "alexandria_dataset.zip"
@@ -453,7 +457,9 @@ process_state = {
     "review": {"running": False, "logs": []},
     "lora_training": {"running": False, "logs": []},
     "dataset_gen": {"running": False, "logs": []},
-    "dataset_builder": {"running": False, "logs": [], "cancel": False},
+    # Per-project keys: {safe_name: {"running": False, "logs": [], "cancel": False}}.
+    # Built lazily on first batch start so projects never share running/logs/cancel.
+    "dataset_builder": {"projects": {}},
     "preparer": {"running": False, "logs": [], "cancel": False, "process": None, "status": "idle", "output_file": None},
     "batch_preparer": {"running": False, "logs": [], "cancel": False, "tasks": [], "current_task_idx": -1},
 }
@@ -1335,12 +1341,48 @@ def _load_builder_state(name):
             pass
     return {"description": "", "global_seed": "", "samples": []}
 
+#: Per-dataset locks serializing every read-modify-write on a project's
+#: ``state.json``. The batch generator runs on a background thread while
+#: single-sample generation, row updates, and metadata updates run on the event
+#: loop, so concurrent read-modify-write cycles on the same project would
+#: otherwise lose updates (each reader working from a stale copy). The state
+#: file is also written via ``atomic_json_write`` (atomic ``os.replace``), so a
+#: concurrent reader never observes a partially-written file.
+_builder_state_locks: dict[str, threading.Lock] = {}
+_builder_state_locks_guard = threading.Lock()
+
+
+def _get_builder_lock(name: str) -> threading.Lock:
+    """Return the per-dataset lock guarding ``name``'s state.json."""
+    with _builder_state_locks_guard:
+        lock = _builder_state_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _builder_state_locks[name] = lock
+        return lock
+
+
+def _update_builder_state(name: str, mutator):
+    """Run a read-modify-write on ``name``'s state under its per-dataset lock.
+
+    The whole load -> mutate -> save cycle is serialized on the per-dataset
+    lock and the save uses ``atomic_json_write``. ``mutator(state)`` mutates
+    the freshly-loaded state dict in place and may return a value; the state
+    dict itself is always what gets written. Returns the mutator's result (or
+    the mutated state when the mutator returns ``None``).
+    """
+    with _get_builder_lock(name):
+        state = _load_builder_state(name)
+        result = mutator(state)
+        _save_builder_state(name, state)
+        return result if result is not None else state
+
+
 def _save_builder_state(name, state):
-    """Save per-sample state to dataset builder working directory."""
+    """Save state to dataset builder working directory (atomic JSON replace)."""
     work_dir = os.path.join(DATASET_BUILDER_DIR, name)
     os.makedirs(work_dir, exist_ok=True)
-    with open(os.path.join(work_dir, "state.json"), "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    atomic_json_write(state, os.path.join(work_dir, "state.json"))
 
 @app.get("/api/dataset_builder/list")
 async def dataset_builder_list():
@@ -1379,10 +1421,13 @@ async def dataset_builder_update_meta(request: DatasetBuilderUpdateMetaRequest):
     work_dir = os.path.join(DATASET_BUILDER_DIR, safe_name)
     if not os.path.exists(work_dir):
         raise HTTPException(status_code=404, detail="Project not found")
-    state = _load_builder_state(safe_name)
-    state["description"] = request.description
-    state["global_seed"] = request.global_seed
-    _save_builder_state(safe_name, state)
+    # Serialized so a concurrent batch/sample generation cannot clobber meta edits
+    def _mutate(state):
+        state["description"] = request.description
+        state["global_seed"] = request.global_seed
+        return state
+
+    _update_builder_state(safe_name, _mutate)
     return {"status": "ok"}
 
 @app.post("/api/dataset_builder/update_rows")
@@ -1392,27 +1437,30 @@ async def dataset_builder_update_rows(request: DatasetBuilderUpdateRowsRequest):
     work_dir = os.path.join(DATASET_BUILDER_DIR, safe_name)
     if not os.path.exists(work_dir):
         raise HTTPException(status_code=404, detail="Project not found")
-    state = _load_builder_state(safe_name)
-    existing = state.get("samples", [])
-    # Merge: keep status/audio_url from existing samples where text unchanged
-    new_samples = []
-    for i, row in enumerate(request.rows):
-        sample = {
-            "emotion": row.get("emotion", ""),
-            "text": row.get("text", "").strip(),
-            "seed": row.get("seed", ""),
-            "status": "pending",
-            "audio_url": None,
-        }
-        if i < len(existing):
-            old = existing[i]
-            # Preserve generation state if text unchanged (trimmed comparison)
-            if old.get("text", "").strip() == sample["text"]:
-                sample["status"] = old.get("status", "pending")
-                sample["audio_url"] = old.get("audio_url")
-        new_samples.append(sample)
-    state["samples"] = new_samples
-    _save_builder_state(safe_name, state)
+    # Serialized so a concurrent batch/sample generation cannot clobber row edits
+    def _mutate(state):
+        existing = state.get("samples", [])
+        # Merge: keep status/audio_url from existing samples where text unchanged
+        new_samples = []
+        for i, row in enumerate(request.rows):
+            sample = {
+                "emotion": row.get("emotion", ""),
+                "text": row.get("text", "").strip(),
+                "seed": row.get("seed", ""),
+                "status": "pending",
+                "audio_url": None,
+            }
+            if i < len(existing):
+                old = existing[i]
+                # Preserve generation state if text unchanged (trimmed comparison)
+                if old.get("text", "").strip() == sample["text"]:
+                    sample["status"] = old.get("status", "pending")
+                    sample["audio_url"] = old.get("audio_url")
+            new_samples.append(sample)
+        state["samples"] = new_samples
+        return new_samples
+
+    new_samples = _update_builder_state(safe_name, _mutate)
     return {"status": "ok", "sample_count": len(new_samples)}
 
 @app.post("/api/dataset_builder/generate_sample")
@@ -1436,24 +1484,28 @@ async def dataset_builder_generate_sample(request: DatasetSampleGenRequest):
         dest_path = os.path.join(work_dir, dest_filename)
         shutil.copy2(wav_path, dest_path)
 
-        # Update state (cache-bust URL so browser loads fresh audio on regen)
+        # Update state (cache-bust URL so browser loads fresh audio on regen).
+        # Serialized per dataset so concurrent batch/sample writes don't lose it.
         cache_bust = int(time.time())
         audio_url = f"/dataset_builder/{request.dataset_name}/{dest_filename}?t={cache_bust}"
-        state = _load_builder_state(request.dataset_name)
-        samples = state.get("samples", [])
-        # Ensure list is large enough
-        while len(samples) <= request.sample_index:
-            samples.append({"status": "pending"})
-        existing_sample = samples[request.sample_index] if request.sample_index < len(samples) else {}
-        samples[request.sample_index] = {
-            **existing_sample,
-            "status": "done",
-            "audio_url": audio_url,
-            "text": request.text.strip(),
-            "description": request.description,
-        }
-        state["samples"] = samples
-        _save_builder_state(request.dataset_name, state)
+
+        def _mutate(state):
+            samples = state.get("samples", [])
+            # Ensure list is large enough
+            while len(samples) <= request.sample_index:
+                samples.append({"status": "pending"})
+            existing_sample = samples[request.sample_index]
+            samples[request.sample_index] = {
+                **existing_sample,
+                "status": "done",
+                "audio_url": audio_url,
+                "text": request.text.strip(),
+                "description": request.description,
+            }
+            state["samples"] = samples
+            return state
+
+        _update_builder_state(request.dataset_name, _mutate)
 
         return {
             "status": "done",
@@ -1462,14 +1514,20 @@ async def dataset_builder_generate_sample(request: DatasetSampleGenRequest):
         }
     except Exception as e:
         logger.error(f"Dataset builder sample generation failed: {e}")
-        # Mark as error in state
-        state = _load_builder_state(request.dataset_name)
-        samples = state.get("samples", [])
-        while len(samples) <= request.sample_index:
-            samples.append({"status": "pending"})
-        samples[request.sample_index] = {"status": "error", "error": str(e)}
-        state["samples"] = samples
-        _save_builder_state(request.dataset_name, state)
+        # Mark as error in state (serialized per dataset). Capture the exception
+        # text up front so the deferred mutator does not reference the
+        # ``except ... as e`` binding (which is cleared once the block is left).
+        err = str(e)
+
+        def _mutate(state):
+            samples = state.get("samples", [])
+            while len(samples) <= request.sample_index:
+                samples.append({"status": "pending"})
+            samples[request.sample_index] = {"status": "error", "error": err}
+            state["samples"] = samples
+            return state
+
+        _update_builder_state(request.dataset_name, _mutate)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/dataset_builder/generate_batch")
@@ -1500,36 +1558,38 @@ async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
     per_seeds = request.seeds
 
     def task():
-        process_state["dataset_builder"]["logs"] = []
+        pstate = process_state["dataset_builder"]["projects"][safe_name]
+        pstate["logs"] = []
 
         try:
             engine = get_tts_engine()
             if not engine:
-                process_state["dataset_builder"]["logs"].append("[ERROR] Failed to initialize TTS engine")
+                pstate["logs"].append("[ERROR] Failed to initialize TTS engine")
                 return
-
-            state = _load_builder_state(safe_name)
-            samples_state = state.get("samples", [])
-            # Ensure list is large enough for all samples
-            while len(samples_state) < len(samples_snapshot):
-                samples_state.append({"status": "pending"})
 
             completed = 0
             for i, idx in enumerate(to_generate):
-                if process_state["dataset_builder"]["cancel"]:
-                    process_state["dataset_builder"]["logs"].append(f"[CANCEL] Stopped at {completed}/{total}")
+                if pstate["cancel"]:
+                    pstate["logs"].append(f"[CANCEL] Stopped at {completed}/{total}")
                     break
 
                 emotion, text = samples_snapshot[idx]
                 description = f"{root_desc}, {emotion}" if emotion else root_desc
 
-                # Mark as generating (preserve existing fields like emotion, seed)
-                existing_s = samples_state[idx] if idx < len(samples_state) else {}
-                samples_state[idx] = {**existing_s, "status": "generating", "text": text, "emotion": emotion, "description": description}
-                state["samples"] = samples_state
-                _save_builder_state(safe_name, state)
+                # Mark as generating (preserve existing fields like emotion, seed).
+                # Serialized per dataset: re-read under the lock so a concurrent
+                # row/meta/single-sample edit is not overwritten from a stale copy.
+                with _get_builder_lock(safe_name):
+                    state = _load_builder_state(safe_name)
+                    samples_state = state.get("samples", [])
+                    while len(samples_state) <= idx:
+                        samples_state.append({"status": "pending"})
+                    existing_s = samples_state[idx]
+                    samples_state[idx] = {**existing_s, "status": "generating", "text": text, "emotion": emotion, "description": description}
+                    state["samples"] = samples_state
+                    _save_builder_state(safe_name, state)
 
-                process_state["dataset_builder"]["logs"].append(
+                pstate["logs"].append(
                     f"[{i+1}/{total}] {('[' + emotion + '] ' if emotion else '')}\"{text[:60]}{'...' if len(text) > 60 else ''}\""
                 )
 
@@ -1550,56 +1610,76 @@ async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
                     dest_path = os.path.join(work_dir, dest_filename)
                     shutil.copy2(wav_path, dest_path)
 
-                    samples_state[idx] = {
-                        **samples_state[idx],
-                        "status": "done",
-                        "audio_url": f"/dataset_builder/{safe_name}/{dest_filename}?t={int(time.time())}",
-                        "text": text,
-                        "emotion": emotion,
-                        "description": description,
-                    }
+                    with _get_builder_lock(safe_name):
+                        state = _load_builder_state(safe_name)
+                        samples_state = state.get("samples", [])
+                        samples_state[idx] = {
+                            **samples_state[idx],
+                            "status": "done",
+                            "audio_url": f"/dataset_builder/{safe_name}/{dest_filename}?t={int(time.time())}",
+                            "text": text,
+                            "emotion": emotion,
+                            "description": description,
+                        }
+                        state["samples"] = samples_state
+                        _save_builder_state(safe_name, state)
                     completed += 1
                 except Exception as e:
                     logger.error(f"Dataset builder sample {idx} failed: {e}")
-                    process_state["dataset_builder"]["logs"].append(f"  Error: {e}")
-                    samples_state[idx] = {**samples_state[idx], "status": "error", "error": str(e), "text": text, "emotion": emotion}
+                    pstate["logs"].append(f"  Error: {e}")
 
-                state["samples"] = samples_state
-                _save_builder_state(safe_name, state)
+                    with _get_builder_lock(safe_name):
+                        state = _load_builder_state(safe_name)
+                        samples_state = state.get("samples", [])
+                        samples_state[idx] = {**samples_state[idx], "status": "error", "error": str(e), "text": text, "emotion": emotion}
+                        state["samples"] = samples_state
+                        _save_builder_state(safe_name, state)
 
-            process_state["dataset_builder"]["logs"].append(
+            pstate["logs"].append(
                 f"[DONE] Generated {completed}/{total} samples"
             )
         except Exception as e:
             logger.exception("Dataset builder batch failed")
-            process_state["dataset_builder"]["logs"].append(f"[ERROR] Batch generation failed: {e}")
+            pstate["logs"].append(f"[ERROR] Batch generation failed: {e}")
         finally:
-            process_state["dataset_builder"]["running"] = False
+            pstate["running"] = False
 
-    if not _claim_process("dataset_builder"):
-        raise HTTPException(status_code=400, detail="Dataset generation already running")
-    process_state["dataset_builder"]["cancel"] = False
+    # Claim the single active batch slot, but track running/logs/cancel per
+    # project so one project can never observe or cancel another project's batch.
+    with process_state_lock:
+        projects = process_state["dataset_builder"]["projects"]
+        if any(p["running"] for p in projects.values()):
+            raise HTTPException(status_code=400, detail="Dataset generation already running")
+        project = projects.setdefault(safe_name, {"running": False, "logs": [], "cancel": False})
+        project["running"] = True
+        project["cancel"] = False
     threading.Thread(target=task, daemon=True).start()
     return {"status": "started", "dataset_name": safe_name, "total": total}
 
 @app.post("/api/dataset_builder/cancel")
-async def dataset_builder_cancel():
-    """Cancel ongoing batch dataset generation."""
-    if process_state["dataset_builder"]["running"]:
-        process_state["dataset_builder"]["cancel"] = True
+async def dataset_builder_cancel(request: DatasetBuilderCancelRequest):
+    """Cancel ongoing batch generation for a specific dataset project."""
+    safe_name = _sanitize_name(request.name)
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid dataset name")
+    project = process_state["dataset_builder"]["projects"].get(safe_name)
+    if project and project["running"]:
+        project["cancel"] = True
         return {"status": "cancelling"}
     return {"status": "not_running"}
 
 @app.get("/api/dataset_builder/status/{name}")
 async def dataset_builder_status(name: str):
     """Get per-sample generation status for a dataset builder project."""
-    state = _load_builder_state(name)
+    safe_name = _sanitize_name(name)
+    state = _load_builder_state(safe_name)
+    project = process_state["dataset_builder"]["projects"].get(safe_name, {})
     return {
         "description": state.get("description", ""),
         "global_seed": state.get("global_seed", ""),
         "samples": state.get("samples", []),
-        "running": process_state["dataset_builder"]["running"],
-        "logs": process_state["dataset_builder"]["logs"],
+        "running": project.get("running", False),
+        "logs": project.get("logs", []),
     }
 
 @app.post("/api/dataset_builder/save")
@@ -1806,29 +1886,62 @@ async def preparer_download(filename: str):
         raise HTTPException(status_code=400, detail="Invalid filename.")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
-    return FileResponse(file_path, media_type="application/zip", filename=os.path.basename(file_path))
-
-
-@app.post("/api/preparer/batch/start")
-async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: BackgroundTasks):
+    return FileResponse(file_path,@app.post("/api/preparer/batch/start")
+async def preparer_batch_start(request: Request, background_tasks: BackgroundTasks):
     """Process multiple audio files sequentially through the preparer script."""
+    if not _claim_process("batch_preparer"):
+        raise HTTPException(status_code=400, detail="Batch preparer is already running.")
+    process_state["batch_preparer"]["cancel"] = False
+
+    try:
+        if request.headers.get("content-type", "").startswith("multipart/form-data"):
+            form = await request.form()
+            try:
+                tasks = [BatchPreparerTask.model_validate(task) for task in json.loads(form.get("tasks", "[]"))]
+                batch_request = BatchPreparerRequest(
+                    tasks=tasks,
+                    lang=str(form.get("lang", "en")),
+                    min_confidence=float(form.get("min_confidence", 0.85)),
+                    min_snr=int(form.get("min_snr", 25)),
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as e:
+                raise HTTPException(status_code=422, detail=f"Invalid batch request: {e}") from e
+            uploaded_files = form.getlist("audio_files")
+            if len(uploaded_files) != len(tasks):
+                raise HTTPException(status_code=400, detail="Each batch task must include an audio file.")
+            os.makedirs(UPLOADS_DIR, exist_ok=True)
+            for task, uploaded_file in zip(tasks, uploaded_files):
+                if not isinstance(uploaded_file, StarletteUploadFile):
+                    raise HTTPException(status_code=400, detail="Invalid audio file upload.")
+                if os.path.basename(uploaded_file.filename or "") != task.audio_filename:
+                    raise HTTPException(status_code=400, detail="Uploaded filename does not match its task.")
+                with open(os.path.join(UPLOADS_DIR, task.audio_filename), "wb") as destination:
+                    shutil.copyfileobj(uploaded_file.file, destination)
+        else:
+            batch_request = BatchPreparerRequest.model_validate(await request.json())
+    except Exception:
+        process_state["batch_preparer"]["running"] = False
+        raise
+
     if not os.path.exists(PREPARER_SCRIPT_PATH):
+        process_state["batch_preparer"]["running"] = False
         raise HTTPException(
             status_code=503,
             detail="Preparer script not installed. Add app/alexandria_preparer.py to enable this feature.",
         )
     has_space, free_gb = check_disk_space(ROOT_DIR, 5.0)
     if not has_space:
+        process_state["batch_preparer"]["running"] = False
         raise HTTPException(status_code=400, detail=f"Insufficient disk space ({free_gb} GB free, 5 GB recommended).")
 
     def _run():
         state = process_state["batch_preparer"]
-        state["logs"] = [f"Starting batch of {len(request.tasks)} tasks..."]
-        state["tasks"] = [{"audio": t.audio_filename, "status": "pending"} for t in request.tasks]
+        state["logs"] = [f"Starting batch of {len(batch_request.tasks)} tasks..."]
+        state["tasks"] = [{"audio": t.audio_filename, "status": "pending"} for t in batch_request.tasks]
         state["current_task_idx"] = -1
 
         try:
-            for i, task in enumerate(request.tasks):
+            for i, task in enumerate(batch_request.tasks):
                 if state["cancel"]:
                     state["logs"].append("Batch cancelled.")
                     break
@@ -1838,18 +1951,18 @@ async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: 
 
                 audio_path = os.path.join(UPLOADS_DIR, task.audio_filename)
                 if not os.path.exists(audio_path):
-                    state["logs"].append(f"[{i+1}/{len(request.tasks)}] Skipping — audio not found: {task.audio_filename}")
+                    state["logs"].append(f"[{i+1}/{len(batch_request.tasks)}] Skipping — audio not found: {task.audio_filename}")
                     state["tasks"][i]["status"] = "failed"
                     continue
 
-                state["logs"].append(f"--- [{i+1}/{len(request.tasks)}] {task.audio_filename} ---")
+                state["logs"].append(f"--- [{i+1}/{len(batch_request.tasks)}] {task.audio_filename} ---")
 
                 cmd = [sys.executable, "-u", PREPARER_SCRIPT_PATH,
                        "--audio", audio_path,
                        "--output", os.path.join(PREPARER_OUTPUT_DIR, task.output_filename),
-                       "--lang", request.lang,
-                       "--min-confidence", str(request.min_confidence),
-                       "--min-snr", str(request.min_snr)]
+                        "--lang", batch_request.lang,
+                        "--min-confidence", str(batch_request.min_confidence),
+                        "--min-snr", str(batch_request.min_snr)]
 
                 rc = _stream_subprocess_to_logs(cmd, BASE_DIR, state, log_prefix=f"[{i+1}] ")
 
@@ -1869,10 +1982,9 @@ async def preparer_batch_start(request: BatchPreparerRequest, background_tasks: 
             state["running"] = False
             state["logs"].append("Batch processing finished.")
 
-    if not _claim_process("batch_preparer"):
-        raise HTTPException(status_code=400, detail="Batch preparer is already running.")
-    process_state["batch_preparer"]["cancel"] = False
     background_tasks.add_task(_run)
+    return {"status": "started", "task_count": len(batch_request.tasks)}
+un)
     return {"status": "started", "task_count": len(request.tasks)}
 
 
