@@ -37,6 +37,7 @@ from typing import List, Optional
 import re
 import time
 import queue
+import stat
 import threading
 import zipfile
 import subprocess
@@ -845,6 +846,21 @@ async def clone_voices_delete(voice_id: str):
 
 LORA_MODELS_MANIFEST = os.path.join(LORA_MODELS_DIR, "manifest.json")
 
+def _safe_extract_zip(zf, destination):
+    """Extract ZIP members only when they remain inside ``destination``."""
+    destination = os.path.realpath(destination)
+    for member in zf.infolist():
+        if stat.S_ISLNK(member.external_attr >> 16):
+            raise HTTPException(status_code=400, detail="ZIP contains a symlink member")
+        member_path = os.path.realpath(os.path.join(destination, member.filename))
+        try:
+            is_within_destination = os.path.commonpath((destination, member_path)) == destination
+        except ValueError:
+            is_within_destination = False
+        if not is_within_destination:
+            raise HTTPException(status_code=400, detail="ZIP contains an unsafe member path")
+    zf.extractall(destination)
+
 def _load_builtin_lora_manifest():
     """Load built-in LoRA manifest from HF (with local fallback). Returns ALL entries with download status."""
     entries = fetch_builtin_manifest(BUILTIN_LORA_DIR)
@@ -884,8 +900,12 @@ async def lora_upload_dataset(file: UploadFile = File(...)):
             await out_file.write(content)
 
         os.makedirs(dataset_dir, exist_ok=True)
-        with zipfile.ZipFile(tmp_path, "r") as zf:
-            zf.extractall(dataset_dir)
+        try:
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                _safe_extract_zip(zf, dataset_dir)
+        except Exception:
+            shutil.rmtree(dataset_dir, ignore_errors=True)
+            raise
 
         # Check for metadata.jsonl (may be inside a subdirectory)
         metadata_path = os.path.join(dataset_dir, "metadata.jsonl")
@@ -1618,6 +1638,8 @@ async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
                     with _get_builder_lock(safe_name):
                         state = _load_builder_state(safe_name)
                         samples_state = state.get("samples", [])
+                        while len(samples_state) <= idx:
+                            samples_state.append({"status": "pending"})
                         samples_state[idx] = {
                             **samples_state[idx],
                             "status": "done",
@@ -1636,6 +1658,8 @@ async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
                     with _get_builder_lock(safe_name):
                         state = _load_builder_state(safe_name)
                         samples_state = state.get("samples", [])
+                        while len(samples_state) <= idx:
+                            samples_state.append({"status": "pending"})
                         samples_state[idx] = {**samples_state[idx], "status": "error", "error": str(e), "text": text, "emotion": emotion}
                         state["samples"] = samples_state
                         _save_builder_state(safe_name, state)
@@ -1684,7 +1708,7 @@ async def dataset_builder_status(name: str):
         "global_seed": state.get("global_seed", ""),
         "samples": state.get("samples", []),
         "running": project.get("running", False),
-        "logs": project.get("logs", []),
+        "logs": list(project.get("logs", [])),
     }
 
 @app.post("/api/dataset_builder/save")
