@@ -1772,34 +1772,36 @@ async def dataset_builder_save(request: DatasetSaveRequest):
     if not safe_name:
         raise HTTPException(status_code=400, detail="Invalid dataset name")
 
-    work_dir = os.path.join(DATASET_BUILDER_DIR, safe_name)
-    if not os.path.exists(work_dir):
-        raise HTTPException(status_code=404, detail="Dataset builder project not found")
-
-    state = _load_builder_state(safe_name)
-    samples = state.get("samples", [])
-
-    # Collect completed samples
-    done_samples = [(i, s) for i, s in enumerate(samples) if s.get("status") == "done"]
-    if not done_samples:
-        raise HTTPException(status_code=400, detail="No completed samples to save")
-
-    # Check ref_index is valid
-    ref_idx = request.ref_index
-    ref_sample = next((s for i, s in done_samples if i == ref_idx), None)
-    if ref_sample is None:
-        # Fall back to first completed sample
-        ref_idx = done_samples[0][0]
-        ref_sample = done_samples[0][1]
-
-    # Create training dataset directory
-    dataset_dir = os.path.join(LORA_DATASETS_DIR, safe_name)
-    if os.path.exists(dataset_dir):
-        raise HTTPException(status_code=400, detail=f"Dataset '{safe_name}' already exists in training datasets")
-
-    os.makedirs(dataset_dir, exist_ok=True)
-
+    builder_lock = _get_builder_lock(safe_name)
+    builder_lock.acquire()
+    dataset_dir = None
     try:
+        work_dir = os.path.join(DATASET_BUILDER_DIR, safe_name)
+        if not os.path.exists(work_dir):
+            raise HTTPException(status_code=404, detail="Dataset builder project not found")
+
+        state = _load_builder_state(safe_name)
+        samples = state.get("samples", [])
+
+        # Collect completed samples
+        done_samples = [(i, s) for i, s in enumerate(samples) if s.get("status") == "done"]
+        if not done_samples:
+            raise HTTPException(status_code=400, detail="No completed samples to save")
+
+        # Check ref_index is valid
+        ref_idx = request.ref_index
+        ref_sample = next((s for i, s in done_samples if i == ref_idx), None)
+        if ref_sample is None:
+            # Fall back to first completed sample
+            ref_idx = done_samples[0][0]
+            ref_sample = done_samples[0][1]
+
+        # Create training dataset directory
+        dataset_dir = os.path.join(LORA_DATASETS_DIR, safe_name)
+        if os.path.exists(dataset_dir):
+            raise HTTPException(status_code=400, detail=f"Dataset '{safe_name}' already exists in training datasets")
+
+        os.makedirs(dataset_dir, exist_ok=True)
         metadata_lines = []
         for i, sample in done_samples:
             src_filename = f"sample_{i:03d}.wav"
@@ -1836,11 +1838,15 @@ async def dataset_builder_save(request: DatasetSaveRequest):
             "dataset_id": safe_name,
             "sample_count": sample_count,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         # Clean up on failure
-        if os.path.exists(dataset_dir):
+        if dataset_dir and os.path.exists(dataset_dir):
             shutil.rmtree(dataset_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        builder_lock.release()
 
 @app.delete("/api/dataset_builder/{name}")
 async def dataset_builder_delete(name: str):

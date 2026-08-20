@@ -188,3 +188,33 @@ def test_dataset_builder_delete_rejects_running_project(tmp_path, monkeypatch) -
     delete_response = client.delete("/api/dataset_builder/Project A")
     assert delete_response.status_code == 200, delete_response.text
     assert "project_a" not in module.process_state["dataset_builder"]["projects"]
+
+
+def test_dataset_builder_save_releases_lock_on_rejected_requests(tmp_path, monkeypatch) -> None:
+    module = app.app
+    monkeypatch.setattr(module, "DATASET_BUILDER_DIR", str(tmp_path))
+    monkeypatch.setattr(module, "LORA_DATASETS_DIR", str(tmp_path / "datasets"))
+    module.process_state["dataset_builder"]["projects"].clear()
+    client = _client()
+
+    project_dir = tmp_path / "project_a"
+    project_dir.mkdir()
+    (project_dir / "state.json").write_text('{"samples": []}', encoding="utf-8")
+
+    response = client.post("/api/dataset_builder/save", json={"name": "Project A"})
+
+    assert response.status_code == 400
+    assert module._get_builder_lock("project_a").acquire(blocking=False)
+    module._get_builder_lock("project_a").release()
+
+    datasets_dir = tmp_path / "datasets" / "project_a"
+    datasets_dir.mkdir(parents=True)
+    (project_dir / "state.json").write_text(
+        '{"samples": [{"status": "done", "text": "Hello."}]}',
+        encoding="utf-8",
+    )
+    response = client.post("/api/dataset_builder/save", json={"name": "Project A"})
+
+    assert response.status_code == 400
+    assert module._get_builder_lock("project_a").acquire(blocking=False)
+    module._get_builder_lock("project_a").release()
