@@ -1761,11 +1761,19 @@ class TTSEngine:
 
     @staticmethod
     def _save_wav(audio_array, sample_rate, output_path):
-        """Save a numpy audio array as a WAV file."""
+        """Save a numpy audio array as a WAV file.
+
+        For defensive support of channel-first ``(channels, samples)`` input,
+        transpose 2-D arrays before writing.  SoundFile expects
+        ``(frames, channels)``; flattening channel-first input in row-major
+        order writes each channel as a contiguous block instead of
+        interleaving samples by frame.
+        """
         # Ensure numpy array
         if not isinstance(audio_array, np.ndarray):
             audio_array = np.array(audio_array)
-        # Flatten if needed
-        if audio_array.ndim > 1:
-            audio_array = audio_array.flatten()
+        if audio_array.ndim == 2:
+            audio_array = audio_array.T
+        elif audio_array.ndim > 2:
+            raise ValueError("WAV audio must be a 1-D or 2-D array")
         sf.write(output_path, audio_array, sample_rate)
