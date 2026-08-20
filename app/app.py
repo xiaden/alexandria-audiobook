@@ -465,6 +465,10 @@ process_state = {
     "batch_preparer": {"running": False, "logs": [], "cancel": False, "tasks": [], "current_task_idx": -1},
 }
 process_state_lock = threading.Lock()
+# LoRA training and TTS preview/test both use the GPU.  Serialize their
+# engine/subprocess lifetimes so a preview cannot load an adapter while
+# training is holding the device (and vice versa).
+lora_gpu_lock = threading.Lock()
 
 
 def _claim_process(task_name: str) -> bool:
@@ -475,6 +479,14 @@ def _claim_process(task_name: str) -> bool:
             return False
         state["running"] = True
         return True
+
+
+def _try_acquire_lora_gpu() -> bool:
+    """Reserve the shared GPU for a synchronous LoRA generation request."""
+    with process_state_lock:
+        if process_state["lora_training"]["running"]:
+            return False
+    return lora_gpu_lock.acquire(blocking=False)
 
 def run_process(command: List[str], task_name: str):
     """Run a subprocess and stream its output into process_state logs."""
@@ -728,7 +740,10 @@ async def voice_design_preview(request: VoiceDesignPreviewRequest):
 async def voice_design_save(request: VoiceDesignSaveRequest):
     """Save a preview voice as a permanent designed voice."""
     previews_dir = os.path.join(DESIGNED_VOICES_DIR, "previews")
-    preview_path = os.path.join(previews_dir, request.preview_file)
+    preview_name = os.path.basename(request.preview_file)
+    if preview_name != request.preview_file or not preview_name.endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Invalid preview file")
+    preview_path = os.path.join(previews_dir, preview_name)
 
     if not os.path.exists(preview_path):
         raise HTTPException(status_code=404, detail="Preview file not found")
@@ -859,7 +874,22 @@ def _safe_extract_zip(zf, destination):
             is_within_destination = False
         if not is_within_destination:
             raise HTTPException(status_code=400, detail="ZIP contains an unsafe member path")
-    zf.extractall(destination)
+
+    # Validate every member before creating the destination or writing any
+    # files.  ``ZipFile.extractall`` sanitizes names on some platforms, but
+    # relying on that behavior would leave archive extraction platform-
+    # dependent and would not protect against symlink-based escapes.
+    os.makedirs(destination, exist_ok=True)
+    for member in zf.infolist():
+        target_path = os.path.join(destination, member.filename)
+        if member.is_dir():
+            os.makedirs(target_path, exist_ok=True)
+        else:
+            parent = os.path.dirname(target_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with zf.open(member) as source, open(target_path, "wb") as target:
+                shutil.copyfileobj(source, target)
 
 def _load_builtin_lora_manifest():
     """Load built-in LoRA manifest from HF (with local fallback). Returns ALL entries with download status."""
@@ -1114,46 +1144,51 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
     if not _claim_process("lora_training"):
         raise HTTPException(status_code=400, detail="LoRA training already running")
 
-    # Free cached TTS models in place so concurrent consumers retain the
-    # shared engine singleton and cannot construct a second GPU model.
-    try:
-        unload_tts_engine_models()
-        from utils import clear_gpu_cache
-        clear_gpu_cache()
-        logger.info(
-            "Shared TTS engine models unloaded in place; LoRA training starts "
-            "asynchronously and VRAM release is best-effort"
-        )
-    except Exception:
-        process_state["lora_training"]["running"] = False
-        raise
-
     def on_training_complete():
         """After training subprocess finishes, update manifest if adapter was saved."""
-        run_process(command, "lora_training")
-
-        # Check if training produced an adapter
-        if os.path.isdir(output_dir) and os.path.exists(os.path.join(output_dir, "training_meta.json")):
+        with lora_gpu_lock:
+            # Free cached TTS models in place only after the GPU reservation is
+            # held, so a preview/test cannot use the engine during unloading.
             try:
-                with open(os.path.join(output_dir, "training_meta.json"), "r") as f:
-                    meta = json.load(f)
+                unload_tts_engine_models()
+                from utils import clear_gpu_cache
+                clear_gpu_cache()
+                logger.info(
+                    "Shared TTS engine models unloaded in place; LoRA training "
+                    "starts asynchronously and VRAM release is best-effort"
+                )
+            except Exception:
+                with process_state_lock:
+                    process_state["lora_training"]["running"] = False
+                    process_state["lora_training"]["logs"].append(
+                        "Failed to prepare GPU for LoRA training; training did not start"
+                    )
+                raise
 
-                manifest = _load_manifest(LORA_MODELS_MANIFEST)
-                manifest.append({
-                    "id": adapter_id,
-                    "name": request.name,
-                    "dataset_id": request.dataset_id,
-                    "epochs": meta.get("epochs", request.epochs),
-                    "final_loss": meta.get("final_loss"),
-                    "sample_count": meta.get("num_samples"),
-                    "lora_r": meta.get("lora_r"),
-                    "lr": meta.get("lr"),
-                    "created": time.time(),
-                })
-                _save_manifest(LORA_MODELS_MANIFEST, manifest)
-                logger.info(f"LoRA adapter registered: {adapter_id}")
-            except Exception as e:
-                logger.error(f"Failed to update LoRA manifest: {e}")
+            run_process(command, "lora_training")
+
+            # Check if training produced an adapter
+            if os.path.isdir(output_dir) and os.path.exists(os.path.join(output_dir, "training_meta.json")):
+                try:
+                    with open(os.path.join(output_dir, "training_meta.json"), "r") as f:
+                        meta = json.load(f)
+
+                    manifest = _load_manifest(LORA_MODELS_MANIFEST)
+                    manifest.append({
+                        "id": adapter_id,
+                        "name": request.name,
+                        "dataset_id": request.dataset_id,
+                        "epochs": meta.get("epochs", request.epochs),
+                        "final_loss": meta.get("final_loss"),
+                        "sample_count": meta.get("num_samples"),
+                        "lora_r": meta.get("lora_r"),
+                        "lr": meta.get("lr"),
+                        "created": time.time(),
+                    })
+                    _save_manifest(LORA_MODELS_MANIFEST, manifest)
+                    logger.info(f"LoRA adapter registered: {adapter_id}")
+                except Exception as e:
+                    logger.error(f"Failed to update LoRA manifest: {e}")
 
     background_tasks.add_task(on_training_complete)
     return {"status": "started", "adapter_id": adapter_id}
@@ -1259,11 +1294,14 @@ async def lora_test_model(request: LoraTestRequest):
     elif not os.path.isdir(adapter_dir):
         raise HTTPException(status_code=404, detail="Adapter files not found")
 
-    engine = get_tts_engine()
-    if not engine:
-        raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
+    if not _try_acquire_lora_gpu():
+        raise HTTPException(status_code=409, detail="LoRA training or another LoRA generation is using the GPU")
 
     try:
+        engine = get_tts_engine()
+        if not engine:
+            raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
+
         output_filename = f"test_{request.adapter_id}_{int(time.time())}.wav"
         output_path = os.path.join(adapter_dir, output_filename)
 
@@ -1285,9 +1323,13 @@ async def lora_test_model(request: LoraTestRequest):
             "status": "ok",
             "audio_url": f"{audio_url_prefix}/{output_filename}",
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"LoRA test generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        lora_gpu_lock.release()
 
 LORA_PREVIEW_TEXT = "The ancient library stood at the crossroads of two forgotten paths, its weathered stone walls covered in ivy that had been growing for centuries."
 
@@ -1325,11 +1367,14 @@ async def lora_preview(adapter_id: str):
         return {"status": "cached", "audio_url": f"{url_prefix}/preview_sample.wav"}
 
     # Generate preview
-    engine = get_tts_engine()
-    if not engine:
-        raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
+    if not _try_acquire_lora_gpu():
+        raise HTTPException(status_code=409, detail="LoRA training or another LoRA generation is using the GPU")
 
     try:
+        engine = get_tts_engine()
+        if not engine:
+            raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
+
         voice_data = {
             "type": "lora",
             "adapter_id": adapter_id,
@@ -1344,9 +1389,13 @@ async def lora_preview(adapter_id: str):
             output_path=preview_path,
         )
         return {"status": "generated", "audio_url": f"{url_prefix}/preview_sample.wav"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"LoRA preview generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        lora_gpu_lock.release()
 
 ## ── Dataset Builder ──────────────────────────────────────────
 
@@ -1791,12 +1840,23 @@ async def dataset_builder_save(request: DatasetSaveRequest):
 @app.delete("/api/dataset_builder/{name}")
 async def dataset_builder_delete(name: str):
     """Discard a dataset builder working project."""
-    work_dir = os.path.join(DATASET_BUILDER_DIR, name)
-    if not os.path.exists(work_dir):
-        raise HTTPException(status_code=404, detail="Dataset builder project not found")
-    shutil.rmtree(work_dir, ignore_errors=True)
-    logger.info(f"Dataset builder project discarded: {name}")
-    return {"status": "deleted", "name": name}
+    if "/" in name or "\\" in name:
+        raise HTTPException(status_code=400, detail="Invalid dataset name")
+    safe_name = _sanitize_name(name)
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid dataset name")
+    work_dir = os.path.join(DATASET_BUILDER_DIR, safe_name)
+    with process_state_lock:
+        project = process_state["dataset_builder"]["projects"].get(safe_name)
+        if project and project["running"]:
+            raise HTTPException(status_code=409, detail="Dataset generation in progress")
+        with _get_builder_lock(safe_name):
+            if not os.path.exists(work_dir):
+                raise HTTPException(status_code=404, detail="Dataset builder project not found")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            process_state["dataset_builder"]["projects"].pop(safe_name, None)
+    logger.info(f"Dataset builder project discarded: {safe_name}")
+    return {"status": "deleted", "name": safe_name}
 
 # ── Preparer ─────────────────────────────────────────────────────────────────
 

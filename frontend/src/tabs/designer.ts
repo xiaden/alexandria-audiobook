@@ -276,7 +276,7 @@ async function openDesignedVoiceForEdit(voiceId: string): Promise<void> {
     // Update preview audio and current preview file
     const audio = document.getElementById('design-preview-audio') as HTMLAudioElement;
     if (audio) {
-      audio.src = `/designed_voices/${voice.filename}?t=${Date.now()}`;
+      audio.src = `/designed_voices/${encodeURIComponent(voice.filename)}?t=${Date.now()}`;
     }
     currentPreviewFile = voice.filename;
     editingDesignedVoiceId = voice.id;
