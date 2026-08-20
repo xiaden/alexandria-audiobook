@@ -173,6 +173,7 @@ class TestCreateCloneReference:
         resp = client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("clip.wav", payload, "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 201
         relative = resp.json()["reference"]["relative_path"]
@@ -180,19 +181,37 @@ class TestCreateCloneReference:
         assert os.path.isfile(written)
         assert open(written, "rb").read() == payload
 
-    def test_upload_no_ref_text_leaves_voice_ref_text(self, client):
+    def test_upload_missing_ref_text_returns_422(self, client):
         payload = make_wav()
         resp = client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("clip.wav", payload, "audio/wav")},
         )
+        assert resp.status_code == 422
+
+    def test_upload_blank_ref_text_returns_400(self, client):
+        resp = client.post(
+            "/api/pipeline/voices/vclone/references",
+            files={"audio": ("clip.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "   "},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "Reference text is required"
+
+    def test_upload_strips_ref_text(self, client):
+        resp = client.post(
+            "/api/pipeline/voices/vclone/references",
+            files={"audio": ("clip.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "  hello world  "},
+        )
         assert resp.status_code == 201
-        assert resp.json()["voice"]["ref_text"] is None
+        assert resp.json()["voice"]["ref_text"] == "hello world"
 
     def test_upload_unknown_voice_404(self, client):
         resp = client.post(
             "/api/pipeline/voices/nope/references",
             files={"audio": ("clip.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 404
 
@@ -200,6 +219,7 @@ class TestCreateCloneReference:
         resp = client.post(
             "/api/pipeline/voices/vbogus/references",
             files={"audio": ("clip.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 400
 
@@ -207,6 +227,7 @@ class TestCreateCloneReference:
         resp = client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("evil.txt", b"text", "text/plain")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 400
 
@@ -214,6 +235,7 @@ class TestCreateCloneReference:
         resp = client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("clip.wav", b"not really wav", "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 400
         assert list(os.listdir(ref_root)) == []
@@ -223,6 +245,7 @@ class TestCreateCloneReference:
         resp = client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("clip.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 400
         assert list(os.listdir(ref_root)) == []
@@ -232,6 +255,7 @@ class TestCreateCloneReference:
         resp = client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("clip.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 400
         assert list(os.listdir(ref_root)) == []
@@ -240,6 +264,7 @@ class TestCreateCloneReference:
         resp = client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("../../evil.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 201
         ref = resp.json()["reference"]
@@ -255,6 +280,7 @@ class TestCreateCloneReference:
         resp = real_client.post(
             "/api/pipeline/voices/vclone/references",
             files={"audio": ("clip.wav", make_wav(), "audio/wav")},
+            data={"ref_text": "hello world"},
         )
         assert resp.status_code == 503
         assert resp.headers.get("retry-after") == "5"
@@ -389,6 +415,42 @@ class TestDownloadCloneReference:
 
 
 class TestDeleteCloneReference:
+    def test_delete_clears_matching_voice_reference_config(self, client, storage):
+        _insert_reference(storage, "r1", relative_path="r1.wav")
+        storage.execute_update(
+            "UPDATE voice_config SET ref_audio = ?, ref_text = ? WHERE id = ?",
+            ("r1.wav", "matching transcript", "vclone"),
+        )
+
+        resp = client.delete("/api/pipeline/voices/vclone/references/r1")
+
+        assert resp.status_code == 204
+        voice = storage.execute_query(
+            "SELECT ref_audio, ref_text FROM voice_config WHERE id = ?",
+            ("vclone",),
+        )[0]
+        assert voice["ref_audio"] is None
+        assert voice["ref_text"] is None
+
+    def test_delete_does_not_clear_newer_voice_reference_config(
+        self, client, storage
+    ):
+        _insert_reference(storage, "r1", relative_path="r1.wav")
+        storage.execute_update(
+            "UPDATE voice_config SET ref_audio = ?, ref_text = ? WHERE id = ?",
+            ("newer.wav", "newer transcript", "vclone"),
+        )
+
+        resp = client.delete("/api/pipeline/voices/vclone/references/r1")
+
+        assert resp.status_code == 204
+        voice = storage.execute_query(
+            "SELECT ref_audio, ref_text FROM voice_config WHERE id = ?",
+            ("vclone",),
+        )[0]
+        assert voice["ref_audio"] == "newer.wav"
+        assert voice["ref_text"] == "newer transcript"
+
     def test_delete_204_tombstones_and_removes_file(self, client, storage, ref_root):
         _insert_reference(storage, "r1", relative_path="r1.wav")
         with open(os.path.join(ref_root, "r1.wav"), "wb") as fh:

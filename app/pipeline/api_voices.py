@@ -123,11 +123,11 @@ class CloneReferenceDTO(BaseModel):
 class CloneReferenceUploadRequest(BaseModel):
     """Multipart upload contract (not a JSON body).
 
-    The ``audio`` part carries the reference media file and ``ref_text`` is an
-    optional aligned transcript.  Bound by the endpoint via ``File``/``Form``.
+    The ``audio`` part carries the reference media file and ``ref_text`` is a
+    required aligned transcript.  Bound by the endpoint via ``File``/``Form``.
     """
 
-    ref_text: Optional[str] = None
+    ref_text: str
 
 
 class CloneReferenceListResponse(BaseModel):
@@ -567,7 +567,7 @@ def _resolve_reference_path(
 async def create_clone_reference(
     voice_id: str,
     audio: UploadFile = File(...),
-    ref_text: str | None = Form(None),
+    ref_text: str = Form(...),
     storage: PipelineStorage = Depends(get_storage),
     tts_engine: object | None = Depends(get_tts_engine),
 ) -> dict:
@@ -576,7 +576,7 @@ async def create_clone_reference(
     The multipart ``audio`` part is validated (allow-listed extension, magic-
     byte content sniff, byte-size and decoded-duration bounds), written under
     the reference root, inserted into ``clone_reference``, and selected as the
-    voice's ``ref_audio`` (plus ``ref_text`` when provided).  Returns the new
+    voice's ``ref_audio`` and required ``ref_text``.  Returns the new
     ``CloneReferenceDTO`` and the updated ``VoiceConfigDTO``.
 
     Raises
@@ -591,6 +591,9 @@ async def create_clone_reference(
         raise HTTPException(
             status_code=400, detail="Voice config has invalid type"
         )
+    ref_text = ref_text.strip()
+    if not ref_text:
+        raise HTTPException(status_code=400, detail="Reference text is required")
 
     # Bounded invoke-time cleanup of expired, tombstoned, unreferenced files.
     cleanup_expired_references(
@@ -635,9 +638,8 @@ async def create_clone_reference(
             storage.insert_clone_reference(record)
             set_sql = "UPDATE voice_config SET ref_audio = ?"
             params: list = [relative_path]
-            if ref_text is not None:
-                set_sql += ", ref_text = ?"
-                params.append(ref_text)
+            set_sql += ", ref_text = ?"
+            params.append(ref_text)
             set_sql += " WHERE id = ?"
             params.append(voice_id)
             storage.execute_update(set_sql, tuple(params))
@@ -734,6 +736,14 @@ async def delete_clone_reference(
         with storage.transaction():
             storage.tombstone_clone_reference(
                 reference_id, _LOCAL_OWNER_ID, _now_ms()
+            )
+            # Clear only this deleted reference.  A newer upload may have
+            # selected a different reference since the row was read.
+            # ``ref_text`` belongs to the same clone prompt as ``ref_audio``.
+            storage.execute_update(
+                "UPDATE voice_config SET ref_audio = NULL, ref_text = NULL "
+                "WHERE id = ? AND ref_audio = ?",
+                (voice_id, row["relative_path"]),
             )
     except KeyError:
         raise HTTPException(status_code=404, detail="Clone reference not found")

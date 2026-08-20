@@ -227,7 +227,7 @@ describe('uploadCloneReferenceFromPanel', () => {
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Choose an audio file'), 'warning');
   });
 
-  it('uploads with the file name and optional ref text', async () => {
+  it('uploads with the file name and required ref text', async () => {
     const button = await setupUpload('voice-1');
     const file = new File(['data'], 'sample.wav', { type: 'audio/wav' });
     Object.defineProperty(document.getElementById('clone-ref-audio-file') as HTMLInputElement, 'files', {
@@ -248,6 +248,20 @@ describe('uploadCloneReferenceFromPanel', () => {
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Reference uploaded'), 'success');
   });
 
+  it('rejects blank reference text before hitting the network', async () => {
+    const button = await setupUpload('voice-1');
+    const file = new File(['data'], 'sample.wav', { type: 'audio/wav' });
+    Object.defineProperty(document.getElementById('clone-ref-audio-file') as HTMLInputElement, 'files', {
+      value: [file],
+      configurable: true,
+    });
+    (document.getElementById('clone-ref-text') as HTMLInputElement).value = '   ';
+
+    await uploadCloneReferenceFromPanel(button);
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Enter the transcript'), 'warning');
+    expect(API.uploadCloneReference).not.toHaveBeenCalled();
+  });
+
   it('rejects an oversized file before hitting the network', async () => {
     const button = await setupUpload('voice-1');
     const big = new File([new Uint8Array(CLONE_REF_MAX_BYTES + 1)], 'big.wav', { type: 'audio/wav' });
@@ -255,6 +269,7 @@ describe('uploadCloneReferenceFromPanel', () => {
       value: [big],
       configurable: true,
     });
+    (document.getElementById('clone-ref-text') as HTMLInputElement).value = 'transcript';
     await uploadCloneReferenceFromPanel(button);
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('limit'), 'error');
     expect(API.uploadCloneReference).not.toHaveBeenCalled();
@@ -267,6 +282,7 @@ describe('uploadCloneReferenceFromPanel', () => {
       value: [file],
       configurable: true,
     });
+    (document.getElementById('clone-ref-text') as HTMLInputElement).value = 'transcript';
     vi.mocked(API.uploadCloneReference).mockRejectedValue(new Error('rejected'));
     await uploadCloneReferenceFromPanel(button);
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('rejected'), 'error');

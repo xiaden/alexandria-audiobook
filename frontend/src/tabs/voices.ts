@@ -873,8 +873,8 @@ function ensureCloneReferencePanel(): HTMLElement | null {
         <div id="clone-ref-limits" class="form-text">WAV/MP3/OGG/FLAC/M4A/AAC up to ${formatCloneByteSize(CLONE_REF_MAX_BYTES)} and ${formatCloneDuration(CLONE_REF_MAX_DURATION_MS)}. Server-enforced bounds apply.</div>
       </div>
       <div class="mb-3">
-        <label for="clone-ref-text" class="form-label fw-bold">Reference Text <span class="text-muted fw-normal">(optional)</span></label>
-        <input type="text" id="clone-ref-text" class="form-control form-control-sm" placeholder="Aligned transcript of the reference audio">
+        <label for="clone-ref-text" class="form-label fw-bold">Reference Text <span class="text-danger" aria-hidden="true">*</span></label>
+        <input type="text" id="clone-ref-text" class="form-control form-control-sm" placeholder="Aligned transcript of the reference audio" required>
       </div>
       <button type="button" class="btn btn-sm btn-primary" data-action="clone-ref-upload">Upload Reference</button>
       <div id="clone-reference-list" class="mt-3"></div>
@@ -1020,7 +1020,7 @@ export function renderCloneReferenceList(references: CloneReference[]): void {
 }
 
 /**
- * Upload the selected file + optional ref_text for the currently selected
+ * Upload the selected file + required ref_text for the currently selected
  * clone voice. Bounded client-side guard (informational; server is authority).
  */
 export async function uploadCloneReferenceFromPanel(button: HTMLButtonElement): Promise<void> {
@@ -1037,6 +1037,12 @@ export async function uploadCloneReferenceFromPanel(button: HTMLButtonElement): 
     showToast('Choose an audio file to upload', 'warning');
     return;
   }
+  const refText = refTextInput?.value.trim() ?? '';
+  if (!refText) {
+    refTextInput?.focus();
+    showToast('Enter the transcript for the reference audio', 'warning');
+    return;
+  }
   if (file.size > CLONE_REF_MAX_BYTES) {
     showToast(`Reference audio exceeds the ${formatCloneByteSize(CLONE_REF_MAX_BYTES)} limit`, 'error');
     return;
@@ -1047,8 +1053,7 @@ export async function uploadCloneReferenceFromPanel(button: HTMLButtonElement): 
   button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Uploading…';
 
   try {
-    const refText = refTextInput?.value.trim() ?? undefined;
-    const res = await API.uploadCloneReference(voiceId, file, file.name, refText || undefined);
+    const res = await API.uploadCloneReference(voiceId, file, file.name, refText);
     showToast(`Reference uploaded: ${res.reference.original_filename}`, 'success');
     // The upload also selected this reference as the voice's ref_audio — refresh
     // the catalog card and cached row so downstream assignment shows it.

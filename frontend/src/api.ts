@@ -228,7 +228,7 @@ export async function delWithRetryOnce<T = unknown>(
  * POST a multipart ``FormData`` body with exactly ONE automatic retry on a
  * retryable status (default 503, the pipeline concurrent-write contract) plus
  * Retry-After. Honors the integer-second delay. Used by the clone-reference
- * upload (multipart ``audio`` part + optional ``ref_text``). Never loops.
+ * upload (multipart ``audio`` part + required ``ref_text``). Never loops.
  */
 export async function postFormWithRetryOnce<T = unknown>(
   endpoint: string,
@@ -276,20 +276,18 @@ export async function delNoContentWithRetryOnce(
  * Upload a validated clone-voice reference audio sample.
  *
  * POST /api/pipeline/voices/{voice_id}/references — multipart ``audio`` file
- * plus optional ``ref_text``. Returns the new CloneReference and the updated
+ * plus required ``ref_text``. Returns the new CloneReference and the updated
  * VoiceConfig (its ref_audio/ref_text now point at this reference).
  */
 export async function uploadCloneReference(
   voiceId: string,
   file: File | Blob,
   filename: string,
-  refText?: string,
+  refText: string,
 ): Promise<CloneReferenceUploadResponse> {
   const form = new FormData();
   form.append('audio', file, filename);
-  if (refText !== undefined && refText !== '') {
-    form.append('ref_text', refText);
-  }
+  form.append('ref_text', refText);
   return postFormWithRetryOnce<CloneReferenceUploadResponse>(
     `/api/pipeline/voices/${encodeURIComponent(voiceId)}/references`,
     form,

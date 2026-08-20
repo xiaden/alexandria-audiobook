@@ -256,7 +256,7 @@ describe('Journey 1 — clone voice upload→preview→assign→delete', () => {
     resetPipeline();
   });
 
-  it('uploads a fixture WAV (multipart) with optional ref_text and refreshes the list', async () => {
+  it('uploads a fixture WAV (multipart) with required ref_text and refreshes the list', async () => {
     const file = new File([createWavBytes(2000, 8000)], 'sample.wav', { type: 'audio/wav' });
     const input = document.getElementById('clone-ref-audio-file') as HTMLInputElement;
     Object.defineProperty(input, 'files', { value: [file], configurable: true });
@@ -282,6 +282,7 @@ describe('Journey 1 — clone voice upload→preview→assign→delete', () => {
     const file = new File([createWavBytes(2000, 8000)], 'sample.wav', { type: 'audio/wav' });
     const input = document.getElementById('clone-ref-audio-file') as HTMLInputElement;
     Object.defineProperty(input, 'files', { value: [file], configurable: true });
+    (document.getElementById('clone-ref-text') as HTMLInputElement).value = 'aligned transcript';
     vi.mocked(API.uploadCloneReference).mockRejectedValue(new Error('Failed to generate preview: 500'));
 
     const button = document.querySelector<HTMLButtonElement>('[data-action="clone-ref-upload"]')!;
