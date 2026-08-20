@@ -2570,6 +2570,26 @@ class TestCancelRenderPersistence:
         finally:
             del api_export._render_jobs[job_id]
 
+    def test_cancel_persisted_job_after_restart_is_not_404(self, client, storage):
+        """A persisted job with no in-memory event is still a known job."""
+        import time
+
+        job_id = "cancel-after-restart-1"
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO render_job (job_id, book_id, mode, status, created_ms, "
+            "started_ms) VALUES (?, 'b1', 'batch', 'running', ?, ?)",
+            (job_id, now, now),
+        )
+
+        response = client.post("/api/pipeline/cancel_render", json={"job_id": job_id})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "already_finished",
+            "job_id": job_id,
+        }
+
 class TestCancelWalksPersistence:
     """POST /cancel_walks persists walk_run.cancel_requested=1 on active rows."""
 

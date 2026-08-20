@@ -645,7 +645,10 @@ async def export_chunk(
 
 
 @router.post("/cancel_render")
-async def cancel_render(request: CancelRenderRequest) -> dict:
+async def cancel_render(
+    request: CancelRenderRequest,
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
     """Request cancellation of a running render job.
 
     Schema-compatible cancel semantics (manager decision L20; the
@@ -658,10 +661,19 @@ async def cancel_render(request: CancelRenderRequest) -> dict:
     background job task observes the event (the CancelledError path in
     ``_run_render_job`` / ``render_audiobook``).  Crash-survival of stuck
     'running' rows is handled by startup reconciliation (running ->
-    interrupted).
+    interrupted). If the in-memory entry is absent but a ``render_job`` row
+    exists (for example, after a server restart), the job is known but no
+    longer cancellable and the endpoint returns ``already_finished`` instead
+    of 404.
     """
     job = _render_jobs.get(request.job_id)
     if job is None:
+        rows = storage.execute_query(
+            "SELECT 1 FROM render_job WHERE job_id = ?",
+            (request.job_id,),
+        )
+        if rows:
+            return {"status": "already_finished", "job_id": request.job_id}
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {request.job_id}")
     if job["status"] != "running":
         return {"status": "already_finished", "job_id": request.job_id}
