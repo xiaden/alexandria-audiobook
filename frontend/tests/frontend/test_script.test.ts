@@ -1934,7 +1934,11 @@ describe('Script Tab — Per-Walk Log Viewer (Part D)', () => {
       it('keeps polling while a reserved walk is pending before it starts', async () => {
         let pollCount = 0;
         vi.mocked(API.get).mockImplementation((endpoint: string) => {
-          if (String(endpoint).endsWith('/runs')) return Promise.resolve([]);
+          if (String(endpoint).endsWith('/runs')) {
+            return Promise.resolve([
+              viewerRun({ run_id: 'run-pending', status: pollCount === 0 ? 'pending' : 'running' }),
+            ]);
+          }
           pollCount += 1;
           const statuses: Record<string, string> = {};
           for (const walkName of WALK_ORDER) statuses[walkName] = 'completed';
@@ -1947,6 +1951,24 @@ describe('Script Tab — Per-Walk Log Viewer (Part D)', () => {
 
         await vi.advanceTimersByTimeAsync(2000);
         expect(pollCount).toBe(2);
+      });
+
+      it('stops when only never-started walks remain pending', async () => {
+        let pollCount = 0;
+        vi.mocked(API.get).mockImplementation((endpoint: string) => {
+          if (String(endpoint).endsWith('/runs')) {
+            return Promise.resolve([viewerRun({ run_id: 'run-done', status: 'completed' })]);
+          }
+          pollCount += 1;
+          const statuses: Record<string, string> = {};
+          for (const walkName of WALK_ORDER) statuses[walkName] = 'pending';
+          statuses['walk_2a_scene_segmentation'] = 'completed';
+          return Promise.resolve(statuses);
+        });
+
+        await onboardViaUi();
+        await vi.advanceTimersByTimeAsync(4000);
+        expect(pollCount).toBe(1);
       });
     });
 

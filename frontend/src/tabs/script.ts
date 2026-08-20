@@ -679,14 +679,16 @@ export function closeWalkLog(runId: string): void {
  * Uses `bookId` when given (restored-session tab load); otherwise the current
  * book. No-op without a book; failures are logged and leave the list as-is.
  */
-async function refreshWalkRuns(bookId?: string): Promise<void> {
+async function refreshWalkRuns(bookId?: string): Promise<WalkRunRow[] | null> {
   const id = bookId ?? currentBookId;
-  if (!id) return;
+  if (!id) return null;
   try {
     const runs = await pipelineWalkRuns(id);
     renderWalkRuns(runs);
+    return runs;
   } catch (e) {
     console.error('Walk runs fetch error', e);
+    return null;
   }
 }
 
@@ -707,7 +709,7 @@ export function startWalkPolling(): void {
       renderWalkStatuses(statuses);
       updateWalkButtons(statuses);
       // Runs history refreshes alongside walk status on every poll tick.
-      await refreshWalkRuns();
+      const runs = await refreshWalkRuns();
 
       // Detect failed walks and show error toast
       for (const [walkName, status] of Object.entries(statuses)) {
@@ -719,11 +721,11 @@ export function startWalkPolling(): void {
       }
 
       // A reserved run is reported as pending until its background task starts.
-      // Keep polling during that window, otherwise the immediate first poll can
-      // stop before the task transitions to running.
-      const anyActive = Object.values(statuses).some(
-        s => s === 'pending' || s === 'running',
-      );
+      // Use persisted run rows to distinguish that state from walks that have
+      // never run; otherwise single-walk polling would never stop on the other
+      // walks' default pending statuses.
+      const anyActive = Object.values(statuses).some(s => s === 'running')
+        || (runs?.some(run => run.status === 'pending' || run.status === 'running') ?? false);
       if (!anyActive) {
         stopWalkPolling();
         updateRunAllButton(false);
