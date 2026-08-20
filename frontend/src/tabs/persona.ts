@@ -43,7 +43,6 @@ import type {
 let _personaInitialized = false;
 let _activeCharacterId: string | null = null;
 let _currentBaseRevision = 0;
-let _activeProtected = false;
 
 /** The five bounded profile field keys, in display order. */
 export const PERSONA_FIELD_KEYS: PersonaFieldKey[] = [
@@ -156,7 +155,7 @@ export function renderPersonaEditor(
     `</select>`;
 
   const protectionBanner = protectedFlag
-    ? '<div class="alert alert-warning py-1 small mb-2">This persona is <strong>protected</strong>. Edits preserve protection and evidence; rerun is blocked.</div>'
+    ? '<div class="alert alert-warning py-1 small mb-2">This persona is <strong>protected</strong>. Edits preserve protection by default; uncheck Protected to unlock the new revision. Rerun is blocked.</div>'
     : '';
 
   const revisionRows = revisions.map((r) => (
@@ -264,7 +263,7 @@ export function buildWriteRequest(): PersonaWriteRequest {
     container?.querySelectorAll<HTMLInputElement>('[data-role="scene-check"]:checked') ?? [],
   ).map((c) => c.value);
   const reviewState = (container?.querySelector<HTMLSelectElement>('[data-role="review-state"]')?.value ?? 'draft') as PersonaReviewState;
-  const protectedFlag = Boolean(container?.querySelector<HTMLInputElement>('[data-role="protected"]')?.checked) || _activeProtected;
+  const protectedFlag = Boolean(container?.querySelector<HTMLInputElement>('[data-role="protected"]')?.checked);
   return {
     base_revision: _currentBaseRevision,
     book_id: state.pipelineBookId,
@@ -396,7 +395,6 @@ export async function openPersonaEditor(characterId: string): Promise<void> {
       revisions = [];
     }
     _currentBaseRevision = persona?.revision ?? 0;
-    _activeProtected = Boolean(persona?.protected);
     container.innerHTML = renderPersonaEditor(persona, characterName, revisions, sceneOptionsFromWorkbench());
     container.style.display = '';
     container.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' });
@@ -415,7 +413,6 @@ export function closePersonaEditor(): void {
   }
   _activeCharacterId = null;
   _currentBaseRevision = 0;
-  _activeProtected = false;
 }
 
 function renderErrors(message: string): void {

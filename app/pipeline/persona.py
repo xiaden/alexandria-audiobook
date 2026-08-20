@@ -11,7 +11,8 @@ Owns the persona-revision contract enforced at the domain layer:
   prior record is preserved and marked ``superseded_by``.
 * **Protected records** — a ``protected`` revision cannot be replaced by a
   ``source="rerun"`` write (``ProtectedRevisionError``); a ``source="human"``
-  write may supersede it but must carry forward the protected flag and evidence.
+  write may supersede it, preserving evidence while honoring the explicit
+  protected flag (unlockable).
 * **Deterministic rejection** — invalid anchors, aliases, scene scopes, and
   review states raise ``ValidationError`` (HTTP 422).
 * **Derived voice consequences** — ``voice_consequences`` is explainable output
@@ -317,7 +318,8 @@ class PersonaDomain:
         """Append a new persona revision, superseding the current head.
 
         * ``source="human"`` may supersede a protected head, carrying forward
-          the protected flag and evidence.
+          evidence while honoring the explicit ``protected`` flag (preserved
+          by default in the editor, but unlockable by unchecking it).
         * ``source="rerun"`` is rejected against a protected head
           (:class:`ProtectedRevisionError`).
         """
@@ -349,12 +351,11 @@ class PersonaDomain:
 
         evidence = write.get("evidence", [])
         protected = write.get("protected", False)
-        # Human edits preserve evidence + protection from the protected head.
-        if head and source == "human" and bool(head["protected"]):
-            if not evidence:
-                head_row = self.get_revision(head["persona_id"])
-                evidence = head_row["evidence"] if head_row else evidence
-            protected = True
+        # Human edits preserve evidence from the protected head, while allowing
+        # the editor to explicitly unlock the new revision.
+        if head and source == "human" and bool(head["protected"]) and not evidence:
+            head_row = self.get_revision(head["persona_id"])
+            evidence = head_row["evidence"] if head_row else evidence
 
         next_revision = current + 1
         persona_id = "persona-" + uuid4().hex

@@ -5,8 +5,9 @@ Covers the S1 acceptance criteria:
 * Both adapters implement the same persona and prompt-revision contracts
   (append-only, owner/book bounded, supersede) and the domain maps contention
   through the existing transaction errors.
-* Persona writes are append-only, revision-checked, preserve protected records,
-  and derive explainable voice consequences without assigning a voice.
+* Persona writes are append-only, revision-checked, preserve protected-head
+  evidence while allowing explicit unlocks, and derive explainable voice
+   consequences without assigning a voice.
 * Invalid anchors, aliases, scene scopes, and review states are rejected
   deterministically.
 
@@ -219,15 +220,16 @@ def test_save_validation_rejection_does_not_write(domain):
 
 
 # ---------------------------------------------------------------------------
-# Protected records — preserved on human edit, rejected for rerun
+# Protected records — unlockable on human edit, rejected for rerun
 # ---------------------------------------------------------------------------
 
 
-def test_protected_revision_preserved_on_human_edit(domain):
+def test_protected_revision_can_be_unlocked_on_human_edit(domain):
     first = domain.save(_write(protected=True), base_revision=0)
     second = domain.save(_write(), base_revision=1, source="human")
-    # evidence + protection carried forward onto the new revision
-    assert second["protected"] is True
+    # Evidence carries forward, but the explicit unchecked flag unlocks the
+    # newly-created revision.
+    assert second["protected"] is False
     assert second["evidence"] == first["evidence"]
 
 

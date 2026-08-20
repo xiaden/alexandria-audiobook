@@ -226,6 +226,17 @@ describe('buildWriteRequest', () => {
     expect(req.protected).toBe(false);
     expect(el.textContent).toContain('Alice');
   });
+
+  it('allows a protected persona to be explicitly unlocked', async () => {
+    const protectedPersona: Persona = { ...MOCK_PERSONA, protected: true };
+    vi.mocked(API.getPersona).mockResolvedValue(protectedPersona);
+    vi.mocked(API.listPersonaRevisions).mockResolvedValue([protectedPersona]);
+    await openPersonaEditor('char-1');
+    const checkbox = document.querySelector<HTMLInputElement>('[data-role="protected"]');
+    expect(checkbox?.checked).toBe(true);
+    checkbox!.checked = false;
+    expect(buildWriteRequest().protected).toBe(false);
+  });
 });
 
 describe('savePersonaChecked', () => {
