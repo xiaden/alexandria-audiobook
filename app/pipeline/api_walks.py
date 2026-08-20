@@ -341,6 +341,7 @@ async def get_walk_runs(
 
 
 _MAX_LAST_EVENT_ID = 2**63 - 1
+_SSE_KEEPALIVE_SECONDS = 15.0
 
 
 def _parse_last_event_id(request: Request, run_id: str) -> int:
@@ -383,11 +384,12 @@ async def _event_stream(
     run_id: str,
     db_status: str,
     after_seq: int = -1,
+    storage: PipelineStorage | None = None,
 ) -> AsyncIterator[str]:
     """Emit each ``WalkLogRecord`` as SSE framing, then ``event: complete``.
 
     Each record is ``id: {run_id}:{seq}`` / ``event: log`` / one JSON ``data:``
-    line / blank line. Records with ``seq <= after_seq`` (already consumed by the
+    line / blank line. Quiet streams emit ``event: heartbeat`` frames. Records with ``seq <= after_seq`` (already consumed by the
     client's ``Last-Event-ID`` cursor) are suppressed so the stream strictly
     resumes after the cursor for both file replay and live records. After the
     terminal record the stream emits ``complete`` with ``{run_id, status}`` and
@@ -396,7 +398,17 @@ async def _event_stream(
     """
     try:
         terminal_status: str | None = None
-        async for rec in subscription:
+        iterator = subscription.__aiter__()
+        while True:
+            try:
+                rec = await asyncio.wait_for(
+                    iterator.__anext__(), timeout=_SSE_KEEPALIVE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                yield "event: heartbeat\ndata: {}\n\n"
+                continue
+            except StopAsyncIteration:
+                break
             if rec.seq <= after_seq:
                 continue
             yield (
@@ -409,7 +421,14 @@ async def _event_stream(
         # Terminal status is authoritative from the streamed terminal record; when
         # no terminal record was streamed (e.g. a cursor beyond the tail of an
         # already-terminal run), fall back to the walk_run row's status.
-        status = terminal_status if terminal_status is not None else db_status
+        status = terminal_status
+        if status is None and storage is not None:
+            rows = storage.execute_query(
+                "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+            )
+            if rows:
+                status = rows[0]["status"]
+        status = status if status is not None else db_status
         yield (
             f"event: complete\n"
             f"data: {json.dumps({'run_id': run_id, 'status': status}, ensure_ascii=False)}\n\n"
@@ -469,7 +488,7 @@ async def stream_walk_log(
             detail=f"Walk log file not available for run: {run_id}",
         ) from None
     return StreamingResponse(
-        _event_stream(subscription, run_id, db_status, after_seq),
+        _event_stream(subscription, run_id, db_status, after_seq, storage),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1282,8 +1301,9 @@ async def rerun_scoped_walk(
     rejects scenes scope (reuses the combined-workbench 2c contract).  The
     referenced revision's settings are re-applied through the existing
     ``walk_override`` single-writer (via ``PromptConfigDomain.save``) as a new
-    head revision (the ``run``), so an identical revision+scope rerun is
-    rejected ``409 already_ran`` — never a silent duplicate.  Reruns never
+    head revision (the ``run``), so rerunning the revision that directly
+    produced the current head is rejected ``409 already_ran`` — never a silent
+    duplicate.  Reruns never
     auto-run a walk (no auto-cascade).  For the 2b/2c/2d tasks the
     combined-workbench invalidation DAG is reused to report the downstream
     walks a later run would invalidate.
@@ -1350,12 +1370,11 @@ async def rerun_scoped_walk(
                 detail=f"scene_ids not reachable from book: {missing}",
             )
 
-    # Dedupe: re-applying a revision that is no longer the (book, task) head
-    # means this exact revision+scope already ran — 409 already_ran, never a
-    # silent duplicate.  The first rerun of a live head is legitimate and
-    # produces a new head revision.
+    # Dedupe only when this revision directly produced the current head.  An
+    # older revision may still be rerun after later revisions have advanced the
+    # chain; rejecting every non-head revision incorrectly blocks that case.
     head = domain.list_revisions(book_id, task)
-    if head and head[0]["revision_id"] != request.revision_id:
+    if head and row["superseded_by"] == head[0]["revision_id"]:
         raise revision_conflict_http(
             code=CODE_ALREADY_RAN,
             message=(
@@ -1380,7 +1399,11 @@ async def rerun_scoped_walk(
         "prompt": _prompt_override_value(storage, book_id, task, "prompt"),
     }
     try:
-        saved = domain.save(book_id, write=write, base_revision=request.revision_id)
+        saved = domain.save(
+            book_id,
+            write=write,
+            base_revision=head[0]["revision_id"] if head else None,
+        )
     except (BookNotFoundError, StaleRevisionError, ValidationError) as exc:
         raise _prompt_http(exc) from exc
 

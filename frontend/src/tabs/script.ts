@@ -80,6 +80,7 @@ interface WalkLogEntry {
   renderedIds: Set<string>;
   renderedCount: number;
   open: boolean;
+  idleTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /** Walk log registry keyed by run_id (server-provided IDs only). */
@@ -96,6 +97,7 @@ const boundWalkRunsContainers = new WeakSet<HTMLElement>();
 const WALK_LOG_ENTRY_CAP = 200;
 const WALK_LOG_RECORD_TEXT_CAP = 500;
 const WALK_LOG_STATUS_TEXT_CAP = 200;
+const WALK_LOG_IDLE_TIMEOUT_MS = 60_000;
 
 /**
  * WalkLogRecord-shaped SSE `log` payload (mirrors the Part A record DTO:
@@ -470,6 +472,10 @@ function updateWalkRunRow(rowEl: HTMLElement, run: WalkRunRow): void {
  * (e.g. the test harness afterEach) are not closed twice.
  */
 function closeWalkLogEntry(runId: string, entry: WalkLogEntry, deleteEntry: boolean): void {
+  if (entry.idleTimer !== null) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
   if (entry.source && (entry.source as { closed?: boolean }).closed !== true) {
     entry.source.close();
   }
@@ -570,6 +576,7 @@ export function openWalkLog(runId: string): void {
       renderedIds: new Set(),
       renderedCount: 0,
       open: false,
+      idleTimer: null,
     };
     walkLogRegistry.set(runId, entry);
   } else {
@@ -591,6 +598,18 @@ export function openWalkLog(runId: string): void {
   const source = new EventSource(`/api/pipeline/walks/log/${runId}`);
   logEntry.source = source;
 
+  const refreshIdleTimer = (): void => {
+    if (logEntry.idleTimer !== null) clearTimeout(logEntry.idleTimer);
+    logEntry.idleTimer = setTimeout(() => {
+      if (!logEntry.open || logEntry.source !== source) return;
+      if (logEntry.statusEl) {
+        logEntry.statusEl.textContent = 'Log stream timed out.'.slice(0, WALK_LOG_STATUS_TEXT_CAP);
+      }
+      closeWalkLogEntry(runId, logEntry, false);
+    }, WALK_LOG_IDLE_TIMEOUT_MS);
+  };
+  refreshIdleTimer();
+
   // 'log': JSON-parse the record, dedup by the opaque {run_id}:{seq} id, and
   // append ONE bounded, text-only rendering (data-walk-log-entry) to the
   // viewer. Malformed JSON never throws and never corrupts the viewer; ids
@@ -599,6 +618,7 @@ export function openWalkLog(runId: string): void {
   // further elements are created.
   source.addEventListener('log', (evt: Event) => {
     if (!walkLogRegistry.get(runId) || !logEntry.open) return; // removed/closed guard
+    refreshIdleTimer();
     let record: WalkLogRecordPayload;
     try {
       const parsed: unknown = JSON.parse(String((evt as MessageEvent).data));
@@ -621,6 +641,8 @@ export function openWalkLog(runId: string): void {
     entryEl.textContent = buildLogEntryText(record).slice(0, WALK_LOG_RECORD_TEXT_CAP);
     logEntry.viewerEl?.appendChild(entryEl);
   });
+
+  source.addEventListener('heartbeat', () => refreshIdleTimer());
 
   // 'complete': {run_id,status} — announce the bounded status text, close and
   // remove the source exactly once, and mark the entry closed so a later

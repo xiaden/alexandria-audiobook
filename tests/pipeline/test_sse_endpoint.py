@@ -38,6 +38,7 @@ import os
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -71,6 +72,44 @@ except ImportError:  # Historical safeguard: dependency absent only in pre-GREEN
 def _canonical_uuid() -> str:
     """Return a fresh canonical UUID string."""
     return str(uuid.uuid4())
+
+
+def test_event_stream_emits_keepalive_and_completes():
+    """A quiet live subscription stays observable and still terminates."""
+    class Subscription:
+        def __init__(self):
+            self.closed = False
+            self.calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(0.02)
+                return SimpleNamespace(
+                    seq=0,
+                    id="run:0",
+                    data={"status": "completed"},
+                    terminal=True,
+                )
+            raise StopAsyncIteration
+
+        def close(self):
+            self.closed = True
+
+    async def collect():
+        import app.pipeline.api_walks as module
+        old = module._SSE_KEEPALIVE_SECONDS
+        module._SSE_KEEPALIVE_SECONDS = 0.001
+        try:
+            return [item async for item in _event_stream(Subscription(), "run", "running")]
+        finally:
+            module._SSE_KEEPALIVE_SECONDS = old
+
+    events = asyncio.run(collect())
+    assert any("event: heartbeat" in event for event in events)
 
 
 def _insert_run(

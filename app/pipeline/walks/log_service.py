@@ -673,6 +673,25 @@ class _RunBroker:
             if loop is not None:
                 loop.call_soon_threadsafe(sub._close_queue, True)
 
+    def close_for_completion(self) -> None:
+        """Finish subscribers when terminal-record persistence failed.
+
+        ``close_run`` must release live subscribers even when the filesystem
+        cannot accept the terminal record.  In that case the database status is
+        still authoritative and the SSE layer emits its completion event using
+        that status.  Existing queued records are drained before the sentinel.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            subscribers = list(self._subscribers)
+            self._subscribers.clear()
+        for sub in subscribers:
+            loop = sub._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(sub._close_queue, False)
+
 
 # ---------------------------------------------------------------------------
 # Subscription (replay snapshot + loop-safe live broker delivery)
@@ -888,12 +907,16 @@ class WalkLogService:
             sink = self._sinks.get(run_id)
         if sink is None:
             return None
-        rec = sink.append_terminal(status, payload)
-        with self._lock:
-            self._sinks.pop(run_id, None)
-            self._brokers.pop(run_id, None)
-        sink.close()
-        return rec
+        broker: _RunBroker | None = None
+        try:
+            return sink.append_terminal(status, payload)
+        finally:
+            with self._lock:
+                self._sinks.pop(run_id, None)
+                broker = self._brokers.pop(run_id, None)
+            sink.close()
+            if broker is not None:
+                broker.close_for_completion()
 
     def open_subscription(
         self,
