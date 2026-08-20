@@ -888,8 +888,11 @@ def _safe_extract_zip(zf, destination):
             parent = os.path.dirname(target_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            with zf.open(member) as source, open(target_path, "wb") as target:
-                shutil.copyfileobj(source, target)
+            try:
+                with zf.open(member) as source, open(target_path, "wb") as target:
+                    shutil.copyfileobj(source, target)
+            except OSError as exc:
+                raise HTTPException(status_code=400, detail="ZIP contains an invalid member") from exc
 
 def _load_builtin_lora_manifest():
     """Load built-in LoRA manifest from HF (with local fallback). Returns ALL entries with download status."""

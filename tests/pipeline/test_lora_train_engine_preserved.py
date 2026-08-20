@@ -22,6 +22,7 @@ under their bare names before ``app.app`` is imported.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -189,3 +190,35 @@ class TestLoraTrainPreservesEngine:
 
         assert resp.status_code == 200
         assert app.engine._tts_engine is None
+
+
+class TestLoraGpuExclusion:
+    def test_gpu_acquisition_rejects_running_training(self, train_api) -> None:
+        """Preview/test requests must fail fast while training is running."""
+        app.app.process_state["lora_training"]["running"] = True
+
+        assert app.app._try_acquire_lora_gpu() is False
+        assert app.app.lora_gpu_lock.acquire(blocking=False) is True
+        app.app.lora_gpu_lock.release()
+
+    def test_preview_releases_gpu_lock_when_generation_fails(
+        self, train_api, monkeypatch, tmp_path
+    ) -> None:
+        """A failed preview must not block the next GPU user forever."""
+        adapter_dir = tmp_path / "models" / "adapter1"
+        adapter_dir.mkdir(parents=True)
+        monkeypatch.setattr(app.app, "LORA_MODELS_DIR", str(tmp_path / "models"))
+        monkeypatch.setattr(app.app, "_load_builtin_lora_manifest", lambda: [])
+        monkeypatch.setattr(
+            app.app, "_load_manifest", lambda _path: [{"id": "adapter1"}]
+        )
+        monkeypatch.setattr(
+            app.app, "get_tts_engine", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        with pytest.raises(app.app.HTTPException) as exc_info:
+            asyncio.run(app.app.lora_preview("adapter1"))
+
+        assert exc_info.value.status_code == 500
+        assert app.app.lora_gpu_lock.acquire(blocking=False) is True
+        app.app.lora_gpu_lock.release()
