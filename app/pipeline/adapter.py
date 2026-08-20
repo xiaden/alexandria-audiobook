@@ -173,12 +173,11 @@ class PipelineStorage(ABC):
     def list_clone_references(
         self, voice_id: str, owner_id: str
     ) -> list[dict]:
-        """Return the *owner_id*-owned ``clone_reference`` rows for *voice_id*.
+        """Return active, owner-owned rows for *voice_id*.
 
-        Owner-scoped: only rows whose ``owner_id`` equals *owner_id* are
-        returned, so a caller can never observe another owner's references
-        (including their tombstones).  Each row is a dict carrying the full
-        column set in schema order.
+        Tombstoned rows are retained for deletion history but are not part of
+        the user-facing reference list. Each row carries the full column set
+        in schema order.
         """
 
     @abstractmethod
@@ -1089,7 +1088,7 @@ class SQLiteAdapter(PipelineStorage):
             "SELECT reference_id, voice_id, owner_id, relative_path,"
             " original_filename, media_type, byte_size, duration_ms, sha256,"
             " created_ms, deleted_ms FROM clone_reference"
-            " WHERE voice_id = ? AND owner_id = ?"
+            " WHERE voice_id = ? AND owner_id = ? AND deleted_ms IS NULL"
             " ORDER BY created_ms ASC, reference_id ASC",
             (voice_id, owner_id),
         )
@@ -1659,7 +1658,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
             "SELECT reference_id, voice_id, owner_id, relative_path,"
             " original_filename, media_type, byte_size, duration_ms, sha256,"
             " created_ms, deleted_ms FROM clone_reference"
-            " WHERE voice_id = ? AND owner_id = ?"
+            " WHERE voice_id = ? AND owner_id = ? AND deleted_ms IS NULL"
             " ORDER BY created_ms ASC, reference_id ASC",
             (voice_id, owner_id),
         )

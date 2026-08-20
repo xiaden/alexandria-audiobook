@@ -289,6 +289,19 @@ class TestListCloneReferences:
         assert resp.status_code == 200
         assert resp.json()["references"] == []
 
+    def test_list_excludes_deleted_references(self, client, storage):
+        _insert_reference(storage, "active", created_ms=1)
+        _insert_reference(storage, "deleted", created_ms=2)
+        storage.execute_update(
+            "UPDATE clone_reference SET deleted_ms = ? WHERE reference_id = ?",
+            (123, "deleted"),
+        )
+
+        resp = client.get("/api/pipeline/voices/vclone/references")
+
+        assert resp.status_code == 200
+        assert [r["reference_id"] for r in resp.json()["references"]] == ["active"]
+
     def test_list_unknown_voice_404(self, client):
         resp = client.get("/api/pipeline/voices/nope/references")
         assert resp.status_code == 404
