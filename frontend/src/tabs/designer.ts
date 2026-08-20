@@ -191,7 +191,7 @@ async function saveDesignedVoice(): Promise<void> {
  * @param filename - The audio filename to play
  */
 function playDesignedVoice(filename: string): void {
-  const audio = new Audio(`/designed_voices/${filename}?t=${Date.now()}`);
+  const audio = new Audio(`/designed_voices/${encodeURIComponent(filename)}?t=${Date.now()}`);
   audio.play();
 }
 

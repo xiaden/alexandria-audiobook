@@ -882,17 +882,17 @@ def _safe_extract_zip(zf, destination):
     os.makedirs(destination, exist_ok=True)
     for member in zf.infolist():
         target_path = os.path.join(destination, member.filename)
-        if member.is_dir():
-            os.makedirs(target_path, exist_ok=True)
-        else:
-            parent = os.path.dirname(target_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            try:
+        try:
+            if member.is_dir():
+                os.makedirs(target_path, exist_ok=True)
+            else:
+                parent = os.path.dirname(target_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 with zf.open(member) as source, open(target_path, "wb") as target:
                     shutil.copyfileobj(source, target)
-            except OSError as exc:
-                raise HTTPException(status_code=400, detail="ZIP contains an invalid member") from exc
+        except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+            raise HTTPException(status_code=400, detail="ZIP contains an invalid member") from exc
 
 def _load_builtin_lora_manifest():
     """Load built-in LoRA manifest from HF (with local fallback). Returns ALL entries with download status."""
@@ -1543,32 +1543,39 @@ async def dataset_builder_update_rows(request: DatasetBuilderUpdateRowsRequest):
 @app.post("/api/dataset_builder/generate_sample")
 async def dataset_builder_generate_sample(request: DatasetSampleGenRequest):
     """Generate a single dataset sample using VoiceDesign."""
+    safe_name = _sanitize_name(request.dataset_name)
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid dataset name")
+
     engine = get_tts_engine()
     if not engine:
         raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
 
-    work_dir = os.path.join(DATASET_BUILDER_DIR, request.dataset_name)
-    os.makedirs(work_dir, exist_ok=True)
+    work_dir = os.path.join(DATASET_BUILDER_DIR, safe_name)
 
-    try:
-        wav_path, sr = engine.generate_voice_design(
-            description=request.description,
-            sample_text=request.text,
-            seed=request.seed,
-        )
+    # Hold the project lock through generation and persistence so delete cannot
+    # remove the directory between the audio copy and state write.
+    with _get_builder_lock(safe_name):
+        if not os.path.isdir(work_dir):
+            raise HTTPException(status_code=404, detail="Project not found")
 
-        dest_filename = f"sample_{request.sample_index:03d}.wav"
-        dest_path = os.path.join(work_dir, dest_filename)
-        shutil.copy2(wav_path, dest_path)
+        try:
+            wav_path, sr = engine.generate_voice_design(
+                description=request.description,
+                sample_text=request.text,
+                seed=request.seed,
+            )
 
-        # Update state (cache-bust URL so browser loads fresh audio on regen).
-        # Serialized per dataset so concurrent batch/sample writes don't lose it.
-        cache_bust = int(time.time())
-        audio_url = f"/dataset_builder/{request.dataset_name}/{dest_filename}?t={cache_bust}"
+            dest_filename = f"sample_{request.sample_index:03d}.wav"
+            dest_path = os.path.join(work_dir, dest_filename)
+            shutil.copy2(wav_path, dest_path)
 
-        def _mutate(state):
+            # Update state (cache-bust URL so browser loads fresh audio on regen).
+            cache_bust = int(time.time())
+            audio_url = f"/dataset_builder/{safe_name}/{dest_filename}?t={cache_bust}"
+
+            state = _load_builder_state(safe_name)
             samples = state.get("samples", [])
-            # Ensure list is large enough
             while len(samples) <= request.sample_index:
                 samples.append({"status": "pending"})
             existing_sample = samples[request.sample_index]
@@ -1580,32 +1587,26 @@ async def dataset_builder_generate_sample(request: DatasetSampleGenRequest):
                 "description": request.description,
             }
             state["samples"] = samples
-            return state
+            _save_builder_state(safe_name, state)
 
-        _update_builder_state(request.dataset_name, _mutate)
-
-        return {
-            "status": "done",
-            "sample_index": request.sample_index,
-            "audio_url": audio_url,
-        }
-    except Exception as e:
-        logger.error(f"Dataset builder sample generation failed: {e}")
-        # Mark as error in state (serialized per dataset). Capture the exception
-        # text up front so the deferred mutator does not reference the
-        # ``except ... as e`` binding (which is cleared once the block is left).
-        err = str(e)
-
-        def _mutate(state):
+            return {
+                "status": "done",
+                "sample_index": request.sample_index,
+                "audio_url": audio_url,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Dataset builder sample generation failed: {e}")
+            err = str(e)
+            state = _load_builder_state(safe_name)
             samples = state.get("samples", [])
             while len(samples) <= request.sample_index:
                 samples.append({"status": "pending"})
             samples[request.sample_index] = {"status": "error", "error": err}
             state["samples"] = samples
-            return state
-
-        _update_builder_state(request.dataset_name, _mutate)
-        raise HTTPException(status_code=500, detail=str(e))
+            _save_builder_state(safe_name, state)
+            raise HTTPException(status_code=500, detail=err)
 
 @app.post("/api/dataset_builder/generate_batch")
 async def dataset_builder_generate_batch(request: DatasetBatchGenRequest):
@@ -1753,7 +1754,8 @@ async def dataset_builder_cancel(request: DatasetBuilderCancelRequest):
 async def dataset_builder_status(name: str):
     """Get per-sample generation status for a dataset builder project."""
     safe_name = _sanitize_name(name)
-    state = _load_builder_state(safe_name)
+    with _get_builder_lock(safe_name):
+        state = _load_builder_state(safe_name)
     project = process_state["dataset_builder"]["projects"].get(safe_name, {})
     return {
         "description": state.get("description", ""),

@@ -308,6 +308,21 @@ def test_voice_design_delete_404():
     assert_status(r, 404)
 
 
+def test_voice_design_save_rejects_invalid_preview():
+    for preview_file, expected_status in (
+        ("../outside.wav", 400),
+        ("preview.txt", 400),
+        (f"{TEST_PREFIX}missing.wav", 404),
+    ):
+        r = post("/api/voice_design/save", json={
+            "name": f"{TEST_PREFIX}invalid_preview",
+            "description": "Test voice",
+            "sample_text": "Test text",
+            "preview_file": preview_file,
+        })
+        assert_status(r, expected_status)
+
+
 def test_voice_design_preview():
     r = post("/api/voice_design/preview", json={
         "description": "A clear young male voice with a steady tone",
