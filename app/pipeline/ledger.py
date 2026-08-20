@@ -126,6 +126,7 @@ class CharacterLedger:
         # Collect review candidates from character_book (low-confidence)
         items: list[dict[str, Any]] = self._storage.execute_query(
             f"""SELECT c.id AS character_id, c.name AS character_name,
+                       'pending' AS status,
                        'character_book' AS junction_table,
                        cb.confidence, cb.source AS walk_name,
                        'Low-confidence character-book association' AS reason

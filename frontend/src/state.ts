@@ -435,7 +435,8 @@ export function selectReviewItems(
     );
     return wb.review_items.filter((r) => conflictItemIds.has(r.item_id));
   }
-  return wb.review_items.filter((r) => r.status.toLowerCase() === normalized);
+  // Legacy payloads may omit status; queue entries are pending by default.
+  return wb.review_items.filter((r) => (r.status ?? 'pending').toLowerCase() === normalized);
 }
 
 /** Presence rows for a given scene. */

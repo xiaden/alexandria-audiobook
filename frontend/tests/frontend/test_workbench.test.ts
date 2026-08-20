@@ -318,6 +318,13 @@ describe('selectors (state.ts)', () => {
     expect(selectReviewItems(MOCK_WB, 'protected')).toHaveLength(1);
   });
 
+  it('treats legacy review items without status as pending', () => {
+    const legacyItem = { ...MOCK_WB.review_items[0] };
+    delete (legacyItem as Partial<typeof legacyItem>).status;
+    const wb = { ...MOCK_WB, review_items: [legacyItem] };
+    expect(selectReviewItems(wb, 'pending')).toEqual([legacyItem]);
+  });
+
   it('selectScenePresence filters by scene', () => {
     expect(selectScenePresence(MOCK_WB, 'scene-1')).toHaveLength(1);
     expect(selectScenePresence(MOCK_WB, null)).toHaveLength(0);

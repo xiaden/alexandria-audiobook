@@ -531,6 +531,7 @@ class ReviewManager:
 
         rows = self._storage.execute_query(
             f"""SELECT c.id AS character_id, c.name AS character_name,
+                       'pending' AS status,
                        'character_scene' AS junction_table,
                        cs.confidence, cs.source AS walk_name,
                        cs.scene_id AS related_entity_id,
@@ -568,6 +569,7 @@ class ReviewManager:
 
         rows = self._storage.execute_query(
             f"""SELECT c.id AS character_id, c.name AS character_name,
+                       'pending' AS status,
                        'character_span' AS junction_table,
                        csp.confidence, csp.source AS walk_name,
                        csp.span_id AS related_entity_id,
@@ -625,6 +627,7 @@ class ReviewManager:
 
         rows = self._storage.execute_query(
             f"""SELECT wri.id AS item_id, wri.kind, wri.target_table,
+                       wri.status,
                        wri.target_id, wri.prior_value, wri.created_ms
                   FROM walk_review_item wri
                  {walk_filter}

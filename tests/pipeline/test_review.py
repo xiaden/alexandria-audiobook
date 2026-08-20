@@ -971,6 +971,7 @@ class TestWalkItemsInQueue:
             "kind",
             "target_table",
             "target_id",
+            "status",
             "prior_value",
             "created_ms",
             "neighbors",
