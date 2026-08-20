@@ -281,6 +281,29 @@ def test_dedupe_same_revision_and_scope(client):
     assert body["detail"]["head_revision_id"] != rid
 
 
+def test_rerun_older_revision_after_later_head_is_allowed(client):
+    first = _save(client)
+    second = client.post("/api/pipeline/walks/b1/reruns", json=_rerun(first)).json()
+    third = client.post(
+        "/api/pipeline/walks/b1/reruns", json=_rerun(second["run_id"])
+    )
+    assert third.status_code == 200
+
+    direct_producer = client.post(
+        "/api/pipeline/walks/b1/reruns", json=_rerun(second["run_id"])
+    )
+    assert direct_producer.status_code == 409
+    _assert_conflict(direct_producer, "ALREADY_RAN")
+
+    rerun_first = client.post("/api/pipeline/walks/b1/reruns", json=_rerun(first))
+    assert rerun_first.status_code == 200
+    assert rerun_first.json()["run_id"] not in {
+        first,
+        second["run_id"],
+        third.json()["run_id"],
+    }
+
+
 def test_dedupe_differs_across_tasks(client):
     # A rerun of one task does not block a rerun of a different task.
     rid_a = _save(client, task="scene_segmentation")

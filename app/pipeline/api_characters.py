@@ -387,11 +387,10 @@ async def rerun_persona(
                 "head_persona_id": head[0]["persona_id"],
             },
         )
-    # Dedupe: a rerun targets a revision that is the current head.  If the
-    # referenced revision has already been superseded, this exact rerun already
-    # ran — 409 already_ran, never duplicated silently.  The first rerun of a
-    # live head is legitimate and produces a new revision.
-    if head and head[0]["persona_id"] != base["persona_id"]:
+    # Dedupe only when this revision directly produced the current head.  An
+    # older revision may still be rerun after later revisions have advanced the
+    # chain; rejecting every non-head revision incorrectly blocks that case.
+    if head and base["superseded_by"] == head[0]["persona_id"]:
         raise revision_conflict_http(
             code=CODE_ALREADY_RAN,
             message=(
