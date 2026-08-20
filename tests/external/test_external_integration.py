@@ -162,7 +162,7 @@ class RecordingEngine:
         self._write_wav(wav_path)
         return wav_path, 8000
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         self._record(
             "generate_batch",
             chunks=list(chunks),

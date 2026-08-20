@@ -963,7 +963,9 @@ class TTSEngine:
             if self._mode == "local":
                 batch_results = self._local_batch_custom(custom_chunks, voice_config, output_dir, batch_seed, cancel_check)
             else:
-                batch_results = self._sequential_custom(custom_chunks, voice_config, output_dir, batch_seed)
+                batch_results = self._sequential_custom(
+                    custom_chunks, voice_config, output_dir, batch_seed, cancel_check
+                )
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
             if batch_results.get("cancelled"):
@@ -1725,11 +1727,16 @@ class TTSEngine:
             traceback.print_exc()
             return False
 
-    def _sequential_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def _sequential_custom(
+        self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None
+    ):
         """Sequential custom voice generation for external mode (no native batch)."""
-        results = {"completed": [], "failed": []}
+        results = {"completed": [], "failed": [], "cancelled": False}
 
         for chunk in chunks:
+            if cancel_check is not None and cancel_check():
+                results["cancelled"] = True
+                return results
             idx = chunk["index"]
             output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
             try:

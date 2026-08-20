@@ -1014,7 +1014,11 @@ def render_audiobook(
                 pause_same_speaker_ms=pause_same_ms,
             )
             result = tts_engine.generate_batch(
-                chunks, voice_config, resolved_dir, batch_seed, cancel_check
+                chunks,
+                voice_config,
+                resolved_dir,
+                batch_seed,
+                cancel_check=cancel_check,
             )
             if result and result.get("cancelled"):
                 raise CancelledError("Render cancelled during batch dispatch")

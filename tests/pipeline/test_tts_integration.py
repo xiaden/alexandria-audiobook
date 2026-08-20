@@ -43,7 +43,7 @@ class FakeTTSEngine:
         self.batch_calls: list[dict] = []
         self.voice_calls: list[dict] = []
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Record the call, write placeholder wavs, and return all indices as completed."""
         self.batch_calls.append(
             {
@@ -51,6 +51,7 @@ class FakeTTSEngine:
                 "voice_config": dict(voice_config),
                 "output_dir": output_dir,
                 "batch_seed": batch_seed,
+                "cancel_check": cancel_check,
             }
         )
         # Mirror app/tts.py's batch file naming so the fsync/manifest
@@ -1044,12 +1045,14 @@ class _RowInspectingBatchEngine(FakeTTSEngine):
         self.job_id = job_id
         self.status_during_batch = None
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         rows = self.storage.execute_query(
             "SELECT status FROM render_job WHERE job_id = ?", (self.job_id,)
         )
         self.status_during_batch = rows[0]["status"] if rows else None
-        return super().generate_batch(chunks, voice_config, output_dir, batch_seed)
+        return super().generate_batch(
+            chunks, voice_config, output_dir, batch_seed, cancel_check
+        )
 
 
 class _RowInspectingVoiceEngine(FakeTTSEngine):
@@ -1083,8 +1086,8 @@ class _RowInspectingVoiceEngine(FakeTTSEngine):
 class _AllFailedBatchEngine(FakeTTSEngine):
     """FakeTTSEngine whose batch generation fails for every chunk."""
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
-        super().generate_batch(chunks, voice_config, output_dir, batch_seed)
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
+        super().generate_batch(chunks, voice_config, output_dir, batch_seed, cancel_check)
         return {
             "completed": [],
             "failed": [(c["index"], f"boom {c['index']}") for c in chunks],
@@ -1735,7 +1738,7 @@ class _RealWavBatchEngine:
         seg = seg.set_channels(self.channels).set_sample_width(self.sample_width)
         seg.export(output_path, format="wav")
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         self.batch_calls.append(list(chunks))
         for chunk in chunks:
             self._write(os.path.join(output_dir, f"temp_batch_{chunk['index']}.wav"))
