@@ -12,7 +12,7 @@
 
 import * as API from '../api';
 import { showToast, showConfirm, escapeHtml } from '../utils';
-import { state } from '../state';
+import { state, setPipelineBookId } from '../state';
 import { WALK_ORDER, WALK_DISPLAY_NAMES } from '../pipeline/walks';
 
 // ---------------------------------------------------------------------------
@@ -693,7 +693,7 @@ async function refreshWalkRuns(bookId?: string): Promise<void> {
 /**
  * Start polling walk status for the current book.
  * Polls GET /api/pipeline/walk_status/{book_id} every 2 seconds.
- * Stops when all walks are completed or failed (no more 'running').
+ * Stops when all walks are terminal (no 'pending' or 'running' walks).
  * Shows error toast if any walk fails.
  */
 export function startWalkPolling(): void {
@@ -718,9 +718,13 @@ export function startWalkPolling(): void {
         }
       }
 
-      // Stop polling if no walks are running
-      const anyRunning = Object.values(statuses).some(s => s === 'running');
-      if (!anyRunning) {
+      // A reserved run is reported as pending until its background task starts.
+      // Keep polling during that window, otherwise the immediate first poll can
+      // stop before the task transitions to running.
+      const anyActive = Object.values(statuses).some(
+        s => s === 'pending' || s === 'running',
+      );
+      if (!anyActive) {
         stopWalkPolling();
         updateRunAllButton(false);
       }
@@ -808,7 +812,7 @@ async function handleOnboard(): Promise<void> {
   try {
     const result = await pipelineOnboard(file);
     currentBookId = result.book_id;
-    state.pipelineBookId = result.book_id;
+    setPipelineBookId(result.book_id);
 
     if (statusEl) {
       statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Onboarded: ${escapeHtml(file.name)} — Book ID: <code>${escapeHtml(result.book_id)}</code> (${result.chapters} chapters)</span>`;
@@ -1022,6 +1026,7 @@ function initPipelineUI(): void {
   // history for the book without starting walk polling (walk-status behavior
   // is unchanged — polling only starts from an explicit run/onboard action).
   if (state.pipelineBookId) {
+    currentBookId = state.pipelineBookId;
     void refreshWalkRuns(state.pipelineBookId ?? undefined);
   }
 

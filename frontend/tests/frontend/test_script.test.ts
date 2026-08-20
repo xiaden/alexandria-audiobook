@@ -747,6 +747,7 @@ describe('Script Tab — Walk Runs List (Plan F, Phase 3)', () => {
     vi.clearAllMocks();
     mockFetch.mockReset(); // also drops stale Once queues from earlier describes
     state.pipelineBookId = null; // isolate from earlier describes (handleOnboard leaks it)
+    localStorage.clear();
     vi.useFakeTimers();
     document.body.innerHTML = `
       <input type="file" id="file-upload">
@@ -896,6 +897,21 @@ describe('Script Tab — Walk Runs List (Plan F, Phase 3)', () => {
     expect(container.querySelectorAll('[data-walk-run-row]').length).toBe(1);
     // Tab load must NOT start walk polling (walk-status behavior unchanged).
     expect(API.get).not.toHaveBeenCalledWith('/api/pipeline/walk_status/book-restored-1');
+  });
+
+  it('uses the restored book ID for walk actions after reload', async () => {
+    state.pipelineBookId = 'book-restored-1';
+    mockPollingApi([]);
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    document.getElementById('btn-cancel-walks')?.dispatchEvent(new Event('click'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockFetch).toHaveBeenCalledWith('/api/pipeline/cancel_walks', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ book_id: 'book-restored-1' }),
+    }));
   });
 
   it('index.html declares #walk-runs-container inside the Script tab, below the walk-status card', () => {
@@ -1913,6 +1929,24 @@ describe('Script Tab — Per-Walk Log Viewer (Part D)', () => {
 
         await vi.advanceTimersByTimeAsync(2000);
         expect(runsCallCount()).toBe(3); // second tick at exactly 4000ms
+      });
+
+      it('keeps polling while a reserved walk is pending before it starts', async () => {
+        let pollCount = 0;
+        vi.mocked(API.get).mockImplementation((endpoint: string) => {
+          if (String(endpoint).endsWith('/runs')) return Promise.resolve([]);
+          pollCount += 1;
+          const statuses: Record<string, string> = {};
+          for (const walkName of WALK_ORDER) statuses[walkName] = 'completed';
+          statuses['walk_2a_scene_segmentation'] = pollCount === 1 ? 'pending' : 'running';
+          return Promise.resolve(statuses);
+        });
+
+        await onboardViaUi();
+        expect(pollCount).toBe(1);
+
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(pollCount).toBe(2);
       });
     });
 
