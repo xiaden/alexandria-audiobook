@@ -213,6 +213,18 @@ export async function pipelineUpdateSpanText(
   return API.put(`/api/pipeline/span/${spanId}/text`, { text });
 }
 
+/**
+ * Invalidate rendered audio after the source spans change. Render chunks are
+ * addressed by presentation index, so retaining the old job after a split,
+ * merge, move, delete, or text edit can play a different span's audio.
+ */
+export function invalidateRenderPreview(): void {
+  state.pipelineRenderJobId = null;
+  // Keep an in-flight job alive so its polling/finally path can clean up, but
+  // prevent it from becoming the active preview job when it completes.
+  if (_currentRenderJobId) _renderPreviewInvalidated = true;
+}
+
 // ---------------------------------------------------------------------------
 // Single-speaker render flag (Plan J, Phase 2)
 // ---------------------------------------------------------------------------
@@ -341,6 +353,7 @@ export async function undoLastSpanEdit(): Promise<void> {
   }
   try {
     await pipelineUpdateSpanText(entry.spanId, entry.priorValue);
+    invalidateRenderPreview();
     // Restore the cached span text + the visible row (matched by data-index,
     // the same key the focusout handler uses).
     const span = _cachedSpans.find(s => s.id === entry.spanId);
@@ -591,7 +604,7 @@ export async function loadSpans(): Promise<void> {
 export function renderSpanRow(span: PipelineSpan): string {
   const isSelected = _selectedIndices.has(span.global_index);
   const rowClass = isSelected ? 'table-active' : '';
-  const jobId = state.pipelineRenderJobId ?? _currentRenderJobId ?? '';
+  const jobId = _renderPreviewInvalidated ? '' : (state.pipelineRenderJobId ?? _currentRenderJobId ?? '');
   // Individual-mode renders write one render_chunk per span in presentation
   // order with a 0-BASED idx (tts_integration.py: enumerate(script) →
   // _insert_chunk_row(job_id, i, ...)), so chunk idx = global_index − 1.
@@ -659,7 +672,7 @@ export function renderSpanRow(span: PipelineSpan): string {
  * nothing plays.
  */
 export async function handlePreviewSpan(index: number): Promise<void> {
-  const jobId = state.pipelineRenderJobId ?? _currentRenderJobId;
+  const jobId = _renderPreviewInvalidated ? null : (state.pipelineRenderJobId ?? _currentRenderJobId);
   if (!jobId) {
     showToast('No render job to preview', 'warning');
     return;
@@ -739,6 +752,7 @@ export async function handleSplit(index: number): Promise<void> {
       presentation_index: index,
       split_point: splitPoint,
     });
+    invalidateRenderPreview();
     showToast(`Span #${index} split at offset ${splitPoint}`, 'success');
     await loadSpans();
   } catch (e) {
@@ -772,6 +786,7 @@ export async function handleMerge(): Promise<void> {
       presentation_index_left: left,
       presentation_index_right: right,
     });
+    invalidateRenderPreview();
     showToast(`Merged spans #${left} and #${right}`, 'success');
     _selectedIndices.clear();
     await loadSpans();
@@ -807,6 +822,7 @@ export async function handleMove(toIndex: number): Promise<void> {
       presentation_index_from: fromIndex,
       presentation_index_to: toIndex,
     });
+    invalidateRenderPreview();
     showToast(`Moved span from #${fromIndex} to #${toIndex}`, 'success');
     _selectedIndices.clear();
     await loadSpans();
@@ -837,6 +853,7 @@ export async function handleDelete(index: number): Promise<void> {
     await pipelineOperation('delete', {
       presentation_index: index,
     });
+    invalidateRenderPreview();
     showToast(`Deleted span #${index}`, 'success');
     _selectedIndices.delete(index);
     await loadSpans();
@@ -1021,6 +1038,9 @@ export async function handleReviewOverride(itemId: string): Promise<void> {
 /** Currently active render job ID (set when render starts, cleared when finished) */
 let _currentRenderJobId: string | null = null;
 
+/** True when the active render no longer matches the edited span set. */
+let _renderPreviewInvalidated = false;
+
 /** Interval handle for render-status polling */
 let _renderPollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -1169,6 +1189,7 @@ export async function pipelineRenderAll(): Promise<void> {
   hideExportM4bForm();
 
   try {
+    _renderPreviewInvalidated = false;
     // Start the render — returns immediately with a job_id
     const result = await pipelineRenderAudiobook(true);
     _currentRenderJobId = result.job_id;
@@ -1190,8 +1211,15 @@ export async function pipelineRenderAll(): Promise<void> {
             if (_renderPollTimer) clearInterval(_renderPollTimer);
             _renderPollTimer = null;
             // Store job_id in global state for merge/download
-            state.pipelineRenderJobId = _currentRenderJobId;
-            showToast('Render complete', 'success');
+            if (!_renderPreviewInvalidated) {
+              state.pipelineRenderJobId = _currentRenderJobId;
+            }
+            showToast(
+              _renderPreviewInvalidated
+                ? 'Render finished — spans changed, render again to preview'
+                : 'Render complete',
+              _renderPreviewInvalidated ? 'warning' : 'success',
+            );
             resolve();
           } else if (status.status === 'failed') {
             if (_renderPollTimer) clearInterval(_renderPollTimer);
@@ -1217,7 +1245,7 @@ export async function pipelineRenderAll(): Promise<void> {
 
     // Reveal the full result surface on success (Plan F): download + whole-book
     // play affordances and the Export M4B card (Phase 4).
-    if (_currentRenderJobId) revealResultSurface(_currentRenderJobId);
+    if (_currentRenderJobId && !_renderPreviewInvalidated) revealResultSurface(_currentRenderJobId);
 
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -1254,7 +1282,7 @@ export async function cancelPipelineRender(skipApi = false): Promise<void> {
  * Uses state.pipelineRenderJobId if no jobId is provided.
  */
 export async function downloadPipelineRender(jobId?: string): Promise<void> {
-  const id = jobId ?? state.pipelineRenderJobId ?? _currentRenderJobId;
+  const id = jobId ?? (_renderPreviewInvalidated ? null : (state.pipelineRenderJobId ?? _currentRenderJobId));
   if (!id) {
     showToast('No render job to download', 'warning');
     return;
@@ -1273,7 +1301,7 @@ export async function downloadPipelineRender(jobId?: string): Promise<void> {
  * After merge completes, the download button can retrieve the merged file.
  */
 export async function mergePipelineAudiobook(): Promise<void> {
-  const jobId = state.pipelineRenderJobId ?? _currentRenderJobId;
+  const jobId = _renderPreviewInvalidated ? null : (state.pipelineRenderJobId ?? _currentRenderJobId);
   if (!jobId) {
     showToast('No render job to merge. Render the audiobook first.', 'warning');
     return;
@@ -1319,7 +1347,7 @@ export async function mergePipelineAudiobook(): Promise<void> {
  * UI (progress/cancel/export) is Plan F scope.
  */
 export async function playPipelineAudiobook(jobId?: string): Promise<void> {
-  const id = jobId ?? state.pipelineRenderJobId ?? _currentRenderJobId;
+  const id = jobId ?? (_renderPreviewInvalidated ? null : (state.pipelineRenderJobId ?? _currentRenderJobId));
   if (!id) {
     showToast('No render job to play. Render the audiobook first.', 'warning');
     return;
@@ -1359,7 +1387,7 @@ export async function playPipelineAudiobook(jobId?: string): Promise<void> {
  * singleton player's playSequence() (stopThenPlay + auto-advance on 'ended').
  */
 export async function playSpanSequence(jobId?: string): Promise<void> {
-  const id = jobId ?? state.pipelineRenderJobId ?? _currentRenderJobId;
+  const id = jobId ?? (_renderPreviewInvalidated ? null : (state.pipelineRenderJobId ?? _currentRenderJobId));
   if (!id) {
     showToast('No render job to play. Render the audiobook first.', 'warning');
     return;

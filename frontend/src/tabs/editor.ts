@@ -32,6 +32,7 @@ import {
   pipelineRenderAudiobook,
   pipelineExportSpans,
   pipelineUpdateSpanText,
+  invalidateRenderPreview,
   // Export M4B (Plan F, Phase 4)
   pipelineExportM4b,
   handleExportM4bSubmit,
@@ -360,6 +361,7 @@ export function initEditor(): void {
           const priorValue = span ? span.text : null;
 
           await pipelineUpdateSpanText(spanId, newText);
+          invalidateRenderPreview();
           // Update local cache
           if (span) {
             span.text = newText;
