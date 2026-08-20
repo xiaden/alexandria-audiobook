@@ -131,3 +131,60 @@ def test_dataset_builder_cancel_requires_name() -> None:
     client = _client()
     r = client.post("/api/dataset_builder/cancel", json={})
     assert r.status_code == 422  # missing required body field 'name'
+
+
+def test_dataset_builder_delete_rejects_unsafe_name(tmp_path, monkeypatch) -> None:
+    module = app.app
+    monkeypatch.setattr(module, "DATASET_BUILDER_DIR", str(tmp_path))
+    module.process_state["dataset_builder"]["projects"].clear()
+    outside = tmp_path.parent / "dataset_builder_delete_guard"
+    outside.mkdir(exist_ok=True)
+    client = _client()
+
+    response = client.delete("/api/dataset_builder/%2E%2E")
+
+    assert response.status_code == 400
+    assert outside.exists()
+
+
+def test_dataset_builder_delete_rejects_running_project(tmp_path, monkeypatch) -> None:
+    module = app.app
+    monkeypatch.setattr(module, "DATASET_BUILDER_DIR", str(tmp_path))
+    module.process_state["dataset_builder"]["projects"].clear()
+
+    release = threading.Event()
+
+    class _BlockingEngine:
+        def generate_voice_design(self, description, sample_text, seed=-1):
+            release.wait(10)
+            wav = tmp_path / "generated.wav"
+            wav.write_bytes(b"RIFFxxxxWAVE")
+            return str(wav), 22050
+
+    monkeypatch.setattr(module, "get_tts_engine", lambda: _BlockingEngine())
+    client = _client()
+    response = client.post(
+        "/api/dataset_builder/generate_batch",
+        json={
+            "name": "Project A",
+            "description": "root",
+            "samples": [{"emotion": "neutral", "text": "Hello."}],
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    delete_response = client.delete("/api/dataset_builder/Project A")
+    assert delete_response.status_code == 409
+    assert (tmp_path / "project_a").exists()
+
+    release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not client.get("/api/dataset_builder/status/project_a").json()["running"]:
+            break
+        time.sleep(0.05)
+    assert client.get("/api/dataset_builder/status/project_a").json()["running"] is False
+
+    delete_response = client.delete("/api/dataset_builder/Project A")
+    assert delete_response.status_code == 200, delete_response.text
+    assert "project_a" not in module.process_state["dataset_builder"]["projects"]
