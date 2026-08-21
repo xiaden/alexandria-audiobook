@@ -3,29 +3,20 @@
  * Ported from app/static/index.html scattered window._ caches and let declarations
  */
 
-/** Voice information from /api/pipeline/voices */
-export interface Voice {
+/** Flat voice_config row returned by the pipeline voice endpoints. */
+export interface VoiceConfigRow {
+  id: string;
   name: string;
-  config?: VoiceConfig;
-}
-
-/** Voice configuration object */
-export interface VoiceConfig {
-  type?: 'custom' | 'builtin_lora' | 'clone' | 'lora' | 'design';
-  alias_of?: string;
-  // Custom voice fields
-  voice?: string;
-  character_style?: string;
-  default_style?: string;
-  seed?: string;
-  // Clone voice fields
-  ref_text?: string;
-  ref_audio?: string;
-  // LoRA fields
-  adapter_id?: string;
-  adapter_path?: string;
-  // Design fields
-  description?: string;
+  voice: string | null;
+  type?: string | null;
+  description?: string | null;
+  character_style?: string | null;
+  seed?: string | null;
+  ref_audio?: string | null;
+  ref_text?: string | null;
+  adapter_id?: string | null;
+  adapter_path?: string | null;
+  alias_of?: string | null;
 }
 
 /** Chunk information (legacy state, no live endpoint) */
@@ -93,8 +84,6 @@ export interface AppState {
   currentScript: unknown[];
   /** Audio chunks (legacy state, no live endpoint) */
   chunks: Chunk[];
-  /** Available voices (from /api/pipeline/voices) */
-  voices: Voice[];
   /** Designed voices cache (from /api/voice_design/list) */
   designedVoices: DesignedVoice[];
   /** Clone voices cache (from /api/clone_voices/list) */
@@ -129,7 +118,6 @@ export interface AppState {
 export const state: AppState = {
   currentScript: [],
   chunks: [],
-  voices: [],
   designedVoices: [],
   cloneVoices: [],
   loraModels: [],
@@ -534,7 +522,7 @@ export interface CloneReferenceListResponse {
  */
 export interface CloneReferenceUploadResponse {
   reference: CloneReference;
-  voice: VoiceConfig & { id: string };
+  voice: VoiceConfigRow;
 }
 
 // ---------------------------------------------------------------------------

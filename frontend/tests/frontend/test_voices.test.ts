@@ -33,9 +33,9 @@ import {
   createVoiceCard,
   renderVoiceCatalog,
   previewVoice,
-  VoiceConfigRow,
 } from '../../src/tabs/voices';
 import { state } from '../../src/state';
+import type { VoiceConfigRow } from '../../src/state';
 import * as API from '../../src/api';
 import { showToast } from '../../src/utils';
 

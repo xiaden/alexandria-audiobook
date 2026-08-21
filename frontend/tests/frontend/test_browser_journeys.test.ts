@@ -39,7 +39,8 @@ import {
   createCloneReferenceRow,
   loadCloneReferences,
 } from '../../src/tabs/voices';
-import type { CloneReference, VoiceConfigRow } from '../../src/tabs/voices';
+import type { CloneReference } from '../../src/state';
+import type { VoiceConfigRow } from '../../src/state';
 import {
   openPersonaEditor,
   buildWriteRequest as buildPersonaWriteRequest,

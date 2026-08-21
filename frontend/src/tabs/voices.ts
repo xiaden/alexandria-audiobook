@@ -15,7 +15,7 @@
 import * as API from '../api';
 import { showToast, escapeHtml, showConfirm } from '../utils';
 import { state } from '../state';
-import type { CloneReference } from '../state';
+import type { CloneReference, VoiceConfigRow } from '../state';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,40 +29,6 @@ export interface Character {
   aliases: string;
   /** Confidence score for character detection (0.0–1.0) */
   confidence: number;
-}
-
-/**
- * Voice config row from GET /api/pipeline/voices (all 12 voice_config columns).
- *
- * The 12 DB columns map 1:1 to the backend VoiceCreateRequest/VoiceUpdateRequest
- * fields (CONTRACTS.md § Voice Catalog): id, name, description, type, voice,
- * character_style, seed, ref_audio, ref_text, adapter_id, adapter_path, alias_of.
- * All config columns except id/name/voice are optional on the wire; a row may
- * omit them (null or absent) depending on its type.
- */
-export interface VoiceConfigRow {
-  id: string;
-  name: string;
-  /** TTS engine voice name used by this config (the NARRATOR row's `voice` column). */
-  voice: string | null;
-  /** Voice type: custom | clone | lora | builtin_lora | design. */
-  type?: string | null;
-  /** Optional human-readable description of the voice. */
-  description?: string | null;
-  /** Character style hint for the TTS engine (e.g. 'warm', 'cheerful'). */
-  character_style?: string | null;
-  /** Random seed used when synthesizing this voice (string; default '-1'). */
-  seed?: string | null;
-  /** Path/URL of the reference audio sample (clone voices). */
-  ref_audio?: string | null;
-  /** Reference transcript aligned with ref_audio (clone voices). */
-  ref_text?: string | null;
-  /** Adapter id for LoRA/builtin_lora voices. */
-  adapter_id?: string | null;
-  /** Adapter path for LoRA/builtin_lora voices. */
-  adapter_path?: string | null;
-  /** Id of the canonical voice this row aliases (alias voices). */
-  alias_of?: string | null;
 }
 
 /** Default narrator TTS voice when no NARRATOR row exists (matches backend NARRATOR_VOICE). */

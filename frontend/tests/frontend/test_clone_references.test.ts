@@ -26,7 +26,8 @@ import {
   CLONE_REF_MAX_BYTES,
   registerVoiceCatalog,
 } from '../../src/tabs/voices';
-import type { CloneReference, VoiceConfigRow } from '../../src/tabs/voices';
+import type { CloneReference } from '../../src/state';
+import type { VoiceConfigRow } from '../../src/state';
 import { showToast, showConfirm } from '../../src/utils';
 import * as API from '../../src/api';
 
