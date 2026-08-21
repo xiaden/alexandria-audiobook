@@ -456,7 +456,7 @@ class BatchPreparerRequest(BaseModel):
 process_state = {
     "script": {"running": False, "logs": []},
     "review": {"running": False, "logs": []},
-    "lora_training": {"running": False, "logs": []},
+    "lora_training": {"running": False, "logs": [], "status": "idle"},
     "dataset_gen": {"running": False, "logs": []},
     # Per-project keys: {safe_name: {"running": False, "logs": [], "cancel": False}}.
     # Built lazily on first batch start so projects never share running/logs/cancel.
@@ -492,6 +492,7 @@ def run_process(command: List[str], task_name: str):
     """Run a subprocess and stream its output into process_state logs."""
     state = process_state[task_name]
     state["logs"] = []
+    state["status"] = "running"
 
     logger.info(f"Starting task {task_name}: {' '.join(command)}")
 
@@ -499,15 +500,19 @@ def run_process(command: List[str], task_name: str):
         return_code = _stream_subprocess_to_logs(command, BASE_DIR, state)
 
         if state.get("cancel"):
+            state["status"] = "cancelled"
             state["logs"].append(f"Task {task_name} cancelled.")
         elif return_code == 0:
+            state["status"] = "succeeded"
             state["logs"].append(f"Task {task_name} completed successfully.")
         else:
-            state["logs"].append(f"Task {task_name} failed with return code {return_code}.")
+            state["status"] = "failed"
+            state["logs"].append(f"[ERROR] Task {task_name} failed with return code {return_code}.")
 
     except Exception as e:
         logger.error(f"Error running {task_name}: {e}")
-        state["logs"].append(f"Error: {str(e)}")
+        state["status"] = "failed"
+        state["logs"].append(f"[ERROR] Error: {str(e)}")
     finally:
         state["process"] = None
         state["running"] = False
@@ -1163,8 +1168,9 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
             except Exception:
                 with process_state_lock:
                     process_state["lora_training"]["running"] = False
+                    process_state["lora_training"]["status"] = "failed"
                     process_state["lora_training"]["logs"].append(
-                        "Failed to prepare GPU for LoRA training; training did not start"
+                        "[ERROR] Failed to prepare GPU for LoRA training; training did not start"
                     )
                 raise
 
@@ -1202,6 +1208,7 @@ async def lora_status():
     return {
         "logs": process_state["lora_training"]["logs"],
         "running": process_state["lora_training"]["running"],
+        "status": process_state["lora_training"].get("status", "idle"),
     }
 
 @app.get("/api/lora/models")

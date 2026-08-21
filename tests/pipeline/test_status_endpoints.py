@@ -64,7 +64,7 @@ class TestLoraStatusEndpoint:
     def test_lora_status_idle_shape(self, client) -> None:
         resp = client.get("/api/lora/status")
         assert resp.status_code == 200
-        assert resp.json() == {"logs": [], "running": False}
+        assert resp.json() == {"logs": [], "running": False, "status": "idle"}
 
 
 class TestPreparerStatusEndpoint:

@@ -163,7 +163,11 @@ function pollLoraTraining(): void {
 
   loraPoller = setInterval(async () => {
     try {
-      const status = await API.get<{ logs: string[]; running: boolean }>('/api/lora/status');
+      const status = await API.get<{
+        logs: string[];
+        running: boolean;
+        status: 'idle' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+      }>('/api/lora/status');
       logsEl.innerText = status.logs.join('\n');
       logsEl.scrollTop = logsEl.scrollHeight;
 
@@ -203,8 +207,15 @@ function pollLoraTraining(): void {
         const statusEl = document.getElementById('lora-train-status');
         if (btn) btn.disabled = false;
 
-        const isDone = status.logs.some(l => l.includes('[DONE]'));
-        const isError = status.logs.some(l => l.includes('[ERROR]'));
+        // The backend status is authoritative; log markers are only a
+        // compatibility fallback for older server responses.
+        const hasTerminalStatus = ['succeeded', 'failed', 'cancelled'].includes(status.status);
+        const isDone = hasTerminalStatus
+          ? status.status === 'succeeded'
+          : status.logs.some(l => l.includes('[DONE]'));
+        const isError = hasTerminalStatus
+          ? status.status === 'failed'
+          : status.logs.some(l => l.includes('[ERROR]'));
 
         if (isDone) {
           if (statusEl) statusEl.innerHTML = '<span class="text-success"><i class="fas fa-check me-1"></i>Training complete!</span>';
