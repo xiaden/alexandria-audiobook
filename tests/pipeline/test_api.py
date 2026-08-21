@@ -2209,6 +2209,8 @@ class TestCancellation:
 
     def test_cancel_running_job_via_api(self, client, tts_engine):
         """POST /cancel_render on completed job returns already_finished."""
+        from app.pipeline import api_export
+
         # Start and complete a render
         response = client.post(
             "/api/pipeline/render",
@@ -2223,6 +2225,8 @@ class TestCancellation:
             if status_resp.json()["status"] == "completed":
                 break
             time.sleep(0.1)
+
+        assert job_id not in api_export._render_jobs
 
         # Try to cancel completed job
         cancel_resp = client.post(
@@ -2587,9 +2591,9 @@ class TestCancelRenderPersistence:
             )
             assert rows[0]["status"] == "cancelled"
             assert rows[0]["finished_ms"] is not None
-            assert api_export._render_jobs[job_id]["status"] == "cancelled"
+            assert job_id not in api_export._render_jobs
         finally:
-            del api_export._render_jobs[job_id]
+            api_export._render_jobs.pop(job_id, None)
 
     def test_cancel_persisted_job_after_restart_is_not_404(self, client, storage):
         """A persisted job with no in-memory event is still a known job."""

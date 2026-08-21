@@ -225,14 +225,16 @@ def _pause_contract_placeholder() -> dict:
 # ---------------------------------------------------------------------------
 
 
-# Each entry:
+# Active-job entries:
 #   {
 #     "mode": "batch" | "individual",
-#     "status": "running" | "completed" | "failed" | "cancelled",
+#     "status": "running",
 #     "output_dir": str | None,
 #     "error": str | None,
 #     "cancel_event": threading.Event,
 #   }
+# Terminal entries are removed when their background task exits; persisted
+# rows remain the source of truth for terminal status and export operations.
 _render_jobs: dict[str, dict] = {}
 
 
@@ -305,7 +307,8 @@ def _run_render_job(
     ``render_audiobook`` persists the ``render_job`` row (rows = truth) on
     its own success/failure paths; this function keeps the legacy
     in-process ``_render_jobs`` dict in sync as the cancellation channel
-    (its ``cancel_event``) and a fallback for row-less entries only —
+    (its ``cancel_event``) while the job is active and as a fallback for
+    row-less entries only — terminal entries are pruned on exit,
     download is row-backed and never consults the dict — and mirrors
     failures that escaped the row handling (e.g. patched callers) back
     into the row.
@@ -338,6 +341,11 @@ def _run_render_job(
         job["status"] = "failed"
         job["error"] = str(exc)
         _mark_job_row_terminal(storage, job_id, "failed", error=str(exc))
+    finally:
+        # The persisted render_job row is authoritative after the background
+        # task reaches a terminal state.  Keep only active jobs in the
+        # in-process registry so completed renders cannot accumulate here.
+        _render_jobs.pop(job_id, None)
 
 
 def _mark_job_row_terminal(
