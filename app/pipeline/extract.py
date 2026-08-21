@@ -240,6 +240,8 @@ def extract_epub_text(
         chapters : list of {id, paragraphs: [{id, spans: [{id, span_type, text}]}]}
     """
     chapter_texts = _parse_epub_chapters(epub_path)
+    if not chapter_texts:
+        raise ValueError("EPUB contains no readable chapters")
     chapters = _build_chapters(chapter_texts)
     return {
         "series_id": _DEFAULT_SERIES_ID,

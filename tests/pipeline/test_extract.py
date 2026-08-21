@@ -94,6 +94,30 @@ def minimal_epub() -> str:
     Path(epub_path).unlink()
 
 
+@pytest.fixture()
+def empty_epub() -> str:
+    """Create a valid EPUB whose spine has no readable content."""
+    with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as tmp:
+        epub_path = tmp.name
+    with zipfile.ZipFile(epub_path, "w") as zf:
+        zf.writestr(
+            "META-INF/container.xml",
+            '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            '<rootfiles><rootfile full-path="content.opf" '
+            'media-type="application/oebps-package+xml"/></rootfiles></container>',
+        )
+        zf.writestr(
+            "content.opf",
+            '<package xmlns="http://www.idpf.org/2007/opf"><manifest>'
+            '<item id="chapter" href="chapter.xhtml" '
+            'media-type="application/xhtml+xml"/></manifest><spine>'
+            '<itemref idref="chapter"/></spine></package>',
+        )
+        zf.writestr("chapter.xhtml", "<html><body>   </body></html>")
+    yield epub_path
+    Path(epub_path).unlink()
+
+
 # ---------------------------------------------------------------------------
 # EPUB parsing tests
 # ---------------------------------------------------------------------------
@@ -417,3 +441,11 @@ def test_extract_epub_text_no_database_insertion(
     # and returns the expected structure
     result = extract_epub_text(minimal_epub, "test-book-456", storage)
     assert result["book_id"] == "test-book-456"
+
+
+def test_extract_epub_text_rejects_epub_without_readable_chapters(
+    empty_epub: str, storage
+) -> None:
+    """An EPUB with no readable spine content is rejected before onboarding."""
+    with pytest.raises(ValueError, match="no readable chapters"):
+        extract_epub_text(empty_epub, "test-book-123", storage)

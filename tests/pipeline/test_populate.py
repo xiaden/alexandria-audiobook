@@ -14,6 +14,8 @@ Covers:
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
@@ -188,17 +190,35 @@ class TestPopulateInitialSpine:
         rows = storage.execute_query("SELECT id FROM series WHERE id = ?", ("series-uuid",))
         assert len(rows) == 1
 
-    def test_empty_chapters_list(self, storage):
-        """populate_initial_spine handles empty chapters list."""
-        populate_initial_spine("series-uuid", "book-uuid", [], storage)
-        # Series and book should exist
-        series_rows = storage.execute_query("SELECT id FROM series WHERE id = ?", ("series-uuid",))
-        assert len(series_rows) == 1
-        book_rows = storage.execute_query("SELECT id FROM book WHERE id = ?", ("book-uuid",))
-        assert len(book_rows) == 1
-        # No chapters
-        chapter_rows = storage.execute_query("SELECT id FROM chapter")
-        assert len(chapter_rows) == 0
+    def test_empty_chapters_list_is_rejected_without_writing(self, storage):
+        """An empty extraction cannot create an orphan book."""
+        with pytest.raises(ValueError, match="without chapters"):
+            populate_initial_spine("series-uuid", "book-uuid", [], storage)
+
+        assert storage.execute_query("SELECT id FROM series") == []
+        assert storage.execute_query("SELECT id FROM book") == []
+
+    def test_book_position_advances_for_existing_series(self, storage, sample_chapters):
+        """A second book does not collide with the first book's position."""
+        populate_initial_spine("series-uuid", "first-book", sample_chapters, storage)
+        second_chapters = deepcopy(sample_chapters)
+        for chapter in second_chapters:
+            chapter["id"] += "-second"
+            for paragraph in chapter["paragraphs"]:
+                paragraph["id"] += "-second"
+                for span in paragraph["spans"]:
+                    span["id"] += "-second"
+        populate_initial_spine("series-uuid", "second-book", second_chapters, storage)
+
+        rows = storage.execute_query(
+            "SELECT id, book_number, position FROM book "
+            "WHERE series_id = ? ORDER BY position",
+            ("series-uuid",),
+        )
+        assert rows == [
+            {"id": "first-book", "book_number": 1, "position": 1},
+            {"id": "second-book", "book_number": 2, "position": 2},
+        ]
 
 
 # ---------------------------------------------------------------------------

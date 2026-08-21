@@ -70,6 +70,9 @@ def populate_initial_spine(
     storage:
         Pipeline storage adapter.
     """
+    if not chapters_data:
+        raise ValueError("Cannot populate a book without chapters")
+
     _ensure_paragraph_text_column(storage)
     _ensure_span_text_column(storage)
     conn = storage.get_connection()
@@ -131,11 +134,22 @@ def _insert_series_and_book(
     storage.execute_insert(
         "INSERT OR IGNORE INTO series (id) VALUES (?)", (series_id,)
     )
+    next_position = _next_book_position(series_id, storage)
     storage.execute_insert(
         "INSERT INTO book (id, series_id, book_number, version, position) "
-        "VALUES (?, ?, 1, 1, 1)",
-        (book_id, series_id),
+        "VALUES (?, ?, ?, 1, ?)",
+        (book_id, series_id, next_position, next_position),
     )
+
+
+def _next_book_position(series_id: str, storage: PipelineStorage) -> int:
+    """Return the next dense position for a book in a series."""
+    rows = storage.execute_query(
+        "SELECT MAX(position) AS max_pos FROM book WHERE series_id = ?",
+        (series_id,),
+    )
+    max_position = rows[0]["max_pos"] if rows and rows[0]["max_pos"] is not None else 0
+    return max_position + 1
 
 
 def _insert_chapters_with_placeholders(
