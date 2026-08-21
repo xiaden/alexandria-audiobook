@@ -22,7 +22,6 @@ import pytest
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.assembly import get_book_version, reonboard_book
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -428,6 +427,45 @@ class TestReonboardEmptyBook:
         new_version = reonboard_book("b-empty", s)
         assert new_version == 2
         assert get_book_version("b-empty", s) == 2
+
+    def test_clears_workbench_rows_and_completes(self, storage):
+        """Re-onboarding removes scene-bound workbench rows before scenes."""
+        storage.execute_insert(
+            "INSERT INTO workbench_decision "
+            "(decision_id, book_id, target_kind, target_key, decision_type, "
+            "base_revision, payload_json, status, source, created_ms) "
+            "VALUES ('d1', 'b1', 'presence', 'sc1:c1', 'set', 0, '{}', "
+            "'active', 'human', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO character_scene_generated "
+            "(id, book_id, character_id, scene_id, relation_type, confidence, "
+            "generation_revision) VALUES ('g1', 'b1', 'c1', 'sc1', 'present', 1, 0)"
+        )
+        storage.execute_insert(
+            "INSERT INTO character_scene_manual "
+            "(id, book_id, character_id, scene_id, relation_type, decision_id) "
+            "VALUES ('m1', 'b1', 'c1', 'sc1', 'present', 'd1')"
+        )
+        storage.execute_insert(
+            "INSERT INTO character_scene_absence "
+            "(book_id, scene_id, character_id, decision_id, created_ms) "
+            "VALUES ('b1', 'sc1', 'c1', 'd1', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO boundary_override "
+            "(override_id, book_id, scene_id, decision_id, payload_json, created_ms) "
+            "VALUES ('o1', 'b1', 'sc1', 'd1', '{}', 1)"
+        )
+
+        assert reonboard_book("b1", storage) == 2
+        for table in (
+            "character_scene_generated",
+            "character_scene_manual",
+            "character_scene_absence",
+            "boundary_override",
+        ):
+            assert storage.execute_query(f"SELECT * FROM {table} WHERE book_id = 'b1'") == []
 
     def test_reonboard_book_with_chapters_but_no_scenes(self):
         """A book with chapters but no scenes still works."""

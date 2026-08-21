@@ -258,6 +258,18 @@ def _clear_scene_entities(
     scene_ids:
         Pre-snapshot of scene IDs belonging to this book.
     """
+    # Workbench projections and overrides retain scene foreign keys without
+    # cascading deletes.  Clear them before removing the scenes so a failed
+    # re-onboard cannot leave the book half-cleared.
+    for table in (
+        "character_scene_absence",
+        "character_alias_merge",
+        "boundary_override",
+        "character_scene_generated",
+        "character_scene_manual",
+    ):
+        storage.execute_delete(f"DELETE FROM {table} WHERE book_id = ?", (book_id,))
+
     # scene_paragraph edges: must be deleted before scenes (FK constraint).
     if scene_ids:
         placeholders = ",".join("?" for _ in scene_ids)
@@ -316,38 +328,39 @@ def reonboard_book(book_id: str, storage: PipelineStorage) -> int:
     int
         The new version number after incrementing.
     """
-    # -- Snapshot IDs before destructive deletes ----------------------------
-    # character_ids: needed for metadata cleanup and voice_assignment reset.
-    char_rows = storage.execute_query(
-        "SELECT character_id FROM character_book WHERE book_id = ?",
-        (book_id,),
-    )
-    character_ids = [r["character_id"] for r in char_rows]
+    with storage.transaction():
+        # -- Snapshot IDs before destructive deletes ------------------------
+        # character_ids: needed for metadata cleanup and voice_assignment reset.
+        char_rows = storage.execute_query(
+            "SELECT character_id FROM character_book WHERE book_id = ?",
+            (book_id,),
+        )
+        character_ids = [r["character_id"] for r in char_rows]
 
-    # scene_ids: needed for scene deletion after chapter_scene edges are
-    # removed (the chapter_scene join is the standard way to find a book's
-    # scenes, so we must snapshot before deleting those edges).
-    scene_rows = storage.execute_query(
-        """SELECT chapter_scene.child_id AS scene_id
-           FROM chapter_scene
-           JOIN book_chapter
-               ON chapter_scene.parent_id = book_chapter.child_id
-           WHERE book_chapter.parent_id = ?""",
-        (book_id,),
-    )
-    scene_ids = [r["scene_id"] for r in scene_rows]
+        # scene_ids: needed for scene deletion after chapter_scene edges are
+        # removed (the chapter_scene join is the standard way to find a book's
+        # scenes, so we must snapshot before deleting those edges).
+        scene_rows = storage.execute_query(
+            """SELECT chapter_scene.child_id AS scene_id
+               FROM chapter_scene
+               JOIN book_chapter
+                   ON chapter_scene.parent_id = book_chapter.child_id
+               WHERE book_chapter.parent_id = ?""",
+            (book_id,),
+        )
+        scene_ids = [r["scene_id"] for r in scene_rows]
 
-    # -- Phase 1: Clear span/scene junctions --------------------------------
-    _clear_span_junctions(storage, book_id, scene_ids)
+        # -- Phase 1: Clear span/scene junctions ----------------------------
+        _clear_span_junctions(storage, book_id, scene_ids)
 
-    # -- Phase 2: Clear character memberships and metadata ------------------
-    _clear_memberships(storage, book_id, character_ids)
+        # -- Phase 2: Clear character memberships and metadata --------------
+        _clear_memberships(storage, book_id, character_ids)
 
-    # -- Phase 3: Clear scene entities and edges ----------------------------
-    _clear_scene_entities(storage, book_id, scene_ids)
+        # -- Phase 3: Clear scene entities and edges ------------------------
+        _clear_scene_entities(storage, book_id, scene_ids)
 
-    # -- Phase 4: Bump version ----------------------------------------------
-    storage.execute_update(
-        "UPDATE book SET version = version + 1 WHERE id = ?", (book_id,)
-    )
-    return get_book_version(book_id, storage)
+        # -- Phase 4: Bump version ------------------------------------------
+        storage.execute_update(
+            "UPDATE book SET version = version + 1 WHERE id = ?", (book_id,)
+        )
+        return get_book_version(book_id, storage)
