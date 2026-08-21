@@ -405,6 +405,29 @@ function validatePauseInputs(): boolean {
 }
 
 /**
+ * Validate the LLM connection fields (URL, API key, model) client-side.
+ * Blank/whitespace-only values are rejected before the config payload is
+ * submitted — the backend LLMConfig accepts empty strings (plain `str`), so an
+ * empty value would otherwise persist a broken LLM connection. Returns false
+ * and toasts the first offending field.
+ */
+function validateLLMInputs(): boolean {
+  const fields: Array<[string, string]> = [
+    ['llm-url', 'LLM API URL'],
+    ['llm-key', 'LLM API key'],
+    ['llm-model', 'LLM model name'],
+  ];
+  for (const [id, label] of fields) {
+    const input = document.getElementById(id) as HTMLInputElement | null;
+    if (!input || input.value.trim() === '') {
+      showToast(`${label} is required`, 'error');
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Recompute the resolved-pause preview line from precedence:
  * book override → global config default (current global input) → 500/250 ms.
  */
@@ -472,6 +495,7 @@ async function handleConfigSubmit(e: Event): Promise<void> {
   e.preventDefault();
 
   if (!validatePauseInputs()) return;
+  if (!validateLLMInputs()) return;
 
   const config = buildConfigPayload();
 

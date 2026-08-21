@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { WALK_TASK_NAMES, collectTaskOverrides, loadConfig, buildConfigPayload, initSetup } from '../../src/tabs/setup';
 import { state, setPipelineBookId, initState } from '../../src/state';
 import * as API from '../../src/api';
+import { showToast } from '../../src/utils';
 
 // Mock the API module
 vi.mock('../../src/api', () => ({
@@ -546,6 +547,11 @@ describe('Book Pause Overrides (Plan L, Phase 5)', () => {
       <input id="book-pause-between-speakers" />
       <input id="book-pause-same-speaker" />
       <div id="pause-resolved-preview"></div>
+      <input id="llm-url" value="http://localhost:1234/v1" />
+      <input id="llm-key" value="test-key" />
+      <input id="llm-model" value="gpt-4" />
+      <input id="llm-reasoning" />
+      <input id="llm-temperature" />
     `;
     state.pipelineBookId = null;
     localStorage.clear();
@@ -622,5 +628,91 @@ describe('Book Pause Overrides (Plan L, Phase 5)', () => {
         pause_same_speaker_ms: null,
       });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LLM config validation (blank/whitespace URL, API key, model)
+// ---------------------------------------------------------------------------
+// The setup form must reject empty LLM connection fields before submitting.
+// The backend LLMConfig accepts empty strings (plain `str` fields), so the
+// frontend enforces non-blank values client-side — mirroring validatePauseInputs.
+
+describe('LLM config validation', () => {
+  function submitConfigForm(): void {
+    initSetup();
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    (document.getElementById('config-form') as HTMLFormElement)
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+  }
+
+  beforeEach(() => {
+    // Common harvest — the same inputs the pause tests rely on, plus the LLM
+    // connection fields under test. The config-form must exist from the start
+    // (a later innerHTML append re-parses and would reset input values).
+    document.body.innerHTML = `
+      <select id="tts-mode"><option value="external">External</option></select>
+      <input id="pause-between-speakers" />
+      <input id="pause-same-speaker" />
+      <input id="book-pause-between-speakers" />
+      <input id="book-pause-same-speaker" />
+      <div id="pause-resolved-preview"></div>
+      <input id="llm-url" value="http://localhost:1234/v1" />
+      <input id="llm-key" value="test-key" />
+      <input id="llm-model" value="gpt-4" />
+      <input id="llm-reasoning" />
+      <input id="llm-temperature" />
+      <form id="config-form"></form>
+    `;
+    state.pipelineBookId = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+    vi.mocked(API.post).mockResolvedValue({ status: 'ok' });
+  });
+
+  it.each([
+    ['llm-url', 'LLM API URL'],
+    ['llm-key', 'LLM API key'],
+    ['llm-model', 'LLM model name'],
+  ])('rejects a blank %s and does not POST', async (fieldId, label) => {
+    // Clearing the attr-backed value directly (no innerHTML re-parse).
+    (document.getElementById(fieldId) as HTMLInputElement).value = '';
+    submitConfigForm();
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(`${label} is required`, 'error');
+    });
+    // Submit is aborted: no config POST, no success toast.
+    expect(API.post).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalledWith('Configuration Saved!', 'success');
+  });
+
+  it.each([
+    ['llm-url', 'LLM API URL'],
+    ['llm-key', 'LLM API key'],
+    ['llm-model', 'LLM model name'],
+  ])('rejects a whitespace-only %s and does not POST', async (fieldId, label) => {
+    (document.getElementById(fieldId) as HTMLInputElement).value = '   ';
+    submitConfigForm();
+
+    await vi.waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(`${label} is required`, 'error');
+    });
+    expect(API.post).not.toHaveBeenCalled();
+  });
+
+  it('POSTs the config when all LLM connection fields are non-blank', async () => {
+    submitConfigForm();
+
+    await vi.waitFor(() => {
+      expect(API.post).toHaveBeenCalledWith('/api/config', expect.objectContaining({
+        llm: expect.objectContaining({
+          base_url: 'http://localhost:1234/v1',
+          api_key: 'test-key',
+          model_name: 'gpt-4',
+        }),
+      }));
+    });
+    expect(showToast).not.toHaveBeenCalledWith(expect.stringContaining('is required'), 'error');
   });
 });
