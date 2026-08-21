@@ -293,7 +293,9 @@ export interface WorkbenchPresence {
   source: string;
   confidence: number | null;
   human_override: boolean;
-  revision: number;
+  generation_revision?: number;
+  decision_id?: string;
+  source_run_id?: string;
 }
 
 /** A confidence review item in the workbench queue. */
@@ -326,11 +328,9 @@ export interface WorkbenchReviewItem {
 
 /** A per-walk config override row. */
 export interface WorkbenchOverride {
-  override_id: string;
   walk_name: string;
   key: string;
   value: unknown;
-  revision: number;
 }
 
 /** Effective config resolution per walk (GET /workbench/{book_id}/config). */

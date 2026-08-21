@@ -127,13 +127,13 @@ const MOCK_WB: WorkbenchState = {
     { merge_id: 'merge-1', decision_id: 'decision-merge-1', canonical_id: 'char-1', member_id: 'char-2', status: 'active', merge_revision: 40, created_ms: 1750000000000, canonical_name: 'Alice', member_name: 'Bobby' },
   ],
   presence: [
-    { scene_id: 'scene-1', character_id: 'char-1', relation_type: 'present', source: 'generated', confidence: 0.95, human_override: false, revision: 41 },
+    { scene_id: 'scene-1', character_id: 'char-1', relation_type: 'present', source: 'walk', confidence: 0.95, human_override: false, generation_revision: 41, source_run_id: 'run-1' },
   ],
   review_items: [
     { item_id: 'walkitem:9', kind: 'junction', target_table: 'character_mentions_scene', target_id: 'x', status: 'pending', decision_id: null, source_run_id: 'run-1', character_id: 'char-1', character_name: 'Alice', confidence: 0.9 },
     { item_id: 'decision:abc', kind: 'decision', target_table: 'decision', target_id: 'abc', status: 'resolved', decision_id: 'abc', source_run_id: null },
   ],
-  overrides: [{ override_id: 'ov-1', walk_name: 'walk_2b_character_discovery', key: 'model_name', value: 'gpt-4', revision: 39 }],
+  overrides: [{ walk_name: 'walk_2b_character_discovery', key: 'model_name', value: 'gpt-4' }],
   effective_config: {
     walk_2b_character_discovery: {
       values: { model_name: 'gpt-4', temperature: 0.7 },
@@ -265,7 +265,7 @@ describe('renderScenePresence', () => {
     const html = renderScenePresence(MOCK_WB, 'scene-1');
     expect(html).toContain('Alice');
     expect(html).toContain('present');
-    expect(html).toContain('generated');
+    expect(html).toContain('walk');
     expect(html).toContain('95%');
     expect(html).toContain('data-action="presence-change"');
     expect(html).toContain('data-character-id="char-1"');
@@ -274,7 +274,7 @@ describe('renderScenePresence', () => {
   it('marks manual presence with explicit text', () => {
     const wb: WorkbenchState = {
       ...MOCK_WB,
-      presence: [{ scene_id: 'scene-1', character_id: 'char-1', relation_type: 'speaker', source: 'manual', confidence: null, human_override: true, revision: 42 }],
+      presence: [{ scene_id: 'scene-1', character_id: 'char-1', relation_type: 'speaker', source: 'human', confidence: null, human_override: true, decision_id: 'decision-presence-42' }],
     };
     const html = renderScenePresence(wb, 'scene-1');
     expect(html).toContain('speaker');
