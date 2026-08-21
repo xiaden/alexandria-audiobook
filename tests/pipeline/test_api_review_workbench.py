@@ -130,6 +130,34 @@ def test_decision_override_returns_action_dto(client):
     assert resp.json()["status"] == "overridden"
 
 
+def test_decision_action_rejects_stale_base_revision(client):
+    storage = client.app.dependency_overrides[pipeline_api.get_storage]()
+    _insert_decision(storage, "dec-1")
+
+    resp = client.post(
+        "/api/pipeline/review/accept",
+        json={"item_id": "decision:dec-1", "base_revision": 99},
+    )
+
+    assert resp.status_code == 409
+    assert storage.execute_query(
+        "SELECT status FROM workbench_decision WHERE decision_id = 'dec-1'"
+    )[0]["status"] == "active"
+
+
+def test_decision_action_accepts_current_base_revision(client):
+    storage = client.app.dependency_overrides[pipeline_api.get_storage]()
+    _insert_decision(storage, "dec-1")
+
+    resp = client.post(
+        "/api/pipeline/review/accept",
+        json={"item_id": "decision:dec-1", "base_revision": 1},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted"
+
+
 # ---------------------------------------------------------------------------
 # junction: dispatch
 # ---------------------------------------------------------------------------

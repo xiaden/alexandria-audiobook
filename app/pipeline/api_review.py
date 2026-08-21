@@ -204,6 +204,7 @@ def _resolve_decision_action(
     action: str,
     decision_id: str,
     new_value: Any,
+    base_revision: int | None,
     workbench: Workbench,
     storage: PipelineStorage,
 ) -> dict:
@@ -226,6 +227,8 @@ def _resolve_decision_action(
         )
     book_id = decision["book_id"]
     _guard(workbench.require_book, book_id)
+    if base_revision is not None:
+        _guard(workbench.check_revision, book_id, base_revision)
     with storage.transaction():
         revision = _guard(workbench.allocate_revision, book_id)
         new_decision_id = _guard(
@@ -326,6 +329,7 @@ async def accept_review_item(
     if request.item_id.startswith("decision:"):
         return _resolve_decision_action(
             "accept", request.item_id[len("decision:"):], request.new_value,
+            request.base_revision,
             workbench, storage,
         )
     if request.item_id.startswith("junction:"):
@@ -359,6 +363,7 @@ async def reject_review_item(
     if request.item_id.startswith("decision:"):
         return _resolve_decision_action(
             "reject", request.item_id[len("decision:"):], request.new_value,
+            request.base_revision,
             workbench, storage,
         )
     if request.item_id.startswith("junction:"):
@@ -392,6 +397,7 @@ async def override_review_item(
     if request.item_id.startswith("decision:"):
         return _resolve_decision_action(
             "override", request.item_id[len("decision:"):], request.new_value,
+            request.base_revision,
             workbench, storage,
         )
     if request.item_id.startswith("junction:"):
