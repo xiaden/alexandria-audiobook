@@ -255,6 +255,57 @@ class TestExecute:
         assert rows
         assert all(row["count"] == 1 for row in rows)
 
+    def test_generated_speaker_guess_is_corrected(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        """Walk 2e replaces a prior generated speaker attribution."""
+        seeded_storage.execute_insert(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES (?, ?, 'speaker', 'walk', 0.6, 0)""",
+            ("char-mary", "span-1b"),
+        )
+        response = json.dumps({"character_id": "char-john", "confidence": 0.9})
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", seeded_storage, {})
+
+        row = seeded_storage.execute_query(
+            """SELECT character_id, source, human_override
+               FROM character_span
+               WHERE span_id = ? AND relation_type = 'speaker'""",
+            ("span-1b",),
+        )[0]
+        assert row["character_id"] == "char-john"
+        assert row["source"] == "walk"
+        assert row["human_override"] == 0
+
+    def test_human_speaker_override_is_protected(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        """Walk 2e cannot replace a human speaker override."""
+        seeded_storage.execute_insert(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES (?, ?, 'speaker', 'human', 1.0, 1)""",
+            ("char-mary", "span-1b"),
+        )
+        response = json.dumps({"character_id": "char-john", "confidence": 0.9})
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", seeded_storage, {})
+
+        row = seeded_storage.execute_query(
+            """SELECT character_id, source, confidence, human_override
+               FROM character_span
+               WHERE span_id = ? AND relation_type = 'speaker'""",
+            ("span-1b",),
+        )[0]
+        assert row["character_id"] == "char-mary"
+        assert row["source"] == "human"
+        assert row["confidence"] == 1.0
+        assert row["human_override"] == 1
+
     def test_unknown_speaker_no_junction(
         self, seeded_storage, mock_llm_client, monkeypatch
     ):

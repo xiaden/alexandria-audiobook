@@ -36,20 +36,36 @@ def sample_chapters():
                 {
                     "id": "para-1",
                     "spans": [
-                        {"id": "span-1a", "span_type": "sentence", "text": "The sun rose over the mountains."},
-                        {"id": "span-1b", "span_type": "quotation", "text": '"Good morning," said John.'},
+                        {
+                            "id": "span-1a",
+                            "span_type": "sentence",
+                            "text": "The sun rose over the mountains.",
+                        },
+                        {
+                            "id": "span-1b",
+                            "span_type": "quotation",
+                            "text": '"Good morning," said John.',
+                        },
                     ],
                 },
                 {
                     "id": "para-2",
                     "spans": [
-                        {"id": "span-2a", "span_type": "sentence", "text": "Mary waved from across the room."},
+                        {
+                            "id": "span-2a",
+                            "span_type": "sentence",
+                            "text": "Mary waved from across the room.",
+                        },
                     ],
                 },
                 {
                     "id": "para-3",
                     "spans": [
-                        {"id": "span-3a", "span_type": "quotation", "text": '"Hello everyone," she said.'},
+                        {
+                            "id": "span-3a",
+                            "span_type": "quotation",
+                            "text": '"Hello everyone," she said.',
+                        },
                     ],
                 },
             ],
@@ -60,13 +76,21 @@ def sample_chapters():
                 {
                     "id": "para-4",
                     "spans": [
-                        {"id": "span-4a", "span_type": "sentence", "text": "Later that day, the scene shifted to the city."},
+                        {
+                            "id": "span-4a",
+                            "span_type": "sentence",
+                            "text": "Later that day, the scene shifted to the city.",
+                        },
                     ],
                 },
                 {
                     "id": "para-5",
                     "spans": [
-                        {"id": "span-5a", "span_type": "quotation", "text": '"Welcome," said Bob.'},
+                        {
+                            "id": "span-5a",
+                            "span_type": "quotation",
+                            "text": '"Welcome," said Bob.',
+                        },
                     ],
                 },
             ],
@@ -122,11 +146,13 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
 class TestExecute:
     """Test the main execute() function."""
 
-    def test_execute_returns_summary_dict(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_returns_summary_dict(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns a summary dict with expected keys."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9}
-        ])
+        response = json.dumps(
+            [{"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9}]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
@@ -138,11 +164,13 @@ class TestExecute:
         assert "errors" in result
         assert result["book_id"] == "book-1"
 
-    def test_execute_processes_all_scenes(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_processes_all_scenes(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() processes all scenes in the book."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9}
-        ])
+        response = json.dumps(
+            [{"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9}]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
@@ -150,12 +178,21 @@ class TestExecute:
         # populate_initial_spine creates one placeholder scene per chapter = 2
         assert result["scenes_processed"] == 2
 
-    def test_characters_created_in_character_table(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_characters_created_in_character_table(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Characters discovered by LLM are created in character table."""
-        response = json.dumps([
-            {"name": "John", "aliases": ["Mr. J"], "role": "speaker", "confidence": 0.9},
-            {"name": "Mary", "aliases": [], "role": "mentioned", "confidence": 0.8},
-        ])
+        response = json.dumps(
+            [
+                {
+                    "name": "John",
+                    "aliases": ["Mr. J"],
+                    "role": "speaker",
+                    "confidence": 0.9,
+                },
+                {"name": "Mary", "aliases": [], "role": "mentioned", "confidence": 0.8},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
@@ -163,16 +200,20 @@ class TestExecute:
         assert result["characters_created"] == 2
 
         # Verify in DB
-        rows = populated_storage.execute_query("SELECT name FROM character ORDER BY name")
+        rows = populated_storage.execute_query(
+            "SELECT name FROM character ORDER BY name"
+        )
         names = [r["name"] for r in rows]
         assert "John" in names
         assert "Mary" in names
 
-    def test_character_scene_junctions_present(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_character_scene_junctions_present(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """character_scene junctions are inserted with relation_type='present'."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9}
-        ])
+        response = json.dumps(
+            [{"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9}]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         execute("book-1", populated_storage, {})
@@ -184,18 +225,23 @@ class TestExecute:
         for row in rows:
             assert row["relation_type"] == "present"
 
-    def test_character_span_junctions_correct_relation_types(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_character_span_junctions_correct_relation_types(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """character_span junctions are inserted with correct relation_types."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
-            {"name": "Mary", "aliases": [], "role": "mentioned", "confidence": 0.8},
-            {"name": "Bob", "aliases": [], "role": "present", "confidence": 0.85},
-        ])
+        response = json.dumps(
+            [
+                {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
+                {"name": "Mary", "aliases": [], "role": "mentioned", "confidence": 0.8},
+                {"name": "Bob", "aliases": [], "role": "present", "confidence": 0.85},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         execute("book-1", populated_storage, {})
 
-        # Check John's spans are 'speaker'
+        # Walk 2b records scene-level speaker guesses as presence evidence;
+        # Walk 2e is the sole authority for span-level speakers.
         john_rows = populated_storage.execute_query(
             """
             SELECT cs.relation_type FROM character_span cs
@@ -205,7 +251,18 @@ class TestExecute:
         )
         assert len(john_rows) > 0
         for row in john_rows:
-            assert row["relation_type"] == "speaker"
+            assert row["relation_type"] == "present"
+
+        # A scene-level speaker role must never claim a quotation.  Walk 2e
+        # is the only producer of authoritative speaker relationships.
+        john_speakers = populated_storage.execute_query(
+            """
+            SELECT 1 FROM character_span cs
+            JOIN character c ON cs.character_id = c.id
+            WHERE c.name = 'John' AND cs.relation_type = 'speaker'
+            """
+        )
+        assert john_speakers == []
 
         # Check Mary's spans are 'mentioned'
         mary_rows = populated_storage.execute_query(
@@ -231,11 +288,15 @@ class TestExecute:
         for row in bob_rows:
             assert row["relation_type"] == "present"
 
-    def test_confidence_filter_high_accepted(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_high_accepted(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Characters with confidence >= 0.7 are auto-accepted."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
@@ -243,11 +304,20 @@ class TestExecute:
         assert result["characters_created"] == 1
         assert result["characters_for_review"] == 0
 
-    def test_confidence_filter_low_rejected(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_low_rejected(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Characters with confidence < 0.5 are auto-rejected."""
-        response = json.dumps([
-            {"name": "Ghost", "aliases": [], "role": "mentioned", "confidence": 0.3},
-        ])
+        response = json.dumps(
+            [
+                {
+                    "name": "Ghost",
+                    "aliases": [],
+                    "role": "mentioned",
+                    "confidence": 0.3,
+                },
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
@@ -257,11 +327,20 @@ class TestExecute:
         rows = populated_storage.execute_query("SELECT COUNT(*) AS cnt FROM character")
         assert rows[0]["cnt"] == 0
 
-    def test_confidence_filter_medium_review(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_medium_review(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Characters with 0.5 <= confidence < 0.7 are flagged for review."""
-        response = json.dumps([
-            {"name": "Mystery", "aliases": [], "role": "mentioned", "confidence": 0.6},
-        ])
+        response = json.dumps(
+            [
+                {
+                    "name": "Mystery",
+                    "aliases": [],
+                    "role": "mentioned",
+                    "confidence": 0.6,
+                },
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
@@ -270,11 +349,15 @@ class TestExecute:
         assert result["characters_created"] == 1
         assert result["characters_for_review"] == 1
 
-    def test_character_book_junction_created(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_character_book_junction_created(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """character_book junction is created for each character."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         execute("book-1", populated_storage, {})
@@ -286,11 +369,15 @@ class TestExecute:
         assert rows[0]["book_id"] == "book-1"
         assert rows[0]["source"] == "walk"
 
-    def test_character_series_junction_created(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_character_series_junction_created(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """character_series junction is created for each character."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         execute("book-1", populated_storage, {})
@@ -302,12 +389,16 @@ class TestExecute:
         assert rows[0]["series_id"] == "series-1"
         assert rows[0]["source"] == "walk"
 
-    def test_no_duplicate_characters_same_book(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_no_duplicate_characters_same_book(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Same character name discovered in multiple scenes creates only one character entity."""
         # Both scenes return "John"
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
@@ -323,18 +414,24 @@ class TestExecute:
         )
         assert scene_rows[0]["cnt"] == 2
 
-    def test_default_confidence_when_not_provided(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_default_confidence_when_not_provided(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Characters without explicit confidence default to 0.8 (auto-accepted)."""
-        response = json.dumps([
-            {"name": "John", "aliases": [], "role": "speaker"},
-        ])
+        response = json.dumps(
+            [
+                {"name": "John", "aliases": [], "role": "speaker"},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", populated_storage, {})
 
         assert result["characters_created"] == 1
 
-    def test_nonexistent_book_returns_error(self, storage, mock_llm_client, monkeypatch):
+    def test_nonexistent_book_returns_error(
+        self, storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns error for nonexistent book."""
         _patch_llm(monkeypatch, mock_llm_client, "[]")
 
@@ -343,13 +440,13 @@ class TestExecute:
         assert len(result["errors"]) > 0
         assert result["characters_created"] == 0
 
+    # ---------------------------------------------------------------------------
+    # Tests: _build_character_discovery_prompt()
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Tests: _build_character_discovery_prompt()
-# ---------------------------------------------------------------------------
-
-
-    def test_walk_override_drives_llm_config(self, populated_storage, monkeypatch, tmp_path):
+    def test_walk_override_drives_llm_config(
+        self, populated_storage, monkeypatch, tmp_path
+    ):
         """A walk_override row for (book, task) overrides the walk's LLM config.
 
         Phase 3 (Plan G): the walk resolves its LLM config via
@@ -379,7 +476,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["temperature"] = temperature
             captured["model_name"] = model_name
@@ -416,7 +518,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -486,9 +593,16 @@ class TestParseResponse:
 
     def test_parse_valid_json(self):
         """Parse valid JSON response."""
-        response = json.dumps([
-            {"name": "John", "aliases": ["Mr. J"], "role": "speaker", "confidence": 0.9}
-        ])
+        response = json.dumps(
+            [
+                {
+                    "name": "John",
+                    "aliases": ["Mr. J"],
+                    "role": "speaker",
+                    "confidence": 0.9,
+                }
+            ]
+        )
 
         characters = _parse_llm_response(response)
 
@@ -517,10 +631,12 @@ class TestParseResponse:
 
     def test_parse_skips_empty_names(self):
         """Parse skips entries with empty names."""
-        response = json.dumps([
-            {"name": "", "aliases": [], "role": "speaker", "confidence": 0.9},
-            {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"name": "", "aliases": [], "role": "speaker", "confidence": 0.9},
+                {"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9},
+            ]
+        )
 
         characters = _parse_llm_response(response)
 
@@ -529,9 +645,11 @@ class TestParseResponse:
 
     def test_parse_defaults_missing_fields(self):
         """Parse defaults missing fields to sensible values."""
-        response = json.dumps([
-            {"name": "John"},
-        ])
+        response = json.dumps(
+            [
+                {"name": "John"},
+            ]
+        )
 
         characters = _parse_llm_response(response)
 

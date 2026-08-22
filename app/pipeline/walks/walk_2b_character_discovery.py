@@ -231,9 +231,7 @@ def _invalidate_downstream(storage, book_id):
 # ---------------------------------------------------------------------------
 
 
-def _load_existing_characters(
-    book_id: str, storage: PipelineStorage
-) -> dict[str, str]:
+def _load_existing_characters(book_id: str, storage: PipelineStorage) -> dict[str, str]:
     """Load existing character name -> id mappings for this book."""
     rows = storage.execute_query(
         """
@@ -345,7 +343,8 @@ def _process_character(
     """Process a single character from the LLM response.
 
     Applies confidence filter, creates character entity if needed, and inserts
-    character_scene + character_span junctions.
+    character_scene + scene-evidence character_span junctions. Walk 2e owns
+    authoritative quotation speaker attribution.
     """
     name = char_data.get("name", "").strip()
     if not name:
@@ -420,15 +419,13 @@ def _process_character(
             "VALUES (?, ?, 'present', 'walk', ?, 0)",
             (character_id, scene_id, confidence),
         )
-    _upsert_generated_presence(
-        storage, book_id, character_id, scene_id, confidence
-    )
+    _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence)
 
-    # character_span junctions — seed based on role
-    # For 'speaker': insert all spans with relation_type='speaker'
-    # For 'mentioned': insert all spans with relation_type='mentioned'
-    # For 'present': insert all spans with relation_type='present'
-    span_relation_type = role  # speaker, mentioned, or present
+    # character_span junctions are scene-level evidence, not authoritative
+    # speaker attribution.  Walk 2e owns the per-quotation speaker relation;
+    # treating a scene-level speaker guess as presence prevents it from
+    # claiming narration and from blocking Walk 2e's finer attribution.
+    span_relation_type = "present" if role == "speaker" else role
     for span_id in span_ids:
         existing_span = storage.execute_query(
             "SELECT 1 FROM character_span "
@@ -482,9 +479,7 @@ def _parse_llm_response(response_text: str) -> list[dict]:
     """Parse the LLM response into a list of character dicts."""
     characters = extract_json_from_llm_response(response_text, expected_type="list")
     if characters is None:
-        logger.error(
-            f"Failed to parse LLM response as JSON: {response_text[:200]}"
-        )
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
         return []
 
     if not isinstance(characters, list):
@@ -502,7 +497,9 @@ def _parse_llm_response(response_text: str) -> list[dict]:
         result.append(
             {
                 "name": name.strip(),
-                "aliases": entry.get("aliases", []) if isinstance(entry.get("aliases"), list) else [],
+                "aliases": entry.get("aliases", [])
+                if isinstance(entry.get("aliases"), list)
+                else [],
                 "role": entry.get("role", "present"),
                 "confidence": entry.get("confidence", 0.8),
             }

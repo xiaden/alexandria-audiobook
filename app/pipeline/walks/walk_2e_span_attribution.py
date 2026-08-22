@@ -292,19 +292,29 @@ def _process_attribution(
 
     is_review = 0.5 <= confidence < 0.7
 
-    # Keep attribution idempotent when Walk 2e is rerun.  A span can have at
-    # most one speaker; preserve an existing human or prior walk attribution.
-    storage.execute_insert(
-        "INSERT INTO character_span "
-        "(character_id, span_id, relation_type, source, confidence, human_override) "
-        "SELECT ?, ?, 'speaker', 'walk', ?, 0 "
-        "WHERE NOT EXISTS ("
-        "SELECT 1 FROM character_span "
-        "WHERE span_id = ? AND relation_type = 'speaker'"
-        ")",
-        (character_id, span_id, confidence, span_id),
+    # Replace generated scene-level guesses (including legacy Walk 2b rows),
+    # but never overwrite a human decision.  This keeps reruns idempotent
+    # while allowing the authoritative span-level walk to correct coarse data.
+    updated = storage.execute_update(
+        "UPDATE character_span SET character_id = ?, source = 'walk', "
+        "confidence = ?, human_override = 0 "
+        "WHERE span_id = ? AND relation_type = 'speaker' "
+        "AND human_override = 0",
+        (character_id, confidence, span_id),
     )
+    if not updated:
+        storage.execute_insert(
+            "INSERT INTO character_span "
+            "(character_id, span_id, relation_type, source, confidence, human_override) "
+            "SELECT ?, ?, 'speaker', 'walk', ?, 0 "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM character_span "
+            "WHERE span_id = ? AND relation_type = 'speaker'"
+            ")",
+            (character_id, span_id, confidence, span_id),
+        )
 
+    # Human overrides are intentionally not counted as a new attribution.
     result["speakers_attributed"] += 1
 
     if is_review:
