@@ -493,6 +493,38 @@ class TestExecute:
 
         assert captured["system_prompt"] == "You are a TEST override prompt."
 
+    def test_releases_savepoint_after_attribution_failure(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        """A failed attribution rolls back and leaves the connection usable."""
+        response = json.dumps({"character_id": "char-john", "confidence": 0.9})
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        original_execute_update = seeded_storage.execute_update
+        failed_once = False
+
+        def fail_first_attribution_update(sql, params=()):
+            nonlocal failed_once
+            if not failed_once and "UPDATE character_span" in sql:
+                failed_once = True
+                raise RuntimeError("simulated attribution write failure")
+            return original_execute_update(sql, params)
+
+        seeded_storage.execute_update = fail_first_attribution_update
+
+        result = execute("book-1", seeded_storage, {})
+
+        assert failed_once
+        assert any(
+            "simulated attribution write failure" in error["error"]
+            for error in result["errors"]
+        )
+        assert seeded_storage.get_connection().in_transaction is False
+        rows = seeded_storage.execute_query(
+            "SELECT span_id FROM character_span WHERE relation_type = 'speaker'"
+        )
+        assert {row["span_id"] for row in rows} == {"span-3a", "span-5a"}
+
 
 class TestBuildPrompt:
     """Test prompt building."""
@@ -643,3 +675,18 @@ class TestGetSurroundingContext:
         )
 
         assert context == {"before": [], "after": []}
+
+    def test_uses_nearest_three_preceding_spans(self):
+        """A late span receives its immediately preceding context window."""
+        storage = Mock()
+        storage.execute_query.return_value = [
+            {"id": f"span-{index}", "text": f"Span {index}", "position": index}
+            for index in range(1, 14)
+        ]
+
+        context = _get_surrounding_context("para-1", "span-10", storage)
+
+        assert context == {
+            "before": ["Span 7", "Span 8", "Span 9"],
+            "after": ["Span 11", "Span 12", "Span 13"],
+        }

@@ -168,7 +168,7 @@ def _load_existing_characters(
 def _get_surrounding_context(
     paragraph_id: str, span_id: str, storage: PipelineStorage
 ) -> dict[str, list[str]]:
-    """Get surrounding spans (2-3 before and after) in the same paragraph."""
+    """Get up to three surrounding spans before and after in the paragraph."""
     # Get all spans in this paragraph ordered by position
     all_spans = storage.execute_query(
         """
@@ -181,24 +181,24 @@ def _get_surrounding_context(
         (paragraph_id,),
     )
 
-    # Find the current span's position
-    current_position = None
-    for span in all_spans:
-        if span["id"] == span_id:
-            current_position = span["position"]
-            break
+    # Find the current span's index.  The query is ordered by position, so
+    # slicing around the index selects the nearest spans rather than the
+    # earliest spans in the paragraph.
+    current_index = next(
+        (index for index, span in enumerate(all_spans) if span["id"] == span_id),
+        None,
+    )
 
-    if current_position is None:
+    if current_index is None:
         return {"before": [], "after": []}
 
-    # Get 2-3 spans before and after
-    before_spans = []
-    after_spans = []
-    for span in all_spans:
-        if span["position"] < current_position and len(before_spans) < 3:
-            before_spans.append(span["text"] or "")
-        elif span["position"] > current_position and len(after_spans) < 3:
-            after_spans.append(span["text"] or "")
+    before_spans = [
+        span["text"] or ""
+        for span in all_spans[max(0, current_index - 3) : current_index]
+    ]
+    after_spans = [
+        span["text"] or "" for span in all_spans[current_index + 1 : current_index + 4]
+    ]
 
     return {"before": before_spans, "after": after_spans}
 
@@ -258,6 +258,7 @@ def _process_span(
         conn.execute("RELEASE SAVEPOINT walk_2e_span")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2e_span")
+        conn.execute("RELEASE SAVEPOINT walk_2e_span")
         raise
 
 
