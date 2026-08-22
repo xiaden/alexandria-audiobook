@@ -106,7 +106,9 @@ async def onboard_epub(
 
     # Save uploaded file to temp location
     tmp_dir = tempfile.mkdtemp(prefix="pipeline_onboard_")
-    tmp_path = os.path.join(tmp_dir, file.filename)
+    # Never use the client-controlled filename as a filesystem path.  A unique
+    # server-generated name also keeps cleanup confined to ``tmp_dir``.
+    tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4()}.epub")
     try:
         content = await file.read()
         with open(tmp_path, "wb") as f:

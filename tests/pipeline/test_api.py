@@ -356,6 +356,46 @@ class TestOnboardEndpoint:
             mock_extract.assert_called_once()
             mock_populate.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("filename", "escaped_path"),
+        [
+            ("../escaped.epub", "parent"),
+            ("/escaped.epub", "root"),
+        ],
+    )
+    def test_onboard_does_not_use_client_filename_as_path(
+        self, client, storage, tmp_path, filename, escaped_path
+    ):
+        """Upload filenames cannot escape the temporary directory."""
+        if escaped_path == "root":
+            filename = str(tmp_path.parent / "absolute-escaped.epub")
+        outside_path = (
+            tmp_path.parent / "escaped.epub"
+            if escaped_path == "parent"
+            else Path(filename)
+        )
+        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract, patch(
+            "app.pipeline.api_onboard.populate_spine"
+        ) as mock_populate, patch(
+            "app.pipeline.api_onboard.tempfile.mkdtemp", return_value=str(tmp_path)
+        ):
+            mock_extract.return_value = {
+                "series_id": "s-test",
+                "book_id": "b-test",
+                "chapters": [],
+            }
+
+            response = client.post(
+                "/api/pipeline/onboard",
+                files={"file": (filename, b"fake epub content", "application/epub+zip")},
+            )
+
+        assert response.status_code == 200
+        assert not outside_path.exists()
+        uploaded_path = mock_extract.call_args.args[0]
+        assert Path(uploaded_path).parent == tmp_path
+        mock_populate.assert_called_once()
+
     def test_onboard_handles_extraction_failure(self, client):
         """Extraction failures return 400."""
         with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract:
