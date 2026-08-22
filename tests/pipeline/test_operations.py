@@ -513,6 +513,20 @@ class TestExecuteMerge:
         assert ("ch1", "speaker", 0.9) in memberships
         assert ("ch2", "mentioned", 0.7) in memberships
 
+    def test_merge_concatenates_span_text(self, storage, executor):
+        """Merge preserves the right span text after the right span is deleted."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        conn.execute("UPDATE span SET text = ? WHERE id = ?", ("Hello ", "sp1"))
+        conn.execute("UPDATE span SET text = ? WHERE id = ?", ("world", "sp2"))
+
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
+
+        assert _get_span_text(conn, "sp1") == "Hello world"
+        assert _get_span_text(conn, "sp2") is None
+
     def test_merge_confidence_tiebreak(self, storage, executor):
         """Merge keeps higher confidence for duplicate (character_id, relation_type)."""
         conn = storage.get_connection()

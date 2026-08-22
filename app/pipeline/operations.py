@@ -391,6 +391,24 @@ class OperationExecutor:
                 (right_span_id,),
             ).fetchall()
 
+            # Preserve the content of both spans on the surviving left span.
+            left_text = conn.execute(
+                "SELECT text FROM span WHERE id = ?", (left_span_id,)
+            ).fetchone()[0]
+            right_text = conn.execute(
+                "SELECT text FROM span WHERE id = ?", (right_span_id,)
+            ).fetchone()[0]
+            if left_text is None:
+                merged_text = right_text
+            elif right_text is None:
+                merged_text = left_text
+            else:
+                merged_text = left_text + right_text
+            conn.execute(
+                "UPDATE span SET text = ? WHERE id = ?",
+                (merged_text, left_span_id),
+            )
+
             # Build union with confidence tiebreak
             # Key: (character_id, relation_type), Value: (source, confidence, human_override)
             membership_map: dict[tuple[str, str], tuple[str, float, int]] = {}
