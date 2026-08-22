@@ -589,8 +589,7 @@ class WalkRunner:
         Returns
         -------
         dict
-            Result summary from the walk's ``execute()`` function with
-            ``status='completed'`` on success, or an error dict with
+            The walk's raw ``execute()`` result on success, or an error dict with
             ``status='failed'`` on failure, or
             ``{'status': 'cancelled', ...}`` when cancellation was requested
             before execution.
@@ -656,10 +655,20 @@ class WalkRunner:
         """Execute a single reserved walk by its persisted pending run ID.
 
         Consumes the reservation created by ``reserve_walk_run``: verifies the
-        exact ``pending`` row exists for ``(run_id, book_id)``, transitions it
-        to ``running``, and executes with
-        ``HeartbeatStorage(self._storage, run_id)``. It NEVER allocates,
+        exact ``pending`` row exists for ``(run_id, book_id)``, atomically checks
+        (under ``storage.transaction``) that no OTHER ``walk_run`` row for the
+        same book is ``running``, transitions it to ``running``, and executes
+        with ``HeartbeatStorage(self._storage, run_id)``. It NEVER allocates,
         generates, or discovers a replacement run ID — the caller owns identity.
+
+        The pending→running transition and the no-running-row guard are committed
+        together in a single ``BEGIN IMMEDIATE`` transaction (A2 serialization):
+        only rows already ``running`` block start, so the nine pre-reserved
+        ``pending`` rows of a batch never block sequential execution. When the
+        guard is violated (another run for the same book is already running) the
+        attempted reservation is deterministically terminalized to ``failed``
+        (pending row only) WITHOUT executing the walk, and ``{status:'failed'}``
+        is returned.
 
         A per-run walk-log sink is opened via ``self._log_service.open_run`` only
         after the pending row is verified and before module execution. When
@@ -672,21 +681,48 @@ class WalkRunner:
         no sink. Exactly one terminal record is appended (via
         ``log_service.close_run``) before the DB row is finalized.
         """
-        rows = self._storage.execute_query(
-            "SELECT status FROM walk_run WHERE run_id = ? AND book_id = ?",
-            (run_id, book_id),
-        )
-        if not rows or rows[0]["status"] != "pending":
-            return {
-                "status": "failed",
-                "error": f"Reservation not pending for run '{run_id}'",
-            }
         self._ensure_book(book_id)
-        now = _now_ms()
-        self._storage.execute_update(
-            "UPDATE walk_run SET status = 'running', heartbeat_ms = ? WHERE run_id = ?",
-            (now, run_id),
-        )
+        with self._storage.transaction():
+            rows = self._storage.execute_query(
+                "SELECT status FROM walk_run WHERE run_id = ? AND book_id = ?",
+                (run_id, book_id),
+            )
+            if not rows or rows[0]["status"] != "pending":
+                return {
+                    "status": "failed",
+                    "error": f"Reservation not pending for run '{run_id}'",
+                }
+            # Serial-execution guard: another walk for the same book is already
+            # running, so this attempted reservation is blocked. Only rows with
+            # status 'running' block start — pending siblings never do. The
+            # blocked row is terminalized to 'failed' deterministically and the
+            # walk is NOT executed.
+            blocked = self._storage.execute_query(
+                "SELECT 1 FROM walk_run WHERE book_id = ? AND status = 'running' "
+                "LIMIT 1",
+                (book_id,),
+            )
+            if blocked:
+                error = f"Another walk is already running for book '{book_id}'"
+                self._storage.execute_update(
+                    "UPDATE walk_run SET status = 'failed', error = ?, "
+                    "finished_ms = ?, heartbeat_ms = ? "
+                    "WHERE run_id = ? AND status = 'pending'",
+                    (error, _now_ms(), _now_ms(), run_id),
+                )
+                logger.error(
+                    "Reserved walk '%s' blocked for book '%s': %s",
+                    walk_name,
+                    book_id,
+                    error,
+                )
+                return {"status": "failed", "error": error}
+            now = _now_ms()
+            self._storage.execute_update(
+                "UPDATE walk_run SET status = 'running', heartbeat_ms = ? "
+                "WHERE run_id = ?",
+                (now, run_id),
+            )
         # Single cancellation dispatcher — honored before walk execution (and
         # before any sink is opened, so a cancelled-before-start run opens none).
         if self.is_cancel_requested(run_id):
@@ -750,6 +786,27 @@ class WalkRunner:
                     exc,
                 )
                 return {"status": "failed", "error": str(exc)}
+            # A3: a non-empty result['errors'] means the walk reported failures
+            # even though it returned without raising. Fail the run and preserve
+            # the raw result (including its errors) as result_json on the failed
+            # row. An empty or missing errors key retains the existing
+            # verification behavior below.
+            if isinstance(result, dict) and result.get("errors"):
+                error = f"Walk '{walk_name}' reported errors for book '{book_id}'"
+                self._terminal_and_close(
+                    run_id,
+                    "failed",
+                    {"error": error, "result": result},
+                )
+                self._finalize_run(run_id, "failed", error=error, result=result)
+                self._set_status(book_id, walk_name, "failed")
+                logger.error(
+                    "Reserved walk '%s' reported %d error(s) for book '%s'",
+                    walk_name,
+                    len(result["errors"]),
+                    book_id,
+                )
+                return {"status": "failed", "error": error, "result": result}
             if not self._run_verification(walk_name, book_id):
                 error = f"Verification failed for walk '{walk_name}'"
                 self._terminal_and_close(
@@ -775,9 +832,9 @@ class WalkRunner:
             logger.info(
                 "Completed reserved walk '%s' for book '%s'", walk_name, book_id
             )
-            # Batch control uses the persisted terminal state, while walk modules
-            # return raw summaries that do not necessarily include a status.
-            return {**result, "status": "completed"}
+            # Batch control reads the persisted terminal state below; preserve
+            # the walk module's raw summary for synchronous callers.
+            return result
         finally:
             # Reset the sink ContextVar on EVERY terminal path (success,
             # exception, import failure, verification failure). token is None
@@ -803,23 +860,36 @@ class WalkRunner:
         Abort-on-first-failure is preserved: when a child fails (or cancels),
         every not-yet-started child is terminalized WITHOUT executing it. On
         cancellation every child is terminalized.
+
+        The abort decision is driven by each child's PERSISTED ``walk_run`` status
+        (rows = truth), read back immediately after ``run_walk_reserved`` returns
+        the raw summary — never by a synthetic ``status`` key on the raw result.
+        The raw result shapes stored in ``results`` are unchanged.
         """
         self._ensure_book(book_id)
         results: dict[str, dict] = {}
         for walk_name, run_id in reservations:
             result = self.run_walk_reserved(run_id, walk_name, book_id, config)
             results[walk_name] = result
-            if result.get("status") != "completed":
+            # The persisted row is authoritative: it reflects run_walk_reserved's
+            # terminal outcome (completed/failed/cancelled), independent of the
+            # raw walk summary's shape. Read back immediately after the raw
+            # summary result; results keep their raw shapes (unchanged).
+            status_rows = self._storage.execute_query(
+                "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+            )
+            persisted_status = status_rows[0]["status"] if status_rows else "failed"
+            if persisted_status != "completed":
                 logger.error(
                     "Reserved walk '%s' finished '%s' — aborting remaining walks "
                     "for book '%s'",
                     walk_name,
-                    result.get("status"),
+                    persisted_status,
                     book_id,
                 )
                 self._terminalize_reserved(
                     [rid for w, rid in reservations if w not in results],
-                    result.get("status", "failed"),
+                    persisted_status,
                 )
                 break
         return results
@@ -962,7 +1032,15 @@ class WalkRunner:
         ``finished_ms`` and refreshes ``heartbeat_ms``.
         """
         now = _now_ms()
-        if result is not None:
+        if result is not None and error is not None:
+            # Both present (A3 errors case): preserve the raw result_json on the
+            # failed row alongside the error text.
+            self._storage.execute_update(
+                "UPDATE walk_run SET status = ?, result_json = ?, error = ?, "
+                "finished_ms = ?, heartbeat_ms = ? WHERE run_id = ?",
+                (status, json.dumps(result), error, now, now, run_id),
+            )
+        elif result is not None:
             self._storage.execute_update(
                 "UPDATE walk_run SET status = ?, result_json = ?, "
                 "finished_ms = ?, heartbeat_ms = ? WHERE run_id = ?",

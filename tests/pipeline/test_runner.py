@@ -1330,7 +1330,7 @@ class TestRunWalkReserved:
             result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
         assert result == expected
 
-    def test_run_walk_reserved_adds_completed_status_to_raw_summary(self, storage):
+    def test_run_walk_reserved_returns_raw_summary_on_success(self, storage):
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         runner = self._runner(storage)
@@ -1341,7 +1341,7 @@ class TestRunWalkReserved:
             patch.object(WalkRunner, "_run_verification", return_value=True),
         ):
             result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
-        assert result == {"chapters": 2, "status": "completed"}
+        assert result == summary
 
     def test_run_walk_reserved_executes_with_heartbeat_storage_run_id(self, storage):
         run_id = str(uuid.uuid4())
@@ -1751,7 +1751,7 @@ class TestRunAllWalksReserved:
             )
 
         assert len(call_log) == len(WALK_ORDER)
-        assert all(results[w]["status"] == "completed" for w in WALK_ORDER)
+        assert all(results[w] == {"scenes_created": 3} for w in WALK_ORDER)
         rows = storage.execute_query(
             "SELECT status, result_json FROM walk_run WHERE book_id = ?",
             (self.BOOK,),
@@ -1831,6 +1831,280 @@ class TestRunAllWalksReserved:
         assert len(rows) == len(WALK_ORDER)
         for row in rows:
             assert row["status"] in ("cancelled", "failed", "interrupted")
+
+
+# ---------------------------------------------------------------------------
+# Serialization + reported-errors lifecycle (A1/A2/A3 fixes)
+# ---------------------------------------------------------------------------
+
+
+class TestReservedSerializationFixes:
+    """Locks the A1/A2/A3 reserved-runner fixes:
+
+    A2 — ``run_walk_reserved`` atomically (under ``storage.transaction``)
+    checks no other ``running`` row exists for the same book and transitions
+    the pending->running row; a blocked reservation is deterministically
+    terminalized to ``failed`` without executing, and the nine pre-reserved
+    ``pending`` rows of a batch never block sequential execution.
+
+    A3 — a non-empty ``result['errors']`` marks the run ``failed`` and preserves
+    the raw result JSON on the failed row; empty/missing errors retains the
+    existing verification behavior.
+
+    A1 — ``run_all_walks_reserved`` drives its abort decision from each child's
+    PERSISTED ``walk_run`` status (rows = truth), not from the returned raw
+    summary's status shape.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    WALK = "walk_2a_scene_segmentation"
+
+    def _runner(self, storage):
+        return WalkRunner(storage, log_service=_FakeLogService())
+
+    def _reservations(self):
+        return [(w, str(uuid.uuid4())) for w in WALK_ORDER]
+
+    # -- A2: serial-execution guard under storage.transaction ---------------
+
+    def test_blocked_by_running_row_terminalizes_and_does_not_execute(self, runner):
+        """A pending reservation blocked by another 'running' row for the same
+        book is terminalized to 'failed' without executing the walk."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(runner._storage, run_id, self.BOOK, self.WALK)
+        other_id = str(uuid.uuid4())
+        _insert_pending_row(runner._storage, other_id, self.BOOK, WALK_ORDER[1])
+        runner._storage.execute_update(
+            "UPDATE walk_run SET status = 'running' WHERE run_id = ?", (other_id,)
+        )
+
+        execute_fn = MagicMock(return_value={"status": "completed"})
+        mock_module = _make_mock_walk_module(execute_fn)
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+
+        assert result["status"] == "failed"
+        assert "already running" in result["error"]
+        execute_fn.assert_not_called()
+        rows = runner._storage.execute_query(
+            "SELECT status, error FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "failed"
+        assert "already running" in rows[0]["error"]
+        rows = runner._storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (other_id,)
+        )
+        assert rows[0]["status"] == "running"
+
+    def test_running_transition_happens_inside_transaction(self, storage):
+        """The pending->running transition UPDATE is issued while a storage
+        transaction is open (A2 atomicity)."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        observed = {}
+        real_update = storage.execute_update
+
+        def recording_update(sql, params=()):
+            if "status = 'running'" in sql:
+                observed["in_txn"] = storage._conn.in_transaction
+            return real_update(sql, params)
+
+        storage.execute_update = recording_update
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert observed["in_txn"] is True
+
+    def test_nine_pending_rows_do_not_block_sequential_execution(self, storage):
+        """The A2 guard only blocks on status='running', so the nine
+        pre-reserved 'pending' rows of a full batch never block sequential
+        start; the whole batch runs to completion."""
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = {w: str(uuid.uuid4()) for w in WALK_ORDER}
+        reserve_all_walk_runs(storage, self.BOOK, list(reservations.items()))
+        runner = self._runner(storage)
+        call_log = []
+
+        def execute_fn(book_id, hbs, config):
+            call_log.append(book_id)
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            results = runner.run_all_walks_reserved(
+                str(uuid.uuid4()), list(reservations.items()), self.BOOK, {}
+            )
+        assert len(call_log) == len(WALK_ORDER)
+        assert all(results[w]["status"] == "completed" for w in WALK_ORDER)
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        assert all(r["status"] == "completed" for r in rows)
+
+    # -- A3: non-empty result['errors'] means failed, result JSON preserved ---
+
+    def test_non_empty_errors_marks_failed_and_preserves_result_json(self, storage):
+        """A walk returning a non-empty result['errors'] (e.g. 'Book not found')
+        is failed; the raw result (including errors) is preserved as result_json
+        on the failed row."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        raw = {
+            "book_id": self.BOOK,
+            "scenes_processed": 0,
+            "errors": [{"chapter_id": "ch1", "error": "Book not found"}],
+        }
+        mock_module = _make_mock_walk_module(MagicMock(return_value=raw))
+        verify = MagicMock(return_value=True)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=verify),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert "reported errors" in result["error"]
+        assert result["result"] == raw
+        rows = storage.execute_query(
+            "SELECT status, result_json, error FROM walk_run WHERE run_id = ?",
+            (run_id,),
+        )
+        assert rows[0]["status"] == "failed"
+        assert json.loads(rows[0]["result_json"]) == raw
+        assert "reported errors" in rows[0]["error"]
+
+    def test_non_empty_errors_skips_verification(self, storage):
+        """A non-empty errors result fails the run before verification runs."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"errors": [{"error": "boom"}]})
+        )
+        verify = MagicMock(return_value=True)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=verify),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        verify.assert_not_called()
+
+    def test_empty_errors_retains_completion(self, storage):
+        """An empty result['errors'] list does NOT fail the run; it completes
+        (verification behavior retained)."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        raw = {"scenes_created": 3, "errors": []}
+        mock_module = _make_mock_walk_module(MagicMock(return_value=raw))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result == raw
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+    def test_missing_errors_retains_verification_behavior(self, storage):
+        """A result with NO 'errors' key keeps the existing verification path:
+        a verification failure still fails the run (rows = truth)."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        raw = {"scenes_created": 1}
+        mock_module = _make_mock_walk_module(MagicMock(return_value=raw))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=False),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "failed"
+        assert "Verification failed" in result["error"]
+
+    # -- A1: run_all_walks_reserved uses persisted status for abort ---------
+
+    def test_abort_uses_persisted_status_over_returned_shape(self, storage):
+        """run_all_walks_reserved aborts based on each child's PERSISTED row
+        status, not the returned raw summary's status key."""
+        reservations = self._reservations()
+        for walk_name, run_id in reservations:
+            _insert_pending_row(storage, run_id, self.BOOK, walk_name)
+        runner = self._runner(storage)
+        batch_id = str(uuid.uuid4())
+        calls = []
+
+        def fake_run_walk_reserved(run_id, walk_name, book_id, config):
+            calls.append(walk_name)
+            storage.execute_update(
+                "UPDATE walk_run SET status = 'failed', error = 'boom' "
+                "WHERE run_id = ?",
+                (run_id,),
+            )
+            return {"status": "completed", "synthetic": True}
+
+        with patch.object(
+            WalkRunner, "run_walk_reserved", side_effect=fake_run_walk_reserved
+        ):
+            results = runner.run_all_walks_reserved(
+                batch_id, reservations, self.BOOK, {}
+            )
+        # Only the first child was attempted: the persisted 'failed' status
+        # drove the abort even though the returned summary said 'completed'.
+        assert calls == [WALK_ORDER[0]]
+        assert results[WALK_ORDER[0]]["status"] == "completed"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        assert rows[0]["status"] == "failed"
+        assert all(r["status"] != "pending" for r in rows[1:])
+
+    def test_abort_when_walk_reports_errors(self, storage):
+        """A child whose walk returns non-empty errors persists 'failed' (A3);
+        run_all_walks_reserved aborts on that persisted status and terminalizes
+        the remaining children (A1)."""
+        from app.pipeline.walks.runner import reserve_all_walk_runs
+
+        reservations = {w: str(uuid.uuid4()) for w in WALK_ORDER}
+        reserve_all_walk_runs(storage, self.BOOK, list(reservations.items()))
+        runner = self._runner(storage)
+        batch_id = str(uuid.uuid4())
+        call_count = [0]
+
+        def execute_fn(book_id, hbs, config):
+            call_count[0] += 1
+            return {"book_id": book_id, "errors": [{"error": "boom"}]}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            results = runner.run_all_walks_reserved(
+                batch_id, list(reservations.items()), self.BOOK, {}
+            )
+        assert call_count[0] == 1  # only the first child executed
+        assert results[WALK_ORDER[0]]["status"] == "failed"
+        rows = storage.execute_query(
+            "SELECT walk_name, status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        by_name = {r["walk_name"]: r["status"] for r in rows}
+        assert by_name[WALK_ORDER[0]] == "failed"
+        for w in WALK_ORDER[1:]:
+            assert by_name[w] in ("failed", "cancelled", "interrupted")
 
 
 # ---------------------------------------------------------------------------
