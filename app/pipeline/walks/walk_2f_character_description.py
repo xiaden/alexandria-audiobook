@@ -269,6 +269,7 @@ def _process_character(
         conn.execute("RELEASE SAVEPOINT walk_2f_character")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2f_character")
+        conn.execute("RELEASE SAVEPOINT walk_2f_character")
         raise
 
     result["descriptions_generated"] += 1

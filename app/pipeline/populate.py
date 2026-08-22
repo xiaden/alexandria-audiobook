@@ -83,6 +83,7 @@ def populate_initial_spine(
         conn.execute("RELEASE SAVEPOINT populate_spine")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT populate_spine")
+        conn.execute("RELEASE SAVEPOINT populate_spine")
         raise
 
 
@@ -119,6 +120,7 @@ def insert_scene(
         conn.execute("RELEASE SAVEPOINT insert_scene")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT insert_scene")
+        conn.execute("RELEASE SAVEPOINT insert_scene")
         raise
 
 

@@ -328,6 +328,7 @@ def _process_character(
         committed_target_ids.append(character_id)
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2g_voice")
+        conn.execute("RELEASE SAVEPOINT walk_2g_voice")
         raise
 
     result["profiles_generated"] += 1

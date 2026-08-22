@@ -388,6 +388,7 @@ def _merge_group(
         conn.execute("RELEASE SAVEPOINT merge_group")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT merge_group")
+        conn.execute("RELEASE SAVEPOINT merge_group")
         raise
 
     if is_review:

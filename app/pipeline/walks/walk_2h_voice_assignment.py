@@ -337,6 +337,7 @@ def _process_character(
             committed_target_ids.append(character_id)
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT walk_2h_voice_assignment")
+            conn.execute("RELEASE SAVEPOINT walk_2h_voice_assignment")
             raise
 
         result["voices_matched"] += 1

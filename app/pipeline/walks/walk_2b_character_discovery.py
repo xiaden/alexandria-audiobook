@@ -328,6 +328,7 @@ def _process_scene(
         conn.execute("RELEASE SAVEPOINT walk_2b_scene")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2b_scene")
+        conn.execute("RELEASE SAVEPOINT walk_2b_scene")
         raise
 
 

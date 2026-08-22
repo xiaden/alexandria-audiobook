@@ -366,6 +366,7 @@ def _process_span(
         committed_target_ids.append(span_id)
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2i_delivery")
+        conn.execute("RELEASE SAVEPOINT walk_2i_delivery")
         raise
 
     result["instructs_generated"] += 1

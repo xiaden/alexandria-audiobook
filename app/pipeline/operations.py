@@ -324,6 +324,7 @@ class OperationExecutor:
             conn.execute("RELEASE SAVEPOINT split_op")
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT split_op")
+            conn.execute("RELEASE SAVEPOINT split_op")
             raise
 
     def execute_merge(
@@ -545,6 +546,7 @@ class OperationExecutor:
             conn.execute("RELEASE SAVEPOINT move_op")
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT move_op")
+            conn.execute("RELEASE SAVEPOINT move_op")
             raise
 
     def execute_delete(self, book_id: str, presentation_index: int) -> None:
@@ -586,4 +588,5 @@ class OperationExecutor:
             conn.execute("RELEASE SAVEPOINT delete_op")
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT delete_op")
+            conn.execute("RELEASE SAVEPOINT delete_op")
             raise

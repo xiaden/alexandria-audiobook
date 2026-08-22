@@ -258,6 +258,7 @@ def _process_span(
         conn.execute("RELEASE SAVEPOINT walk_2e_span")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2e_span")
+        conn.execute("RELEASE SAVEPOINT walk_2e_span")
         raise
 
 
