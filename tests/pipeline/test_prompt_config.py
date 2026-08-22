@@ -43,9 +43,7 @@ def _seed(storage) -> None:
     c.commit()
 
 
-def _insert_override(
-    storage, book_id: str, walk_name: str, key: str, value
-) -> None:
+def _insert_override(storage, book_id: str, walk_name: str, key: str, value) -> None:
     """Insert a ``walk_override`` row (single-writer target the API reuses)."""
     import json
 
@@ -82,7 +80,6 @@ def _client():
 
 
 @pytest.fixture
-
 def client():
     """Router-only TestClient over a seeded in-memory adapter."""
     return _client()[0]
@@ -124,19 +121,29 @@ NINE = [
 
 
 def test_get_config_returns_all_nine_tasks(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.get("/api/pipeline/walks/b1/config")
     assert resp.status_code == 200
     body = resp.json()
     assert set(body["tasks"]) == set(NINE)
     for task in NINE:
         entry = body["tasks"][task]
-        assert set(entry["values"]) == {"model_name", "reasoning_effort", "temperature", "prompt"}
-        assert set(entry["sources"]) == {"model_name", "reasoning_effort", "temperature", "prompt"}
+        assert set(entry["values"]) == {
+            "model_name",
+            "reasoning_effort",
+            "temperature",
+            "prompt",
+        }
+        assert set(entry["sources"]) == {
+            "model_name",
+            "reasoning_effort",
+            "temperature",
+            "prompt",
+        }
 
 
 def test_get_config_unknown_book_404(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.get("/api/pipeline/walks/nope/config")
     assert resp.status_code == 404
 
@@ -185,7 +192,9 @@ def test_non_string_db_prompt_does_not_win(client):
 
 def test_validate_side_effect_free_and_rejects_unknown_task(client):
     client, storage = _client()
-    before = storage.execute_query("SELECT COUNT(*) AS n FROM prompt_config_revision")[0]["n"]
+    before = storage.execute_query("SELECT COUNT(*) AS n FROM prompt_config_revision")[
+        0
+    ]["n"]
     resp = client.post(
         "/api/pipeline/walks/b1/config/validate",
         json={"task": "not_a_task", "settings": {"temperature": 0.0}},
@@ -194,13 +203,15 @@ def test_validate_side_effect_free_and_rejects_unknown_task(client):
     body = resp.json()
     assert body["valid"] is False
     assert body["errors"]
-    after = storage.execute_query("SELECT COUNT(*) AS n FROM prompt_config_revision")[0]["n"]
+    after = storage.execute_query("SELECT COUNT(*) AS n FROM prompt_config_revision")[
+        0
+    ]["n"]
     # Validate never writes a revision.
     assert before == after
 
 
 def test_validate_unknown_key_rejected(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.post(
         "/api/pipeline/walks/b1/config/validate",
         json={"task": "scene_segmentation", "settings": {"bogus_key": "x"}},
@@ -210,7 +221,7 @@ def test_validate_unknown_key_rejected(client):
 
 
 def test_validate_malformed_settings(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.post(
         "/api/pipeline/walks/b1/config/validate",
         json={"task": "scene_segmentation", "settings": {"temperature": "hot"}},
@@ -271,7 +282,7 @@ def test_revisions_saves_and_supersedes(client):
 
 
 def test_revisions_stale_base_revision_409(client):
-    client, storage = _client()
+    client, _storage = _client()
     first = client.post(
         "/api/pipeline/walks/b1/config/revisions",
         json={"task": "scene_segmentation", "settings": {"temperature": 0.1}},
@@ -312,21 +323,18 @@ def test_revisions_list_returns_current_head_after_reload(client):
     )
     assert response.status_code == 200
     assert (
-        response.json()["revisions"][0]["revision_id"]
-        == created.json()["revision_id"]
+        response.json()["revisions"][0]["revision_id"] == created.json()["revision_id"]
     )
 
 
 def test_revisions_list_unknown_task_returns_422(client):
-    client, storage = _client()
-    response = client.get(
-        "/api/pipeline/walks/b1/config/revisions?task=unknown_task"
-    )
+    client, _storage = _client()
+    response = client.get("/api/pipeline/walks/b1/config/revisions?task=unknown_task")
     assert response.status_code == 422
 
 
 def test_revisions_list_unknown_book_returns_404(client):
-    client, storage = _client()
+    client, _storage = _client()
     response = client.get(
         "/api/pipeline/walks/unknown-book/config/revisions?task=scene_segmentation"
     )
@@ -334,7 +342,7 @@ def test_revisions_list_unknown_book_returns_404(client):
 
 
 def test_revisions_unknown_task_422(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.post(
         "/api/pipeline/walks/b1/config/revisions",
         json={"task": "nope", "settings": {"temperature": 0.1}},
@@ -343,7 +351,7 @@ def test_revisions_unknown_task_422(client):
 
 
 def test_revisions_unknown_book_404(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.post(
         "/api/pipeline/walks/nope/config/revisions",
         json={"task": "scene_segmentation", "settings": {"temperature": 0.1}},
@@ -352,7 +360,7 @@ def test_revisions_unknown_book_404(client):
 
 
 def test_revisions_cross_book_base_revision_409(client):
-    client, storage = _client()
+    client, _storage = _client()
     b1 = client.post(
         "/api/pipeline/walks/b1/config/revisions",
         json={"task": "scene_segmentation", "settings": {"temperature": 0.1}},
@@ -373,7 +381,7 @@ def test_revisions_cross_book_base_revision_409(client):
 
 
 def test_revisions_invalid_override_value_422(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.post(
         "/api/pipeline/walks/b1/config/revisions",
         json={"task": "scene_segmentation", "settings": {"temperature": 99}},
@@ -382,7 +390,7 @@ def test_revisions_invalid_override_value_422(client):
 
 
 def test_revisions_malformed_raw_json_422(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.post(
         "/api/pipeline/walks/b1/config/revisions",
         json={
@@ -395,7 +403,7 @@ def test_revisions_malformed_raw_json_422(client):
 
 
 def test_revisions_unknown_key_in_raw_json_422(client):
-    client, storage = _client()
+    client, _storage = _client()
     resp = client.post(
         "/api/pipeline/walks/b1/config/revisions",
         json={
@@ -408,7 +416,7 @@ def test_revisions_unknown_key_in_raw_json_422(client):
 
 
 def test_revisions_contention_503(client):
-    client, storage = _client()
+    _, storage = _client()
 
     class _ContendingStorage:
         def __init__(self, inner):
@@ -419,11 +427,15 @@ def test_revisions_contention_503(client):
             return attr
 
         def transaction(self):
-            raise ConcurrentTransactionError("BEGIN IMMEDIATE timed out under contention")
+            raise ConcurrentTransactionError(
+                "BEGIN IMMEDIATE timed out under contention"
+            )
 
     app = FastAPI()
     app.include_router(pipeline_api.router)
-    app.dependency_overrides[pipeline_api.get_storage] = lambda: _ContendingStorage(storage)
+    app.dependency_overrides[pipeline_api.get_storage] = lambda: _ContendingStorage(
+        storage
+    )
 
     @app.exception_handler(ConcurrentTransactionError)
     async def _h(request, exc):

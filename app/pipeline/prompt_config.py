@@ -42,7 +42,6 @@ from app.pipeline.workbench import (
 )
 from app.utils import load_app_config, resolve_task_config
 
-
 # ---------------------------------------------------------------------------
 # Domain constants
 # ---------------------------------------------------------------------------
@@ -103,7 +102,7 @@ class PromptConfigDomain:
                 (book_id, task, field),
             )
             row = rows[0] if rows else None
-        except Exception:
+        except Exception:  # noqa: BLE001 — best-effort override read; unreadable storage degrades to no override
             row = None
         if row is not None:
             try:
@@ -195,9 +194,10 @@ class PromptConfigDomain:
                         f"temperature must be a number in"
                         f" [{_TEMPERATURE_MIN}, {_TEMPERATURE_MAX}]"
                     )
-            elif key == "prompt":
-                if not _is_truthy_str(value) or len(value) > _MAX_PROMPT_LEN:
-                    errors.append("prompt must be a non-empty string")
+            elif key == "prompt" and (
+                not _is_truthy_str(value) or len(value) > _MAX_PROMPT_LEN
+            ):
+                errors.append("prompt must be a non-empty string")
         return errors
 
     def _validate_raw_json(self, raw_json: Any) -> tuple[list[str], dict | None]:
@@ -221,16 +221,15 @@ class PromptConfigDomain:
         errors: list[str] = []
         task = write.get("task")
         if task not in TASK_NAMES:
-            errors.append(
-                f"unknown task: {task}; must be one of {sorted(TASK_NAMES)}"
-            )
+            errors.append(f"unknown task: {task}; must be one of {sorted(TASK_NAMES)}")
         errors.extend(self._validate_settings(write.get("settings")))
         raw_errors, _ = self._validate_raw_json(write.get("raw_json"))
         errors.extend(raw_errors)
         prompt = write.get("prompt")
-        if prompt is not None:
-            if not _is_truthy_str(prompt) or len(prompt) > _MAX_PROMPT_LEN:
-                errors.append("prompt must be a non-empty string")
+        if prompt is not None and (
+            not _is_truthy_str(prompt) or len(prompt) > _MAX_PROMPT_LEN
+        ):
+            errors.append("prompt must be a non-empty string")
         return {"valid": not errors, "errors": errors, "task": task}
 
     # ------------------------------------------------------------------
@@ -282,7 +281,11 @@ class PromptConfigDomain:
         provided_settings = write.get("settings") or {}
         if isinstance(provided_settings, dict):
             settings.update(
-                {k: v for k, v in provided_settings.items() if k in ALLOWED_OVERRIDE_KEYS}
+                {
+                    k: v
+                    for k, v in provided_settings.items()
+                    if k in ALLOWED_OVERRIDE_KEYS
+                }
             )
         # prompt is a top-level field on the write.
         prompt = write.get("prompt")
@@ -310,10 +313,8 @@ class PromptConfigDomain:
                     if prompt is None:
                         # Ensure no stale prompt override remains (falls through).
                         try:
-                            self._storage.delete_walk_override(
-                                book_id, task, "prompt"
-                            )
-                        except Exception:
+                            self._storage.delete_walk_override(book_id, task, "prompt")
+                        except Exception:  # noqa: BLE001, S110 — best-effort stale-override cleanup inside a transaction
                             pass
                     else:
                         self._storage.upsert_walk_override(
@@ -326,7 +327,9 @@ class PromptConfigDomain:
                     )
 
             # Recompute the effective prompt after applying overrides.
-            effective_prompt = resolve_task_config(task, self._storage, book_id)["prompt"]
+            effective_prompt = resolve_task_config(task, self._storage, book_id)[
+                "prompt"
+            ]
             source_layers = {
                 field: self._source_for(field, task, book_id)
                 for field in ("model_name", "reasoning_effort", "temperature", "prompt")

@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import sqlite3
 from copy import deepcopy
 
 import pytest
@@ -24,7 +25,6 @@ from app.pipeline.populate import (
     populate_initial_spine,
     populate_spine,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -49,14 +49,26 @@ def sample_chapters():
                 {
                     "id": "para-1-1-uuid",
                     "spans": [
-                        {"id": "span-1-1-1-uuid", "span_type": "sentence", "text": "First sentence."},
-                        {"id": "span-1-1-2-uuid", "span_type": "quotation", "text": "hello"},
+                        {
+                            "id": "span-1-1-1-uuid",
+                            "span_type": "sentence",
+                            "text": "First sentence.",
+                        },
+                        {
+                            "id": "span-1-1-2-uuid",
+                            "span_type": "quotation",
+                            "text": "hello",
+                        },
                     ],
                 },
                 {
                     "id": "para-1-2-uuid",
                     "spans": [
-                        {"id": "span-1-2-1-uuid", "span_type": "sentence", "text": "Second paragraph."},
+                        {
+                            "id": "span-1-2-1-uuid",
+                            "span_type": "sentence",
+                            "text": "Second paragraph.",
+                        },
                     ],
                 },
             ],
@@ -67,7 +79,11 @@ def sample_chapters():
                 {
                     "id": "para-2-1-uuid",
                     "spans": [
-                        {"id": "span-2-1-1-uuid", "span_type": "sentence", "text": "Chapter 2 text."},
+                        {
+                            "id": "span-2-1-1-uuid",
+                            "span_type": "sentence",
+                            "text": "Chapter 2 text.",
+                        },
                     ],
                 },
             ],
@@ -84,14 +100,18 @@ class TestPopulateInitialSpine:
     def test_creates_series_row(self, storage, sample_chapters):
         """populate_initial_spine creates series row."""
         populate_initial_spine("series-uuid", "book-uuid", sample_chapters, storage)
-        rows = storage.execute_query("SELECT id FROM series WHERE id = ?", ("series-uuid",))
+        rows = storage.execute_query(
+            "SELECT id FROM series WHERE id = ?", ("series-uuid",)
+        )
         assert len(rows) == 1
         assert rows[0]["id"] == "series-uuid"
 
     def test_creates_book_row_with_version_1(self, storage, sample_chapters):
         """populate_initial_spine creates book row with version=1."""
         populate_initial_spine("series-uuid", "book-uuid", sample_chapters, storage)
-        rows = storage.execute_query("SELECT id, series_id, version FROM book WHERE id = ?", ("book-uuid",))
+        rows = storage.execute_query(
+            "SELECT id, series_id, version FROM book WHERE id = ?", ("book-uuid",)
+        )
         assert len(rows) == 1
         assert rows[0]["id"] == "book-uuid"
         assert rows[0]["series_id"] == "series-uuid"
@@ -107,7 +127,9 @@ class TestPopulateInitialSpine:
         for row in rows:
             assert row["book_id"] == "book-uuid"
 
-    def test_creates_book_chapter_edges_with_dense_positions(self, storage, sample_chapters):
+    def test_creates_book_chapter_edges_with_dense_positions(
+        self, storage, sample_chapters
+    ):
         """populate_initial_spine creates book_chapter edges with dense integer positions."""
         populate_initial_spine("series-uuid", "book-uuid", sample_chapters, storage)
         rows = storage.execute_query(
@@ -154,7 +176,11 @@ class TestPopulateInitialSpine:
         assert len(rows) == 3
         # Check that positions are dense integers
         positions = [row["position"] for row in rows]
-        assert sorted(positions) == [1, 1, 2]  # Two scenes: one with 2 paragraphs, one with 1
+        assert sorted(positions) == [
+            1,
+            1,
+            2,
+        ]  # Two scenes: one with 2 paragraphs, one with 1
 
     def test_creates_span_rows(self, storage, sample_chapters):
         """populate_initial_spine creates span rows with correct span_type."""
@@ -187,7 +213,9 @@ class TestPopulateInitialSpine:
         # Call populate_initial_spine — should not raise
         populate_initial_spine("series-uuid", "book-uuid", sample_chapters, storage)
         # Verify only one series row
-        rows = storage.execute_query("SELECT id FROM series WHERE id = ?", ("series-uuid",))
+        rows = storage.execute_query(
+            "SELECT id FROM series WHERE id = ?", ("series-uuid",)
+        )
         assert len(rows) == 1
 
     def test_empty_chapters_list_is_rejected_without_writing(self, storage):
@@ -231,7 +259,9 @@ class TestInsertScene:
         """insert_scene creates a new scene row."""
         populate_initial_spine("series-uuid", "book-uuid", sample_chapters, storage)
         insert_scene("new-scene-uuid", "chapter-1-uuid", ["para-1-1-uuid"], storage)
-        rows = storage.execute_query("SELECT id FROM scene WHERE id = ?", ("new-scene-uuid",))
+        rows = storage.execute_query(
+            "SELECT id FROM scene WHERE id = ?", ("new-scene-uuid",)
+        )
         assert len(rows) == 1
 
     def test_creates_chapter_scene_edge(self, storage, sample_chapters):
@@ -338,9 +368,13 @@ class TestPopulateSpine:
         """populate_spine is a wrapper that calls populate_initial_spine."""
         populate_spine("series-uuid", "book-uuid", sample_chapters, storage)
         # Verify spine was created
-        series_rows = storage.execute_query("SELECT id FROM series WHERE id = ?", ("series-uuid",))
+        series_rows = storage.execute_query(
+            "SELECT id FROM series WHERE id = ?", ("series-uuid",)
+        )
         assert len(series_rows) == 1
-        book_rows = storage.execute_query("SELECT id FROM book WHERE id = ?", ("book-uuid",))
+        book_rows = storage.execute_query(
+            "SELECT id FROM book WHERE id = ?", ("book-uuid",)
+        )
         assert len(book_rows) == 1
         chapter_rows = storage.execute_query("SELECT id FROM chapter")
         assert len(chapter_rows) == 2
@@ -377,7 +411,7 @@ class TestEdgeConstraints:
             "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES (?, ?, ?)",
             ("scene-x-uuid", "chapter-1-uuid", 2),
         )
-        with pytest.raises(Exception):  # IntegrityError
+        with pytest.raises(sqlite3.IntegrityError):  # IntegrityError
             storage.execute_insert(
                 "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES (?, ?, ?)",
                 ("scene-y-uuid", "chapter-1-uuid", 2),
@@ -400,27 +434,41 @@ class TestAtomicity:
                     {
                         "id": "para-1-uuid",
                         "spans": [
-                            {"id": "span-1-uuid", "span_type": "invalid_type", "text": "text"},
+                            {
+                                "id": "span-1-uuid",
+                                "span_type": "invalid_type",
+                                "text": "text",
+                            },
                         ],
                     },
                 ],
             },
         ]
         # This should fail due to invalid span_type
-        with pytest.raises(Exception):
-            populate_initial_spine("series-uuid", "book-uuid", invalid_chapters, storage)
+        with pytest.raises(sqlite3.IntegrityError):
+            populate_initial_spine(
+                "series-uuid", "book-uuid", invalid_chapters, storage
+            )
         # Verify no partial data was inserted
-        series_rows = storage.execute_query("SELECT id FROM series WHERE id = ?", ("series-uuid",))
+        series_rows = storage.execute_query(
+            "SELECT id FROM series WHERE id = ?", ("series-uuid",)
+        )
         assert len(series_rows) == 0
-        book_rows = storage.execute_query("SELECT id FROM book WHERE id = ?", ("book-uuid",))
+        book_rows = storage.execute_query(
+            "SELECT id FROM book WHERE id = ?", ("book-uuid",)
+        )
         assert len(book_rows) == 0
 
     def test_insert_scene_rollback_on_error(self, storage, sample_chapters):
         """If insert_scene fails, all changes are rolled back."""
         populate_initial_spine("series-uuid", "book-uuid", sample_chapters, storage)
         # Try to insert scene with non-existent paragraph
-        with pytest.raises(Exception):
-            insert_scene("new-scene-uuid", "chapter-1-uuid", ["non-existent-para"], storage)
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_scene(
+                "new-scene-uuid", "chapter-1-uuid", ["non-existent-para"], storage
+            )
         # Verify scene was not created
-        scene_rows = storage.execute_query("SELECT id FROM scene WHERE id = ?", ("new-scene-uuid",))
+        scene_rows = storage.execute_query(
+            "SELECT id FROM scene WHERE id = ?", ("new-scene-uuid",)
+        )
         assert len(scene_rows) == 0

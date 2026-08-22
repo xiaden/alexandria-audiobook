@@ -159,7 +159,7 @@ def test_absent_creates_active_tombstone_and_restore_deactivates(wb):
     assert pres["c1"]["relation_type"] == "absent"
 
     # restoring presence deactivates the tombstone in the same transaction
-    restored = wb.set_presence(
+    wb.set_presence(
         book_id="b1", scene_id="sc1", character_id="c1",
         relation_type="present", base_revision=absent["generation_revision"],
     )

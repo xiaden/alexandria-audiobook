@@ -24,7 +24,6 @@ from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.api_onboard import get_storage
 from app.pipeline.api_voices import router as voices_router
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

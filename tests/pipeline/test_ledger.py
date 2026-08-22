@@ -16,7 +16,6 @@ import pytest
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.ledger import CharacterLedger
 
-
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------

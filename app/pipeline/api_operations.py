@@ -26,7 +26,6 @@ import os
 import sqlite3
 import time
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -40,7 +39,6 @@ from app.pipeline.tts_integration import (
     validate_pause_ms,
 )
 
-
 # ---------------------------------------------------------------------------
 # Pydantic request models
 # ---------------------------------------------------------------------------
@@ -52,12 +50,12 @@ class OperationRequest(BaseModel):
     operation: str  # split, merge, move, delete
     book_id: str
     # Operation-specific params:
-    presentation_index: Optional[int] = None
-    presentation_index_left: Optional[int] = None
-    presentation_index_right: Optional[int] = None
-    presentation_index_from: Optional[int] = None
-    presentation_index_to: Optional[int] = None
-    split_point: Optional[int] = None
+    presentation_index: int | None = None
+    presentation_index_left: int | None = None
+    presentation_index_right: int | None = None
+    presentation_index_from: int | None = None
+    presentation_index_to: int | None = None
+    split_point: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -282,10 +280,12 @@ class PauseSettingsUpdateRequest(BaseModel):
     ``validate_pause_ms``).  A field absent from the payload is left untouched.
     """
 
-    pause_between_speakers_ms: Optional[int] = None
-    pause_same_speaker_ms: Optional[int] = None
+    pause_between_speakers_ms: int | None = None
+    pause_same_speaker_ms: int | None = None
 
-    @field_validator("pause_between_speakers_ms", "pause_same_speaker_ms", mode="before")
+    @field_validator(
+        "pause_between_speakers_ms", "pause_same_speaker_ms", mode="before"
+    )
     @classmethod
     def _validate_pause_field(cls, value):
         if value is None:
@@ -301,7 +301,7 @@ class SpanPauseUpdateRequest(BaseModel):
     ``validate_pause_ms`` (bounded by PAUSE_MAX_MS).
     """
 
-    pause_after_ms: Optional[int] = None
+    pause_after_ms: int | None = None
 
     @field_validator("pause_after_ms", mode="before")
     @classmethod
@@ -532,7 +532,12 @@ def _auto_snapshot_name(created_ms: int, suffix: int = 0) -> str:
     suffix disambiguates snapshots created within the same minute — the
     name is the table PK, so a bare base name would collide.
     """
-    stamp = datetime.fromtimestamp(created_ms / 1000).strftime(_AUTO_NAME_FORMAT)
+    # Local timezone keeps the human-readable snapshot label in local wall-clock
+    # time while making the ``fromtimestamp`` call tz-aware (DTZ006).
+    _local_tz = datetime.now().astimezone().tzinfo
+    stamp = datetime.fromtimestamp(created_ms / 1000, tz=_local_tz).strftime(
+        _AUTO_NAME_FORMAT
+    )
     base = f"{_AUTO_NAME_PREFIX}{stamp}"
     return base if suffix == 0 else f"{base} ({suffix})"
 

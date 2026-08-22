@@ -1,17 +1,17 @@
 """Tests for Walk 2b character discovery."""
 
 import json
-import pytest
 from unittest.mock import Mock
+
+import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.walk_2b_character_discovery import (
-    execute,
     _build_character_discovery_prompt,
     _parse_llm_response,
+    execute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

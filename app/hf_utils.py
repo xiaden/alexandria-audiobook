@@ -42,7 +42,7 @@ def fetch_builtin_manifest(builtin_dir, hf_repo=BUILTIN_LORA_HF_REPO):
         local_path = os.path.join(builtin_dir, "manifest.json")
         with open(local_path, "w", encoding="utf-8") as f:
             json.dump(entries, f, indent=2, ensure_ascii=False)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — remote fetch may fail many ways; falls back to local manifest
         logger.warning(f"Failed to fetch remote LoRA manifest, using local fallback: {e}")
         local_path = os.path.join(builtin_dir, "manifest.json")
         if os.path.exists(local_path):
@@ -88,7 +88,7 @@ def download_builtin_adapter(adapter_id, builtin_dir, hf_repo=BUILTIN_LORA_HF_RE
             )
             shutil.copy2(cached, local_path)
             logger.info(f"Downloaded {hf_name}/{filename} -> {local_path}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — HF download raises many types; required => RuntimeError, optional => warn
             if filename in REQUIRED_ADAPTER_FILES:
                 raise RuntimeError(
                     f"Failed to download {hf_name}/{filename} for {adapter_id}: {e}"

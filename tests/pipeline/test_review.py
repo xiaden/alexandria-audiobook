@@ -18,10 +18,8 @@ import sqlite3
 import pytest
 
 import app.pipeline.review as review_module
-
 from app.pipeline.adapter import ConcurrentTransactionError, InMemorySQLiteAdapter
 from app.pipeline.review import ReviewManager, supersede_targets
-
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -41,9 +39,7 @@ def _populate_storage(storage: InMemorySQLiteAdapter) -> None:
     )
 
     # -- Chapters -----------------------------------------------------------
-    storage.execute_insert(
-        "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-    )
+    storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
     storage.execute_insert(
         "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
     )
@@ -224,15 +220,65 @@ def _insert_walk_review_rows(storage: InMemorySQLiteAdapter) -> None:
         )
 
     # pending — must appear in the union
-    _item("w1", "b1", "run-1", "voice_profile", "character_metadata", "c1", '{"voice":"old"}', "pending", 1000)
-    _item("w2", "b1", "run-2", "voice_assignment", "character", "c2", None, "pending", 2000)
+    _item(
+        "w1",
+        "b1",
+        "run-1",
+        "voice_profile",
+        "character_metadata",
+        "c1",
+        '{"voice":"old"}',
+        "pending",
+        1000,
+    )
+    _item(
+        "w2",
+        "b1",
+        "run-2",
+        "voice_assignment",
+        "character",
+        "c2",
+        None,
+        "pending",
+        2000,
+    )
     _item("w3", "b1", "run-3", "instruction", "span", "sp1", "slow", "pending", 3000)
     # non-pending — must NOT appear
-    _item("w4", "b1", "run-1", "voice_profile", "character_metadata", "c1", '{"voice":"old"}', "resolved", 4000)
-    _item("w5", "b1", "run-2", "voice_assignment", "character", "c2", None, "superseded", 5000)
+    _item(
+        "w4",
+        "b1",
+        "run-1",
+        "voice_profile",
+        "character_metadata",
+        "c1",
+        '{"voice":"old"}',
+        "resolved",
+        4000,
+    )
+    _item(
+        "w5",
+        "b1",
+        "run-2",
+        "voice_assignment",
+        "character",
+        "c2",
+        None,
+        "superseded",
+        5000,
+    )
     _item("w6", "b1", "run-3", "instruction", "span", "sp1", "slow", "stale", 6000)
     # other book — must NOT appear
-    _item("w7", "b2", "run-9", "voice_assignment", "character", "c2", None, "pending", 7000)
+    _item(
+        "w7",
+        "b2",
+        "run-9",
+        "voice_assignment",
+        "character",
+        "c2",
+        None,
+        "pending",
+        7000,
+    )
 
 
 @pytest.fixture
@@ -386,9 +432,15 @@ class TestSupersedeTargets:
     def test_excludes_resolved_and_superseded_rows(self):
         """Only pending rows are touched; resolved/superseded/stale stay as-is."""
         storage = self._make_storage()
-        self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1", status="resolved")
-        self._insert_item(storage, "i2", "b1", "run-1", "voice_profile", "c1", status="superseded")
-        self._insert_item(storage, "i3", "b1", "run-1", "voice_profile", "c1", status="stale")
+        self._insert_item(
+            storage, "i1", "b1", "run-1", "voice_profile", "c1", status="resolved"
+        )
+        self._insert_item(
+            storage, "i2", "b1", "run-1", "voice_profile", "c1", status="superseded"
+        )
+        self._insert_item(
+            storage, "i3", "b1", "run-1", "voice_profile", "c1", status="stale"
+        )
 
         result = supersede_targets(
             storage,
@@ -448,42 +500,30 @@ class TestGetReviewItemsConfidenceFilter:
         # c1/Alice has character_book confidence 0.9 — should not appear
         # as a character_book review item. (Alice appears in other junctions
         # at review-band confidence, so we check junction_table specifically.)
-        book_items = [
-            i for i in items if i["junction_table"] == "character_book"
-        ]
+        book_items = [i for i in items if i["junction_table"] == "character_book"]
         book_names = {i["character_name"] for i in book_items}
         assert "Alice" not in book_names  # 0.9 — too high
 
     def test_excludes_low_confidence(self, manager):
         """Items with confidence <0.5 are excluded."""
         items = manager.get_review_items("b1")
-        book_items = [
-            i for i in items if i["junction_table"] == "character_book"
-        ]
+        book_items = [i for i in items if i["junction_table"] == "character_book"]
         book_names = {i["character_name"] for i in book_items}
         assert "Charlie" not in book_names  # 0.4 — too low
 
     def test_boundary_0_5_included(self, manager):
         """Confidence exactly 0.5 is included in review items."""
         items = manager.get_review_items("b1")
-        scene_items = [
-            i for i in items if i["junction_table"] == "character_scene"
-        ]
-        charlie_scene = [
-            i for i in scene_items if i["character_name"] == "Charlie"
-        ]
+        scene_items = [i for i in items if i["junction_table"] == "character_scene"]
+        charlie_scene = [i for i in scene_items if i["character_name"] == "Charlie"]
         assert len(charlie_scene) == 1
         assert charlie_scene[0]["confidence"] == 0.5
 
     def test_boundary_0_7_excluded(self, manager):
         """Confidence exactly 0.7 is excluded from review items."""
         items = manager.get_review_items("b1")
-        span_items = [
-            i for i in items if i["junction_table"] == "character_span"
-        ]
-        bob_span = [
-            i for i in span_items if i["character_name"] == "Bob"
-        ]
+        span_items = [i for i in items if i["junction_table"] == "character_span"]
+        bob_span = [i for i in span_items if i["character_name"] == "Bob"]
         # Bob's character_span has confidence 0.7 — should NOT be in review
         assert len(bob_span) == 0
 
@@ -504,9 +544,7 @@ class TestGetReviewItemsWalkFilter:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         storage.execute_insert(
             "INSERT INTO character (id, name, aliases) VALUES ('c1', 'Alice', '[]')"
         )
@@ -543,12 +581,8 @@ class TestGetReviewItemsWalkFilter:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
-        storage.execute_insert(
-            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
         storage.execute_insert(
             "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
         )
@@ -609,9 +643,7 @@ class TestAcceptReviewItem:
         """Accepting a review item sets its confidence to 1.0."""
         items = manager.get_review_items("b1")
         # Find a character_book review item (Bob, confidence 0.6)
-        book_item = next(
-            i for i in items if i["junction_table"] == "character_book"
-        )
+        book_item = next(i for i in items if i["junction_table"] == "character_book")
         assert book_item["confidence"] == 0.6
 
         manager.accept_review_item(book_item["item_id"])
@@ -628,7 +660,9 @@ class TestAcceptReviewItem:
         """Accepting a character_scene item sets confidence to 1.0."""
         items = manager.get_review_items("b1")
         scene_item = next(
-            i for i in items if i["junction_table"] == "character_scene"
+            i
+            for i in items
+            if i["junction_table"] == "character_scene"
             and i["character_name"] == "Alice"
         )
         manager.accept_review_item(scene_item["item_id"])
@@ -644,7 +678,9 @@ class TestAcceptReviewItem:
         """Accepting a character_span item sets confidence to 1.0."""
         items = manager.get_review_items("b1")
         span_item = next(
-            i for i in items if i["junction_table"] == "character_span"
+            i
+            for i in items
+            if i["junction_table"] == "character_span"
             and i["character_name"] == "Alice"
         )
         manager.accept_review_item(span_item["item_id"])
@@ -659,18 +695,14 @@ class TestAcceptReviewItem:
     def test_accepted_item_no_longer_in_review(self, manager):
         """After accepting, the item no longer appears in review queue."""
         items = manager.get_review_items("b1")
-        book_item = next(
-            i for i in items if i["junction_table"] == "character_book"
-        )
+        book_item = next(i for i in items if i["junction_table"] == "character_book")
         item_id = book_item["item_id"]
 
         manager.accept_review_item(item_id)
 
         # Re-fetch — item should be gone (confidence now 1.0)
         new_items = manager.get_review_items("b1")
-        book_items = [
-            i for i in new_items if i["junction_table"] == "character_book"
-        ]
+        book_items = [i for i in new_items if i["junction_table"] == "character_book"]
         assert all(i["item_id"] != item_id for i in book_items)
 
 
@@ -683,9 +715,7 @@ class TestRejectReviewItem:
     def test_sets_confidence_to_0_0(self, manager):
         """Rejecting a review item sets its confidence to 0.0."""
         items = manager.get_review_items("b1")
-        book_item = next(
-            i for i in items if i["junction_table"] == "character_book"
-        )
+        book_item = next(i for i in items if i["junction_table"] == "character_book")
         manager.reject_review_item(book_item["item_id"])
 
         rows = manager._storage.execute_query(
@@ -698,9 +728,7 @@ class TestRejectReviewItem:
     def test_sets_human_override(self, manager):
         """Rejecting sets human_override = 1."""
         items = manager.get_review_items("b1")
-        book_item = next(
-            i for i in items if i["junction_table"] == "character_book"
-        )
+        book_item = next(i for i in items if i["junction_table"] == "character_book")
         manager.reject_review_item(book_item["item_id"])
 
         rows = manager._storage.execute_query(
@@ -713,17 +741,13 @@ class TestRejectReviewItem:
     def test_rejected_item_no_longer_in_review(self, manager):
         """After rejecting, the item no longer appears in review queue."""
         items = manager.get_review_items("b1")
-        book_item = next(
-            i for i in items if i["junction_table"] == "character_book"
-        )
+        book_item = next(i for i in items if i["junction_table"] == "character_book")
         item_id = book_item["item_id"]
 
         manager.reject_review_item(item_id)
 
         new_items = manager.get_review_items("b1")
-        book_items = [
-            i for i in new_items if i["junction_table"] == "character_book"
-        ]
+        book_items = [i for i in new_items if i["junction_table"] == "character_book"]
         assert all(i["item_id"] != item_id for i in book_items)
 
 
@@ -737,7 +761,9 @@ class TestOverrideReviewItem:
         """Overriding sets human_override=1 and confidence=1.0."""
         items = manager.get_review_items("b1")
         scene_item = next(
-            i for i in items if i["junction_table"] == "character_scene"
+            i
+            for i in items
+            if i["junction_table"] == "character_scene"
             and i["character_name"] == "Alice"
         )
         manager.override_review_item(scene_item["item_id"], {})
@@ -754,7 +780,9 @@ class TestOverrideReviewItem:
         """Override with dict can update relation_type on character_scene."""
         items = manager.get_review_items("b1")
         scene_item = next(
-            i for i in items if i["junction_table"] == "character_scene"
+            i
+            for i in items
+            if i["junction_table"] == "character_scene"
             and i["character_name"] == "Alice"
         )
         # Alice was 'present', override to 'speaker'
@@ -776,7 +804,9 @@ class TestOverrideReviewItem:
         """Override can update relation_type on character_span."""
         items = manager.get_review_items("b1")
         span_item = next(
-            i for i in items if i["junction_table"] == "character_span"
+            i
+            for i in items
+            if i["junction_table"] == "character_span"
             and i["character_name"] == "Alice"
         )
         # Alice was 'speaker', override to 'mentioned'
@@ -797,13 +827,9 @@ class TestOverrideReviewItem:
     def test_ignores_unknown_columns(self, manager):
         """Override with unknown column names silently ignores them."""
         items = manager.get_review_items("b1")
-        book_item = next(
-            i for i in items if i["junction_table"] == "character_book"
-        )
+        book_item = next(i for i in items if i["junction_table"] == "character_book")
         # Should not raise — unknown column 'nonexistent' is ignored
-        manager.override_review_item(
-            book_item["item_id"], {"nonexistent": "value"}
-        )
+        manager.override_review_item(book_item["item_id"], {"nonexistent": "value"})
 
         # Confidence and human_override still updated
         rows = manager._storage.execute_query(
@@ -817,9 +843,7 @@ class TestOverrideReviewItem:
     def test_non_dict_new_value(self, manager):
         """Override with non-dict new_value just sets override flags."""
         items = manager.get_review_items("b1")
-        book_item = next(
-            i for i in items if i["junction_table"] == "character_book"
-        )
+        book_item = next(i for i in items if i["junction_table"] == "character_book")
         # Non-dict value — should set flags but not update columns
         manager.override_review_item(book_item["item_id"], "some_string")
 
@@ -911,13 +935,15 @@ class TestWalkItemsInQueue:
     after (plan P3-S3).
     """
 
-    _JUNCTION_IDS = {
-        "character_book:c2:b1",
-        "character_scene:c1:sc1",
-        "character_scene:c3:sc2",
-        "character_span:c1:sp1",
-        "character_span:c4:sp3",
-    }
+    _JUNCTION_IDS = frozenset(
+        {
+            "character_book:c2:b1",
+            "character_scene:c1:sc1",
+            "character_scene:c3:sc2",
+            "character_span:c1:sp1",
+            "character_span:c4:sp3",
+        }
+    )
 
     @staticmethod
     def _walk_items(items):
@@ -1139,7 +1165,9 @@ class TestResolveReviewActionDispatch:
         monkeypatch.setattr(
             review_module,
             "_WALK_TARGET_WRITES",
-            {"voice_profile": "UPDATE character_metadata SET value = ? WHERE character_id = ? AND key = 'voice_profile'"},
+            {
+                "voice_profile": "UPDATE character_metadata SET value = ? WHERE character_id = ? AND key = 'voice_profile'"
+            },
         )
         # w2 is kind voice_assignment — not in the patched allowlist
         with pytest.raises(ValueError, match="Unsupported walk item kind"):
@@ -1279,7 +1307,9 @@ class TestWalkItemValueRestore:
         )
         assert rows[0]["value"] == '{"voice":"new"}'  # the walk's value is kept
 
-    def test_item_select_happens_outside_transaction(self, manager, storage, monkeypatch):
+    def test_item_select_happens_outside_transaction(
+        self, manager, storage, monkeypatch
+    ):
         """Rule #6: the walkitem SELECT runs BEFORE the transaction opens."""
         calls: list[tuple[str, str | None]] = []
         real_transaction = storage.transaction
@@ -1325,7 +1355,9 @@ class TestWalkItemValueRestore:
         )
         assert rows[0]["value"] == '{"voice":"new"}'  # unchanged
 
-    def test_status_update_failure_rolls_back_restore(self, manager, storage, monkeypatch):
+    def test_status_update_failure_rolls_back_restore(
+        self, manager, storage, monkeypatch
+    ):
         """The DISCRIMINATING rollback case: the restore write SUCCEEDS inside
         the txn, then the status UPDATE fails — both roll back (target
         unchanged, item still pending).  Without the transaction wrap the
@@ -1348,7 +1380,9 @@ class TestWalkItemValueRestore:
         )
         assert rows[0]["value"] == '{"voice":"new"}'  # the restore was rolled back
 
-    def test_override_write_failure_rolls_back_both(self, manager, storage, monkeypatch):
+    def test_override_write_failure_rolls_back_both(
+        self, manager, storage, monkeypatch
+    ):
         """A failing override write (bogus target SQL) never commits: the item
         stays pending and the target keeps the walk value."""
         monkeypatch.setattr(
@@ -1366,7 +1400,9 @@ class TestWalkItemValueRestore:
         rows = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp1'")
         assert rows[0]["instruct"] == "slowly"  # unchanged
 
-    def test_override_status_update_failure_rolls_back_write(self, manager, storage, monkeypatch):
+    def test_override_status_update_failure_rolls_back_write(
+        self, manager, storage, monkeypatch
+    ):
         """Same discriminating rollback for override: the new_value write
         succeeds inside the txn, the status UPDATE fails, both roll back."""
         real_update = storage.execute_update
@@ -1445,9 +1481,7 @@ def _populate_neighbor_storage(storage: InMemorySQLiteAdapter) -> None:
     storage.execute_insert(
         "INSERT INTO book (id, series_id, position) VALUES ('b-nb', 's-nb', 1)"
     )
-    storage.execute_insert(
-        "INSERT INTO chapter (id, book_id) VALUES ('ch-nb', 'b-nb')"
-    )
+    storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch-nb', 'b-nb')")
     storage.execute_insert(
         "INSERT INTO book_chapter (child_id, parent_id, position) "
         "VALUES ('ch-nb', 'b-nb', 1)"
@@ -1458,9 +1492,7 @@ def _populate_neighbor_storage(storage: InMemorySQLiteAdapter) -> None:
         "VALUES ('sc-nb', 'ch-nb', 1)"
     )
     for i in range(1, 6):
-        storage.execute_insert(
-            f"INSERT INTO paragraph (id) VALUES ('p-nb{i}')"
-        )
+        storage.execute_insert(f"INSERT INTO paragraph (id) VALUES ('p-nb{i}')")
         storage.execute_insert(
             f"INSERT INTO scene_paragraph (child_id, parent_id, position) "
             f"VALUES ('p-nb{i}', 'sc-nb', {i})"
@@ -1598,7 +1630,9 @@ class TestReviewItemNeighborContext:
         item = self._by_id(neighbor_manager)["character_scene:c-nb:sc-nb"]
         assert item["neighbors"] == {"before": [], "after": []}
 
-    def test_walk_item_targeting_span_outside_book_gets_empty_lists(self, neighbor_manager):
+    def test_walk_item_targeting_span_outside_book_gets_empty_lists(
+        self, neighbor_manager
+    ):
         """An instruction walk item whose target_id is not in the book's
         presentation order (e.g. a span of another book) → empty lists."""
         storage = neighbor_manager._storage

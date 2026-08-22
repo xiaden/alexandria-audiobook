@@ -19,7 +19,6 @@ from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.assembly import export_annotated_script
 from app.pipeline.operations import OperationExecutor
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

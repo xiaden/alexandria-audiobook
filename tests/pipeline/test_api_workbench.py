@@ -29,11 +29,10 @@ from app.pipeline.adapter import (
     InMemorySQLiteAdapter,
 )
 from app.pipeline.api_characters import get_workbench as _cp_workbench
-from app.pipeline.api_walks import get_workbench as _wk_workbench
 from app.pipeline.api_review import get_workbench as _rv_workbench
+from app.pipeline.api_walks import get_workbench as _wk_workbench
 from app.pipeline.review import ReviewManager
 from app.pipeline.workbench import Workbench
-
 
 #: All three routers reference the same get_workbench function object.
 _WORKBENCH_DEPS = (_cp_workbench, _wk_workbench, _rv_workbench)

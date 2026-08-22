@@ -20,8 +20,9 @@ _REPO_ROOT = os.path.dirname(_APP_DIR)
 sys.path.insert(0, _APP_DIR)
 sys.path.insert(0, _REPO_ROOT)
 
-from utils import resolve_task_config  # noqa: E402
-from app.pipeline.adapter import SQLiteAdapter  # noqa: E402
+from utils import resolve_task_config
+
+from app.pipeline.adapter import SQLiteAdapter
 
 FALLBACK_MODEL = "richardyoung/qwen3-14b-abliterated:Q8_0"
 

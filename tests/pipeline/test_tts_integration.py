@@ -18,6 +18,7 @@ import os
 import tempfile
 
 import pytest
+from pydub import AudioSegment
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.tts_integration import (
@@ -28,8 +29,6 @@ from app.pipeline.tts_integration import (
     _build_voice_config,
     render_audiobook,
 )
-from pydub import AudioSegment
-
 
 # ---------------------------------------------------------------------------
 # Fake TTSEngine (no GPU/model loading)
@@ -43,7 +42,9 @@ class FakeTTSEngine:
         self.batch_calls: list[dict] = []
         self.voice_calls: list[dict] = []
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
+    def generate_batch(
+        self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None
+    ):
         """Record the call, write placeholder wavs, and return all indices as completed."""
         self.batch_calls.append(
             {
@@ -101,9 +102,7 @@ def _populate_storage(storage: InMemorySQLiteAdapter) -> None:
     )
 
     # -- Chapters -----------------------------------------------------------
-    storage.execute_insert(
-        "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-    )
+    storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
     storage.execute_insert(
         "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
     )
@@ -585,9 +584,7 @@ class TestOutputDir:
     def test_custom_output_dir_used_for_batch(self, storage, fake_engine):
         """Custom output_dir is passed to generate_batch."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            render_audiobook(
-                "b1", storage, fake_engine, output_dir=tmpdir
-            )
+            render_audiobook("b1", storage, fake_engine, output_dir=tmpdir)
             assert fake_engine.batch_calls[0]["output_dir"] == tmpdir
 
     def test_auto_created_run_dir_when_none(self, storage, fake_engine, _render_root):
@@ -778,9 +775,7 @@ class TestCloneVoiceIntegration:
         )
 
         # -- Chapters ---------------------------------------------------------
-        storage.execute_insert(
-            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-        )
+        storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
         storage.execute_insert(
             "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
         )
@@ -905,9 +900,7 @@ class TestVoiceTypeRouting:
         )
 
         # -- Chapters -------------------------------------------------------
-        storage.execute_insert(
-            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-        )
+        storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
         storage.execute_insert(
             "INSERT INTO book_chapter (child_id, parent_id, position) "
             "VALUES ('ch1', 'b1', 1)"
@@ -1022,13 +1015,13 @@ class TestVoiceTypeRouting:
         }
         for speaker, fields in expected.items():
             assert speaker in voice_config, f"{speaker} missing from voice_config"
-            assert (
-                voice_config[speaker]["type"] == fields["type"]
-            ), f"{speaker} should route as {fields['type']}"
+            assert voice_config[speaker]["type"] == fields["type"], (
+                f"{speaker} should route as {fields['type']}"
+            )
             for key, value in fields.items():
-                assert (
-                    voice_config[speaker][key] == value
-                ), f"{speaker}.{key}: expected {value!r}, got {voice_config[speaker][key]!r}"
+                assert voice_config[speaker][key] == value, (
+                    f"{speaker}.{key}: expected {value!r}, got {voice_config[speaker][key]!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1038,9 @@ class _RowInspectingBatchEngine(FakeTTSEngine):
         self.job_id = job_id
         self.status_during_batch = None
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
+    def generate_batch(
+        self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None
+    ):
         rows = self.storage.execute_query(
             "SELECT status FROM render_job WHERE job_id = ?", (self.job_id,)
         )
@@ -1086,8 +1081,12 @@ class _RowInspectingVoiceEngine(FakeTTSEngine):
 class _AllFailedBatchEngine(FakeTTSEngine):
     """FakeTTSEngine whose batch generation fails for every chunk."""
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
-        super().generate_batch(chunks, voice_config, output_dir, batch_seed, cancel_check)
+    def generate_batch(
+        self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None
+    ):
+        super().generate_batch(
+            chunks, voice_config, output_dir, batch_seed, cancel_check
+        )
         return {
             "completed": [],
             "failed": [(c["index"], f"boom {c['index']}") for c in chunks],
@@ -1164,13 +1163,13 @@ class TestRenderJobPersistence:
             assert rows[0]["output_artifact_path"] == tmpdir
             assert rows[0]["finished_ms"] is not None
 
-    def test_individual_failure_records_failed_chunk_and_job(self, storage, fake_engine):
+    def test_individual_failure_records_failed_chunk_and_job(
+        self, storage, fake_engine
+    ):
         """generate_voice exception → failed chunk row + failed job row + re-raise."""
         engine = _FailingVoiceEngine()
         with pytest.raises(RuntimeError, match="voice boom"):
-            render_audiobook(
-                "b1", storage, engine, use_batch=False, job_id="job-fail"
-            )
+            render_audiobook("b1", storage, engine, use_batch=False, job_id="job-fail")
         chunk_rows = storage.execute_query(
             "SELECT idx, status, error FROM render_chunk WHERE job_id = ? ORDER BY idx",
             ("job-fail",),
@@ -1311,7 +1310,9 @@ class TestChunkFsyncDiscipline:
             assert fi < ri
             assert dir_indices[i] > ri
 
-    def test_os_fsync_reached_for_tmp_and_parent(self, storage, fake_engine, monkeypatch):
+    def test_os_fsync_reached_for_tmp_and_parent(
+        self, storage, fake_engine, monkeypatch
+    ):
         """The discipline reaches the real os.fsync: file + parent dir per chunk."""
         calls: list = []
         real_fsync = os.fsync
@@ -1470,9 +1471,7 @@ class TestSingleSpeakerRenderBoundary:
         storage.execute_insert(
             "INSERT INTO book (id, series_id, position) VALUES ('b1', 's1', 1)"
         )
-        storage.execute_insert(
-            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-        )
+        storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
         storage.execute_insert(
             "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
         )
@@ -1738,7 +1737,9 @@ class _RealWavBatchEngine:
         seg = seg.set_channels(self.channels).set_sample_width(self.sample_width)
         seg.export(output_path, format="wav")
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
+    def generate_batch(
+        self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None
+    ):
         self.batch_calls.append(list(chunks))
         for chunk in chunks:
             self._write(os.path.join(output_dir, f"temp_batch_{chunk['index']}.wav"))
@@ -1756,7 +1757,10 @@ def _tone_segment(duration_ms: int, sample_rate: int = 22050) -> AudioSegment:
     import math
 
     n = int(sample_rate * duration_ms / 1000.0)
-    frames = array.array("h", (int(8000 * math.sin(2 * math.pi * 440 * i / sample_rate)) for i in range(n)))
+    frames = array.array(
+        "h",
+        (int(8000 * math.sin(2 * math.pi * 440 * i / sample_rate)) for i in range(n)),
+    )
     return AudioSegment(
         frames.tobytes(),
         frame_rate=sample_rate,
@@ -1774,7 +1778,7 @@ def _silence_duration_ms(segment: AudioSegment) -> int:
     exact inserted gap length.
     """
     total = 0
-    for ms in range(0, len(segment)):
+    for ms in range(len(segment)):
         if segment[ms : ms + 1].dBFS <= -50:
             total += 1
     return total
@@ -1801,7 +1805,8 @@ class TestPausedAssembly:
         script = self._script(["Alice", "Bob"])
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         _assemble_paused_artifact(
-            paths, script,
+            paths,
+            script,
             pause_between_speakers_ms=400,
             pause_same_speaker_ms=100,
             span_pause_after_ms={},
@@ -1819,7 +1824,8 @@ class TestPausedAssembly:
         script = self._script(["Alice", "Alice"])
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         _assemble_paused_artifact(
-            paths, script,
+            paths,
+            script,
             pause_between_speakers_ms=400,
             pause_same_speaker_ms=80,
             span_pause_after_ms={},
@@ -1836,7 +1842,8 @@ class TestPausedAssembly:
         script = self._script(["Alice", "Bob"])
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         _assemble_paused_artifact(
-            paths, script,
+            paths,
+            script,
             pause_between_speakers_ms=400,
             pause_same_speaker_ms=100,
             span_pause_after_ms={"sp0": 900},
@@ -1854,7 +1861,8 @@ class TestPausedAssembly:
         script = self._script(["Alice", "Bob"])
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         _assemble_paused_artifact(
-            paths, script,
+            paths,
+            script,
             pause_between_speakers_ms=400,
             pause_same_speaker_ms=100,
             span_pause_after_ms={"sp0": 0},
@@ -1871,7 +1879,8 @@ class TestPausedAssembly:
         script = self._script(["Alice", "Bob"])
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         _assemble_paused_artifact(
-            paths, script,
+            paths,
+            script,
             pause_between_speakers_ms=400,
             pause_same_speaker_ms=100,
             # sp1 is the LAST span — its override must be ignored.
@@ -1889,7 +1898,8 @@ class TestPausedAssembly:
         script = self._script(["Alice"])
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         _assemble_paused_artifact(
-            paths, script,
+            paths,
+            script,
             pause_between_speakers_ms=400,
             pause_same_speaker_ms=100,
             span_pause_after_ms={},
@@ -1911,7 +1921,8 @@ class TestPausedAssembly:
         script = self._script(["Alice", "Bob"])
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         _assemble_paused_artifact(
-            paths, script,
+            paths,
+            script,
             pause_between_speakers_ms=100,
             pause_same_speaker_ms=100,
             span_pause_after_ms={},
@@ -1920,7 +1931,9 @@ class TestPausedAssembly:
         )
         combined = AudioSegment.from_wav(out)
         assert (combined.frame_rate, combined.channels, combined.sample_width) == (
-            44100, 2, 2,
+            44100,
+            2,
+            2,
         )
 
     def test_mismatched_formats_rejected(self, tmp_path):
@@ -1932,7 +1945,8 @@ class TestPausedAssembly:
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         with pytest.raises(ValueError, match="differ in format"):
             _assemble_paused_artifact(
-                paths, script,
+                paths,
+                script,
                 pause_between_speakers_ms=400,
                 pause_same_speaker_ms=100,
                 span_pause_after_ms={},
@@ -1948,7 +1962,8 @@ class TestPausedAssembly:
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         with pytest.raises(ValueError, match="missing WAV"):
             _assemble_paused_artifact(
-                paths, script,
+                paths,
+                script,
                 pause_between_speakers_ms=400,
                 pause_same_speaker_ms=100,
                 span_pause_after_ms={},
@@ -1968,7 +1983,8 @@ class TestPausedAssembly:
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         with pytest.raises(ValueError, match="outside run dir"):
             _assemble_paused_artifact(
-                paths, script,
+                paths,
+                script,
                 pause_between_speakers_ms=400,
                 pause_same_speaker_ms=100,
                 span_pause_after_ms={},
@@ -1983,7 +1999,8 @@ class TestPausedAssembly:
         out = os.path.join(str(tmp_path), "audiobook-paused.wav")
         with pytest.raises(ValueError, match="does not match script"):
             _assemble_paused_artifact(
-                paths, script,
+                paths,
+                script,
                 pause_between_speakers_ms=400,
                 pause_same_speaker_ms=100,
                 span_pause_after_ms={},
@@ -2003,7 +2020,8 @@ class TestPausedAssembly:
         monkeypatch.setattr(AudioSegment, "export", _boom)
         with pytest.raises(RuntimeError, match="ffmpeg exploded"):
             _assemble_paused_artifact(
-                paths, script,
+                paths,
+                script,
                 pause_between_speakers_ms=400,
                 pause_same_speaker_ms=100,
                 span_pause_after_ms={},
@@ -2033,7 +2051,8 @@ class TestPausedAssemblyWiring:
         assert rows[0]["status"] == "completed"
         assert rows[0]["output_artifact_path"] == paused
         # manifest records the paused artifact (relative)
-        manifest = json.loads(open(os.path.join(run_dir, "manifest.json")).read())
+        with open(os.path.join(run_dir, "manifest.json")) as f:
+            manifest = json.loads(f.read())
         assert manifest["paused_artifact"] == PAUSED_ARTIFACT_NAME
         # 3 spans × 200ms + 2 different-speaker gaps × 500ms defaults
         combined = AudioSegment.from_wav(paused)
@@ -2044,9 +2063,7 @@ class TestPausedAssemblyWiring:
     ):
         """Individual render wires the postprocessor too."""
         engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
-        job_id = render_audiobook(
-            "b1", storage, engine, use_batch=False
-        )
+        job_id = render_audiobook("b1", storage, engine, use_batch=False)
         run_dir = os.path.join(_render_root, "book-b1", job_id)
         paused = os.path.join(run_dir, PAUSED_ARTIFACT_NAME)
         assert os.path.isfile(paused)
@@ -2064,8 +2081,11 @@ class TestPausedAssemblyWiring:
             "b1", storage, _RealWavBatchEngine(duration_ms=200), job_id="p3-par-b"
         )
         ind_job = render_audiobook(
-            "b1", storage, _RealWavBatchEngine(duration_ms=200),
-            use_batch=False, job_id="p3-par-i",
+            "b1",
+            storage,
+            _RealWavBatchEngine(duration_ms=200),
+            use_batch=False,
+            job_id="p3-par-i",
         )
         batch_paused = os.path.join(
             _render_root, "book-b1", batch_job, PAUSED_ARTIFACT_NAME
@@ -2095,7 +2115,9 @@ class TestPausedAssemblyWiring:
             b2 = f.read()
         assert b1 == b2
 
-    def test_fake_engine_skips_assembly_nonfatally(self, storage, fake_engine, _render_root):
+    def test_fake_engine_skips_assembly_nonfatally(
+        self, storage, fake_engine, _render_root
+    ):
         """Non-WAV outputs fail assembly non-fatally; job still completes."""
         job_id = render_audiobook("b1", storage, fake_engine)
         run_dir = os.path.join(_render_root, "book-b1", job_id)
@@ -2121,8 +2143,7 @@ class TestBookTierPauseOverrideWiring:
     def test_book_override_reaches_paused_artifact(self, storage, _render_root):
         """A persisted 700 ms between-speakers override lands in the audio."""
         storage.execute_update(
-            "UPDATE book SET pause_between_speakers_ms = 700"
-            " WHERE id = 'b1'"
+            "UPDATE book SET pause_between_speakers_ms = 700 WHERE id = 'b1'"
         )
         engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
         job_id = render_audiobook("b1", storage, engine)
@@ -2145,8 +2166,7 @@ class TestBookTierPauseOverrideWiring:
     ):
         """A persisted pause_same_speaker_ms override lands on same-speaker gaps."""
         storage.execute_update(
-            "UPDATE book SET pause_same_speaker_ms = 300"
-            " WHERE id = 'b1'"
+            "UPDATE book SET pause_same_speaker_ms = 300 WHERE id = 'b1'"
         )
         # Force sp2 to be the same speaker as sp1 by giving it Alice's junction.
         storage.execute_insert(
@@ -2181,12 +2201,9 @@ class TestBookTierPauseOverrideWiring:
     def test_per_span_override_still_wins_over_book(self, storage, _render_root):
         """Per-span pause_after_ms overrides book/config at its own boundary."""
         storage.execute_update(
-            "UPDATE book SET pause_between_speakers_ms = 700"
-            " WHERE id = 'b1'"
+            "UPDATE book SET pause_between_speakers_ms = 700 WHERE id = 'b1'"
         )
-        storage.execute_update(
-            "UPDATE span SET pause_after_ms = 900 WHERE id = 'sp1'"
-        )
+        storage.execute_update("UPDATE span SET pause_after_ms = 900 WHERE id = 'sp1'")
         engine = _RealWavBatchEngine(duration_ms=200, sample_rate=22050)
         job_id = render_audiobook("b1", storage, engine)
         run_dir = os.path.join(_render_root, "book-b1", job_id)
@@ -2208,7 +2225,9 @@ class TestPausedAssemblyEmptyAndGuard:
             "INSERT INTO book (id, series_id, position) VALUES ('b-empty', 's-empty', 1)"
         )
         job_id = render_audiobook(
-            "b-empty", storage, _RealWavBatchEngine(duration_ms=100),
+            "b-empty",
+            storage,
+            _RealWavBatchEngine(duration_ms=100),
             job_id="p3-empty",
         )
         run_dir = os.path.join(_render_root, "book-b-empty", job_id)
@@ -2228,6 +2247,11 @@ class TestPausedAssemblyEmptyAndGuard:
 
         sig = inspect.signature(combine_audio_with_pauses)
         params = list(sig.parameters)
-        for required in ("audio_segments", "speakers", "pause_ms",
-                         "same_speaker_pause_ms", "pause_overrides"):
+        for required in (
+            "audio_segments",
+            "speakers",
+            "pause_ms",
+            "same_speaker_pause_ms",
+            "pause_overrides",
+        ):
             assert required in params, f"missing param {required}"

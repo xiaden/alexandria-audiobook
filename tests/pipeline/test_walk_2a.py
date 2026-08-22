@@ -1,17 +1,17 @@
 """Tests for Walk 2a scene segmentation."""
 
-import pytest
-from unittest.mock import Mock
 import json
+from unittest.mock import Mock
+
+import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.walk_2a_scene_segmentation import (
-    execute,
     _build_scene_segmentation_prompt,
     _parse_llm_response,
+    execute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -52,7 +52,7 @@ for _name in ("utils", "hf_utils"):
     if _name not in sys.modules:
         _load_app_local_module(_name)
 
-import app.app  # noqa: E402  (after harness setup)
+import app.app
 
 
 @pytest.fixture()
@@ -63,7 +63,9 @@ def builder_api(tmp_path, monkeypatch) -> None:
     cancel) and the per-project ``projects`` dict so the fixture works against
     either batch-state layout.
     """
-    monkeypatch.setattr(app.app, "DATASET_BUILDER_DIR", str(tmp_path / "dataset_builder"))
+    monkeypatch.setattr(
+        app.app, "DATASET_BUILDER_DIR", str(tmp_path / "dataset_builder")
+    )
     app.app.process_state["dataset_builder"] = {
         "running": False,
         "logs": [],
@@ -80,6 +82,7 @@ def _new_client() -> TestClient:
 # Direct unit-level regression: _update_builder_state serializes RMW cycles
 # ---------------------------------------------------------------------------
 
+
 class TestUpdateBuilderStateSerialization:
     def test_concurrent_mutators_lose_no_updates(self, builder_api) -> None:
         """Concurrent read-modify-writes on one project must not lose updates.
@@ -90,7 +93,9 @@ class TestUpdateBuilderStateSerialization:
         their rows would be lost; with the lock every append must survive.
         """
         name = "serialized"
-        app.app._save_builder_state(name, {"description": "", "global_seed": "", "samples": []})
+        app.app._save_builder_state(
+            name, {"description": "", "global_seed": "", "samples": []}
+        )
 
         n_threads = 8
         barrier = threading.Barrier(n_threads)
@@ -109,10 +114,13 @@ class TestUpdateBuilderStateSerialization:
             try:
                 barrier.wait(timeout=5)
                 app.app._update_builder_state(name, mutator)
-            except BaseException as exc:  # pragma: no cover - failure reporting
+            except BaseException as exc:  # noqa: BLE001 — thread worker captures any failure for the concurrency assertion
+                # pragma: no cover - failure reporting
                 errors.append(exc)
 
-        threads = [threading.Thread(target=worker, args=(tid,)) for tid in range(n_threads)]
+        threads = [
+            threading.Thread(target=worker, args=(tid,)) for tid in range(n_threads)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -126,13 +134,20 @@ class TestUpdateBuilderStateSerialization:
     def test_save_is_atomic_valid_json(self, builder_api) -> None:
         """state.json must be parseable after save, with no temp files left over."""
         name = "atomic"
-        app.app._save_builder_state(name, {"description": "d", "global_seed": "1", "samples": [{"status": "done"}]})
+        app.app._save_builder_state(
+            name,
+            {"description": "d", "global_seed": "1", "samples": [{"status": "done"}]},
+        )
 
         work_dir = Path(app.app.DATASET_BUILDER_DIR) / name
         state_file = work_dir / "state.json"
         assert state_file.is_file()
         with state_file.open("r", encoding="utf-8") as f:
-            assert json.load(f) == {"description": "d", "global_seed": "1", "samples": [{"status": "done"}]}
+            assert json.load(f) == {
+                "description": "d",
+                "global_seed": "1",
+                "samples": [{"status": "done"}],
+            }
         # atomic_json_write cleans up its temp file on every path
         assert [p for p in work_dir.iterdir() if p.name.startswith(".tmp_")] == []
 
@@ -141,10 +156,17 @@ class TestUpdateBuilderStateSerialization:
 # Endpoint-level regression: single-sample generation (done + error paths)
 # ---------------------------------------------------------------------------
 
+
 class _FakeEngine:
     """Minimal stand-in for the TTS engine's generate_voice_design contract."""
 
-    def __init__(self, wav_dir: Path, fail_for: set[str] | None = None, started: threading.Event | None = None, gate: threading.Event | None = None):
+    def __init__(
+        self,
+        wav_dir: Path,
+        fail_for: set[str] | None = None,
+        started: threading.Event | None = None,
+        gate: threading.Event | None = None,
+    ):
         self.wav_dir = wav_dir
         self.fail_for = fail_for or set()
         self.started = started
@@ -164,18 +186,30 @@ class _FakeEngine:
 
 
 class TestGenerateSampleEndpoint:
-    def test_success_marks_done_and_persists(self, builder_api, tmp_path, monkeypatch) -> None:
-        monkeypatch.setattr(app.app, "get_tts_engine", lambda: _FakeEngine(tmp_path / "gen"))
+    def test_success_marks_done_and_persists(
+        self, builder_api, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            app.app, "get_tts_engine", lambda: _FakeEngine(tmp_path / "gen")
+        )
         client = _new_client()
 
-        assert client.post("/api/dataset_builder/create", json={"name": "proj"}).status_code == 200
-        resp = client.post("/api/dataset_builder/generate_sample", json={
-            "dataset_name": "proj",
-            "sample_index": 2,
-            "description": "A calm voice",
-            "text": "hello world",
-            "seed": -1,
-        })
+        assert (
+            client.post(
+                "/api/dataset_builder/create", json={"name": "proj"}
+            ).status_code
+            == 200
+        )
+        resp = client.post(
+            "/api/dataset_builder/generate_sample",
+            json={
+                "dataset_name": "proj",
+                "sample_index": 2,
+                "description": "A calm voice",
+                "text": "hello world",
+                "seed": -1,
+            },
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "done"
 
@@ -185,18 +219,32 @@ class TestGenerateSampleEndpoint:
         assert sample["text"] == "hello world"
         assert sample["audio_url"].startswith("/dataset_builder/proj/sample_002.wav?t=")
 
-    def test_failure_marks_error_in_state(self, builder_api, tmp_path, monkeypatch) -> None:
-        monkeypatch.setattr(app.app, "get_tts_engine", lambda: _FakeEngine(tmp_path / "gen", fail_for={"bad"}))
+    def test_failure_marks_error_in_state(
+        self, builder_api, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            app.app,
+            "get_tts_engine",
+            lambda: _FakeEngine(tmp_path / "gen", fail_for={"bad"}),
+        )
         client = _new_client()
 
-        assert client.post("/api/dataset_builder/create", json={"name": "proj"}).status_code == 200
-        resp = client.post("/api/dataset_builder/generate_sample", json={
-            "dataset_name": "proj",
-            "sample_index": 0,
-            "description": "A calm voice",
-            "text": "bad",
-            "seed": -1,
-        })
+        assert (
+            client.post(
+                "/api/dataset_builder/create", json={"name": "proj"}
+            ).status_code
+            == 200
+        )
+        resp = client.post(
+            "/api/dataset_builder/generate_sample",
+            json={
+                "dataset_name": "proj",
+                "sample_index": 0,
+                "description": "A calm voice",
+                "text": "bad",
+                "seed": -1,
+            },
+        )
         assert resp.status_code == 500
 
         status = client.get("/api/dataset_builder/status/proj").json()
@@ -204,14 +252,18 @@ class TestGenerateSampleEndpoint:
         assert sample["status"] == "error"
         assert "boom" in sample["error"]
 
-    def test_concurrent_generate_sample_no_lost_updates(self, builder_api, tmp_path, monkeypatch) -> None:
+    def test_concurrent_generate_sample_no_lost_updates(
+        self, builder_api, tmp_path, monkeypatch
+    ) -> None:
         """Parallel single-sample generations on distinct indices must all persist.
 
         Each HTTP client runs its own event loop, so the read-modify-write
         cycles genuinely race; the per-dataset lock must serialize them so no
         index's status/audio_url is lost.
         """
-        monkeypatch.setattr(app.app, "get_tts_engine", lambda: _FakeEngine(tmp_path / "gen"))
+        monkeypatch.setattr(
+            app.app, "get_tts_engine", lambda: _FakeEngine(tmp_path / "gen")
+        )
         _new_client().post("/api/dataset_builder/create", json={"name": "proj"})
 
         n = 6
@@ -222,13 +274,16 @@ class TestGenerateSampleEndpoint:
         def worker(idx: int) -> None:
             client = _new_client()
             barrier.wait(timeout=5)
-            resp = client.post("/api/dataset_builder/generate_sample", json={
-                "dataset_name": "proj",
-                "sample_index": idx,
-                "description": "A calm voice",
-                "text": f"line {idx}",
-                "seed": -1,
-            })
+            resp = client.post(
+                "/api/dataset_builder/generate_sample",
+                json={
+                    "dataset_name": "proj",
+                    "sample_index": idx,
+                    "description": "A calm voice",
+                    "text": f"line {idx}",
+                    "seed": -1,
+                },
+            )
             with results_lock:
                 results.append((idx, resp.status_code))
 
@@ -239,7 +294,9 @@ class TestGenerateSampleEndpoint:
             t.join(timeout=30)
 
         assert sorted(results) == [(idx, 200) for idx in range(n)]
-        samples = _new_client().get("/api/dataset_builder/status/proj").json()["samples"]
+        samples = (
+            _new_client().get("/api/dataset_builder/status/proj").json()["samples"]
+        )
         assert len(samples) == n
         for idx in range(n):
             assert samples[idx]["status"] == "done"
@@ -250,8 +307,11 @@ class TestGenerateSampleEndpoint:
 # Endpoint-level regression: batch (background thread) vs concurrent meta edit
 # ---------------------------------------------------------------------------
 
+
 class TestBatchThreadVsConcurrentEdit:
-    def test_meta_edit_during_batch_is_not_clobbered(self, builder_api, tmp_path, monkeypatch) -> None:
+    def test_meta_edit_during_batch_is_not_clobbered(
+        self, builder_api, tmp_path, monkeypatch
+    ) -> None:
         """A metadata update issued while the batch thread is mid-flight must
         survive: the batch re-reads state under the lock on every status write
         instead of re-saving a stale in-memory snapshot taken at startup.
@@ -262,13 +322,24 @@ class TestBatchThreadVsConcurrentEdit:
         monkeypatch.setattr(app.app, "get_tts_engine", lambda: engine)
         client = _new_client()
 
-        assert client.post("/api/dataset_builder/create", json={"name": "batchproj"}).status_code == 200
-        resp = client.post("/api/dataset_builder/generate_batch", json={
-            "name": "batchproj",
-            "description": "root desc",
-            "samples": [{"emotion": "", "text": "one"}, {"emotion": "", "text": "two"}],
-            "indices": [0, 1],
-        })
+        assert (
+            client.post(
+                "/api/dataset_builder/create", json={"name": "batchproj"}
+            ).status_code
+            == 200
+        )
+        resp = client.post(
+            "/api/dataset_builder/generate_batch",
+            json={
+                "name": "batchproj",
+                "description": "root desc",
+                "samples": [
+                    {"emotion": "", "text": "one"},
+                    {"emotion": "", "text": "two"},
+                ],
+                "indices": [0, 1],
+            },
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "started"
 
@@ -277,11 +348,14 @@ class TestBatchThreadVsConcurrentEdit:
         assert started.wait(timeout=10), "batch never reached generate_voice_design"
 
         # Concurrent write while the batch holds no lock: metadata edit.
-        meta = client.post("/api/dataset_builder/update_meta", json={
-            "name": "batchproj",
-            "description": "META-DESC",
-            "global_seed": "42",
-        })
+        meta = client.post(
+            "/api/dataset_builder/update_meta",
+            json={
+                "name": "batchproj",
+                "description": "META-DESC",
+                "global_seed": "42",
+            },
+        )
         assert meta.status_code == 200
 
         resume.set()

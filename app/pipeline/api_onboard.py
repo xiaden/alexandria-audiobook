@@ -11,6 +11,7 @@ producer of storage instances.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import uuid
@@ -23,6 +24,12 @@ from app.pipeline.assembly import reonboard_book
 from app.pipeline.extract import extract_epub_text
 from app.pipeline.populate import populate_spine
 from app.pipeline.tts_integration import get_render_root
+
+
+def _write_bytes(path: str, content: bytes) -> None:
+    """Persist uploaded bytes to *path* with a blocking write (off the event loop)."""
+    with open(path, "wb") as f:
+        f.write(content)
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +118,7 @@ async def onboard_epub(
     tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4()}.epub")
     try:
         content = await file.read()
-        with open(tmp_path, "wb") as f:
-            f.write(content)
+        await asyncio.to_thread(_write_bytes, tmp_path, content)
 
         # Generate a book_id
         book_id = str(uuid.uuid4())
@@ -120,7 +126,7 @@ async def onboard_epub(
         # Extract EPUB text
         try:
             result = extract_epub_text(tmp_path, book_id, storage)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — EPUB extraction may raise many types; mapped to HTTP 400
             raise HTTPException(
                 status_code=400, detail=f"Failed to extract EPUB: {exc}"
             )
@@ -133,7 +139,7 @@ async def onboard_epub(
                 result["chapters"],
                 storage,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — spine population may raise many types; mapped to HTTP 500
             raise HTTPException(
                 status_code=500, detail=f"Failed to populate spine: {exc}"
             )

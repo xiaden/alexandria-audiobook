@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any
 
 from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
-
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -132,7 +131,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
             ),
             user_prompt=prompt,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
         logger.error("LLM call failed for book %s: %s", book_id, e)
         result["errors"].append({"book_id": book_id, "error": str(e)})
         result["characters_remaining"] = len(characters)
@@ -177,7 +176,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 result=result,
                 is_review=is_review,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(
                 "Error merging group %s for book %s: %s",
                 character_ids,

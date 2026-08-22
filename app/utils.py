@@ -1,10 +1,9 @@
-import os
-import json
-import time
-import tempfile
-import re
 import gc
-
+import json
+import os
+import re
+import tempfile
+import time
 
 # Structure markers for flattened EPUB text (emitted by app.py extract_epub_text /
 # _HTMLTextExtractor, consumed by the pipeline chunker).
@@ -179,7 +178,7 @@ def resolve_task_config(task: str, storage, book_id) -> dict:
             "SELECT key, value_json FROM walk_override WHERE book_id = ? AND walk_name = ?",
             (book_id, task),
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort override read; unreadable storage degrades to no overrides
         rows = []
 
     for row in rows:
@@ -353,7 +352,7 @@ def repair_json_array(json_text):
         entries = _filter_entries(entries)
         if entries:
             return _json.dumps(entries, indent=2, ensure_ascii=False)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 — best-effort JSON repair; failure returns the original text
         pass
 
     return json_text
@@ -372,7 +371,7 @@ def salvage_json_entries(json_text):
             except _json.JSONDecodeError:
                 continue
         return _json.dumps(entries, indent=2, ensure_ascii=False) if entries else json_text
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort JSON repair; failure returns the original text
         return json_text
 
 
@@ -499,7 +498,7 @@ def load_model_from_cache(model_cls, model_id, **load_kwargs):
         print(f"  Loading from local cache: {local_path}")
         try:
             return model_cls.from_pretrained(local_path, **load_kwargs)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — HF load from cache raises many types; failure retries via model id
             import traceback
             print(f"  Warning: Failed to load from local cache: {e}")
             traceback.print_exc()

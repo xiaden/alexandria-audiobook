@@ -1,18 +1,18 @@
 """Tests for Walk 2h voice assignment."""
 
 import json
-import pytest
 from unittest.mock import Mock
+
+import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2h_voice_assignment import (
-    execute,
     _build_voice_assignment_prompt,
     _parse_llm_response,
+    execute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

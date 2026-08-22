@@ -11,7 +11,7 @@ Provides HTTP endpoints for the unified review workflow:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -24,11 +24,12 @@ from app.pipeline.workbench import (
     ConflictError,
     PreviewExpiredError,
     StaleRevisionError,
-    ValidationError as WorkbenchValidationError,
     Workbench,
     WorkbenchError,
 )
-
+from app.pipeline.workbench import (
+    ValidationError as WorkbenchValidationError,
+)
 
 # ---------------------------------------------------------------------------
 # Workbench error mapping + dependency (shared by api_walks / api_characters)
@@ -55,7 +56,7 @@ def _guard(fn, *args, **kwargs):
     """Invoke a Workbench method, translating domain errors to HTTPException."""
     try:
         return fn(*args, **kwargs)
-    except WorkbenchError as exc:  # noqa: BLE001 - domain boundary translate
+    except WorkbenchError as exc:
         raise _wb_http(exc) from exc
 
 
@@ -89,8 +90,8 @@ class ReviewActionRequest(BaseModel):
     """
 
     item_id: str
-    new_value: Optional[Any] = None  # Only used for override
-    base_revision: Optional[int] = None
+    new_value: Any | None = None  # Only used for override
+    base_revision: int | None = None
 
 
 class ReviewUndoRequest(BaseModel):
@@ -277,7 +278,7 @@ def _resolve_junction_action(
             status_code=400,
             detail=f"Malformed junction target: {item_id!r}",
         )
-    table, character_id, entity_id = parts
+    table, _character_id, entity_id = parts
     book_id = _book_id_for_junction(storage, table, entity_id)
     if book_id is None:
         raise HTTPException(

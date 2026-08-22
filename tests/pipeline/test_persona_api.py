@@ -30,8 +30,8 @@ from app.pipeline.adapter import (
     ConcurrentTransactionError,
     InMemorySQLiteAdapter,
 )
-from app.pipeline.api_onboard import get_storage
 from app.pipeline.api_characters import get_persona_domain
+from app.pipeline.api_onboard import get_storage
 
 
 def _seed(storage: InMemorySQLiteAdapter) -> None:

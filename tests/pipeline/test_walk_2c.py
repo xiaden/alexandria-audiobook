@@ -20,17 +20,15 @@ from __future__ import annotations
 
 import json
 
-
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.walks.walk_2c_alias_resolution import (
-    execute,
-    _parse_llm_response,
-    _merge_group,
-    _redirect_junctions,
-    _consolidate_aliases,
     _build_alias_resolution_prompt,
+    _consolidate_aliases,
+    _merge_group,
+    _parse_llm_response,
+    _redirect_junctions,
+    execute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1141,7 +1139,7 @@ class TestEndToEnd:
         book_rows = storage.execute_query(
             "SELECT character_id FROM character_book WHERE book_id = ?", ("b1",)
         )
-        assert set(r["character_id"] for r in book_rows) == {"c-alice"}
+        assert {r["character_id"] for r in book_rows} == {"c-alice"}
 
         scene_rows = storage.execute_query(
             "SELECT character_id FROM character_scene"

@@ -70,8 +70,7 @@ def _seed_voices(storage: InMemorySQLiteAdapter) -> None:
         "VALUES ('vcustom', 'Custom', 'custom', 'c2')"
     )
     storage.execute_insert(
-        "INSERT INTO voice_config (id, name, type) "
-        "VALUES ('vbogus', 'Bad', 'notatype')"
+        "INSERT INTO voice_config (id, name, type) VALUES ('vbogus', 'Bad', 'notatype')"
     )
 
 
@@ -179,7 +178,8 @@ class TestCreateCloneReference:
         relative = resp.json()["reference"]["relative_path"]
         written = os.path.join(ref_root, relative)
         assert os.path.isfile(written)
-        assert open(written, "rb").read() == payload
+        with open(written, "rb") as f:
+            assert f.read() == payload
 
     def test_upload_missing_ref_text_returns_422(self, client):
         payload = make_wav()
@@ -272,7 +272,9 @@ class TestCreateCloneReference:
         assert ref["relative_path"] == f"{ref['reference_id']}.wav"
         assert not os.path.exists(os.path.join(ref_root, "..", "evil.wav"))
 
-    def test_upload_contention_503_retry_after(self, real_client, storage, ref_root, monkeypatch):
+    def test_upload_contention_503_retry_after(
+        self, real_client, storage, ref_root, monkeypatch
+    ):
         def boom(record):
             raise ConcurrentTransactionError("contention")
 
@@ -352,38 +354,28 @@ class TestPreviewCloneReference:
         os.makedirs(ref_root, exist_ok=True)
         with open(os.path.join(ref_root, "r1.wav"), "wb") as fh:
             fh.write(payload)
-        resp = client.get(
-            "/api/pipeline/voices/vclone/references/r1/preview"
-        )
+        resp = client.get("/api/pipeline/voices/vclone/references/r1/preview")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "audio/wav"
         assert resp.content == payload
 
     def test_preview_missing_media_404(self, client, storage):
         _insert_reference(storage, "r1", relative_path="r1.wav")
-        resp = client.get(
-            "/api/pipeline/voices/vclone/references/r1/preview"
-        )
+        resp = client.get("/api/pipeline/voices/vclone/references/r1/preview")
         assert resp.status_code == 404
 
     def test_preview_unknown_reference_404(self, client):
-        resp = client.get(
-            "/api/pipeline/voices/vclone/references/nope/preview"
-        )
+        resp = client.get("/api/pipeline/voices/vclone/references/nope/preview")
         assert resp.status_code == 404
 
     def test_preview_cross_owner_404(self, client, storage):
         _insert_reference(storage, "r1", owner_id="someone_else")
-        resp = client.get(
-            "/api/pipeline/voices/vclone/references/r1/preview"
-        )
+        resp = client.get("/api/pipeline/voices/vclone/references/r1/preview")
         assert resp.status_code == 404
 
     def test_preview_cross_voice_404(self, client, storage):
         _insert_reference(storage, "r1", voice_id="vclone")
-        resp = client.get(
-            "/api/pipeline/voices/vcustom/references/r1/preview"
-        )
+        resp = client.get("/api/pipeline/voices/vcustom/references/r1/preview")
         assert resp.status_code == 404
 
 
@@ -393,9 +385,7 @@ class TestDownloadCloneReference:
         _insert_reference(storage, "r1", relative_path="r1.wav")
         with open(os.path.join(ref_root, "r1.wav"), "wb") as fh:
             fh.write(payload)
-        resp = client.get(
-            "/api/pipeline/voices/vclone/references/r1/download"
-        )
+        resp = client.get("/api/pipeline/voices/vclone/references/r1/download")
         assert resp.status_code == 200
         disposition = resp.headers["content-disposition"]
         assert disposition.lower().startswith("attachment")
@@ -403,9 +393,7 @@ class TestDownloadCloneReference:
         assert resp.content == payload
 
     def test_download_unknown_reference_404(self, client):
-        resp = client.get(
-            "/api/pipeline/voices/vclone/references/nope/download"
-        )
+        resp = client.get("/api/pipeline/voices/vclone/references/nope/download")
         assert resp.status_code == 404
 
 
@@ -432,9 +420,7 @@ class TestDeleteCloneReference:
         assert voice["ref_audio"] is None
         assert voice["ref_text"] is None
 
-    def test_delete_does_not_clear_newer_voice_reference_config(
-        self, client, storage
-    ):
+    def test_delete_does_not_clear_newer_voice_reference_config(self, client, storage):
         _insert_reference(storage, "r1", relative_path="r1.wav")
         storage.execute_update(
             "UPDATE voice_config SET ref_audio = ?, ref_text = ? WHERE id = ?",
@@ -455,9 +441,7 @@ class TestDeleteCloneReference:
         _insert_reference(storage, "r1", relative_path="r1.wav")
         with open(os.path.join(ref_root, "r1.wav"), "wb") as fh:
             fh.write(b"data")
-        resp = client.delete(
-            "/api/pipeline/voices/vclone/references/r1"
-        )
+        resp = client.delete("/api/pipeline/voices/vclone/references/r1")
         assert resp.status_code == 204
         row = storage.get_clone_reference("r1", _LOCAL)
         assert row["deleted_ms"] is not None
@@ -465,12 +449,14 @@ class TestDeleteCloneReference:
 
     def test_delete_is_idempotent(self, client, storage):
         _insert_reference(storage, "r1", relative_path="r1.wav")
-        assert client.delete(
-            "/api/pipeline/voices/vclone/references/r1"
-        ).status_code == 204
-        assert client.delete(
-            "/api/pipeline/voices/vclone/references/r1"
-        ).status_code == 204
+        assert (
+            client.delete("/api/pipeline/voices/vclone/references/r1").status_code
+            == 204
+        )
+        assert (
+            client.delete("/api/pipeline/voices/vclone/references/r1").status_code
+            == 204
+        )
 
     def test_delete_cross_owner_404(self, client, storage, ref_root):
         _insert_reference(storage, "r1", owner_id="someone_else")

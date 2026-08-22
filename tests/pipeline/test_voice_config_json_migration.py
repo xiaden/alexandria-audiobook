@@ -19,8 +19,8 @@ import pytest
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from app.pipeline.adapter import InMemorySQLiteAdapter  # noqa: E402
-from scripts.migrate_voice_config_json_to_db import (  # noqa: E402
+from app.pipeline.adapter import InMemorySQLiteAdapter
+from scripts.migrate_voice_config_json_to_db import (
     migrate_voice_config_json_to_db,
     read_voice_config_json,
 )

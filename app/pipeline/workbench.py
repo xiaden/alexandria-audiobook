@@ -38,7 +38,6 @@ from uuid import uuid4
 from app.pipeline.adapter import PipelineStorage
 from app.utils import load_app_config, resolve_task_config
 
-
 # ---------------------------------------------------------------------------
 # Domain errors
 # ---------------------------------------------------------------------------
@@ -705,8 +704,7 @@ class Workbench:
         known = {
             r["id"]
             for r in self._storage.execute_query(
-                "SELECT id FROM character WHERE id IN (%s)"
-                % ", ".join("?" for _ in [canonical_id, *member_ids]),
+                "SELECT id FROM character WHERE id IN ({})".format(", ".join("?" for _ in [canonical_id, *member_ids])),
                 (canonical_id, *member_ids),
             )
         }
@@ -725,15 +723,14 @@ class Workbench:
             }
             for r in self._storage.execute_query(
                 "SELECT id, name, aliases, voice_assignment_id FROM character"
-                " WHERE id IN (%s)" % ", ".join("?" for _ in member_ids),
+                " WHERE id IN ({})".format(", ".join("?" for _ in member_ids)),
                 tuple(member_ids),
             )
         ]
         review_items = self._storage.execute_query(
             "SELECT id, kind, target_table, target_id, prior_value, status"
             " FROM walk_review_item WHERE book_id = ? AND status = 'pending'"
-            " AND (target_id IN (%s) OR kind = 'alias_merge')"
-            % ", ".join("?" for _ in member_ids),
+            " AND (target_id IN ({}) OR kind = 'alias_merge')".format(", ".join("?" for _ in member_ids)),
             (book_id, *member_ids),
         )
         downstream_scenes = sorted(self._member_scene_keys(book_id, member_ids))
@@ -882,8 +879,7 @@ class Workbench:
             # the actionable queue no longer offers stale member targets.
             for row in self._storage.execute_query(
                 "SELECT id FROM walk_review_item WHERE book_id = ?"
-                " AND status = 'pending' AND target_id IN (%s)"
-                % ", ".join("?" for _ in member_ids),
+                " AND status = 'pending' AND target_id IN ({})".format(", ".join("?" for _ in member_ids)),
                 (book_id, *member_ids),
             ):
                 self._storage.execute_update(
@@ -990,36 +986,33 @@ class Workbench:
             raise ValidationError(
                 "anchor must provide at least one of chapter_id, scene_id, paragraph_id"
             )
-        if chapter_id:
-            if not self._storage.execute_query(
-                "SELECT child_id FROM book_chapter"
-                " WHERE parent_id = ? AND child_id = ?",
-                (book_id, chapter_id),
-            ):
-                raise ValidationError(
-                    f"chapter {chapter_id} not reachable from book {book_id}"
-                )
-        if scene_id:
-            if not self._storage.execute_query(
-                "SELECT chs.child_id FROM chapter_scene chs"
-                " JOIN book_chapter bc ON chs.parent_id = bc.child_id"
-                " WHERE bc.parent_id = ? AND chs.child_id = ?",
-                (book_id, scene_id),
-            ):
-                raise ValidationError(
-                    f"scene {scene_id} not reachable from book {book_id}"
-                )
-        if paragraph_id:
-            if not self._storage.execute_query(
-                "SELECT child_id FROM scene_paragraph scp"
-                " JOIN chapter_scene chs ON scp.parent_id = chs.child_id"
-                " JOIN book_chapter bc ON chs.parent_id = bc.child_id"
-                " WHERE bc.parent_id = ? AND scp.child_id = ?",
-                (book_id, paragraph_id),
-            ):
-                raise ValidationError(
-                    f"paragraph {paragraph_id} not reachable from book {book_id}"
-                )
+        if chapter_id and not self._storage.execute_query(
+            "SELECT child_id FROM book_chapter"
+            " WHERE parent_id = ? AND child_id = ?",
+            (book_id, chapter_id),
+        ):
+            raise ValidationError(
+                f"chapter {chapter_id} not reachable from book {book_id}"
+            )
+        if scene_id and not self._storage.execute_query(
+            "SELECT chs.child_id FROM chapter_scene chs"
+            " JOIN book_chapter bc ON chs.parent_id = bc.child_id"
+            " WHERE bc.parent_id = ? AND chs.child_id = ?",
+            (book_id, scene_id),
+        ):
+            raise ValidationError(
+                f"scene {scene_id} not reachable from book {book_id}"
+            )
+        if paragraph_id and not self._storage.execute_query(
+            "SELECT child_id FROM scene_paragraph scp"
+            " JOIN chapter_scene chs ON scp.parent_id = chs.child_id"
+            " JOIN book_chapter bc ON chs.parent_id = bc.child_id"
+            " WHERE bc.parent_id = ? AND scp.child_id = ?",
+            (book_id, paragraph_id),
+        ):
+            raise ValidationError(
+                f"paragraph {paragraph_id} not reachable from book {book_id}"
+            )
         return {
             "chapter_id": chapter_id,
             "scene_id": scene_id,
@@ -1406,7 +1399,7 @@ class Workbench:
                 (book_id, walk_name, field),
             )
             row = rows[0] if rows else None
-        except Exception:
+        except Exception:  # noqa: BLE001 — best-effort override read; unreadable storage degrades to no override
             row = None
         if row is not None:
             try:

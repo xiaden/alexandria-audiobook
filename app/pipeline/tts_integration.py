@@ -23,13 +23,12 @@ import re
 import sys
 import time
 import uuid
-from typing import Callable
+from collections.abc import Callable
 
 from pydub import AudioSegment
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.assembly import export_annotated_script
-
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -95,16 +94,16 @@ def validate_pause_ms(value: object) -> int:
     plus one function.
     """
     if isinstance(value, bool):
-        raise ValueError("pause must be an integer, not a boolean")
+        raise ValueError("pause must be an integer, not a boolean")  # noqa: TRY004 — Pydantic validators require ValueError, not TypeError
     if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
+        if value != value or value in (float("inf"), float("-inf")):  # noqa: PLR0124 — `value != value` is the deliberate NaN idiom
             raise ValueError("pause must be a finite integer, not NaN/infinity")
         truncated = int(value)
         if truncated != value:
             raise ValueError("pause must be an integer (no fractional milliseconds)")
         value = truncated
     if not isinstance(value, int):
-        raise ValueError("pause must be an integer millisecond value")
+        raise ValueError("pause must be an integer millisecond value")  # noqa: TRY004 — Pydantic validators require ValueError, not TypeError
     if value < 0:
         raise ValueError("pause must be non-negative")
     if value > PAUSE_MAX_MS:
@@ -400,9 +399,7 @@ def _resolve_pause_ms(tts_config: dict | None) -> tuple[int, int]:
     """
     if not tts_config:
         return PAUSE_BETWEEN_SPEAKERS_MS, PAUSE_SAME_SPEAKER_MS
-    between = tts_config.get(
-        "pause_between_speakers_ms", PAUSE_BETWEEN_SPEAKERS_MS
-    )
+    between = tts_config.get("pause_between_speakers_ms", PAUSE_BETWEEN_SPEAKERS_MS)
     same = tts_config.get("pause_same_speaker_ms", PAUSE_SAME_SPEAKER_MS)
     return between, same
 
@@ -803,9 +800,7 @@ def _assemble_paused_artifact(
     from app.tts import combine_audio_with_pauses  # local import: app.tts chain
 
     speakers = [entry["speaker"] for entry in script]
-    pause_overrides = [
-        span_pause_after_ms.get(entry["id"]) for entry in script
-    ]
+    pause_overrides = [span_pause_after_ms.get(entry["id"]) for entry in script]
     combined = combine_audio_with_pauses(
         segments,
         speakers,
@@ -966,7 +961,9 @@ def render_audiobook(
 
         # Step 4: Handle empty script — nothing to render, job completes
         if not script:
-            _finalize_job(storage, resolved_job_id, "completed", resolved_dir=resolved_dir)
+            _finalize_job(
+                storage, resolved_job_id, "completed", resolved_dir=resolved_dir
+            )
             _write_manifest_best_effort(
                 resolved_dir,
                 job_id=resolved_job_id,

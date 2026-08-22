@@ -25,7 +25,6 @@ from app.pipeline.assembly import (
 from app.pipeline.operations import OperationExecutor
 from app.pipeline.review import ReviewManager
 
-
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------

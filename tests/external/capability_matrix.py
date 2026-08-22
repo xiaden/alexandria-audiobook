@@ -35,12 +35,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
-import struct
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 #: Opt-in environment marker that enables real-engine probing.  Deterministic
 #: CI does NOT set this; engine capabilities then report ``unavailable``.

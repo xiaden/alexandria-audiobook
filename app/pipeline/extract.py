@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import re
 import uuid
-import zipfile
 import xml.etree.ElementTree as ET
+import zipfile
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING
 

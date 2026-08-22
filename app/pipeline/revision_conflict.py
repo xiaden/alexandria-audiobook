@@ -23,11 +23,8 @@ body of already-existing 409 responses.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import HTTPException
 from pydantic import BaseModel
-
 
 # ---------------------------------------------------------------------------
 # Conflict codes
@@ -57,14 +54,14 @@ class RevisionConflictDTO(BaseModel):
     error: str = "revision_conflict"
     code: str
     message: str
-    detail: Optional[dict] = None
+    detail: dict | None = None
 
 
 def revision_conflict_http(
     *,
     code: str,
     message: str,
-    detail: Optional[dict] = None,
+    detail: dict | None = None,
     error: str = "revision_conflict",
 ) -> HTTPException:
     """Return an HTTP 409 whose body is a :class:`RevisionConflictDTO`."""

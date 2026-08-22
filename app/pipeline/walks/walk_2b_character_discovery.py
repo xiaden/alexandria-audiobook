@@ -124,7 +124,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 name_to_id=name_to_id,
                 result=result,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(f"Error processing scene {scene_id}: {e}")
             result["errors"].append({"scene_id": scene_id, "error": str(e)})
 

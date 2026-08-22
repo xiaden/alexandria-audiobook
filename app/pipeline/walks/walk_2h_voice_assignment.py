@@ -31,6 +31,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from app.pipeline.review import supersede_targets
+
 from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
 if TYPE_CHECKING:
@@ -129,7 +130,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 result=result,
                 committed_target_ids=committed_target_ids,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(f"Error processing character {character_id}: {e}")
             result["errors"].append({"character_id": character_id, "error": str(e)})
 

@@ -17,7 +17,8 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
-from typing import BinaryIO, Callable, cast
+from collections.abc import Callable
+from typing import BinaryIO, cast
 
 # Allow-listed reference-audio content types, keyed by lowercase extension.
 # Matches the media types FFmpeg's demuxer detects so extension spoofing is
@@ -78,9 +79,7 @@ def reference_root() -> str:
     the DD's "``designed_voices/references`` style" guidance.
     """
     default = os.path.join(
-        os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ),
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "designed_voices",
         "references",
     )
@@ -137,9 +136,7 @@ def compute_sha256(fileobj: BinaryIO) -> str:
     return digest.hexdigest()
 
 
-def probe_duration_ms(
-    path: str, tts_engine: object | None = None
-) -> int:
+def probe_duration_ms(path: str, tts_engine: object | None = None) -> int:
     """Integer-ms decoded duration of *path* (bounded; raises on failure).
 
     Prefers the TTS-engine seam when the engine exposes a public duration
@@ -165,14 +162,18 @@ def _probe_duration_ms_ffprobe(path: str) -> int:
         result = subprocess.run(
             [
                 "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
                 path,
             ],
             capture_output=True,
             text=True,
             timeout=_FFPROBE_TIMEOUT_S,
+            check=False,
         )
     except FileNotFoundError:
         raise CloneReferenceMediaError("ffprobe not found on system")
@@ -180,12 +181,10 @@ def _probe_duration_ms_ffprobe(path: str) -> int:
         raise CloneReferenceMediaError("ffprobe timed out probing reference audio")
     if result.returncode != 0:
         stderr = (result.stderr or "")[-300:]
-        raise CloneReferenceMediaError(
-            f"cannot decode reference audio: {stderr}"
-        )
+        raise CloneReferenceMediaError(f"cannot decode reference audio: {stderr}")
     text = (result.stdout or "").strip()
     try:
-        return int(round(float(text) * 1000))
+        return round(float(text) * 1000)
     except ValueError:
         raise CloneReferenceMediaError("unparseable reference audio duration")
 
@@ -232,9 +231,7 @@ def validate_and_copy(
 
     byte_limit = max_bytes if max_bytes is not None else configured_max_bytes()
     duration_limit = (
-        max_duration_ms
-        if max_duration_ms is not None
-        else configured_max_duration_ms()
+        max_duration_ms if max_duration_ms is not None else configured_max_duration_ms()
     )
 
     tmp_path = f"{canonical}.tmp"
@@ -255,9 +252,7 @@ def validate_and_copy(
                 out.write(chunk)
         duration_ms = probe_duration_ms(tmp_path, tts_engine=tts_engine)
         if duration_ms > duration_limit:
-            raise CloneReferenceMediaError(
-                "reference audio exceeds duration limit"
-            )
+            raise CloneReferenceMediaError("reference audio exceeds duration limit")
         os.replace(tmp_path, canonical)
     finally:
         if os.path.exists(tmp_path):
@@ -294,9 +289,7 @@ def cleanup_expired_references(
     is skipped untouched.  Returns the list of removed ``reference_id``s.
     """
     removed: list[str] = []
-    for row in storage.get_tombstoned_references_unreferenced(
-        older_than_ms, now_ms
-    ):
+    for row in storage.get_tombstoned_references_unreferenced(older_than_ms, now_ms):
         dest = os.path.join(dest_root, row["relative_path"])
         canonical = canonical_contain(dest_root, dest)
         if canonical is None:

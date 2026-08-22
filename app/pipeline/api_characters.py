@@ -12,8 +12,6 @@ Uses dependency injection for storage so tests can inject InMemorySQLiteAdapter.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -37,7 +35,6 @@ from app.pipeline.revision_conflict import (
 )
 from app.pipeline.workbench import Workbench
 
-
 # ---------------------------------------------------------------------------
 # Pydantic request models
 # ---------------------------------------------------------------------------
@@ -49,7 +46,7 @@ class CharacterVoiceUpdateRequest(BaseModel):
     ``voice_assignment_id`` may be ``null`` to clear the assignment.
     """
 
-    voice_assignment_id: Optional[str] = None
+    voice_assignment_id: str | None = None
 
 
 class CharacterPresenceRequest(BaseModel):
@@ -64,7 +61,7 @@ class CharacterPresenceRequest(BaseModel):
     scene_id: str
     character_id: str
     relation_type: str
-    decision_id: Optional[str] = None
+    decision_id: str | None = None
     base_revision: int
 
 
@@ -83,7 +80,7 @@ class PersonaWriteRequest(BaseModel):
     """
 
     base_revision: int
-    book_id: Optional[str] = None
+    book_id: str | None = None
     fields: dict[str, str] = {}
     evidence: list[dict] = []
     aliases: list[str] = []

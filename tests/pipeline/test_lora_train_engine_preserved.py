@@ -50,8 +50,8 @@ for _name in ("utils", "hf_utils"):
     if _name not in sys.modules:
         _load_app_local_module(_name)
 
-import app.app  # noqa: E402  (after harness setup)
-import app.engine  # noqa: E402
+import app.app
+import app.engine
 
 
 class _FakeEngine:
@@ -208,7 +208,7 @@ class TestLoraGpuExclusion:
         adapter_dir = tmp_path / "models" / "adapter1"
         adapter_dir.mkdir(parents=True)
         monkeypatch.setattr(app.app, "LORA_MODELS_DIR", str(tmp_path / "models"))
-        monkeypatch.setattr(app.app, "_load_builtin_lora_manifest", lambda: [])
+        monkeypatch.setattr(app.app, "_load_builtin_lora_manifest", list)
         monkeypatch.setattr(
             app.app, "_load_manifest", lambda _path: [{"id": "adapter1"}]
         )

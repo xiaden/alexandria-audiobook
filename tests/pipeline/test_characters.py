@@ -16,9 +16,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
-from app.pipeline.api_onboard import get_storage
 from app.pipeline.api_characters import router as characters_router
-
+from app.pipeline.api_onboard import get_storage
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -136,7 +136,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 existing_characters=existing_characters,
                 result=result,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(f"Error processing span {span_id}: {e}")
             result["errors"].append({"span_id": span_id, "error": str(e)})
 

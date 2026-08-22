@@ -96,7 +96,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 insert_scene_fn=insert_scene,
                 result=result,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(f"Error processing chapter {chapter_id}: {e}")
             result["errors"].append({"chapter_id": chapter_id, "error": str(e)})
 

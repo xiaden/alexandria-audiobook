@@ -26,7 +26,8 @@ import shutil
 import sys
 import time
 import traceback
-from utils import resolve_device, setup_rocm, clear_gpu_cache
+
+from utils import clear_gpu_cache, resolve_device, setup_rocm
 
 
 def parse_args():
@@ -105,7 +106,7 @@ def load_dataset(data_dir, hf_model, processor, device, dtype, max_audio_seconds
 
     print(f"[DATA] Using reference audio: {os.path.basename(ref_audio_path)}", flush=True)
 
-    ref_audio, ref_sr = librosa.load(ref_audio_path, sr=24000, mono=True)
+    ref_audio, _ref_sr = librosa.load(ref_audio_path, sr=24000, mono=True)
     ref_audio = ref_audio.astype(np.float32)
 
     with torch.no_grad():
@@ -116,7 +117,7 @@ def load_dataset(data_dir, hf_model, processor, device, dtype, max_audio_seconds
         ).transpose(1, 2).to(device).to(dtype)
         spk_embedding = hf_model.speaker_encoder(ref_mels).detach()
 
-    print(f"[DATA] Speaker embedding extracted from reference audio", flush=True)
+    print("[DATA] Speaker embedding extracted from reference audio", flush=True)
 
     samples = []
     skipped = 0
@@ -328,7 +329,6 @@ def build_teacher_forcing_input(sample, hf_model, device, dtype, language="engli
 def train(args):
     import torch
     import torch.nn.functional as F
-    from transformers import AutoProcessor
 
     device = resolve_device(args.device)
     dtype = torch.bfloat16 if "cuda" in device else torch.float32
@@ -561,7 +561,7 @@ if __name__ == "__main__":
     args = parse_args()
     try:
         train(args)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — top-level CLI entry: any failure prints and exits non-zero
         print(f"[ERROR] {e}", flush=True)
         traceback.print_exc()
         sys.exit(1)

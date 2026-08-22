@@ -24,7 +24,6 @@ with temperature=0.1 for format stability.
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -123,7 +122,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 existing_characters=existing_characters,
                 result=result,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(f"Error processing scene {scene_id}: {e}")
             result["errors"].append({"scene_id": scene_id, "error": str(e)})
 

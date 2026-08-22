@@ -51,7 +51,7 @@ for _name in ("utils", "hf_utils"):
     if _name not in sys.modules:
         _load_app_local_module(_name)
 
-import app.app  # noqa: E402  (after harness setup)
+import app.app
 
 
 @pytest.fixture()

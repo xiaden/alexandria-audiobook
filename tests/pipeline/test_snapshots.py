@@ -30,9 +30,9 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from app.pipeline import api_operations
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.api import get_storage, router
-import app.pipeline.api_operations as api_operations
 
 # Base auto-name: "Project 2026-08-07 12:34", with optional same-minute
 # collision suffix " (2)".

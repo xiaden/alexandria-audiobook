@@ -22,9 +22,9 @@ import sqlite3
 import tempfile
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
-from unittest.mock import MagicMock
 
 from app.pipeline.adapter import (
     ConcurrentTransactionError,
@@ -35,7 +35,6 @@ from app.pipeline.adapter import (
     start_gc_scheduler,
     stop_gc_scheduler,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -293,9 +292,7 @@ class TestInMemoryAdapterParity:
 class TestExecuteQuery:
     """execute_query must return list[dict]."""
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_returns_list_of_dicts(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
@@ -305,17 +302,13 @@ class TestExecuteQuery:
         assert isinstance(rows[0], dict)
         assert rows[0]["id"] == "s1"
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_empty_result(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         rows = adapter.execute_query("SELECT id FROM series")
         assert rows == []
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_with_params(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
@@ -324,9 +317,7 @@ class TestExecuteQuery:
         assert len(rows) == 1
         assert rows[0]["id"] == "s1"
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_multiple_columns(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
@@ -348,33 +339,21 @@ class TestExecuteQuery:
 class TestExecuteInsert:
     """execute_insert must return lastrowid as int."""
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_returns_int(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
-        rowid = adapter.execute_insert(
-            "INSERT INTO series (id) VALUES (?)", ("s1",)
-        )
+        rowid = adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
         assert isinstance(rowid, int)
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_returns_lastrowid(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         # With TEXT PK and no AUTOINCREMENT, lastrowid is the internal rowid
-        rowid1 = adapter.execute_insert(
-            "INSERT INTO series (id) VALUES (?)", ("s1",)
-        )
-        rowid2 = adapter.execute_insert(
-            "INSERT INTO series (id) VALUES (?)", ("s2",)
-        )
+        rowid1 = adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+        rowid2 = adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s2",))
         assert rowid2 > rowid1
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_fk_violation_raises(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         with pytest.raises(sqlite3.IntegrityError):
@@ -387,9 +366,7 @@ class TestExecuteInsert:
 class TestExecuteUpdate:
     """execute_update must return rowcount as int."""
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_returns_int(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
@@ -399,9 +376,7 @@ class TestExecuteUpdate:
         assert isinstance(count, int)
         assert count == 1
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_no_rows_affected(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         count = adapter.execute_update(
@@ -409,9 +384,7 @@ class TestExecuteUpdate:
         )
         assert count == 0
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_multiple_rows_updated(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
@@ -424,9 +397,7 @@ class TestExecuteUpdate:
 class TestExecuteDelete:
     """execute_delete must return rowcount as int."""
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_returns_int(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
@@ -434,17 +405,13 @@ class TestExecuteDelete:
         assert isinstance(count, int)
         assert count == 1
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_no_rows_deleted(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         count = adapter.execute_delete("DELETE FROM series WHERE id = ?", ("nope",))
         assert count == 0
 
-    @pytest.mark.parametrize(
-        "adapter_name", ["sqlite_adapter", "memory_adapter"]
-    )
+    @pytest.mark.parametrize("adapter_name", ["sqlite_adapter", "memory_adapter"])
     def test_fk_violation_on_delete(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
         adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
@@ -454,7 +421,6 @@ class TestExecuteDelete:
         )
         with pytest.raises(sqlite3.IntegrityError):
             adapter.execute_delete("DELETE FROM series WHERE id = ?", ("s1",))
-
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +468,7 @@ class TestSQLiteAdapterPersistence:
             assert rows[0]["id"] == "series-persist"
         finally:
             conn.close()
+
     def test_insert_survives_using_adapter(self, tmp_path):
         """Same as above but reads back through a second SQLiteAdapter
         instance (not just a raw connection)."""
@@ -584,9 +551,7 @@ class TestSQLiteAdapterPersistence:
         adapter.init_db()
 
         # First insert some valid data.
-        adapter.execute_insert(
-            "INSERT INTO series (id) VALUES (?)", ("series-ok",)
-        )
+        adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("series-ok",))
 
         # Now attempt an FK-violating insert.
         with pytest.raises(sqlite3.IntegrityError):
@@ -653,10 +618,9 @@ class TestTransactionContextManager:
     @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
     def test_rolls_back_on_exception(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
-        with pytest.raises(RuntimeError, match="boom"):
-            with adapter.transaction():
-                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"), adapter.transaction():
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+            raise RuntimeError("boom")
         # Rollback must close the transaction and discard the write.
         assert adapter.get_connection().in_transaction is False
         rows = adapter.execute_query("SELECT id FROM series")
@@ -673,9 +637,7 @@ class TestTransactionContextManager:
 
         def write_from_other_thread() -> None:
             try:
-                adapter.execute_insert(
-                    "INSERT INTO series (id) VALUES (?)", ("s2",)
-                )
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s2",))
             except ConcurrentTransactionError as exc:
                 captured["error"] = exc
 
@@ -713,11 +675,10 @@ class TestTransactionContextManager:
     @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
     def test_exception_in_nested_block_rolls_back_outer(self, adapter_name, request):
         adapter = request.getfixturevalue(adapter_name)
-        with pytest.raises(RuntimeError, match="inner"):
+        with pytest.raises(RuntimeError, match="inner"), adapter.transaction():
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
             with adapter.transaction():
-                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
-                with adapter.transaction():
-                    raise RuntimeError("inner")
+                raise RuntimeError("inner")
         # The uncaught inner exception must roll back the entire transaction.
         assert adapter.get_connection().in_transaction is False
         rows = adapter.execute_query("SELECT id FROM series")
@@ -797,9 +758,7 @@ class TestBusyTimeout:
 
         try:
             with adapter.transaction():
-                adapter.execute_insert(
-                    "INSERT INTO series (id) VALUES (?)", ("s1",)
-                )
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
                 thread = threading.Thread(target=acquire_from_second_connection)
                 thread.start()
                 # The second connection is now contending on the write lock;
@@ -829,9 +788,7 @@ class _FailingBeginConnection:
     has to be injected through a wrapper instead of a monkeypatch.
     """
 
-    def __init__(
-        self, real: sqlite3.Connection, error: Exception
-    ) -> None:
+    def __init__(self, real: sqlite3.Connection, error: Exception) -> None:
         self._real = real
         self._error = error
 
@@ -877,11 +834,13 @@ class TestTransactionBeginFailure:
             holder = sqlite3.connect(db_path, isolation_level=None)
             holder.execute("BEGIN IMMEDIATE")
             try:
-                with pytest.raises(
-                    ConcurrentTransactionError, match="BEGIN IMMEDIATE timed out"
+                with (
+                    pytest.raises(
+                        ConcurrentTransactionError, match="BEGIN IMMEDIATE timed out"
+                    ),
+                    adapter.transaction(),
                 ):
-                    with adapter.transaction():
-                        pass
+                    pass
                 # No transaction may be left half-open.
                 assert adapter.get_connection().in_transaction is False
             finally:
@@ -889,9 +848,7 @@ class TestTransactionBeginFailure:
                 holder.close()
             # The adapter must be usable again (guard state reset).
             with adapter.transaction():
-                adapter.execute_insert(
-                    "INSERT INTO series (id) VALUES (?)", ("s1",)
-                )
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
             rows = adapter.execute_query("SELECT id FROM series")
             assert [r["id"] for r in rows] == ["s1"]
         finally:
@@ -908,19 +865,19 @@ class TestTransactionBeginFailure:
             adapter, sqlite3.OperationalError("database is locked"), monkeypatch
         )
 
-        with pytest.raises(
-            ConcurrentTransactionError, match="BEGIN IMMEDIATE timed out"
+        with (
+            pytest.raises(
+                ConcurrentTransactionError, match="BEGIN IMMEDIATE timed out"
+            ),
+            adapter.transaction(),
         ):
-            with adapter.transaction():
-                pass
+            pass
 
         captured: dict[str, bool] = {}
 
         def write_from_other_thread() -> None:
             try:
-                adapter.execute_insert(
-                    "INSERT INTO series (id) VALUES (?)", ("s2",)
-                )
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s2",))
                 captured["ok"] = True
             except ConcurrentTransactionError:
                 captured["ok"] = False
@@ -937,22 +894,17 @@ class TestTransactionBeginFailure:
         """A non-OperationalError BEGIN failure propagates unchanged, but the
         owner guard is still cleared."""
         adapter = request.getfixturevalue(adapter_name)
-        self._arm_failing_begin(
-            adapter, RuntimeError("begin exploded"), monkeypatch
-        )
+        self._arm_failing_begin(adapter, RuntimeError("begin exploded"), monkeypatch)
 
-        with pytest.raises(RuntimeError, match="begin exploded"):
-            with adapter.transaction():
-                pass
+        with adapter.transaction(), pytest.raises(RuntimeError, match="begin exploded"):
+            pass
 
         # Guard disarmed: a write from another thread must not be rejected.
         captured: dict[str, bool] = {}
 
         def write_from_other_thread() -> None:
             try:
-                adapter.execute_insert(
-                    "INSERT INTO series (id) VALUES (?)", ("s2",)
-                )
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s2",))
                 captured["ok"] = True
             except ConcurrentTransactionError:
                 captured["ok"] = False
@@ -961,6 +913,7 @@ class TestTransactionBeginFailure:
         thread.start()
         thread.join()
         assert captured.get("ok") is True
+
 
 # ---------------------------------------------------------------------------
 # P4-S1: reconcile_stale_runs — startup-only stale running → interrupted
@@ -1058,8 +1011,7 @@ class TestReconcileStaleRuns:
             assert counts == {"render_job": 1, "walk_run": 2}
 
             rj = adapter.execute_query(
-                "SELECT status, error, finished_ms FROM render_job "
-                "WHERE job_id = ?",
+                "SELECT status, error, finished_ms FROM render_job WHERE job_id = ?",
                 ("rj-stale",),
             )[0]
             assert rj["status"] == "interrupted"
@@ -1068,8 +1020,7 @@ class TestReconcileStaleRuns:
 
             for run_id in ("wr-stale", "wr-nohb"):
                 wr = adapter.execute_query(
-                    "SELECT status, error, finished_ms FROM walk_run "
-                    "WHERE run_id = ?",
+                    "SELECT status, error, finished_ms FROM walk_run WHERE run_id = ?",
                     (run_id,),
                 )[0]
                 assert wr["status"] == "interrupted"
@@ -1096,13 +1047,9 @@ class TestReconcileStaleRuns:
         try:
             counts = adapter.reconcile_stale_runs()
             assert counts == {"render_job": 0, "walk_run": 0}
-            jobs = adapter.execute_query(
-                "SELECT job_id, status FROM render_job"
-            )
+            jobs = adapter.execute_query("SELECT job_id, status FROM render_job")
             assert jobs == [{"job_id": "rj-fresh", "status": "running"}]
-            runs = adapter.execute_query(
-                "SELECT run_id, status FROM walk_run"
-            )
+            runs = adapter.execute_query("SELECT run_id, status FROM walk_run")
             assert runs == [{"run_id": "wr-fresh", "status": "running"}]
         finally:
             adapter.close()
@@ -1133,13 +1080,12 @@ class TestReconcileStaleRuns:
                 )
             }
             assert jobs == {
-                f"rj-{s}": s for s in ("completed", "failed", "cancelled", "interrupted")
+                f"rj-{s}": s
+                for s in ("completed", "failed", "cancelled", "interrupted")
             }
             runs = {
                 row["run_id"]: row["status"]
-                for row in adapter.execute_query(
-                    "SELECT run_id, status FROM walk_run"
-                )
+                for row in adapter.execute_query("SELECT run_id, status FROM walk_run")
             }
             assert runs == {
                 **{
@@ -1185,9 +1131,7 @@ class TestReconcileStaleRuns:
             adapter.close()
 
     @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
-    def test_reconcile_flips_stale_rows_on_both_adapters(
-        self, adapter_name, request
-    ):
+    def test_reconcile_flips_stale_rows_on_both_adapters(self, adapter_name, request):
         """Both adapters expose the same reconcile behavior (mirror parity):
         stale rows flip, fresh rows survive."""
         adapter = request.getfixturevalue(adapter_name)
@@ -1227,7 +1171,7 @@ class TestReconcileStartupWiring:
     after init_db(), before the API serves any request."""
 
     def test_production_storage_bootstrap_runs_reconcile_once(self, monkeypatch):
-        import app.pipeline.api_onboard as api_onboard
+        from app.pipeline import api_onboard
 
         fake = MagicMock()
         monkeypatch.setattr(api_onboard, "_storage", None)
@@ -1306,9 +1250,7 @@ class TestRebuildManifests:
 
     @staticmethod
     def _manifest(root: str, book_id: str, job_id: str) -> dict:
-        with open(
-            os.path.join(root, f"book-{book_id}", job_id, "manifest.json")
-        ) as f:
+        with open(os.path.join(root, f"book-{book_id}", job_id, "manifest.json")) as f:
             return json.load(f)
 
     def test_rebuild_writes_missing_manifest_individual(self, tmp_path):
@@ -1397,9 +1339,7 @@ class TestRebuildManifests:
         db_path = str(tmp_path / "rebuild.db")
         writer = SQLiteAdapter(db_path=db_path)
         writer.init_db()
-        _insert_completed_render_job(
-            writer, "job-b1", mode="batch", output_dir=run_dir
-        )
+        _insert_completed_render_job(writer, "job-b1", mode="batch", output_dir=run_dir)
         writer.close()
 
         adapter = self._reopen(db_path)
@@ -1432,9 +1372,7 @@ class TestRebuildManifests:
         db_path = str(tmp_path / "rebuild.db")
         writer = SQLiteAdapter(db_path=db_path)
         writer.init_db()
-        _insert_completed_render_job(
-            writer, "job-bp", mode="batch", output_dir=run_dir
-        )
+        _insert_completed_render_job(writer, "job-bp", mode="batch", output_dir=run_dir)
         writer.close()
 
         adapter = self._reopen(db_path)
@@ -1493,8 +1431,7 @@ class TestRebuildManifests:
             counts = adapter.rebuild_manifests(root)
             assert counts == {"manifests_rebuilt": 0, "jobs_marked_expired": 1}
             row = adapter.execute_query(
-                "SELECT status, error, finished_ms FROM render_job "
-                "WHERE job_id = ?",
+                "SELECT status, error, finished_ms FROM render_job WHERE job_id = ?",
                 ("job-gone",),
             )[0]
             assert row["status"] == "expired"
@@ -1647,8 +1584,14 @@ class TestRebuildManifests:
         writer = SQLiteAdapter(db_path=db_path)
         writer.init_db()
         now = int(time.time() * 1000)
-        for status in ("pending", "running", "failed", "cancelled",
-                       "interrupted", "expired"):
+        for status in (
+            "pending",
+            "running",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "expired",
+        ):
             writer.execute_insert(
                 "INSERT INTO render_job (job_id, book_id, mode, status, "
                 " output_dir, created_ms) VALUES (?, 'b1', 'batch', ?, ?, ?)",
@@ -1660,8 +1603,14 @@ class TestRebuildManifests:
         try:
             counts = adapter.rebuild_manifests(root)
             assert counts == {"manifests_rebuilt": 0, "jobs_marked_expired": 0}
-            for status in ("pending", "running", "failed", "cancelled",
-                           "interrupted", "expired"):
+            for status in (
+                "pending",
+                "running",
+                "failed",
+                "cancelled",
+                "interrupted",
+                "expired",
+            ):
                 row = adapter.execute_query(
                     "SELECT status FROM render_job WHERE job_id = ?",
                     (f"job-{status}",),
@@ -1743,7 +1692,7 @@ class TestRebuildStartupWiring:
     def test_production_storage_bootstrap_rebuilds_manifests_after_reconcile(
         self, monkeypatch, tmp_path
     ):
-        import app.pipeline.api_onboard as api_onboard
+        from app.pipeline import api_onboard
 
         fake = MagicMock()
         monkeypatch.setattr(api_onboard, "_storage", None)
@@ -1761,9 +1710,7 @@ class TestRebuildStartupWiring:
         # Reconcile first, then rebuild: freshly-interrupted rows must not be
         # rebuilt as if they had completed.
         calls = [call[0] for call in fake.method_calls]
-        assert calls.index("reconcile_stale_runs") < calls.index(
-            "rebuild_manifests"
-        )
+        assert calls.index("reconcile_stale_runs") < calls.index("rebuild_manifests")
 
 
 # ---------------------------------------------------------------------------
@@ -1773,11 +1720,12 @@ class TestRebuildStartupWiring:
 _DAY_MS = 24 * 3600 * 1000
 
 
-def _insert_done_chunk_at(adapter, job_id: str, idx: int, wav_path: str, status: str = "done"):
+def _insert_done_chunk_at(
+    adapter, job_id: str, idx: int, wav_path: str, status: str = "done"
+):
     """Insert a render_chunk row with an explicit status (GC test helper)."""
     adapter.execute_insert(
-        "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO render_chunk (job_id, idx, status, wav_path) VALUES (?, ?, ?, ?)",
         (job_id, idx, status, wav_path),
     )
 
@@ -1914,7 +1862,9 @@ class TestGCSweep:
                 _insert_done_chunk_at(
                     adapter, "job-old", i, os.path.join(run_dir, f"chunk_{i:04d}.wav")
                 )
-            before_jobs = adapter.execute_query("SELECT COUNT(*) AS n FROM render_job")[0]["n"]
+            before_jobs = adapter.execute_query("SELECT COUNT(*) AS n FROM render_job")[
+                0
+            ]["n"]
             before_chunks = adapter.execute_query(
                 "SELECT COUNT(*) AS n FROM render_chunk"
             )[0]["n"]
@@ -1953,7 +1903,9 @@ class TestGCSweep:
                     " started_ms, finished_ms) VALUES (?, ?, 'batch', ?, ?, ?, ?, ?)",
                     (job_id, "b1", status, run_dir, old, old, old),
                 )
-                _insert_done_chunk_at(adapter, job_id, 0, os.path.join(run_dir, "chunk_0000.wav"))
+                _insert_done_chunk_at(
+                    adapter, job_id, 0, os.path.join(run_dir, "chunk_0000.wav")
+                )
 
             summary = adapter.gc_expired_artifacts(root)
 
@@ -1986,7 +1938,9 @@ class TestGCSweep:
                 "'expired', ?, ?, ?, ?, ?)",
                 ("job-exp", "b1", run_dir, old, old, old, "previously expired"),
             )
-            _insert_done_chunk_at(adapter, "job-exp", 0, os.path.join(run_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-exp", 0, os.path.join(run_dir, "chunk_0000.wav")
+            )
 
             summary = adapter.gc_expired_artifacts(root)
 
@@ -2020,7 +1974,9 @@ class TestGCSweep:
                 output_dir=missing,
                 finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
             )
-            _insert_done_chunk_at(adapter, "job-ghost", 0, os.path.join(missing, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-ghost", 0, os.path.join(missing, "chunk_0000.wav")
+            )
 
             summary = adapter.gc_expired_artifacts(root)
 
@@ -2070,9 +2026,15 @@ class TestGCSweep:
             old = int(time.time() * 1000) - 8 * _DAY_MS
             for job_id, run_dir in (("job-ref", ref_dir), ("job-free", free_dir)):
                 _insert_completed_render_job(
-                    adapter, job_id, mode="individual", output_dir=run_dir, finished_ms=old
+                    adapter,
+                    job_id,
+                    mode="individual",
+                    output_dir=run_dir,
+                    finished_ms=old,
                 )
-                _insert_done_chunk_at(adapter, job_id, 0, os.path.join(run_dir, "chunk_0000.wav"))
+                _insert_done_chunk_at(
+                    adapter, job_id, 0, os.path.join(run_dir, "chunk_0000.wav")
+                )
             # Snapshot referencing an artifact path INSIDE the run dir and a
             # second, URI-embedded form (Plan I's snapshot schema is not yet
             # implemented, so refs are matched defensively by shape).
@@ -2129,7 +2091,9 @@ class TestGCSweep:
                 output_dir=run_dir,
                 finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
             )
-            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav")
+            )
             _insert_snapshot(adapter, "snap-broken", "{not valid json!!")
 
             summary = adapter.gc_expired_artifacts(root)
@@ -2166,12 +2130,20 @@ class TestGCSweep:
         adapter = self._open(db_path)
         try:
             _insert_completed_render_job(
-                adapter, "job-old", mode="individual", output_dir=old_dir,
+                adapter,
+                "job-old",
+                mode="individual",
+                output_dir=old_dir,
                 finished_ms=now - 300_000,
             )
-            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(old_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-old", 0, os.path.join(old_dir, "chunk_0000.wav")
+            )
             _insert_completed_render_job(
-                adapter, "job-young", mode="individual", output_dir=young_dir,
+                adapter,
+                "job-young",
+                mode="individual",
+                output_dir=young_dir,
                 finished_ms=now - 30_000,
             )
             _insert_done_chunk_at(
@@ -2203,17 +2175,27 @@ class TestGCSweep:
             # would be evicted while 'done' files were just deleted).
             mid_dir = _make_run_dir(root, "b1", "job-mid", n_chunks=1)
             _insert_completed_render_job(
-                adapter, "job-mid", mode="individual", output_dir=mid_dir,
+                adapter,
+                "job-mid",
+                mode="individual",
+                output_dir=mid_dir,
                 finished_ms=now - 8 * _DAY_MS,
             )
-            _insert_done_chunk_at(adapter, "job-mid", 0, os.path.join(mid_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-mid", 0, os.path.join(mid_dir, "chunk_0000.wav")
+            )
             # 1001 days old: past both cutoffs -> swept.
             old_dir = _make_run_dir(root, "b1", "job-old", n_chunks=1)
             _insert_completed_render_job(
-                adapter, "job-old", mode="individual", output_dir=old_dir,
+                adapter,
+                "job-old",
+                mode="individual",
+                output_dir=old_dir,
                 finished_ms=now - 1001 * _DAY_MS,
             )
-            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(old_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-old", 0, os.path.join(old_dir, "chunk_0000.wav")
+            )
 
             monkeypatch.setenv("CHUNK_RETENTION_DAYS", "1000")
             summary = adapter.gc_expired_artifacts(root)
@@ -2240,7 +2222,9 @@ class TestGCSweep:
                 output_dir=None,
                 finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
             )
-            _insert_done_chunk_at(adapter, "job-null", 0, os.path.join(run_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-null", 0, os.path.join(run_dir, "chunk_0000.wav")
+            )
 
             summary = adapter.gc_expired_artifacts(root)
 
@@ -2329,20 +2313,31 @@ class TestGCSweep:
                 ("job-ref", ref_dir, now - 8 * _DAY_MS),
             ):
                 _insert_completed_render_job(
-                    adapter, job_id, mode="batch", output_dir=run_dir,
+                    adapter,
+                    job_id,
+                    mode="batch",
+                    output_dir=run_dir,
                     finished_ms=finished_ms,
                 )
             for i in range(2):
                 _insert_done_chunk_at(
-                    adapter, "job-old-ind", i,
+                    adapter,
+                    "job-old-ind",
+                    i,
                     os.path.join(old_ind_dir, f"chunk_{i:04d}.wav"),
                 )
-            _insert_done_chunk_at(adapter, "job-young", 0, os.path.join(young_dir, "chunk_0000.wav"))
-            _insert_done_chunk_at(adapter, "job-ref", 0, os.path.join(ref_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-young", 0, os.path.join(young_dir, "chunk_0000.wav")
+            )
+            _insert_done_chunk_at(
+                adapter, "job-ref", 0, os.path.join(ref_dir, "chunk_0000.wav")
+            )
             _insert_snapshot(
                 adapter,
                 "snap-1",
-                json.dumps({"tracks": [{"path": os.path.join(ref_dir, "chunk_0000.wav")}]}),
+                json.dumps(
+                    {"tracks": [{"path": os.path.join(ref_dir, "chunk_0000.wav")}]}
+                ),
             )
 
             summary = adapter.gc_expired_artifacts(root)
@@ -2372,11 +2367,15 @@ class TestGCSweep:
                 output_dir=run_dir,
                 finished_ms=int(time.time() * 1000) - 300_000,
             )
-            _insert_done_chunk_at(adapter, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav"))
+            _insert_done_chunk_at(
+                adapter, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav")
+            )
             monkeypatch.setenv("JOB_RETENTION_DAYS", "1000")
             monkeypatch.setenv("CHUNK_RETENTION_DAYS", "1000")
 
-            summary = adapter.gc_expired_artifacts(root, job_retention_days=0.001, chunk_retention_days=0.001)
+            summary = adapter.gc_expired_artifacts(
+                root, job_retention_days=0.001, chunk_retention_days=0.001
+            )
 
             assert summary["run_dirs_deleted"] == 1
             assert not os.path.isdir(run_dir)
@@ -2517,7 +2516,9 @@ class TestGCScheduler:
             output_dir=run_dir,
             finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
         )
-        _insert_done_chunk_at(writer, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav"))
+        _insert_done_chunk_at(
+            writer, "job-old", 0, os.path.join(run_dir, "chunk_0000.wav")
+        )
         writer.close()
         monkeypatch.setenv("PIPELINE_DB_PATH", db_path)
         monkeypatch.setenv("RENDER_ROOT", root)
@@ -2577,8 +2578,7 @@ class TestSQLiteAdapterSnapshotMethods:
     def _seed_book(adapter, book_id="b1", series_id="s1") -> None:
         """Insert a book row for a snapshot to reference."""
         adapter.execute_insert(
-            "INSERT INTO book (id, series_id, position, version)"
-            " VALUES (?, ?, 1, 1)",
+            "INSERT INTO book (id, series_id, position, version) VALUES (?, ?, 1, 1)",
             (book_id, series_id),
         )
 

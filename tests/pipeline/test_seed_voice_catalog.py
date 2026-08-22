@@ -18,9 +18,9 @@ import pytest
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from app.pipeline.adapter import InMemorySQLiteAdapter  # noqa: E402
-import scripts.seed_voice_catalog as seed_module  # noqa: E402
-from scripts.seed_voice_catalog import seed_voice_catalog  # noqa: E402
+import scripts.seed_voice_catalog as seed_module
+from app.pipeline.adapter import InMemorySQLiteAdapter
+from scripts.seed_voice_catalog import seed_voice_catalog
 
 
 @pytest.fixture
@@ -105,7 +105,7 @@ class TestSeedDefaultVoices:
         )
         row = cursor.fetchone()
         assert row is not None
-        id_, name, type_, voice, desc = row
+        id_, name, type_, voice, _desc = row
         assert id_ == "ryan"
         assert name == "Ryan"
         assert type_ == "custom"

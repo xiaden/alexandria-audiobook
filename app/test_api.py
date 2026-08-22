@@ -16,6 +16,7 @@ import argparse
 import io
 import json
 import sys
+
 import requests
 
 # ── Global state ─────────────────────────────────────────────
@@ -60,7 +61,7 @@ def run_test(name, func, requires_full=False):
             print(f"           {msg}")
             results["failed"] += 1
             failures.append((name, msg))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — custom test runner: any test exception is recorded as FAILED and the run continues
         print(f"  [ FAIL ] {name}")
         print(f"           {type(e).__name__}: {e}")
         results["failed"] += 1
@@ -447,9 +448,8 @@ def test_lora_list_models():
         raise TestFailure(f"Expected list, got {type(data).__name__}")
     # Verify built-in adapters have 'downloaded' field
     for m in data:
-        if m.get("builtin"):
-            if "downloaded" not in m:
-                raise TestFailure(f"Built-in adapter {m['id']} missing 'downloaded' field")
+        if m.get("builtin") and "downloaded" not in m:
+            raise TestFailure(f"Built-in adapter {m['id']} missing 'downloaded' field")
     shared["lora_models"] = data
 
 
@@ -706,19 +706,19 @@ def cleanup():
     try:
         delete(f"/api/dataset_builder/{TEST_PREFIX}builder_proj")
         items.append("builder project")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 — best-effort teardown; missing resource is a non-failure
         pass
 
     try:
         delete(f"/api/dataset_builder/{TEST_PREFIX}gen_proj")
         items.append("gen project")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 — best-effort teardown; missing resource is a non-failure
         pass
 
     try:
         delete(f"/api/lora/datasets/{TEST_PREFIX}dataset")
         items.append("test dataset")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 — best-effort teardown; missing resource is a non-failure
         pass
 
     try:
@@ -728,7 +728,7 @@ def cleanup():
                 if v.get("id", "").startswith(TEST_PREFIX):
                     delete(f"/api/voice_design/{v['id']}")
                     items.append(f"voice {v['id']}")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 — best-effort teardown; missing resource is a non-failure
         pass
 
     if items:

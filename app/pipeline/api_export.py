@@ -24,6 +24,7 @@ Provides HTTP endpoints for exporting annotated scripts and rendering audiobooks
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
@@ -34,7 +35,6 @@ import threading
 import time
 import uuid
 import zipfile
-from typing import Optional
 
 from fastapi import (
     APIRouter,
@@ -49,7 +49,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders
-from starlette.responses import MalformedRangeHeader, PlainTextResponse, RangeNotSatisfiable
+from starlette.responses import (
+    MalformedRangeHeader,
+    PlainTextResponse,
+    RangeNotSatisfiable,
+)
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
@@ -65,7 +69,6 @@ from app.pipeline.tts_integration import (
 )
 from app.utils import load_tts_config
 
-
 # ---------------------------------------------------------------------------
 # Pydantic request models
 # ---------------------------------------------------------------------------
@@ -76,8 +79,8 @@ class RenderRequest(BaseModel):
 
     book_id: str
     use_batch: bool = True
-    output_dir: Optional[str] = None
-    batch_seed: Optional[int] = None
+    output_dir: str | None = None
+    batch_seed: int | None = None
 
 
 class CancelRenderRequest(BaseModel):
@@ -125,11 +128,20 @@ _PAUSES_STATE_FAILED = "failed"
 def _natural_filename_key(name: str) -> tuple[tuple[int, str | int], ...]:
     """Sort filenames by embedded numbers instead of their digit strings."""
     return tuple(
-        (1, int(part))
-        if part.isascii() and part.isdigit()
-        else (0, part.casefold())
+        (1, int(part)) if part.isascii() and part.isdigit() else (0, part.casefold())
         for part in re.split(r"(\d+)", name)
     )
+
+
+def _write_concat_list(
+    concat_list_path: str, output_dir: str, chunk_files: list[str]
+) -> None:
+    """Write the ffmpeg concat demuxer file list (blocking I/O for thread offload)."""
+    with open(concat_list_path, "w") as f:
+        for chunk in chunk_files:
+            # ffmpeg concat demuxer expects file paths
+            chunk_path = os.path.join(output_dir, chunk)
+            f.write(f"file '{chunk_path}'\n")
 
 
 def _resolved_pause_metadata(storage: PipelineStorage, book_id: str) -> dict:
@@ -260,7 +272,9 @@ def get_tts_engine() -> object | None:
     dependency via FastAPI ``dependency_overrides``; only
     ``TestGetTTSEngineProduction`` exercises the real production path.
     """
-    from app.engine import get_tts_engine as _get_engine  # lazy import — avoids circular dependency
+    from app.engine import (
+        get_tts_engine as _get_engine,  # lazy import — avoids circular dependency
+    )
 
     return _get_engine()
 
@@ -298,7 +312,7 @@ def _run_render_job(
     storage: PipelineStorage,
     tts_engine: object,
     use_batch: bool,
-    output_dir: Optional[str],
+    output_dir: str | None,
     batch_seed: int,
     tts_config: dict | None = None,
 ) -> None:
@@ -359,8 +373,7 @@ def _mark_job_row_terminal(
     no-op at the row level.
     """
     storage.execute_update(
-        "UPDATE render_job SET status = ?, error = ?, finished_ms = ? "
-        "WHERE job_id = ?",
+        "UPDATE render_job SET status = ?, error = ?, finished_ms = ? WHERE job_id = ?",
         (status, error, _now_ms(), job_id),
     )
 
@@ -637,7 +650,9 @@ async def export_chunk(
         candidate = os.path.join(run_dir, wav_path)
     real_candidate = os.path.realpath(candidate)
     real_run_dir = os.path.realpath(run_dir)
-    if real_candidate != real_run_dir and not real_candidate.startswith(real_run_dir + os.sep):
+    if real_candidate != real_run_dir and not real_candidate.startswith(
+        real_run_dir + os.sep
+    ):
         # Path escapes the run dir (poisoned/relocated row, relative '..'
         # traversal): treat as not found — never serve outside the run dir.
         raise HTTPException(status_code=404, detail="Chunk not found")
@@ -804,7 +819,9 @@ def _cap_range_headers(headers, file_size: int, cap: int) -> list:
     capped = []
     for name, value in headers:
         if name.lower() == b"range":
-            value = _cap_range_value(value.decode("latin-1"), file_size, cap).encode("latin-1")
+            value = _cap_range_value(value.decode("latin-1"), file_size, cap).encode(
+                "latin-1"
+            )
         capped.append((name, value))
     return capped
 
@@ -1012,7 +1029,7 @@ class ConcatenatedWavResponse(Response):
         """Yield the virtual stream bytes in [start, end) — end is exclusive."""
         header_len = len(self._header)
         if start < header_len:
-            yield self._header[start:min(end, header_len)]
+            yield self._header[start : min(end, header_len)]
         position = header_len
         for path, data_offset, data_size in self._chunks:
             segment_end = position + data_size
@@ -1052,7 +1069,9 @@ class ConcatenatedWavResponse(Response):
     async def _send_simple(self, send: object, send_header_only: bool) -> None:
         headers = self._base_headers()
         headers["content-length"] = str(self._total_size)
-        await send({"type": "http.response.start", "status": 200, "headers": headers.raw})
+        await send(
+            {"type": "http.response.start", "status": 200, "headers": headers.raw}
+        )
         await self._send_body(send, 0, self._total_size, send_header_only)
 
     async def _send_range(
@@ -1061,7 +1080,9 @@ class ConcatenatedWavResponse(Response):
         headers = self._base_headers()
         headers["content-range"] = f"bytes {start}-{end - 1}/{self._total_size}"
         headers["content-length"] = str(end - start)
-        await send({"type": "http.response.start", "status": 206, "headers": headers.raw})
+        await send(
+            {"type": "http.response.start", "status": 206, "headers": headers.raw}
+        )
         await self._send_body(send, start, end, send_header_only)
 
     async def __call__(self, scope: object, receive: object, send: object) -> None:
@@ -1073,7 +1094,9 @@ class ConcatenatedWavResponse(Response):
         try:
             ranges = FileResponse._parse_range_header(http_range, self._total_size)
         except MalformedRangeHeader as exc:
-            return await PlainTextResponse(exc.content, status_code=400)(scope, receive, send)
+            return await PlainTextResponse(exc.content, status_code=400)(
+                scope, receive, send
+            )
         except RangeNotSatisfiable as exc:
             response = PlainTextResponse(
                 status_code=416, headers={"Content-Range": f"bytes */{exc.max_size}"}
@@ -1186,7 +1209,8 @@ async def export_audio(
         for c in chunk_rows:
             if c["status"] != "done":
                 raise HTTPException(
-                    status_code=409, detail=f"Chunk not servable (status: {c['status']})"
+                    status_code=409,
+                    detail=f"Chunk not servable (status: {c['status']})",
                 )
         candidates: list[str] = []
         for c in chunk_rows:
@@ -1330,7 +1354,9 @@ async def download_render(
             detail="Zip archive not found",
         )
 
-    raise HTTPException(status_code=404, detail="No audiobook file found in output directory")
+    raise HTTPException(
+        status_code=404, detail="No audiobook file found in output directory"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1477,8 +1503,7 @@ async def merge_audiobook(
             (
                 f
                 for f in names
-                if f.endswith(".wav")
-                and (f.startswith("chunk_") or f.startswith("temp_batch_"))
+                if f.endswith(".wav") and (f.startswith(("chunk_", "temp_batch_")))
             ),
             key=_natural_filename_key,
         )
@@ -1491,11 +1516,9 @@ async def merge_audiobook(
 
     # Build ffmpeg concat file list
     concat_list_path = os.path.join(output_dir, "concat_list.txt")
-    with open(concat_list_path, "w") as f:
-        for chunk in chunk_files:
-            # ffmpeg concat demuxer expects file paths
-            chunk_path = os.path.join(output_dir, chunk)
-            f.write(f"file '{chunk_path}'\n")
+    await asyncio.to_thread(
+        _write_concat_list, concat_list_path, output_dir, chunk_files
+    )
 
     m4b_path = os.path.join(output_dir, "audiobook.m4b")
     temp_m4b_path = f"{m4b_path}.tmp"
@@ -1506,21 +1529,29 @@ async def merge_audiobook(
 
     try:
         # Use ffmpeg concat demuxer to join WAV chunks into M4B
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             [
                 "ffmpeg",
                 "-y",  # overwrite output
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_list_path,
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-f", "ipod",  # M4B container
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_list_path,
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-f",
+                "ipod",  # M4B container
                 temp_m4b_path,
             ],
             capture_output=True,
             text=True,
             timeout=300,
+            check=False,
         )
 
         if result.returncode != 0:
@@ -1569,13 +1600,15 @@ _FFPROBE_TIMEOUT_S = 60
 _M4B_EXPORT_TMP_DIR = ".m4b-export"
 
 # Per-process feature-detect cache for the libmp3lame encoder.
-_libmp3lame_cache: Optional[bool] = None
+_libmp3lame_cache: bool | None = None
 
 
 def _max_cover_bytes() -> int:
     """Cover upload size cap in bytes, env-tunable like PIPELINE_MAX_RANGE_BYTES."""
     try:
-        return max(1, int(os.environ.get("PIPELINE_MAX_COVER_BYTES", str(20 * 1024 * 1024))))
+        return max(
+            1, int(os.environ.get("PIPELINE_MAX_COVER_BYTES", str(20 * 1024 * 1024)))
+        )
     except ValueError:
         return 20 * 1024 * 1024
 
@@ -1589,7 +1622,9 @@ def _run_media_command(
     non-zero exit all become HTTP 500 with a bounded stderr excerpt.
     """
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout, check=False
+        )
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail=f"{what} not found on system")
     except subprocess.TimeoutExpired:
@@ -1615,6 +1650,7 @@ def _libmp3lame_available() -> bool:
                 capture_output=True,
                 text=True,
                 timeout=_FFMPEG_TIMEOUT_S,
+                check=False,
             )
             _libmp3lame_cache = result.returncode == 0 and "libmp3lame" in result.stdout
         except (OSError, subprocess.TimeoutExpired):
@@ -1625,7 +1661,9 @@ def _libmp3lame_available() -> bool:
 # Control characters (0x00-0x1F incl. newline, plus 0x7F) are stripped from
 # every metadata value: FFMETADATA1 is line-oriented, so a literal newline in
 # a value would silently corrupt the file structure.
-_CONTROL_CHARS_TRANSLATE = str.maketrans("", "", "".join(chr(c) for c in range(32)) + chr(127))
+_CONTROL_CHARS_TRANSLATE = str.maketrans(
+    "", "", "".join(chr(c) for c in range(32)) + chr(127)
+)
 
 
 def _clean_metadata_value(value: str) -> str:
@@ -1685,7 +1723,9 @@ def _write_ffmetadata(
         lines.append("TIMEBASE=1/1000")
         lines.append(f"START={start_ms}")
         lines.append(f"END={end_ms}")
-        lines.append(f"title={_escape_ffmetadata_value(_clean_metadata_value(chapter_title))}")
+        lines.append(
+            f"title={_escape_ffmetadata_value(_clean_metadata_value(chapter_title))}"
+        )
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1706,7 +1746,7 @@ def _chunk_duration_ms(path: str) -> int:
     byte_rate = sample_rate * channels * bits // 8
     if byte_rate <= 0:
         raise HTTPException(status_code=409, detail="Chunk has invalid WAV parameters")
-    return int(round(data_size / byte_rate * 1000))
+    return round(data_size / byte_rate * 1000)
 
 
 def _probe_duration_ms(path: str) -> int:
@@ -1717,9 +1757,12 @@ def _probe_duration_ms(path: str) -> int:
     result = _run_media_command(
         [
             "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             path,
         ],
         timeout=_FFPROBE_TIMEOUT_S,
@@ -1727,9 +1770,11 @@ def _probe_duration_ms(path: str) -> int:
     )
     text = (result.stdout or "").strip()
     try:
-        return int(round(float(text) * 1000))
+        return round(float(text) * 1000)
     except ValueError:
-        raise HTTPException(status_code=500, detail="ffprobe returned an unparseable duration")
+        raise HTTPException(
+            status_code=500, detail="ffprobe returned an unparseable duration"
+        )
 
 
 @router.post("/export/m4b")
@@ -1800,7 +1845,9 @@ def export_m4b(
     if status == "expired":
         raise HTTPException(status_code=410, detail="Job expired by garbage collection")
     if status != "completed":
-        raise HTTPException(status_code=404, detail=f"Job not completed (status: {status})")
+        raise HTTPException(
+            status_code=404, detail=f"Job not completed (status: {status})"
+        )
 
     run_dir = row["output_dir"] or os.path.join(
         get_render_root(), f"book-{row['book_id']}", job_id
@@ -1825,7 +1872,8 @@ def export_m4b(
         for c in chunk_rows:
             if c["status"] != "done":
                 raise HTTPException(
-                    status_code=409, detail=f"Chunk not servable (status: {c['status']})"
+                    status_code=409,
+                    detail=f"Chunk not servable (status: {c['status']})",
                 )
         candidates: list[str] = []
         for c in chunk_rows:
@@ -1852,7 +1900,9 @@ def export_m4b(
             key=lambda path: _natural_filename_key(os.path.basename(path)),
         )
         if not candidates:
-            raise HTTPException(status_code=400, detail="No audio files found in output directory")
+            raise HTTPException(
+                status_code=400, detail="No audio files found in output directory"
+            )
 
     # P4-S1: consume the canonical paused whole-book artifact when it is
     # usable.  The paused artifact (PAUSED_ARTIFACT_NAME) is the whole book with
@@ -1903,9 +1953,13 @@ def export_m4b(
             max_bytes = _max_cover_bytes()
             cover_bytes = cover.file.read(max_bytes + 1)
             if len(cover_bytes) > max_bytes:
-                raise HTTPException(status_code=400, detail="Cover image exceeds the size limit")
+                raise HTTPException(
+                    status_code=400, detail="Cover image exceeds the size limit"
+                )
             if not (cover.content_type or "").startswith("image/"):
-                raise HTTPException(status_code=400, detail="Cover must be an image file")
+                raise HTTPException(
+                    status_code=400, detail="Cover must be an image file"
+                )
             cover_path = os.path.join(tmp_dir, "cover.img")
             with open(cover_path, "wb") as f:
                 f.write(cover_bytes)
@@ -1915,13 +1969,23 @@ def export_m4b(
         #    demuxer's own rules (``'`` -> ``'\''``) for odd-but-legal paths.
         with open(concat_list_path, "w", encoding="utf-8") as f:
             for path in candidates:
-                f.write(f"file '{path.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+                f.write(
+                    f"file '{path.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+                )
         _run_media_command(
             [
-                "ffmpeg", "-y", "-v", "error",
-                "-f", "concat", "-safe", "0",
-                "-i", concat_list_path,
-                "-c:a", "copy",
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_list_path,
+                "-c:a",
+                "copy",
                 intermediate_wav,
             ],
             what="ffmpeg",
@@ -1953,19 +2017,38 @@ def export_m4b(
         #    from the ffmetadata file; the cover is embedded as an mjpeg
         #    ``attached_pic`` stream when provided.
         mux_args = [
-            "ffmpeg", "-y", "-v", "error",
-            "-i", intermediate_wav,
-            "-i", ffmetadata_path,
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            intermediate_wav,
+            "-i",
+            ffmetadata_path,
         ]
         if cover_path is not None:
             mux_args += ["-i", cover_path]
         mux_args += ["-map", "0:a"]
         if cover_path is not None:
-            mux_args += ["-map", "2:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+            mux_args += [
+                "-map",
+                "2:v",
+                "-c:v",
+                "mjpeg",
+                "-disposition:v",
+                "attached_pic",
+            ]
         mux_args += [
-            "-map_metadata", "1", "-map_chapters", "1",
-            "-c:a", "aac", "-b:a", "128k",
-            "-f", "ipod",
+            "-map_metadata",
+            "1",
+            "-map_chapters",
+            "1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-f",
+            "ipod",
             m4b_path,
         ]
         _run_media_command(mux_args, what="ffmpeg")
@@ -1975,11 +2058,20 @@ def export_m4b(
         if _libmp3lame_available():
             _run_media_command(
                 [
-                    "ffmpeg", "-y", "-v", "error",
-                    "-i", intermediate_wav,
-                    "-i", ffmetadata_path,
-                    "-map_metadata", "1",
-                    "-c:a", "libmp3lame", "-b:a", "128k",
+                    "ffmpeg",
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    intermediate_wav,
+                    "-i",
+                    ffmetadata_path,
+                    "-map_metadata",
+                    "1",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "128k",
                     mp3_path,
                 ],
                 what="ffmpeg",

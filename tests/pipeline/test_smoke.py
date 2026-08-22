@@ -65,11 +65,9 @@ for _name in ("utils", "hf_utils"):
     if _name not in sys.modules:
         _load_app_local_module(_name)
 
-import app.app as app_module  # noqa: E402  (after harness import-path setup)
-
-from app.pipeline.adapter import InMemorySQLiteAdapter  # noqa: E402
-from app.pipeline.api import get_storage, get_tts_engine  # noqa: E402
-
+import app.app as app_module
+from app.pipeline.adapter import InMemorySQLiteAdapter
+from app.pipeline.api import get_storage, get_tts_engine
 
 # ---------------------------------------------------------------------------
 # Fixtures

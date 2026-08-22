@@ -14,7 +14,6 @@ import pytest
 
 from app.pipeline.schema import create_schema
 
-
 WORKBENCH_TABLES = {
     "workbench_generation",
     "workbench_decision",

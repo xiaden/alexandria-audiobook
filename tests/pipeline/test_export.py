@@ -82,7 +82,6 @@ from fastapi.testclient import TestClient
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.api import get_storage, router
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -131,10 +130,15 @@ class TestDownloadRender:
         resp = client.get(f"/api/pipeline/download/{job_id}")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "audio/mp4"
-        assert resp.headers["content-disposition"] == 'attachment; filename="audiobook.m4b"'
+        assert (
+            resp.headers["content-disposition"]
+            == 'attachment; filename="audiobook.m4b"'
+        )
         assert resp.content == b"FAKE-M4B-CONTENT"
 
-    def test_present_wav_artifact_returns_200_audio_wav(self, client, storage, tmp_path):
+    def test_present_wav_artifact_returns_200_audio_wav(
+        self, client, storage, tmp_path
+    ):
         """A recorded paused WAV is downloaded with its native type and name."""
         output_dir = tmp_path / "out-wav"
         output_dir.mkdir()
@@ -161,7 +165,12 @@ class TestDownloadRender:
         (application/zip) containing exactly the wav/mp3/m4a/flac files."""
         output_dir = tmp_path / "out-zip"
         output_dir.mkdir()
-        chunk_names = ("chunk_0000.wav", "chunk_0001.mp3", "chunk_0002.m4a", "chunk_0003.flac")
+        chunk_names = (
+            "chunk_0000.wav",
+            "chunk_0001.mp3",
+            "chunk_0002.m4a",
+            "chunk_0003.flac",
+        )
         for name in chunk_names:
             (output_dir / name).write_bytes(b"audio-data-" + name.encode())
         # Non-audio file must be excluded from the archive.
@@ -179,12 +188,17 @@ class TestDownloadRender:
         resp = client.get(f"/api/pipeline/download/{job_id}")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "application/zip"
-        assert resp.headers["content-disposition"] == 'attachment; filename="audiobook.zip"'
+        assert (
+            resp.headers["content-disposition"]
+            == 'attachment; filename="audiobook.zip"'
+        )
 
         zf = zipfile.ZipFile(io.BytesIO(resp.content))
         assert sorted(zf.namelist()) == sorted(chunk_names)
         assert zf.testzip() is None
-        assert zf.getinfo("chunk_0000.wav").file_size == len(b"audio-data-chunk_0000.wav")
+        assert zf.getinfo("chunk_0000.wav").file_size == len(
+            b"audio-data-chunk_0000.wav"
+        )
 
     def test_zip_fallback_natural_chunk_order(self, client, storage, tmp_path):
         """The on-demand ZIP preserves numeric batch chunk order."""
@@ -236,7 +250,10 @@ class TestDownloadRender:
         # Mirror the legacy in-memory entry the dict-backed implementation
         # would carry (status completed + output_dir) so the RED run hits the
         # actual defect: 200 empty zip instead of a 404.
-        api_export._render_jobs[job_id] = {"status": "completed", "output_dir": str(output_dir)}
+        api_export._render_jobs[job_id] = {
+            "status": "completed",
+            "output_dir": str(output_dir),
+        }
 
         try:
             resp = client.get(f"/api/pipeline/download/{job_id}")
@@ -265,14 +282,20 @@ class TestDownloadRender:
         storage.execute_insert(
             "INSERT INTO render_job (job_id, book_id, mode, status, output_dir, "
             "output_artifact_path) VALUES (?, 'b1', 'batch', 'completed', ?, ?)",
-            (job_id, "/nonexistent/output/dir", "/nonexistent/output/dir/audiobook.m4b"),
+            (
+                job_id,
+                "/nonexistent/output/dir",
+                "/nonexistent/output/dir/audiobook.m4b",
+            ),
         )
 
         resp = client.get(f"/api/pipeline/download/{job_id}")
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Output directory not found"
 
-    def test_serves_m4b_produced_by_merge_after_finalize(self, client, storage, tmp_path):
+    def test_serves_m4b_produced_by_merge_after_finalize(
+        self, client, storage, tmp_path
+    ):
         """A row completed without an m4b (artifact = output dir) still serves an
         m4b that POST /merge produced later — the m4b-first parity path."""
         output_dir = tmp_path / "out-late-merge"
@@ -290,7 +313,10 @@ class TestDownloadRender:
         resp = client.get(f"/api/pipeline/download/{job_id}")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "audio/mp4"
-        assert resp.headers["content-disposition"] == 'attachment; filename="audiobook.m4b"'
+        assert (
+            resp.headers["content-disposition"]
+            == 'attachment; filename="audiobook.m4b"'
+        )
         assert resp.content == b"LATE-MERGE-M4B"
 
 
@@ -339,11 +365,15 @@ class TestExportChunkBoundedRange:
         chunk_file.write_bytes(data)
         return str(chunk_file)
 
-    def test_full_get_without_range_returns_200_audio_wav(self, client, storage, tmp_path):
+    def test_full_get_without_range_returns_200_audio_wav(
+        self, client, storage, tmp_path
+    ):
         """A done chunk served without a Range header returns the full body as
         audio/wav (200) — the whole-body path is never capped."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-full", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-full", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get("/api/pipeline/export/chunk/job-full/0")
         assert resp.status_code == 200
@@ -351,10 +381,14 @@ class TestExportChunkBoundedRange:
         assert resp.headers["accept-ranges"] == "bytes"
         assert resp.content == self._WAV
 
-    def test_partial_range_returns_206_with_content_range(self, client, storage, tmp_path):
+    def test_partial_range_returns_206_with_content_range(
+        self, client, storage, tmp_path
+    ):
         """A valid byte range returns 206 with Content-Range and the slice only."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-range", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-range", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get(
             "/api/pipeline/export/chunk/job-range/0", headers={"Range": "bytes=2-5"}
@@ -367,19 +401,26 @@ class TestExportChunkBoundedRange:
     def test_open_ended_range_returns_206_rest_of_file(self, client, storage, tmp_path):
         """bytes=<start>- (open-ended) serves from start to EOF as 206."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-open", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-open", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get(
             "/api/pipeline/export/chunk/job-open/0", headers={"Range": "bytes=4-"}
         )
         assert resp.status_code == 206
-        assert resp.headers["content-range"] == f"bytes 4-{len(self._WAV) - 1}/{len(self._WAV)}"
+        assert (
+            resp.headers["content-range"]
+            == f"bytes 4-{len(self._WAV) - 1}/{len(self._WAV)}"
+        )
         assert resp.content == self._WAV[4:]
 
     def test_unsatisfiable_range_returns_416_with_star(self, client, storage, tmp_path):
         """A range starting beyond EOF returns 416 with Content-Range: bytes */N."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-416", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-416", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get(
             "/api/pipeline/export/chunk/job-416/0", headers={"Range": "bytes=999999-"}
@@ -390,13 +431,19 @@ class TestExportChunkBoundedRange:
     def test_range_end_beyond_eof_clamped_to_eof(self, client, storage, tmp_path):
         """A range whose end exceeds the file size is clamped to EOF (206)."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-clamp-eof", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-clamp-eof", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get(
-            "/api/pipeline/export/chunk/job-clamp-eof/0", headers={"Range": "bytes=2-99999"}
+            "/api/pipeline/export/chunk/job-clamp-eof/0",
+            headers={"Range": "bytes=2-99999"},
         )
         assert resp.status_code == 206
-        assert resp.headers["content-range"] == f"bytes 2-{len(self._WAV) - 1}/{len(self._WAV)}"
+        assert (
+            resp.headers["content-range"]
+            == f"bytes 2-{len(self._WAV) - 1}/{len(self._WAV)}"
+        )
         assert resp.content == self._WAV[2:]
 
     def test_malformed_range_returns_400(self, client, storage, tmp_path):
@@ -405,7 +452,9 @@ class TestExportChunkBoundedRange:
         starlette 1.3.1 sends 400 for malformed and 416 only for unsatisfiable,
         which is the behavior locked by the >= 0.49.1 pin)."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-mal", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-mal", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         for bad in ("bytes=abc", "bytes="):
             resp = client.get(
@@ -422,7 +471,9 @@ class TestExportChunkBoundedRange:
     def test_unknown_idx_returns_404(self, client, storage, tmp_path):
         """A job with no chunk row for the idx -> 404."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-nochunk", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-nochunk", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get("/api/pipeline/export/chunk/job-nochunk/7")
         assert resp.status_code == 404
@@ -432,7 +483,9 @@ class TestExportChunkBoundedRange:
         """A non-integer idx can name no chunk -> 404 (validation choice, plan
         allows 404 or 400 for non-int / out-of-range idx)."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-alpha", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-alpha", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         for bad in ("abc", "1.5"):
             resp = client.get(f"/api/pipeline/export/chunk/job-alpha/{bad}")
@@ -441,7 +494,9 @@ class TestExportChunkBoundedRange:
     def test_negative_idx_returns_404(self, client, storage, tmp_path):
         """A negative idx has no row -> 404."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-neg", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-neg", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get("/api/pipeline/export/chunk/job-neg/-1")
         assert resp.status_code == 404
@@ -450,7 +505,12 @@ class TestExportChunkBoundedRange:
     def test_pending_chunk_returns_409(self, client, storage, tmp_path):
         """A pending chunk row is not servable yet -> 409 Conflict."""
         self._seed_job_and_chunk(
-            storage, "job-pending", 0, "ignored.wav", status="pending", output_dir=str(tmp_path)
+            storage,
+            "job-pending",
+            0,
+            "ignored.wav",
+            status="pending",
+            output_dir=str(tmp_path),
         )
         resp = client.get("/api/pipeline/export/chunk/job-pending/0")
         assert resp.status_code == 409
@@ -459,7 +519,12 @@ class TestExportChunkBoundedRange:
     def test_failed_chunk_returns_409(self, client, storage, tmp_path):
         """A failed chunk row is permanently unservable -> 409 Conflict."""
         self._seed_job_and_chunk(
-            storage, "job-failed", 0, "ignored.wav", status="failed", output_dir=str(tmp_path)
+            storage,
+            "job-failed",
+            0,
+            "ignored.wav",
+            status="failed",
+            output_dir=str(tmp_path),
         )
         resp = client.get("/api/pipeline/export/chunk/job-failed/0")
         assert resp.status_code == 409
@@ -469,19 +534,28 @@ class TestExportChunkBoundedRange:
         """An evicted chunk row is a GC tombstone -> 410 Gone (the row exists but
         the artifact was intentionally removed and will not return)."""
         self._seed_job_and_chunk(
-            storage, "job-evicted", 0, "evicted.wav", status="evicted", output_dir=str(tmp_path)
+            storage,
+            "job-evicted",
+            0,
+            "evicted.wav",
+            status="evicted",
+            output_dir=str(tmp_path),
         )
         resp = client.get("/api/pipeline/export/chunk/job-evicted/0")
         assert resp.status_code == 410
         assert "evicted" in resp.json()["detail"].lower()
 
-    def test_range_slice_capped_to_env_limit(self, client, storage, tmp_path, monkeypatch):
+    def test_range_slice_capped_to_env_limit(
+        self, client, storage, tmp_path, monkeypatch
+    ):
         """A Range request never streams more than PIPELINE_MAX_RANGE_BYTES per
         request: oversized / open-ended ranges are clamped to a cap-sized prefix
         (206 with the clamped Content-Range)."""
         monkeypatch.setenv("PIPELINE_MAX_RANGE_BYTES", "4")
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-cap", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-cap", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         # Open-ended bytes=0- would stream the whole 18-byte file: clamped to 4.
         resp = client.get(
@@ -506,25 +580,33 @@ class TestExportChunkBoundedRange:
         returns the whole body even when the file exceeds the cap."""
         monkeypatch.setenv("PIPELINE_MAX_RANGE_BYTES", "4")
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-big", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-big", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.get("/api/pipeline/export/chunk/job-big/0")
         assert resp.status_code == 200
         assert resp.content == self._WAV
 
-    def test_relative_wav_path_resolved_against_run_dir(self, client, storage, tmp_path):
+    def test_relative_wav_path_resolved_against_run_dir(
+        self, client, storage, tmp_path
+    ):
         """A relative wav_path (the manifest form) is resolved against the row's
         output_dir before serving."""
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         (run_dir / "chunk_0000.wav").write_bytes(self._WAV)
-        self._seed_job_and_chunk(storage, "job-rel", 0, "chunk_0000.wav", output_dir=str(run_dir))
+        self._seed_job_and_chunk(
+            storage, "job-rel", 0, "chunk_0000.wav", output_dir=str(run_dir)
+        )
 
         resp = client.get("/api/pipeline/export/chunk/job-rel/0")
         assert resp.status_code == 200
         assert resp.content == self._WAV
 
-    def test_derived_run_dir_when_output_dir_null(self, client, storage, tmp_path, monkeypatch):
+    def test_derived_run_dir_when_output_dir_null(
+        self, client, storage, tmp_path, monkeypatch
+    ):
         """With output_dir NULL the run dir is derived as
         RENDER_ROOT/book-{id}/{job_id}/ (phase 1 layout) and the stored
         wav_path is resolved against it."""
@@ -548,7 +630,9 @@ class TestExportChunkBoundedRange:
         run_dir.mkdir()
         outside = tmp_path / "outside.wav"
         outside.write_bytes(self._WAV)
-        self._seed_job_and_chunk(storage, "job-trav", 0, "../../outside.wav", output_dir=str(run_dir))
+        self._seed_job_and_chunk(
+            storage, "job-trav", 0, "../../outside.wav", output_dir=str(run_dir)
+        )
         self._seed_job_and_chunk(
             storage, "job-trav-abs", 1, str(outside), output_dir=str(run_dir)
         )
@@ -564,7 +648,9 @@ class TestExportChunkBoundedRange:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         wav_path = str(run_dir / "chunk_0000.wav")  # never created
-        self._seed_job_and_chunk(storage, "job-gone", 0, wav_path, output_dir=str(run_dir))
+        self._seed_job_and_chunk(
+            storage, "job-gone", 0, wav_path, output_dir=str(run_dir)
+        )
 
         resp = client.get("/api/pipeline/export/chunk/job-gone/0")
         assert resp.status_code == 404
@@ -574,7 +660,9 @@ class TestExportChunkBoundedRange:
         """HEAD is served trivially (Starlette auto-adds HEAD to GET routes and
         FileResponse sends headers only)."""
         wav_path = self._write_chunk(tmp_path)
-        self._seed_job_and_chunk(storage, "job-head", 0, wav_path, output_dir=str(tmp_path))
+        self._seed_job_and_chunk(
+            storage, "job-head", 0, wav_path, output_dir=str(tmp_path)
+        )
 
         resp = client.head("/api/pipeline/export/chunk/job-head/0")
         assert resp.status_code == 200
@@ -588,7 +676,9 @@ class TestExportChunkBoundedRange:
 # ---------------------------------------------------------------------------
 
 
-def _make_wav(data: bytes, sample_rate: int = 16000, channels: int = 1, bits: int = 16) -> bytes:
+def _make_wav(
+    data: bytes, sample_rate: int = 16000, channels: int = 1, bits: int = 16
+) -> bytes:
     """Build a minimal 44-byte-header PCM WAV carrying *data* as its payload.
 
     The synthesized whole-book body for concatenated chunks is byte-identical
@@ -684,8 +774,12 @@ class TestExportAudioWholeBook:
         m4b = out / "audiobook.m4b"
         m4b.write_bytes(b"M4B-DATA-0123456789")
         self._seed_job(
-            storage, "job-art", mode="batch", status="completed",
-            output_dir=str(out), artifact=str(m4b),
+            storage,
+            "job-art",
+            mode="batch",
+            status="completed",
+            output_dir=str(out),
+            artifact=str(m4b),
         )
 
         resp = client.get("/api/pipeline/export/audio/job-art")
@@ -702,8 +796,12 @@ class TestExportAudioWholeBook:
         m4b = out / "audiobook.m4b"
         m4b.write_bytes(b"M4B-DATA-0123456789")
         self._seed_job(
-            storage, "job-art-range", mode="batch", status="completed",
-            output_dir=str(out), artifact=str(m4b),
+            storage,
+            "job-art-range",
+            mode="batch",
+            status="completed",
+            output_dir=str(out),
+            artifact=str(m4b),
         )
 
         resp = client.get(
@@ -720,8 +818,12 @@ class TestExportAudioWholeBook:
         mp3 = out / "audiobook.mp3"
         mp3.write_bytes(b"MP3-FAKE")
         self._seed_job(
-            storage, "job-mp3", mode="batch", status="completed",
-            output_dir=str(out), artifact=str(mp3),
+            storage,
+            "job-mp3",
+            mode="batch",
+            status="completed",
+            output_dir=str(out),
+            artifact=str(mp3),
         )
 
         resp = client.get("/api/pipeline/export/audio/job-mp3")
@@ -736,8 +838,12 @@ class TestExportAudioWholeBook:
         m4b = out / "audiobook.m4b"
         m4b.write_bytes(b"M4B-DATA-0123456789")
         self._seed_job(
-            storage, "job-art-head", mode="batch", status="completed",
-            output_dir=str(out), artifact=str(m4b),
+            storage,
+            "job-art-head",
+            mode="batch",
+            status="completed",
+            output_dir=str(out),
+            artifact=str(m4b),
         )
 
         resp = client.head("/api/pipeline/export/audio/job-art-head")
@@ -753,8 +859,12 @@ class TestExportAudioWholeBook:
         out.mkdir()
         missing = out / "audiobook.m4b"  # never created
         self._seed_job(
-            storage, "job-art-gone", mode="batch", status="completed",
-            output_dir=str(out), artifact=str(missing),
+            storage,
+            "job-art-gone",
+            mode="batch",
+            status="completed",
+            output_dir=str(out),
+            artifact=str(missing),
         )
 
         resp = client.get("/api/pipeline/export/audio/job-art-gone")
@@ -929,7 +1039,9 @@ class TestExportAudioWholeBook:
         assert resp.headers["content-type"] == "audio/wav"
         assert resp.content == b""
 
-    def test_batch_mode_whole_book_from_dir_enumeration(self, client, storage, tmp_path):
+    def test_batch_mode_whole_book_from_dir_enumeration(
+        self, client, storage, tmp_path
+    ):
         """Batch mode has no chunk rows (by contract): the whole-book WAV is
         synthesized from the sorted *.wav files in the run dir."""
         run_dir = tmp_path / "run"
@@ -937,8 +1049,12 @@ class TestExportAudioWholeBook:
         (run_dir / "temp_batch_0.wav").write_bytes(_make_wav(b"AAAA"))
         (run_dir / "temp_batch_1.wav").write_bytes(_make_wav(b"BBBB"))
         self._seed_job(
-            storage, "job-batch", mode="batch", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-batch",
+            mode="batch",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
 
         resp = client.get("/api/pipeline/export/audio/job-batch")
@@ -955,8 +1071,12 @@ class TestExportAudioWholeBook:
                 _make_wav(str(index).encode())
             )
         self._seed_job(
-            storage, "job-batch-natural", mode="batch", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-batch-natural",
+            mode="batch",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
 
         resp = client.get("/api/pipeline/export/audio/job-batch-natural")
@@ -968,8 +1088,12 @@ class TestExportAudioWholeBook:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         self._seed_job(
-            storage, "job-empty", mode="batch", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-empty",
+            mode="batch",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
 
         resp = client.get("/api/pipeline/export/audio/job-empty")
@@ -983,8 +1107,12 @@ class TestExportAudioWholeBook:
         chunk0 = run_dir / "chunk_0000.wav"
         chunk0.write_bytes(_make_wav(b"0123456789"))
         self._seed_job(
-            storage, "job-evict", mode="individual", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-evict",
+            mode="individual",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
         self._seed_chunk(storage, "job-evict", 0, str(chunk0))
         self._seed_chunk(storage, "job-evict", 1, "gone.wav", status="evicted")
@@ -1000,8 +1128,12 @@ class TestExportAudioWholeBook:
         chunk0 = run_dir / "chunk_0000.wav"
         chunk0.write_bytes(_make_wav(b"0123456789"))
         self._seed_job(
-            storage, "job-pend", mode="individual", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-pend",
+            mode="individual",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
         self._seed_chunk(storage, "job-pend", 0, str(chunk0))
         self._seed_chunk(storage, "job-pend", 1, "ignored.wav", status="pending")
@@ -1016,8 +1148,12 @@ class TestExportAudioWholeBook:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         self._seed_job(
-            storage, "job-gone", mode="individual", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-gone",
+            mode="individual",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
         # Row says done; the file was never written.
         self._seed_chunk(storage, "job-gone", 0, str(run_dir / "chunk_0000.wav"))
@@ -1031,15 +1167,21 @@ class TestExportAudioWholeBook:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         self._seed_job(
-            storage, "job-norows", mode="individual", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-norows",
+            mode="individual",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
 
         resp = client.get("/api/pipeline/export/audio/job-norows")
         assert resp.status_code == 404
         assert resp.json()["detail"] == "No audio chunks found for job"
 
-    def test_derived_run_dir_when_output_dir_null(self, client, storage, tmp_path, monkeypatch):
+    def test_derived_run_dir_when_output_dir_null(
+        self, client, storage, tmp_path, monkeypatch
+    ):
         """With output_dir NULL the run dir is derived as
         RENDER_ROOT/book-{id}/{job_id}/ and chunk wav_paths resolve against it."""
         render_root = tmp_path / "render_root"
@@ -1063,8 +1205,12 @@ class TestExportAudioWholeBook:
         outside = tmp_path / "outside.wav"
         outside.write_bytes(_make_wav(b"0123456789"))
         self._seed_job(
-            storage, "job-trav", mode="individual", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-trav",
+            mode="individual",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
         self._seed_chunk(storage, "job-trav", 0, "../../outside.wav")
 
@@ -1083,8 +1229,12 @@ class TestExportAudioWholeBook:
         chunk1 = run_dir / "chunk_0001.wav"
         chunk1.write_bytes(_make_wav(b"abcdefghij", sample_rate=8000))
         self._seed_job(
-            storage, "job-fmt", mode="individual", status="completed",
-            output_dir=str(run_dir), artifact=str(run_dir),
+            storage,
+            "job-fmt",
+            mode="individual",
+            status="completed",
+            output_dir=str(run_dir),
+            artifact=str(run_dir),
         )
         self._seed_chunk(storage, "job-fmt", 0, str(chunk0))
         self._seed_chunk(storage, "job-fmt", 1, str(chunk1))
@@ -1124,8 +1274,7 @@ def _seed_job_row(
 def _seed_chunk_row(storage, job_id, idx, wav_path, status="done"):
     """Insert a render_chunk row."""
     storage.execute_insert(
-        "INSERT INTO render_chunk (job_id, idx, status, wav_path) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO render_chunk (job_id, idx, status, wav_path) VALUES (?, ?, ?, ?)",
         (job_id, idx, status, wav_path),
     )
 
@@ -1178,7 +1327,7 @@ def _wav_duration_ms(path):
     byte_rate = struct.unpack("<I", header[28:32])[0]
     data_size = struct.unpack("<I", header[40:44])[0]
     assert byte_rate > 0
-    return int(round(data_size / byte_rate * 1000))
+    return round(data_size / byte_rate * 1000)
 
 
 def _ffprobe_json(*args):
@@ -1187,6 +1336,7 @@ def _ffprobe_json(*args):
         ["ffprobe", "-v", "error", "-of", "json", *args],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -1235,7 +1385,9 @@ class TestExportM4B:
             "/api/pipeline/export/m4b", data={"job_id": job_id, **fields}
         )
 
-    def _post_with_cover(self, client, job_id, cover_bytes, content_type="image/jpeg", **fields):
+    def _post_with_cover(
+        self, client, job_id, cover_bytes, content_type="image/jpeg", **fields
+    ):
         return client.post(
             "/api/pipeline/export/m4b",
             data={"job_id": job_id, **fields},
@@ -1255,9 +1407,15 @@ class TestExportM4B:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         resp = self._export(
-            client, storage, "job-ok", run_dir,
-            title="The Title", author="The Author", narrator="The Narrator",
-            year="2024", description="The description.",
+            client,
+            storage,
+            "job-ok",
+            run_dir,
+            title="The Title",
+            author="The Author",
+            narrator="The Narrator",
+            year="2024",
+            description="The description.",
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -1274,7 +1432,9 @@ class TestExportM4B:
         probe = _ffprobe_json("-show_chapters", body["output_path"])
         assert len(probe["chapters"]) == 2
 
-    def test_pauses_truthful_fallback_when_no_paused_artifact(self, client, storage, tmp_path):
+    def test_pauses_truthful_fallback_when_no_paused_artifact(
+        self, client, storage, tmp_path
+    ):
         """Without a canonical paused artifact (a render that completed without
         assembly, e.g. a fake engine) the export falls back to the per-chunk
         concat so legacy rows still export, and the tri-state truthfully reports
@@ -1297,7 +1457,9 @@ class TestExportM4B:
         assert "resolved_pause_same_speaker_ms" in body
         assert "pause_override_count" in body
 
-    def test_paused_artifact_used_truthful_and_duration_matches(self, client, storage, tmp_path):
+    def test_paused_artifact_used_truthful_and_duration_matches(
+        self, client, storage, tmp_path
+    ):
         """When the canonical paused artifact is present it is the export source:
         pauses_applied=true / pauses_state='applied' with a concise message, and
         the decoded m4b duration equals the paused artifact duration (not the
@@ -1319,25 +1481,23 @@ class TestExportM4B:
         assert "pauses_message" in body
         paused_ms = _wav_duration_ms(str(paused_path))
         # m4b duration == paused artifact duration (within encoder tolerance).
-        m4b_ms = int(
-            round(
-                float(
-                    _ffprobe_json("-show_entries", "format=duration", body["output_path"])
-                    ["format"]["duration"]
-                )
-                * 1000
+        m4b_ms = round(
+            float(
+                _ffprobe_json("-show_entries", "format=duration", body["output_path"])[
+                    "format"
+                ]["duration"]
             )
+            * 1000
         )
         assert m4b_ms == pytest.approx(paused_ms, abs=250), (m4b_ms, paused_ms)
         # The mp3 derives from the same paused source.
-        mp3_ms = int(
-            round(
-                float(
-                    _ffprobe_json("-show_entries", "format=duration", body["mp3_path"])
-                    ["format"]["duration"]
-                )
-                * 1000
+        mp3_ms = round(
+            float(
+                _ffprobe_json("-show_entries", "format=duration", body["mp3_path"])[
+                    "format"
+                ]["duration"]
             )
+            * 1000
         )
         assert mp3_ms == pytest.approx(paused_ms, abs=250), (mp3_ms, paused_ms)
         # The Audacity bundle carries the paused source, never the unpaused chunks.
@@ -1363,14 +1523,13 @@ class TestExportM4B:
         body = resp.json()
         assert body["pauses_applied"] is True
         paused_ms = _wav_duration_ms(str(paused_path))
-        m4b_ms = int(
-            round(
-                float(
-                    _ffprobe_json("-show_entries", "format=duration", body["output_path"])
-                    ["format"]["duration"]
-                )
-                * 1000
+        m4b_ms = round(
+            float(
+                _ffprobe_json("-show_entries", "format=duration", body["output_path"])[
+                    "format"
+                ]["duration"]
             )
+            * 1000
         )
         assert m4b_ms == pytest.approx(paused_ms, abs=250), (m4b_ms, paused_ms)
         with zipfile.ZipFile(body["audacity_path"]) as zf:
@@ -1392,14 +1551,13 @@ class TestExportM4B:
         assert body["pauses_applied"] is False
         assert body["pauses_state"] == "failed"
         # The unpaused per-chunk concat (2 x 0.5 s = 1.0 s) was still exported.
-        m4b_ms = int(
-            round(
-                float(
-                    _ffprobe_json("-show_entries", "format=duration", body["output_path"])
-                    ["format"]["duration"]
-                )
-                * 1000
+        m4b_ms = round(
+            float(
+                _ffprobe_json("-show_entries", "format=duration", body["output_path"])[
+                    "format"
+                ]["duration"]
             )
+            * 1000
         )
         assert m4b_ms == pytest.approx(1000, abs=250), m4b_ms
 
@@ -1441,7 +1599,6 @@ class TestExportM4B:
             "/api/pipeline/export/audio/job-srv", headers={"Range": "bytes=0-9"}
         )
         assert rng.status_code == 206
-
 
     def test_output_artifact_path_updated_and_servable(self, client, storage, tmp_path):
         """The render_job row's output_artifact_path is updated to the m4b and
@@ -1495,8 +1652,10 @@ class TestExportM4B:
         assert expected_total == 1000
         assert chapters[1]["END"] == str(expected_total)
         # Never exceeds the real muxed stream duration either.
-        m4b_probe = _ffprobe_json("-show_entries", "format=duration", str(run_dir / "audiobook.m4b"))
-        m4b_duration_ms = int(round(float(m4b_probe["format"]["duration"]) * 1000))
+        m4b_probe = _ffprobe_json(
+            "-show_entries", "format=duration", str(run_dir / "audiobook.m4b")
+        )
+        m4b_duration_ms = round(float(m4b_probe["format"]["duration"]) * 1000)
         assert int(chapters[1]["END"]) <= m4b_duration_ms
 
     def test_ffmetadata_global_tags(self, client, storage, tmp_path):
@@ -1506,9 +1665,15 @@ class TestExportM4B:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         resp = self._export(
-            client, storage, "job-tags", run_dir,
-            title="The Title", author="The Author", narrator="The Narrator",
-            year="2024", description="The description.",
+            client,
+            storage,
+            "job-tags",
+            run_dir,
+            title="The Title",
+            author="The Author",
+            narrator="The Narrator",
+            year="2024",
+            description="The description.",
         )
         assert resp.status_code == 200, resp.text
         _, _, tags = _parse_ffmetadata(run_dir / "audiobook.ffmetadata")
@@ -1519,7 +1684,8 @@ class TestExportM4B:
         assert tags["comment"] == "The description."
 
         probe = _ffprobe_json(
-            "-show_entries", "format_tags=title,artist,album_artist,date,comment",
+            "-show_entries",
+            "format_tags=title,artist,album_artist,date,comment",
             str(run_dir / "audiobook.m4b"),
         )
         fmt_tags = probe["format"]["tags"]
@@ -1538,18 +1704,29 @@ class TestExportM4B:
         nasty = "Semi=Colon;Hash#Back\\Slash"
         newline = "Line1\nLine2"
         resp = self._export(
-            client, storage, "job-esc", run_dir, title=nasty, description=newline,
+            client,
+            storage,
+            "job-esc",
+            run_dir,
+            title=nasty,
+            description=newline,
         )
         assert resp.status_code == 200, resp.text
         _, _, tags = _parse_ffmetadata(run_dir / "audiobook.ffmetadata")
         # Same escape order as the generator: backslash first, then the
         # line-structure specials (= ; #).
-        expected = nasty.replace("\\", "\\\\").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#")
+        expected = (
+            nasty.replace("\\", "\\\\")
+            .replace("=", "\\=")
+            .replace(";", "\\;")
+            .replace("#", "\\#")
+        )
         assert tags["title"] == expected
         assert "\n" not in tags["comment"]  # newline stripped, not written
 
         probe = _ffprobe_json(
-            "-show_entries", "format_tags=title,comment",
+            "-show_entries",
+            "format_tags=title,comment",
             str(run_dir / "audiobook.m4b"),
         )
         fmt_tags = probe["format"]["tags"]
@@ -1569,7 +1746,9 @@ class TestExportM4B:
         probe = _ffprobe_json("-show_entries", "stream=codec_name", str(mp3_path))
         assert probe["streams"][0]["codec_name"] == "mp3"
 
-    def test_mp3_degraded_when_encoder_absent(self, client, storage, tmp_path, monkeypatch):
+    def test_mp3_degraded_when_encoder_absent(
+        self, client, storage, tmp_path, monkeypatch
+    ):
         """When libmp3lame is not available the endpoint degrades to M4B-only:
         mp3 flag False, no mp3 file, no mp3_path, and a clear message — while
         the m4b export still succeeds (DD open item #8)."""
@@ -1643,9 +1822,22 @@ class TestExportM4B:
         """A tiny real JPEG generated once per test via ffmpeg."""
         path = tmp_path / "cover.jpg"
         result = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
-             "-i", "color=c=red:s=32x32", "-frames:v", "1", str(path)],
-            capture_output=True, text=True,
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x32",
+                "-frames:v",
+                "1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert result.returncode == 0, result.stderr
         return path.read_bytes()
@@ -1659,7 +1851,9 @@ class TestExportM4B:
         resp = self._post_with_cover(client, "job-cover", cover_jpg, title="T")
         assert resp.status_code == 200, resp.text
         probe = _ffprobe_json(
-            "-show_streams", "-select_streams", "v",
+            "-show_streams",
+            "-select_streams",
+            "v",
             str(run_dir / "audiobook.m4b"),
         )
         assert len(probe["streams"]) == 1
@@ -1682,7 +1876,11 @@ class TestExportM4B:
         run_dir.mkdir()
         _seed_two_chunk_job(storage, "job-textcover", run_dir)
         resp = self._post_with_cover(
-            client, "job-textcover", b"not an image", content_type="text/plain", title="T"
+            client,
+            "job-textcover",
+            b"not an image",
+            content_type="text/plain",
+            title="T",
         )
         assert resp.status_code == 400
 
@@ -1713,8 +1911,10 @@ class TestExportM4B:
         """Completed row whose output dir does not exist -> 404 (download_render
         precedent)."""
         _seed_job_row(
-            storage, "job-nodir",
-            output_dir=str(tmp_path / "nowhere"), artifact=str(tmp_path / "nowhere"),
+            storage,
+            "job-nodir",
+            output_dir=str(tmp_path / "nowhere"),
+            artifact=str(tmp_path / "nowhere"),
         )
         resp = self._post(client, "job-nodir")
         assert resp.status_code == 404
@@ -1744,7 +1944,9 @@ class TestExportM4B:
         'No audio chunks' precedent)."""
         run_dir = tmp_path / "run"
         run_dir.mkdir()
-        _seed_job_row(storage, "job-0chunk", output_dir=str(run_dir), artifact=str(run_dir))
+        _seed_job_row(
+            storage, "job-0chunk", output_dir=str(run_dir), artifact=str(run_dir)
+        )
         resp = self._post(client, "job-0chunk")
         assert resp.status_code == 400
         assert "no audio chunks" in resp.json()["detail"].lower()
@@ -1758,7 +1960,9 @@ class TestExportM4B:
         chunk0.write_bytes(_make_wav(b"0123456789", sample_rate=16000))
         chunk1 = run_dir / "chunk_0001.wav"
         chunk1.write_bytes(_make_wav(b"abcdefghij", sample_rate=8000))
-        _seed_job_row(storage, "job-fmt", output_dir=str(run_dir), artifact=str(run_dir))
+        _seed_job_row(
+            storage, "job-fmt", output_dir=str(run_dir), artifact=str(run_dir)
+        )
         _seed_chunk_row(storage, "job-fmt", 0, str(chunk0))
         _seed_chunk_row(storage, "job-fmt", 1, str(chunk1))
         resp = self._post(client, "job-fmt")
@@ -1770,7 +1974,9 @@ class TestExportM4B:
         ffmpeg -> 404 (containment discipline from phases 4-5)."""
         run_dir = tmp_path / "run"
         run_dir.mkdir()
-        _seed_job_row(storage, "job-escape", output_dir=str(run_dir), artifact=str(run_dir))
+        _seed_job_row(
+            storage, "job-escape", output_dir=str(run_dir), artifact=str(run_dir)
+        )
         _seed_chunk_row(storage, "job-escape", 0, str(tmp_path / "evil.wav"))
         resp = self._post(client, "job-escape")
         assert resp.status_code == 404
@@ -1778,7 +1984,9 @@ class TestExportM4B:
     def test_missing_chunk_file_404(self, client, storage, tmp_path):
         run_dir = tmp_path / "run"
         run_dir.mkdir()
-        _seed_job_row(storage, "job-gone", output_dir=str(run_dir), artifact=str(run_dir))
+        _seed_job_row(
+            storage, "job-gone", output_dir=str(run_dir), artifact=str(run_dir)
+        )
         _seed_chunk_row(storage, "job-gone", 0, str(run_dir / "chunk_0000.wav"))
         _seed_chunk_row(storage, "job-gone", 1, str(run_dir / "chunk_0001.wav"))
         resp = self._post(client, "job-gone")

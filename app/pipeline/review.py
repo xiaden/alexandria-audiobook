@@ -28,7 +28,6 @@ from typing import Any
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.ledger import CharacterLedger
 
-
 # ---------------------------------------------------------------------------
 # Confidence thresholds
 # ---------------------------------------------------------------------------

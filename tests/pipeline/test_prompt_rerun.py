@@ -121,25 +121,19 @@ def _assert_conflict(resp, code: str) -> dict:
 
 def test_rerun_requires_confirm(client):
     rid = _save(client)
-    resp = client.post(
-        "/api/pipeline/walks/b1/reruns", json=_rerun(rid, confirm=False)
-    )
+    resp = client.post("/api/pipeline/walks/b1/reruns", json=_rerun(rid, confirm=False))
     assert resp.status_code == 422
     assert "confirm=true" in resp.json()["detail"]
 
 
 def test_rerun_unknown_revision_returns_404(client):
-    resp = client.post(
-        "/api/pipeline/walks/b1/reruns", json=_rerun("missing-revision")
-    )
+    resp = client.post("/api/pipeline/walks/b1/reruns", json=_rerun("missing-revision"))
     assert resp.status_code == 404
 
 
 def test_rerun_unknown_book_returns_404(client):
     rid = _save(client)
-    resp = client.post(
-        "/api/pipeline/walks/nope/reruns", json=_rerun(rid)
-    )
+    resp = client.post("/api/pipeline/walks/nope/reruns", json=_rerun(rid))
     assert resp.status_code == 404
 
 
@@ -284,9 +278,7 @@ def test_dedupe_same_revision_and_scope(client):
 def test_rerun_older_revision_after_later_head_is_allowed(client):
     first = _save(client)
     second = client.post("/api/pipeline/walks/b1/reruns", json=_rerun(first)).json()
-    third = client.post(
-        "/api/pipeline/walks/b1/reruns", json=_rerun(second["run_id"])
-    )
+    third = client.post("/api/pipeline/walks/b1/reruns", json=_rerun(second["run_id"]))
     assert third.status_code == 200
 
     direct_producer = client.post(
@@ -308,8 +300,14 @@ def test_dedupe_differs_across_tasks(client):
     # A rerun of one task does not block a rerun of a different task.
     rid_a = _save(client, task="scene_segmentation")
     rid_b = _save(client, task="span_attribution")
-    assert client.post("/api/pipeline/walks/b1/reruns", json=_rerun(rid_a)).status_code == 200
-    assert client.post("/api/pipeline/walks/b1/reruns", json=_rerun(rid_b)).status_code == 200
+    assert (
+        client.post("/api/pipeline/walks/b1/reruns", json=_rerun(rid_a)).status_code
+        == 200
+    )
+    assert (
+        client.post("/api/pipeline/walks/b1/reruns", json=_rerun(rid_b)).status_code
+        == 200
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +316,7 @@ def test_dedupe_differs_across_tasks(client):
 
 
 def test_rerun_contention_503(client):
-    client, storage = _client()
+    _, storage = _client()
 
     class _ContendingStorage:
         def __init__(self, inner):
@@ -328,7 +326,9 @@ def test_rerun_contention_503(client):
             return getattr(self._inner, name)
 
         def transaction(self):
-            raise ConcurrentTransactionError("BEGIN IMMEDIATE timed out under contention")
+            raise ConcurrentTransactionError(
+                "BEGIN IMMEDIATE timed out under contention"
+            )
 
     # Save the revision against the real storage first so the rerun validates.
     real_client = _make_app(storage)
@@ -336,7 +336,9 @@ def test_rerun_contention_503(client):
 
     app = FastAPI()
     app.include_router(pipeline_api.router)
-    app.dependency_overrides[pipeline_api.get_storage] = lambda: _ContendingStorage(storage)
+    app.dependency_overrides[pipeline_api.get_storage] = lambda: _ContendingStorage(
+        storage
+    )
 
     @app.exception_handler(ConcurrentTransactionError)
     async def _h(request, exc):

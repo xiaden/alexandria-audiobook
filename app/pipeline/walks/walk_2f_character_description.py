@@ -112,7 +112,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 system_prompt_override=prompt,
                 result=result,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(f"Error processing character {character_id}: {e}")
             result["errors"].append({"character_id": character_id, "error": str(e)})
 

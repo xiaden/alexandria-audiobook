@@ -371,9 +371,7 @@ class TestCreateSchemaPauseColumns:
         ).fetchone()[0]
         assert "pause_after_ms IS NULL OR pause_after_ms >= 0" in span_sql
         # existing row migrates with NULL
-        row = conn.execute(
-            "SELECT pause_after_ms FROM span WHERE id='sp1'"
-        ).fetchone()
+        row = conn.execute("SELECT pause_after_ms FROM span WHERE id='sp1'").fetchone()
         assert row == (None,)
         # CHECK rejects negative, accepts 0 and NULL
         conn.execute("UPDATE span SET pause_after_ms = 0 WHERE id='sp1'")
@@ -409,7 +407,9 @@ class TestParityMigrationOnOldSchema:
     without data loss, and a second run must add nothing twice.
     """
 
-    PARITY_TABLES = {"clone_reference", "persona_revision", "prompt_config_revision"}
+    PARITY_TABLES = frozenset(
+        {"clone_reference", "persona_revision", "prompt_config_revision"}
+    )
 
     def _old_schema_db(self, tmp_path: Path, name: str) -> Path:
         """A pre-parity DB: full old schema but without the three parity tables."""
@@ -474,20 +474,14 @@ class TestParityMigrationOnOldSchema:
             "INSERT INTO book (id, series_id, book_number, position, single_speaker)"
             " VALUES ('b1', 's1', 1, 1, 0)"
         )
-        conn.execute(
-            "INSERT INTO voice_config (id, name) VALUES ('v1', 'Voice')"
-        )
+        conn.execute("INSERT INTO voice_config (id, name) VALUES ('v1', 'Voice')")
         conn.commit()
         conn.close()
 
         conn = sqlite3.connect(str(db_path))
         create_schema(conn)
-        row = conn.execute(
-            "SELECT id FROM book WHERE id='b1'"
-        ).fetchone()
-        voice = conn.execute(
-            "SELECT id FROM voice_config WHERE id='v1'"
-        ).fetchone()
+        row = conn.execute("SELECT id FROM book WHERE id='b1'").fetchone()
+        voice = conn.execute("SELECT id FROM voice_config WHERE id='v1'").fetchone()
         conn.close()
         assert row == ("b1",)
         assert voice == ("v1",)

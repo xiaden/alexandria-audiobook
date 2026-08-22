@@ -1,18 +1,18 @@
 """Tests for Walk 2f character description generation."""
 
 import json
-import pytest
 from unittest.mock import Mock
+
+import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.walk_2f_character_description import (
-    execute,
     _build_description_prompt,
     _parse_llm_response,
     _sample_spans,
+    execute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

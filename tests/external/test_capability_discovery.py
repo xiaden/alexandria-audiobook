@@ -13,8 +13,6 @@ Gate: ``/tmp/qa-venv/bin/pytest -q tests/external/`` — deterministic green.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from tests.external.capability_matrix import (

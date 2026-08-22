@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import stat
-import zipfile
-import importlib.util
 import sys
+import zipfile
 from pathlib import Path
 
-from fastapi import HTTPException
 import pytest
+from fastapi import HTTPException
 
 # Load app-local bare-name modules before importing app.app, matching the
 # top-level app test harness used by the rest of this test directory.
@@ -44,7 +44,10 @@ def test_rejects_path_traversal_without_writing_outside(tmp_path, member_name):
         archive.writestr(member_name, "owned")
     archive_data.seek(0)
 
-    with zipfile.ZipFile(archive_data) as archive, pytest.raises(HTTPException) as exc_info:
+    with (
+        zipfile.ZipFile(archive_data) as archive,
+        pytest.raises(HTTPException) as exc_info,
+    ):
         _safe_extract_zip(archive, destination)
 
     assert exc_info.value.status_code == 400
@@ -77,7 +80,10 @@ def test_rejects_unsafe_member_before_writing_safe_members(tmp_path):
         archive.writestr("../outside.txt", "owned")
     archive_data.seek(0)
 
-    with zipfile.ZipFile(archive_data) as archive, pytest.raises(HTTPException) as exc_info:
+    with (
+        zipfile.ZipFile(archive_data) as archive,
+        pytest.raises(HTTPException) as exc_info,
+    ):
         _safe_extract_zip(archive, destination)
 
     assert exc_info.value.status_code == 400
@@ -92,9 +98,11 @@ def test_rejects_member_name_collision_as_bad_archive(tmp_path):
         archive.writestr("a/nested.txt", "conflict")
     archive_data.seek(0)
 
-    with zipfile.ZipFile(archive_data) as archive:
-        with pytest.raises(HTTPException) as exc_info:
-            _safe_extract_zip(archive, tmp_path / "dataset")
+    with (
+        zipfile.ZipFile(archive_data) as archive,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        _safe_extract_zip(archive, tmp_path / "dataset")
 
     assert exc_info.value.status_code == 400
 
@@ -107,8 +115,10 @@ def test_rejects_symlink_members(tmp_path):
         archive.writestr(member, "outside")
     archive_data.seek(0)
 
-    with zipfile.ZipFile(archive_data) as archive:
-        with pytest.raises(HTTPException) as exc_info:
-            _safe_extract_zip(archive, tmp_path / "dataset")
+    with (
+        zipfile.ZipFile(archive_data) as archive,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        _safe_extract_zip(archive, tmp_path / "dataset")
 
     assert exc_info.value.status_code == 400

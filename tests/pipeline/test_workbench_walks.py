@@ -21,7 +21,6 @@ from app.pipeline.walks.walk_2b_character_discovery import execute as execute_2b
 from app.pipeline.walks.walk_2c_alias_resolution import execute as execute_2c
 from app.pipeline.walks.walk_2d_scene_presence import execute as execute_2d
 
-
 # ---------------------------------------------------------------------------
 # Fixtures & helpers
 # ---------------------------------------------------------------------------

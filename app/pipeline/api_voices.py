@@ -15,9 +15,18 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from typing import Literal, Optional
+from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -54,18 +63,18 @@ VoiceType = Literal["custom", "clone", "builtin_lora", "lora", "design"]
 class VoiceCreateRequest(BaseModel):
     """Request body for POST /api/pipeline/voices."""
 
-    id: Optional[str] = None
+    id: str | None = None
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     type: VoiceType = "custom"
-    voice: Optional[str] = None
-    character_style: Optional[str] = None
-    seed: Optional[str] = "-1"
-    ref_audio: Optional[str] = None
-    ref_text: Optional[str] = None
-    adapter_id: Optional[str] = None
-    adapter_path: Optional[str] = None
-    alias_of: Optional[str] = None
+    voice: str | None = None
+    character_style: str | None = None
+    seed: str | None = "-1"
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    adapter_id: str | None = None
+    adapter_path: str | None = None
+    alias_of: str | None = None
 
 
 class VoiceUpdateRequest(BaseModel):
@@ -76,17 +85,17 @@ class VoiceUpdateRequest(BaseModel):
     "field not sent" from "field sent as None".
     """
 
-    name: Optional[str] = None
-    description: Optional[str] = None
-    type: Optional[VoiceType] = None
-    voice: Optional[str] = None
-    character_style: Optional[str] = None
-    seed: Optional[str] = None
-    ref_audio: Optional[str] = None
-    ref_text: Optional[str] = None
-    adapter_id: Optional[str] = None
-    adapter_path: Optional[str] = None
-    alias_of: Optional[str] = None
+    name: str | None = None
+    description: str | None = None
+    type: VoiceType | None = None
+    voice: str | None = None
+    character_style: str | None = None
+    seed: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    adapter_id: str | None = None
+    adapter_path: str | None = None
+    alias_of: str | None = None
 
 
 class VoicePreviewRequest(BaseModel):
@@ -117,7 +126,7 @@ class CloneReferenceDTO(BaseModel):
     duration_ms: int
     sha256: str
     created_ms: int
-    deleted_ms: Optional[int] = None
+    deleted_ms: int | None = None
 
 
 class CloneReferenceUploadRequest(BaseModel):
@@ -144,17 +153,17 @@ class VoiceConfigDTO(BaseModel):
     """Voice-config DTO returned alongside a created clone reference."""
 
     id: str
-    name: Optional[str] = None
-    description: Optional[str] = None
-    type: Optional[str] = None
-    voice: Optional[str] = None
-    character_style: Optional[str] = None
-    seed: Optional[str] = None
-    ref_audio: Optional[str] = None
-    ref_text: Optional[str] = None
-    adapter_id: Optional[str] = None
-    adapter_path: Optional[str] = None
-    alias_of: Optional[str] = None
+    name: str | None = None
+    description: str | None = None
+    type: str | None = None
+    voice: str | None = None
+    character_style: str | None = None
+    seed: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    adapter_id: str | None = None
+    adapter_path: str | None = None
+    alias_of: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +478,7 @@ async def preview_voice(
             voice_config=voice_config,
             output_path=output_path,
         )
-    except Exception as exc:  # noqa: BLE001 — surface TTS errors
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"TTS generation failed: {exc}",

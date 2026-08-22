@@ -22,23 +22,26 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-# Import sub-routers
-from app.pipeline.api_onboard import router as _onboard_router
-from app.pipeline.api_walks import router as _walks_router
-from app.pipeline.api_operations import router as _operations_router
-from app.pipeline.api_review import router as _review_router
-from app.pipeline.api_export import router as _export_router
 from app.pipeline.api_characters import router as _characters_router
-from app.pipeline.api_voices import router as _voices_router
+from app.pipeline.api_export import get_tts_engine  # noqa: F401
+from app.pipeline.api_export import router as _export_router
 
 # Re-export dependencies for backward compatibility with tests
-from app.pipeline.api_onboard import get_storage  # noqa: F401
-from app.pipeline.api_onboard import extract_epub_text, populate_spine  # noqa: F401
-from app.pipeline.api_walks import get_walk_runner, get_character_ledger  # noqa: F401
-from app.pipeline.api_operations import get_operation_executor  # noqa: F401
-from app.pipeline.api_review import get_review_manager  # noqa: F401
-from app.pipeline.api_export import get_tts_engine  # noqa: F401
+from app.pipeline.api_onboard import (  # noqa: F401
+    extract_epub_text,
+    get_storage,
+    populate_spine,
+)
 
+# Import sub-routers
+from app.pipeline.api_onboard import router as _onboard_router
+from app.pipeline.api_operations import get_operation_executor  # noqa: F401
+from app.pipeline.api_operations import router as _operations_router
+from app.pipeline.api_review import get_review_manager  # noqa: F401
+from app.pipeline.api_review import router as _review_router
+from app.pipeline.api_voices import router as _voices_router
+from app.pipeline.api_walks import get_character_ledger, get_walk_runner  # noqa: F401
+from app.pipeline.api_walks import router as _walks_router
 
 # ---------------------------------------------------------------------------
 # Combined router

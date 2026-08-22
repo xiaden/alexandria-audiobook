@@ -1,17 +1,17 @@
 """Tests for Walk 2d scene presence refinement."""
 
 import json
-import pytest
 from unittest.mock import Mock
+
+import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.walk_2d_scene_presence import (
-    execute,
     _build_prompt,
     _parse_llm_response,
+    execute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
