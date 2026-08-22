@@ -77,18 +77,15 @@ def export_annotated_script(book_id: str, storage: PipelineStorage) -> list[dict
               LEFT JOIN character_span AS cs
                   ON span.id = cs.span_id
                  AND cs.relation_type = 'speaker'
-                 AND cs.rowid = (
-                     SELECT MIN(cs_existing.rowid)
-                     FROM character_span AS cs_existing
-                     WHERE cs_existing.span_id = span.id
-                       AND cs_existing.relation_type = 'speaker'
-                 )
-           AND cs.rowid = (
-               SELECT MIN(existing.rowid)
-               FROM character_span AS existing
-               WHERE existing.span_id = span.id
-                 AND existing.relation_type = 'speaker'
-           )
+                  AND cs.rowid = (
+                      SELECT cs_existing.rowid
+                      FROM character_span AS cs_existing
+                      WHERE cs_existing.span_id = span.id
+                        AND cs_existing.relation_type = 'speaker'
+                      ORDER BY cs_existing.human_override DESC,
+                               cs_existing.rowid DESC
+                      LIMIT 1
+                  )
         LEFT JOIN character AS c
             ON cs.character_id = c.id
         WHERE book.id = ?

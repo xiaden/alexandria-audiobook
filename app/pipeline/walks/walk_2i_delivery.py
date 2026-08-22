@@ -197,8 +197,9 @@ def _find_speaker_character(
         SELECT cs.character_id
         FROM character_span cs
         WHERE cs.span_id = ?
-          AND cs.relation_type = 'speaker'
-        LIMIT 1
+           AND cs.relation_type = 'speaker'
+         ORDER BY cs.human_override DESC, cs.rowid DESC
+         LIMIT 1
         """,
         (span_id,),
     )
@@ -207,9 +208,7 @@ def _find_speaker_character(
     return None
 
 
-def _get_character_description(
-    character_id: str, storage: PipelineStorage
-) -> str:
+def _get_character_description(character_id: str, storage: PipelineStorage) -> str:
     """Retrieve the character description from character_metadata.
 
     Returns the description string, or empty string if not found.
@@ -223,9 +222,7 @@ def _get_character_description(
     return ""
 
 
-def _get_character_voice_profile(
-    character_id: str, storage: PipelineStorage
-) -> str:
+def _get_character_voice_profile(character_id: str, storage: PipelineStorage) -> str:
     """Retrieve the character voice profile from character_metadata.
 
     Returns the voice profile JSON string, or empty string if not found.
@@ -376,9 +373,7 @@ def _process_span(
         result["instructs_for_review"] += 1
 
 
-def _get_prior_instruct(
-    span_id: str, storage: PipelineStorage
-) -> str | None:
+def _get_prior_instruct(span_id: str, storage: PipelineStorage) -> str | None:
     """Return the span's current instruct value, or None if absent.
 
     Read OUTSIDE the savepoint so ``prior_value`` reflects the pre-write
@@ -424,9 +419,7 @@ def _insert_review_item(
     )
 
 
-def _get_character_name(
-    character_id: str, storage: PipelineStorage
-) -> str:
+def _get_character_name(character_id: str, storage: PipelineStorage) -> str:
     """Retrieve the character name."""
     rows = storage.execute_query(
         "SELECT name FROM character WHERE id = ?",
@@ -507,9 +500,7 @@ def _parse_llm_response(response_text: str) -> dict:
     """
     instruct_data = extract_json_from_llm_response(response_text, expected_type="dict")
     if instruct_data is None:
-        logger.error(
-            f"Failed to parse LLM response as JSON: {response_text[:200]}"
-        )
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
         return {}
 
     if not isinstance(instruct_data, dict):
