@@ -185,14 +185,18 @@ class TestRunWalk:
 class TestWalkStatusTransitions:
     def test_initial_status_is_pending(self, runner):
         """Walk status is 'pending' before any run."""
-        assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "pending"
+        assert (
+            runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "pending"
+        )
 
     def test_status_running_during_execution(self, runner):
         """Status is 'running' while walk is executing."""
         captured_status = []
 
         def execute_fn(book_id, storage, config):
-            captured_status.append(runner.get_walk_status(book_id, "walk_2a_scene_segmentation"))
+            captured_status.append(
+                runner.get_walk_status(book_id, "walk_2a_scene_segmentation")
+            )
             return {"status": "completed"}
 
         mock_module = _make_mock_walk_module(execute_fn)
@@ -208,16 +212,23 @@ class TestWalkStatusTransitions:
             patch.object(WalkRunner, "_run_verification", return_value=True),
         ):
             runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
-        assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "completed"
+        assert (
+            runner.get_walk_status("book-1", "walk_2a_scene_segmentation")
+            == "completed"
+        )
 
     def test_status_failed_after_exception(self, runner):
         """Status is 'failed' when execute() raises an exception."""
-        mock_module = _make_mock_walk_module(MagicMock(side_effect=RuntimeError("boom")))
+        mock_module = _make_mock_walk_module(
+            MagicMock(side_effect=RuntimeError("boom"))
+        )
         with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
             result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
         assert result["status"] == "failed"
         assert "boom" in result["error"]
-        assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
+        assert (
+            runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
+        )
 
     def test_unknown_walk_status_is_pending(self, runner):
         """get_walk_status returns 'pending' for unknown walk name."""
@@ -225,7 +236,10 @@ class TestWalkStatusTransitions:
 
     def test_unknown_book_status_is_pending(self, runner):
         """get_walk_status returns 'pending' for unknown book_id."""
-        assert runner.get_walk_status("unknown-book", "walk_2a_scene_segmentation") == "pending"
+        assert (
+            runner.get_walk_status("unknown-book", "walk_2a_scene_segmentation")
+            == "pending"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -316,15 +330,15 @@ class TestVerification:
             result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
         assert result["status"] == "failed"
         assert "Verification failed" in result["error"]
-        assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
+        assert (
+            runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
+        )
 
     def test_verification_failure_marks_failed(self, storage):
         """If verification fails, status is 'failed' even though execute() succeeded."""
         runner = WalkRunner(storage)
         # Set up chapters but no chapter_scene edges (verification will fail)
-        storage.execute_insert(
-            "INSERT INTO series (id) VALUES (?)", ("series-1",)
-        )
+        storage.execute_insert("INSERT INTO series (id) VALUES (?)", ("series-1",))
         storage.execute_insert(
             "INSERT INTO book (id, series_id, book_number, version, position) VALUES (?, ?, 1, 1, 1)",
             ("book-1", "series-1"),
@@ -341,7 +355,9 @@ class TestVerification:
             result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
         assert result["status"] == "failed"
         assert "Verification failed" in result["error"]
-        assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
+        assert (
+            runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
+        )
 
     def test_verification_passes_with_scenes(self, storage):
         """Verification passes when a non-placeholder scene exists."""
@@ -367,7 +383,10 @@ class TestVerification:
         with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
             result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
         assert result["status"] == "completed"
-        assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "completed"
+        assert (
+            runner.get_walk_status("book-1", "walk_2a_scene_segmentation")
+            == "completed"
+        )
 
     def test_no_verification_registered_passes(self, runner):
         """Walks without a registered verification function pass by default."""
@@ -476,7 +495,9 @@ class TestBackgroundWalkExecution:
         with patch.object(
             WalkRunner,
             "_load_walk_module",
-            return_value=MagicMock(execute=MagicMock(return_value={"status": "completed"})),
+            return_value=MagicMock(
+                execute=MagicMock(return_value={"status": "completed"})
+            ),
         ):
             result = runner.run_walk("walk_test", "book-1", {})
             assert result["status"] == "completed"
@@ -490,7 +511,9 @@ class TestBackgroundWalkExecution:
         with patch.object(
             WalkRunner,
             "_load_walk_module",
-            return_value=MagicMock(execute=MagicMock(return_value={"status": "completed"})),
+            return_value=MagicMock(
+                execute=MagicMock(return_value={"status": "completed"})
+            ),
         ):
             # We can't easily test the running state without threading,
             # but we can verify the final state is completed
@@ -530,7 +553,9 @@ class TestCancellation:
         """A rerun after cancellation is allowed once the latch is cleared."""
         runner.cancel_walks("book-1")
         runner.clear_cancel("book-1")
-        with patch.object(WalkRunner, "_load_walk_module", return_value=_make_mock_walk_module()):
+        with patch.object(
+            WalkRunner, "_load_walk_module", return_value=_make_mock_walk_module()
+        ):
             result = runner.run_walk("walk_test", "book-1", {})
         assert result["status"] == "completed"
 
@@ -922,9 +947,7 @@ class TestConcurrentTransactionRetry:
             storage.execute_update(self.WRITE_SQL, (book_id,))
             return {"status": "completed"}
 
-        with patch(
-            "app.pipeline.walks.runner.time.sleep", side_effect=recording_sleep
-        ):
+        with patch("app.pipeline.walks.runner.time.sleep", side_effect=recording_sleep):
             result = self._run_walk(runner, execute_fn)
         assert result["status"] == "failed"
         # 4 attempts (initial + 3 retries) => 3 backoff sleeps.
@@ -1098,7 +1121,9 @@ class TestReservationHelpers:
         from app.pipeline.walks.runner import reserve_walk_run
 
         run_id = self._run_id()
-        returned = reserve_walk_run(storage, run_id, self.BOOK, self.WALK, created_ms=1000)
+        returned = reserve_walk_run(
+            storage, run_id, self.BOOK, self.WALK, created_ms=1000
+        )
         assert returned == run_id
 
     def test_reserve_walk_run_inserts_exact_pending_row(self, storage):
@@ -1305,6 +1330,19 @@ class TestRunWalkReserved:
             result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
         assert result == expected
 
+    def test_run_walk_reserved_adds_completed_status_to_raw_summary(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        summary = {"chapters": 2}
+        mock_module = _make_mock_walk_module(MagicMock(return_value=summary))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result == {"chapters": 2, "status": "completed"}
+
     def test_run_walk_reserved_executes_with_heartbeat_storage_run_id(self, storage):
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
@@ -1329,7 +1367,9 @@ class TestRunWalkReserved:
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         runner = self._runner(storage)
-        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
         with (
             patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
             patch.object(WalkRunner, "_run_verification", return_value=True),
@@ -1363,7 +1403,9 @@ class TestRunWalkReserved:
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         runner = self._runner(storage)
-        mock_module = _make_mock_walk_module(MagicMock(side_effect=RuntimeError("boom")))
+        mock_module = _make_mock_walk_module(
+            MagicMock(side_effect=RuntimeError("boom"))
+        )
         with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
             result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
         assert result["status"] == "failed"
@@ -1389,7 +1431,9 @@ class TestRunWalkReserved:
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         runner = self._runner(storage)
-        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
         with (
             patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
             patch.object(WalkRunner, "_run_verification", return_value=False),
@@ -1505,7 +1549,9 @@ class TestRunWalkReserved:
 
     # -- terminal-ordering invariant: close_run precedes _finalize_run ------
 
-    def test_run_walk_reserved_close_run_precedes_db_finalize_on_complete(self, storage):
+    def test_run_walk_reserved_close_run_precedes_db_finalize_on_complete(
+        self, storage
+    ):
         """On completion, close_run must fire BEFORE the DB row is finalized
         (terminal record before the row = truth). During execute the sink is
         still open and no close has happened."""
@@ -1532,7 +1578,9 @@ class TestRunWalkReserved:
         assert len(service.close_calls) == 1
         assert service.close_calls[0][0] == run_id
 
-    def test_run_walk_reserved_completion_emits_one_terminal_matching_row(self, storage):
+    def test_run_walk_reserved_completion_emits_one_terminal_matching_row(
+        self, storage
+    ):
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         service = _FakeLogService()
@@ -1593,14 +1641,14 @@ class TestRunWalkReserved:
         )
         assert service.close_calls[0][1] == rows[0]["status"]
 
-    def test_run_walk_reserved_import_error_emits_one_terminal_matching_row(self, storage):
+    def test_run_walk_reserved_import_error_emits_one_terminal_matching_row(
+        self, storage
+    ):
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         service = _FakeLogService()
         runner = WalkRunner(storage, log_service=service)
-        result = runner.run_walk_reserved(
-            run_id, "walk_does_not_exist", self.BOOK, {}
-        )
+        result = runner.run_walk_reserved(run_id, "walk_does_not_exist", self.BOOK, {})
         assert result["status"] == "failed"
         assert len(service.close_calls) == 1
         assert service.close_calls[0][0] == run_id
@@ -1682,12 +1730,45 @@ class TestRunAllWalksReserved:
         for w in WALK_ORDER:
             assert by_name[w] == "completed"
 
+    def test_run_all_walks_reserved_accepts_raw_walk_summaries(self, storage):
+        reservations = self._reservations()
+        self._insert_reserved_rows(storage, reservations)
+        runner = self._runner(storage)
+        call_log = []
+
+        def execute_fn(book_id, hbs, config):
+            call_log.append(book_id)
+            return {"scenes_created": 3}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        batch_id = str(uuid.uuid4())
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            results = runner.run_all_walks_reserved(
+                batch_id, reservations, self.BOOK, {}
+            )
+
+        assert len(call_log) == len(WALK_ORDER)
+        assert all(results[w]["status"] == "completed" for w in WALK_ORDER)
+        rows = storage.execute_query(
+            "SELECT status, result_json FROM walk_run WHERE book_id = ?",
+            (self.BOOK,),
+        )
+        assert len(rows) == len(WALK_ORDER)
+        assert all(row["status"] == "completed" for row in rows)
+        assert all("scenes_created" in json.loads(row["result_json"]) for row in rows)
+        assert all("status" not in json.loads(row["result_json"]) for row in rows)
+
     def test_run_all_walks_reserved_batch_id_has_no_parent_row(self, storage):
         reservations = self._reservations()
         self._insert_reserved_rows(storage, reservations)
         runner = self._runner(storage)
         batch_id = str(uuid.uuid4())
-        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
         with (
             patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
             patch.object(WalkRunner, "_run_verification", return_value=True),
@@ -1698,7 +1779,9 @@ class TestRunAllWalksReserved:
         )
         assert rows == []
 
-    def test_run_all_walks_reserved_terminalizes_unstarted_children_on_abort(self, storage):
+    def test_run_all_walks_reserved_terminalizes_unstarted_children_on_abort(
+        self, storage
+    ):
         reservations = self._reservations()
         self._insert_reserved_rows(storage, reservations)
         runner = self._runner(storage)
@@ -1734,7 +1817,9 @@ class TestRunAllWalksReserved:
         runner = self._runner(storage)
         runner.cancel_walks(self.BOOK)
         batch_id = str(uuid.uuid4())
-        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
         with (
             patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
             patch.object(WalkRunner, "_run_verification", return_value=True),
@@ -1830,7 +1915,9 @@ class TestWalkLogSinkContextVar:
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         runner = self._runner(storage)
-        mock_module = _make_mock_walk_module(MagicMock(side_effect=RuntimeError("boom")))
+        mock_module = _make_mock_walk_module(
+            MagicMock(side_effect=RuntimeError("boom"))
+        )
         with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
             result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
         assert result["status"] == "failed"
@@ -1852,7 +1939,9 @@ class TestWalkLogSinkContextVar:
         run_id = str(uuid.uuid4())
         _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
         runner = self._runner(storage)
-        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
         with (
             patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
             patch.object(WalkRunner, "_run_verification", return_value=False),
@@ -1883,7 +1972,9 @@ class TestWalkLogSinkContextVar:
                 raise OSError("no space left on device")
 
         runner = WalkRunner(storage, log_service=_FailingService())
-        mock_module = _make_mock_walk_module(MagicMock(return_value={"status": "completed"}))
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
         with (
             patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
             patch.object(WalkRunner, "_run_verification", return_value=True),
@@ -2029,7 +2120,9 @@ class TestWalkModuleStaticAudit:
         _insert_pending_row(storage, run_id, book_id, walk_name)
         service = _FakeLogService()
         runner = WalkRunner(storage, log_service=service)
-        usage = types.SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3)
+        usage = types.SimpleNamespace(
+            prompt_tokens=1, completion_tokens=2, total_tokens=3
+        )
         response = _FakeResponse("gpt-4o", _FakeChoice('{"a": 1}', "stop"), usage)
         client = _FakeClient(response)
 

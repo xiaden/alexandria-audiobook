@@ -172,8 +172,8 @@ def mark_reserved_runs_failed(
 _MAX_WRITE_RETRIES = 3  # contract rule #6: retry the idempotent write x3
 # Total attempts = initial + 3 retries (contract counts retries, not attempts).
 _MAX_WRITE_ATTEMPTS = _MAX_WRITE_RETRIES + 1
-_BACKOFF_MIN_S = 0.05    # contract lower bound: 50 ms
-_BACKOFF_MAX_S = 0.10    # contract upper bound: 100 ms
+_BACKOFF_MIN_S = 0.05  # contract lower bound: 50 ms
+_BACKOFF_MAX_S = 0.10  # contract upper bound: 100 ms
 
 
 def _retry_write(write_fn: Callable[[], int]) -> int:
@@ -567,9 +567,7 @@ class WalkRunner:
         # {book_id: bool} — cancellation flag per book
         self._cancelled: dict[str, bool] = {}
 
-    def run_walk(
-        self, walk_name: str, book_id: str, config: dict
-    ) -> dict:
+    def run_walk(self, walk_name: str, book_id: str, config: dict) -> dict:
         """Execute a single walk by name.
 
         Allocates a fresh ``walk_run`` row and executes it through the same
@@ -591,8 +589,9 @@ class WalkRunner:
         Returns
         -------
         dict
-            Result dict from the walk's ``execute()`` function, or an
-            error dict with ``status='failed'`` on failure, or
+            Result summary from the walk's ``execute()`` function with
+            ``status='completed'`` on success, or an error dict with
+            ``status='failed'`` on failure, or
             ``{'status': 'cancelled', ...}`` when cancellation was requested
             before execution.
         """
@@ -685,8 +684,7 @@ class WalkRunner:
         self._ensure_book(book_id)
         now = _now_ms()
         self._storage.execute_update(
-            "UPDATE walk_run SET status = 'running', heartbeat_ms = ? "
-            "WHERE run_id = ?",
+            "UPDATE walk_run SET status = 'running', heartbeat_ms = ? WHERE run_id = ?",
             (now, run_id),
         )
         # Single cancellation dispatcher — honored before walk execution (and
@@ -777,7 +775,9 @@ class WalkRunner:
             logger.info(
                 "Completed reserved walk '%s' for book '%s'", walk_name, book_id
             )
-            return result
+            # Batch control uses the persisted terminal state, while walk modules
+            # return raw summaries that do not necessarily include a status.
+            return {**result, "status": "completed"}
         finally:
             # Reset the sink ContextVar on EVERY terminal path (success,
             # exception, import failure, verification failure). token is None
