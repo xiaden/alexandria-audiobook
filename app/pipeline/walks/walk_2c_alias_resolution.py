@@ -175,6 +175,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 merged_ids=merged_ids,
                 result=result,
                 is_review=is_review,
+                book_id=book_id,
             )
         except Exception as e:  # noqa: BLE001 — per-item error isolation: any error must log, record, and continue
             logger.error(
@@ -183,10 +184,12 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
                 book_id,
                 e,
             )
-            result["errors"].append({
-                "character_ids": character_ids,
-                "error": str(e),
-            })
+            result["errors"].append(
+                {
+                    "character_ids": character_ids,
+                    "error": str(e),
+                }
+            )
 
     # Count remaining characters
     remaining = storage.execute_query(
@@ -226,7 +229,9 @@ def _build_alias_resolution_prompt(characters: list[dict]) -> str:
             aliases = []
 
         aliases_str = ", ".join(aliases) if aliases else "none"
-        character_lines.append(f"- ID: {char_id} | Name: {name} | Aliases: {aliases_str}")
+        character_lines.append(
+            f"- ID: {char_id} | Name: {name} | Aliases: {aliases_str}"
+        )
 
     characters_text = "\n".join(character_lines)
 
@@ -252,9 +257,7 @@ If no characters should be merged, return an empty array: []
     return prompt
 
 
-def _parse_llm_response(
-    response_text: str, characters: list[dict]
-) -> list[dict]:
+def _parse_llm_response(response_text: str, characters: list[dict]) -> list[dict]:
     """Parse the LLM response into a list of merge group dicts.
 
     Validates that all character_ids in each group actually exist in the
@@ -296,11 +299,13 @@ def _parse_llm_response(
         if not isinstance(confidence, (int, float)):
             confidence = 0.0
 
-        result.append({
-            "character_ids": valid_group_ids,
-            "canonical_name": canonical_name.strip(),
-            "confidence": float(confidence),
-        })
+        result.append(
+            {
+                "character_ids": valid_group_ids,
+                "canonical_name": canonical_name.strip(),
+                "confidence": float(confidence),
+            }
+        )
 
     return result
 
@@ -368,10 +373,8 @@ def _merge_group(
             # Record before junction redirect so member_scene consequences are
             # captured from the member's own junctions.
             if book_id is not None:
-                _record_member_merge(
-                    storage, book_id, canonical_id, nc_id, decision_id
-                )
-            _redirect_junctions(storage, canonical_id, nc_id)
+                _record_member_merge(storage, book_id, canonical_id, nc_id, decision_id)
+            _redirect_junctions(storage, canonical_id, nc_id, book_id)
             merged_ids.add(nc_id)
             result["characters_merged"] += 1
 
@@ -468,9 +471,7 @@ def _record_member_merge(storage, book_id, canonical_id, member_id, decision_id)
     consequence_json = json.dumps(
         {
             "downstream_invalidations": {
-                "walk_2d_scene_presence": sorted(
-                    {r["scene_id"] for r in member_scenes}
-                )
+                "walk_2d_scene_presence": sorted({r["scene_id"] for r in member_scenes})
             }
         }
     )
@@ -513,71 +514,65 @@ def _redirect_junctions(
     storage: PipelineStorage,
     canonical_id: str,
     non_canonical_id: str,
+    book_id: str | None = None,
 ) -> None:
     """Update all junction tables to point from non-canonical to canonical.
 
     Handles potential duplicate rows by deleting conflicting rows first.
     """
+    book_filter = "" if book_id is None else " AND book_id = ?"
+    book_params = () if book_id is None else (book_id,)
     # character_book: delete non-canonical rows where canonical already has
     # the same book_id, then update remaining
     storage.execute_update(
         "DELETE FROM character_book "
-        "WHERE character_id = ? AND book_id IN "
+        "WHERE character_id = ?" + book_filter + " AND book_id IN "
         "(SELECT book_id FROM character_book WHERE character_id = ?)",
-        (non_canonical_id, canonical_id),
+        (non_canonical_id, *book_params, canonical_id),
     )
     storage.execute_update(
-        "UPDATE character_book SET character_id = ? WHERE character_id = ?",
-        (canonical_id, non_canonical_id),
+        "UPDATE character_book SET character_id = ? WHERE character_id = ?"
+        + book_filter,
+        (canonical_id, non_canonical_id, *book_params),
     )
 
-    # character_series: same pattern
-    storage.execute_update(
-        "DELETE FROM character_series "
-        "WHERE character_id = ? AND series_id IN "
-        "(SELECT series_id FROM character_series WHERE character_id = ?)",
-        (non_canonical_id, canonical_id),
+    scene_filter = (
+        ""
+        if book_id is None
+        else " AND scene_id IN (SELECT chs.child_id FROM chapter_scene chs JOIN book_chapter bc ON chs.parent_id = bc.child_id WHERE bc.parent_id = ?)"
     )
-    storage.execute_update(
-        "UPDATE character_series SET character_id = ? WHERE character_id = ?",
-        (canonical_id, non_canonical_id),
-    )
-
-    # character_scene: delete where canonical already has same (scene_id, relation_type)
+    scene_params = () if book_id is None else (book_id,)
     storage.execute_update(
         "DELETE FROM character_scene "
-        "WHERE character_id = ? AND (scene_id, relation_type) IN "
+        "WHERE character_id = ?" + scene_filter + " AND (scene_id, relation_type) IN "
         "(SELECT scene_id, relation_type FROM character_scene WHERE character_id = ?)",
-        (non_canonical_id, canonical_id),
+        (non_canonical_id, *scene_params, canonical_id),
     )
     storage.execute_update(
-        "UPDATE character_scene SET character_id = ? WHERE character_id = ?",
-        (canonical_id, non_canonical_id),
+        "UPDATE character_scene SET character_id = ? WHERE character_id = ?"
+        + scene_filter,
+        (canonical_id, non_canonical_id, *scene_params),
     )
 
-    # character_span: delete where canonical already has same (span_id, relation_type)
+    span_filter = (
+        ""
+        if book_id is None
+        else " AND span_id IN (SELECT psp.child_id FROM paragraph_span psp JOIN scene_paragraph scp ON psp.parent_id = scp.child_id JOIN chapter_scene chs ON scp.parent_id = chs.child_id JOIN book_chapter bc ON chs.parent_id = bc.child_id WHERE bc.parent_id = ?)"
+    )
+    span_params = () if book_id is None else (book_id,)
     storage.execute_update(
         "DELETE FROM character_span "
-        "WHERE character_id = ? AND (span_id, relation_type) IN "
+        "WHERE character_id = ?" + span_filter + " AND (span_id, relation_type) IN "
         "(SELECT span_id, relation_type FROM character_span WHERE character_id = ?)",
-        (non_canonical_id, canonical_id),
+        (non_canonical_id, *span_params, canonical_id),
     )
     storage.execute_update(
-        "UPDATE character_span SET character_id = ? WHERE character_id = ?",
-        (canonical_id, non_canonical_id),
+        "UPDATE character_span SET character_id = ? WHERE character_id = ?"
+        + span_filter,
+        (canonical_id, non_canonical_id, *span_params),
     )
 
-    # character_metadata: delete where canonical already has same key
-    storage.execute_update(
-        "DELETE FROM character_metadata "
-        "WHERE character_id = ? AND key IN "
-        "(SELECT key FROM character_metadata WHERE character_id = ?)",
-        (non_canonical_id, canonical_id),
-    )
-    storage.execute_update(
-        "UPDATE character_metadata SET character_id = ? WHERE character_id = ?",
-        (canonical_id, non_canonical_id),
-    )
+    # Series membership and metadata are global identity data; leave untouched.
 
 
 def _consolidate_aliases(

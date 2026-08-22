@@ -63,7 +63,9 @@ def _patch_llm(monkeypatch, response_text: str):
         mock_create_client,
     )
 
-    def mock_call_llm(client, model_name, temperature, reasoning_effort, system_prompt, user_prompt):
+    def mock_call_llm(
+        client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+    ):
         return response_text
 
     monkeypatch.setattr(
@@ -126,9 +128,7 @@ class TestExecuteSummary:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
 
         _patch_llm(monkeypatch, "[]")
 
@@ -148,9 +148,7 @@ class TestExecuteSummary:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
 
         llm_called = []
 
@@ -160,7 +158,14 @@ class TestExecuteSummary:
         def mock_create_client(config_path=None):
             return object(), None
 
-        def mock_call_llm(client, model_name, temperature, reasoning_effort, system_prompt, user_prompt):
+        def mock_call_llm(
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
+        ):
             llm_called.append(True)
             return "[]"
 
@@ -189,9 +194,7 @@ class TestGlobalScope:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
 
         _insert_character(storage, "c1", "Alice")
         _insert_character(storage, "c2", "Bob")
@@ -217,9 +220,7 @@ class TestLLMInteraction:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
 
         _insert_character(storage, "c1", "Alice")
         _insert_character(storage, "c2", "Bob")
@@ -228,7 +229,14 @@ class TestLLMInteraction:
 
         captured_prompt = []
 
-        def mock_call_llm(client, model_name, temperature, reasoning_effort, system_prompt, user_prompt):
+        def mock_call_llm(
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
+        ):
             captured_prompt.append(user_prompt)
             return "[]"
 
@@ -261,9 +269,7 @@ class TestLLMInteraction:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c1", "Alice")
         _insert_char_book(storage, "c1", "b1", 0.9)
 
@@ -285,11 +291,9 @@ class TestLLMInteraction:
         execute("b1", storage, {})
         assert captured_task == ["script_alias_resolution"]
 
-
-# ---------------------------------------------------------------------------
-# Tests: parse_llm_response
-# ---------------------------------------------------------------------------
-
+    # ---------------------------------------------------------------------------
+    # Tests: parse_llm_response
+    # ---------------------------------------------------------------------------
 
     def test_walk_override_drives_llm_config(self, monkeypatch, tmp_path):
         """A walk_override row for (book, task) overrides the walk's LLM config.
@@ -328,7 +332,12 @@ class TestLLMInteraction:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["temperature"] = temperature
             captured["model_name"] = model_name
@@ -370,7 +379,12 @@ class TestLLMInteraction:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -404,7 +418,9 @@ class TestLLMInteraction:
 
         assert captured["system_prompt"] == "You are a TEST override prompt."
 
-    def test_prompt_override_config_section_drives_system_prompt(self, monkeypatch, tmp_path):
+    def test_prompt_override_config_section_drives_system_prompt(
+        self, monkeypatch, tmp_path
+    ):
         """Top-level config walk_override[task].prompt flows into system_prompt."""
         (tmp_path / "config.json").write_text(
             json.dumps(
@@ -433,7 +449,12 @@ class TestLLMInteraction:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -451,12 +472,14 @@ class TestLLMInteraction:
 class TestParseLLMResponse:
     def test_parses_valid_json_array(self):
         """Valid JSON array of merge groups is parsed correctly."""
-        response_text = json.dumps([
-            {
-                "canonical_name": "Alice",
-                "character_ids": ["c1", "c2"],
-            }
-        ])
+        response_text = json.dumps(
+            [
+                {
+                    "canonical_name": "Alice",
+                    "character_ids": ["c1", "c2"],
+                }
+            ]
+        )
         all_chars = [
             {"id": "c1", "name": "Alice", "aliases": "[]"},
             {"id": "c2", "name": "Alicia", "aliases": "[]"},
@@ -468,10 +491,12 @@ class TestParseLLMResponse:
 
     def test_parses_multiple_merge_groups(self):
         """Multiple merge groups in one response."""
-        response_text = json.dumps([
-            {"canonical_name": "Alice", "character_ids": ["c1", "c2"]},
-            {"canonical_name": "Bob", "character_ids": ["c3", "c4"]},
-        ])
+        response_text = json.dumps(
+            [
+                {"canonical_name": "Alice", "character_ids": ["c1", "c2"]},
+                {"canonical_name": "Bob", "character_ids": ["c3", "c4"]},
+            ]
+        )
         all_chars = [
             {"id": "c1", "name": "Alice", "aliases": "[]"},
             {"id": "c2", "name": "Alicia", "aliases": "[]"},
@@ -497,9 +522,11 @@ class TestParseLLMResponse:
 
     def test_validates_character_ids_exist(self):
         """character_ids that don't match any known character are filtered."""
-        response_text = json.dumps([
-            {"canonical_name": "Alice", "character_ids": ["c1", "nonexistent"]},
-        ])
+        response_text = json.dumps(
+            [
+                {"canonical_name": "Alice", "character_ids": ["c1", "nonexistent"]},
+            ]
+        )
         all_chars = [
             {"id": "c1", "name": "Alice", "aliases": "[]"},
         ]
@@ -509,10 +536,12 @@ class TestParseLLMResponse:
 
     def test_candidate_list_missing_fields(self):
         """Groups missing required fields are skipped."""
-        response_text = json.dumps([
-            {"canonical_name": "Alice"},
-            {"character_ids": ["c1"]},
-        ])
+        response_text = json.dumps(
+            [
+                {"canonical_name": "Alice"},
+                {"character_ids": ["c1"]},
+            ]
+        )
         all_chars = [{"id": "c1", "name": "Alice", "aliases": "[]"}]
         result = _parse_llm_response(response_text, all_chars)
         assert result == []
@@ -530,9 +559,7 @@ class TestMergeGroup:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c1", "Alice")
         _insert_character(storage, "c2", "Alicia")
         _insert_char_book(storage, "c1", "b1", 0.9)
@@ -559,16 +586,12 @@ class TestMergeGroup:
         assert "c2" in merged_ids
 
         # Canonical survives
-        rows = storage.execute_query(
-            "SELECT id FROM character WHERE id = ?", ("c1",)
-        )
+        rows = storage.execute_query("SELECT id FROM character WHERE id = ?", ("c1",))
         assert len(rows) == 1
 
         # Non-destructive merge: member survives and stays addressable, and
         # the merge relation is recorded for reversal.
-        rows = storage.execute_query(
-            "SELECT id FROM character WHERE id = ?", ("c2",)
-        )
+        rows = storage.execute_query("SELECT id FROM character WHERE id = ?", ("c2",))
         assert len(rows) == 1
         merges = storage.execute_query(
             "SELECT canonical_id, member_id, status FROM character_alias_merge "
@@ -584,9 +607,7 @@ class TestMergeGroup:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c-zzz", "Bob")
         _insert_character(storage, "c-aaa", "Alice")
         _insert_char_book(storage, "c-zzz", "b1", 0.9)
@@ -643,15 +664,99 @@ class TestMergeGroup:
 
 
 class TestJunctionRedirection:
+    def test_scoped_redirect_leaves_shared_book_data_untouched(self):
+        """A merge for one book must not rewrite a shared character in another."""
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        for book_id, chapter_id, scene_id, paragraph_id, span_id in (
+            ("b1", "ch1", "sc1", "p1", "sp1"),
+            ("b2", "ch2", "sc2", "p2", "sp2"),
+        ):
+            storage.execute_insert(
+                "INSERT INTO book (id, series_id) VALUES (?, 's1')", (book_id,)
+            )
+            storage.execute_insert(
+                "INSERT INTO chapter (id, book_id) VALUES (?, ?)", (chapter_id, book_id)
+            )
+            storage.execute_insert(
+                "INSERT INTO book_chapter (child_id, parent_id, position) VALUES (?, ?, 1)",
+                (chapter_id, book_id),
+            )
+            storage.execute_insert("INSERT INTO scene (id) VALUES (?)", (scene_id,))
+            storage.execute_insert(
+                "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES (?, ?, 1)",
+                (scene_id, chapter_id),
+            )
+            storage.execute_insert(
+                "INSERT INTO paragraph (id) VALUES (?)", (paragraph_id,)
+            )
+            storage.execute_insert(
+                "INSERT INTO scene_paragraph (child_id, parent_id, position) VALUES (?, ?, 1)",
+                (paragraph_id, scene_id),
+            )
+            storage.execute_insert(
+                "INSERT INTO span (id, span_type) VALUES (?, 'quotation')", (span_id,)
+            )
+            storage.execute_insert(
+                "INSERT INTO paragraph_span (child_id, parent_id, position) VALUES (?, ?, 1)",
+                (span_id, paragraph_id),
+            )
+        _insert_character(storage, "canon", "Canon")
+        _insert_character(storage, "member", "Member")
+        _insert_char_book(storage, "canon", "b1", 0.9)
+        _insert_char_book(storage, "member", "b1", 0.8)
+        _insert_char_book(storage, "member", "b2", 0.8)
+        _insert_char_scene(storage, "member", "sc1", 0.8)
+        _insert_char_scene(storage, "member", "sc2", 0.8)
+        _insert_char_span(storage, "member", "sp1", 0.8)
+        _insert_char_span(storage, "member", "sp2", 0.8)
+        _insert_char_metadata(storage, "member", "role", "shared")
+        storage.execute_insert(
+            "INSERT INTO character_series (character_id, series_id, source, confidence) VALUES (?, 's1', 'walk', 0.8)",
+            ("member",),
+        )
+
+        _redirect_junctions(storage, "canon", "member", "b1")
+
+        assert (
+            storage.execute_query(
+                "SELECT character_id FROM character_book WHERE book_id = 'b2'"
+            )[0]["character_id"]
+            == "member"
+        )
+        assert (
+            storage.execute_query(
+                "SELECT character_id FROM character_scene WHERE scene_id = 'sc2'"
+            )[0]["character_id"]
+            == "member"
+        )
+        assert (
+            storage.execute_query(
+                "SELECT character_id FROM character_span WHERE span_id = 'sp2'"
+            )[0]["character_id"]
+            == "member"
+        )
+        assert (
+            storage.execute_query("SELECT character_id FROM character_metadata")[0][
+                "character_id"
+            ]
+            == "member"
+        )
+        assert (
+            storage.execute_query("SELECT character_id FROM character_series")[0][
+                "character_id"
+            ]
+            == "member"
+        )
+
     def test_redirects_character_book(self):
         """character_book rows for non-canonical characters are redirected to
         the canonical, and duplicates are removed."""
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "canon", "Canon")
         _insert_character(storage, "noncanon", "NonCanon")
         _insert_char_book(storage, "canon", "b1", 0.9)
@@ -672,9 +777,7 @@ class TestJunctionRedirection:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         storage.execute_insert("INSERT INTO scene (id) VALUES ('sc1')")
         storage.execute_insert("INSERT INTO scene (id) VALUES ('sc2')")
         _insert_character(storage, "canon", "Canon")
@@ -698,10 +801,10 @@ class TestJunctionRedirection:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
+            "INSERT INTO span (id, span_type) VALUES ('sp1', 'quotation')"
         )
-        storage.execute_insert("INSERT INTO span (id, span_type) VALUES ('sp1', 'quotation')")
         _insert_character(storage, "canon", "Canon")
         _insert_character(storage, "noncanon", "NonCanon")
         _insert_char_span(storage, "noncanon", "sp1", 0.8)
@@ -715,13 +818,11 @@ class TestJunctionRedirection:
         assert rows[0]["character_id"] == "canon"
 
     def test_redirects_character_metadata(self):
-        """character_metadata rows are redirected, duplicates removed."""
+        """Metadata remains untouched by a book-scoped alias decision."""
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "canon", "Canon")
         _insert_character(storage, "noncanon", "NonCanon")
         _insert_char_metadata(storage, "noncanon", "gender", "female")
@@ -730,12 +831,12 @@ class TestJunctionRedirection:
         _redirect_junctions(storage, "canon", "noncanon")
 
         rows = storage.execute_query(
-            "SELECT character_id, key, value FROM character_metadata WHERE character_id = ?",
-            ("canon",),
+            "SELECT character_id, key, value FROM character_metadata"
         )
-        keys = {r["key"]: r["value"] for r in rows}
-        assert keys.get("gender") == "female"
-        assert keys.get("age") == "30"
+        assert {(r["character_id"], r["key"], r["value"]) for r in rows} == {
+            ("noncanon", "gender", "female"),
+            ("noncanon", "age", "30"),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -750,9 +851,7 @@ class TestNonCanonicalDeletion:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "canon", "Canon")
         _insert_character(storage, "noncanon", "NonCanon")
         _insert_char_book(storage, "canon", "b1", 0.9)
@@ -792,9 +891,7 @@ class TestNonCanonicalDeletion:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "canon", "Canon")
         _insert_character(storage, "noncanon", "NonCanon")
 
@@ -818,9 +915,7 @@ class TestAliasConsolidation:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "canon", "Alice", '["Ally"]')
         _insert_character(storage, "noncanon", "Alicia")
         _insert_char_book(storage, "canon", "b1", 0.9)
@@ -864,7 +959,9 @@ class TestConsolidateAliasesStandalone:
 
         _consolidate_aliases(
             canonical_id="canon",
-            non_canonical_ids=["nc1"],  # not in all_chars, but alias set logic handles it
+            non_canonical_ids=[
+                "nc1"
+            ],  # not in all_chars, but alias set logic handles it
             canonical_name="Alice",
             all_characters=all_chars,
             storage=storage,
@@ -914,21 +1011,21 @@ class TestConfidenceFiltering:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c1", "Alice")
         _insert_character(storage, "c2", "Alicia")
         _insert_char_book(storage, "c1", "b1", 0.9)
         _insert_char_book(storage, "c2", "b1", 0.9)
 
-        response = json.dumps([
-            {
-                "canonical_name": "Alice",
-                "character_ids": ["c1", "c2"],
-                "confidence": 0.95,
-            }
-        ])
+        response = json.dumps(
+            [
+                {
+                    "canonical_name": "Alice",
+                    "character_ids": ["c1", "c2"],
+                    "confidence": 0.95,
+                }
+            ]
+        )
         _patch_llm(monkeypatch, response)
 
         result = execute("b1", storage, {})
@@ -941,21 +1038,21 @@ class TestConfidenceFiltering:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c1", "Alice")
         _insert_character(storage, "c2", "Alicia")
         _insert_char_book(storage, "c1", "b1", 0.9)
         _insert_char_book(storage, "c2", "b1", 0.9)
 
-        response = json.dumps([
-            {
-                "canonical_name": "Alice",
-                "character_ids": ["c1", "c2"],
-                "confidence": 0.3,
-            }
-        ])
+        response = json.dumps(
+            [
+                {
+                    "canonical_name": "Alice",
+                    "character_ids": ["c1", "c2"],
+                    "confidence": 0.3,
+                }
+            ]
+        )
         _patch_llm(monkeypatch, response)
 
         result = execute("b1", storage, {})
@@ -967,21 +1064,21 @@ class TestConfidenceFiltering:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c1", "Alice")
         _insert_character(storage, "c2", "Alicia")
         _insert_char_book(storage, "c1", "b1", 0.9)
         _insert_char_book(storage, "c2", "b1", 0.9)
 
-        response = json.dumps([
-            {
-                "canonical_name": "Alice",
-                "character_ids": ["c1", "c2"],
-                "confidence": 0.6,
-            }
-        ])
+        response = json.dumps(
+            [
+                {
+                    "canonical_name": "Alice",
+                    "character_ids": ["c1", "c2"],
+                    "confidence": 0.6,
+                }
+            ]
+        )
         _patch_llm(monkeypatch, response)
 
         result = execute("b1", storage, {})
@@ -993,9 +1090,7 @@ class TestConfidenceFiltering:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c1", "Alice")
         _insert_character(storage, "c2", "Alicia")
         _insert_character(storage, "c3", "Bob")
@@ -1009,11 +1104,25 @@ class TestConfidenceFiltering:
         _insert_char_book(storage, "c5", "b1", 0.9)
         _insert_char_book(storage, "c6", "b1", 0.9)
 
-        response = json.dumps([
-            {"canonical_name": "Alice", "character_ids": ["c1", "c2"], "confidence": 0.95},
-            {"canonical_name": "Bob", "character_ids": ["c3", "c4"], "confidence": 0.6},
-            {"canonical_name": "Charlie", "character_ids": ["c5", "c6"], "confidence": 0.2},
-        ])
+        response = json.dumps(
+            [
+                {
+                    "canonical_name": "Alice",
+                    "character_ids": ["c1", "c2"],
+                    "confidence": 0.95,
+                },
+                {
+                    "canonical_name": "Bob",
+                    "character_ids": ["c3", "c4"],
+                    "confidence": 0.6,
+                },
+                {
+                    "canonical_name": "Charlie",
+                    "character_ids": ["c5", "c6"],
+                    "confidence": 0.2,
+                },
+            ]
+        )
         _patch_llm(monkeypatch, response)
 
         result = execute("b1", storage, {})
@@ -1039,9 +1148,7 @@ class TestLLMErrorHandling:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         _insert_character(storage, "c1", "Alice")
         _insert_char_book(storage, "c1", "b1", 0.9)
 
@@ -1072,13 +1179,22 @@ class TestEndToEnd:
         storage = InMemorySQLiteAdapter()
         storage.init_db()
         storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
-        storage.execute_insert(
-            "INSERT INTO book (id, series_id) VALUES ('b1', 's1')"
-        )
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
         storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
+        storage.execute_insert(
+            "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
+        )
         storage.execute_insert("INSERT INTO scene (id) VALUES ('sc1')")
         storage.execute_insert("INSERT INTO scene (id) VALUES ('sc2')")
-        storage.execute_insert("INSERT INTO span (id, span_type) VALUES ('sp1', 'quotation')")
+        storage.execute_insert(
+            "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES ('sc1', 'ch1', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES ('sc2', 'ch1', 2)"
+        )
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type) VALUES ('sp1', 'quotation')"
+        )
 
         _insert_character(storage, "c-alice", "Alice", '["Ally"]')
         _insert_character(storage, "c-alicia", "Alicia")
@@ -1094,13 +1210,15 @@ class TestEndToEnd:
         _insert_char_metadata(storage, "c-alice", "role", "protagonist")
         _insert_char_metadata(storage, "c-alicia", "age", "28")
 
-        response = json.dumps([
-            {
-                "canonical_name": "Alice",
-                "character_ids": ["c-alice", "c-alicia"],
-                "confidence": 0.85,
-            }
-        ])
+        response = json.dumps(
+            [
+                {
+                    "canonical_name": "Alice",
+                    "character_ids": ["c-alice", "c-alicia"],
+                    "confidence": 0.85,
+                }
+            ]
+        )
         _patch_llm(monkeypatch, response)
 
         result = execute("b1", storage, {})
@@ -1141,9 +1259,7 @@ class TestEndToEnd:
         )
         assert {r["character_id"] for r in book_rows} == {"c-alice"}
 
-        scene_rows = storage.execute_query(
-            "SELECT character_id FROM character_scene"
-        )
+        scene_rows = storage.execute_query("SELECT character_id FROM character_scene")
         assert all(r["character_id"] == "c-alice" for r in scene_rows)
 
         span_rows = storage.execute_query("SELECT character_id FROM character_span")
