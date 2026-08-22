@@ -510,6 +510,19 @@ class TestGetSurroundingContext:
         assert len(context["before"]) == 2  # span-1a and span-1b
         assert context["after"] == []
 
+    def test_uses_nearest_three_preceding_spans(self):
+        """Preceding context is the nearest window, not the first three spans."""
+        storage = Mock()
+        storage.execute_query.return_value = [
+            {"id": f"span-{position}", "text": f"Span {position}", "position": position}
+            for position in range(1, 14)
+        ]
+
+        context = _get_surrounding_context("para-1", "span-10", storage)
+
+        assert context["before"] == ["Span 7", "Span 8", "Span 9"]
+        assert context["after"] == ["Span 11", "Span 12", "Span 13"]
+
     def test_unknown_span_returns_empty(self, populated_storage):
         """Unknown span_id returns empty before and after."""
         context = _get_surrounding_context("para-1", "nonexistent-span", populated_storage)

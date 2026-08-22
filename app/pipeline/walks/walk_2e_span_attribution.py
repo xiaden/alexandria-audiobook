@@ -191,16 +191,16 @@ def _get_surrounding_context(
     if current_position is None:
         return {"before": [], "after": []}
 
-    # Get 2-3 spans before and after
-    before_spans = []
+    # Keep the nearest three preceding spans while preserving paragraph order.
+    preceding_spans = []
     after_spans = []
     for span in all_spans:
-        if span["position"] < current_position and len(before_spans) < 3:
-            before_spans.append(span["text"] or "")
+        if span["position"] < current_position:
+            preceding_spans.append(span["text"] or "")
         elif span["position"] > current_position and len(after_spans) < 3:
             after_spans.append(span["text"] or "")
 
-    return {"before": before_spans, "after": after_spans}
+    return {"before": preceding_spans[-3:], "after": after_spans}
 
 
 def _process_span(
