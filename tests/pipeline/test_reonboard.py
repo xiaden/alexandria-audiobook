@@ -41,12 +41,8 @@ def _populate_storage(storage: InMemorySQLiteAdapter) -> None:
     )
 
     # -- Chapters -----------------------------------------------------------
-    storage.execute_insert(
-        "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-    )
-    storage.execute_insert(
-        "INSERT INTO chapter (id, book_id) VALUES ('ch2', 'b1')"
-    )
+    storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
+    storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch2', 'b1')")
     storage.execute_insert(
         "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
     )
@@ -264,6 +260,40 @@ class TestReonboardClearsCharacterBook:
         )
         assert after[0]["cnt"] == 0
 
+    def test_preserves_shared_character_metadata_and_membership(self, storage):
+        """Shared character state survives re-onboarding one of its books."""
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s2')")
+        storage.execute_insert(
+            "INSERT INTO book (id, series_id, position) VALUES ('b2', 's2', 1)"
+        )
+        storage.execute_insert(
+            "INSERT INTO character_book (character_id, book_id, source, confidence) "
+            "VALUES ('c1', 'b2', 'walk', 0.9)"
+        )
+
+        reonboard_book("b1", storage)
+
+        metadata = storage.execute_query(
+            "SELECT key, value FROM character_metadata WHERE character_id = 'c1' "
+            "ORDER BY key"
+        )
+        assert [(row["key"], row["value"]) for row in metadata] == [
+            ("description", "A brave heroine"),
+            ("voice_profile", "warm and confident"),
+        ]
+        voice = storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id = 'c1'"
+        )
+        assert voice[0]["voice_assignment_id"] == "vc1"
+        membership = storage.execute_query(
+            "SELECT book_id FROM character_book WHERE character_id = 'c1'"
+        )
+        assert [row["book_id"] for row in membership] == ["b2"]
+        unshared = storage.execute_query(
+            "SELECT COUNT(*) AS cnt FROM character_metadata WHERE character_id = 'c2'"
+        )
+        assert unshared[0]["cnt"] == 0
+
     def test_clears_character_metadata(self, storage):
         """character_metadata for book-linked characters is deleted."""
         before = storage.execute_query(
@@ -290,21 +320,15 @@ class TestReonboardClearsSpanInstruct:
     def test_clears_span_instruct(self, storage):
         """span.instruct is reset to NULL for the book's spans."""
         # Before: sp1 has instruct='cheerfully', sp3 has instruct='sadly'
-        before = storage.execute_query(
-            "SELECT instruct FROM span WHERE id = 'sp1'"
-        )
+        before = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp1'")
         assert before[0]["instruct"] == "cheerfully"
 
         reonboard_book("b1", storage)
 
-        after_sp1 = storage.execute_query(
-            "SELECT instruct FROM span WHERE id = 'sp1'"
-        )
+        after_sp1 = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp1'")
         assert after_sp1[0]["instruct"] is None
 
-        after_sp3 = storage.execute_query(
-            "SELECT instruct FROM span WHERE id = 'sp3'"
-        )
+        after_sp3 = storage.execute_query("SELECT instruct FROM span WHERE id = 'sp3'")
         assert after_sp3[0]["instruct"] is None
 
 
@@ -340,9 +364,7 @@ class TestReonboardPreservesTreeStructure:
     def test_preserves_chapters(self, storage):
         """Chapter rows still exist after reonboard."""
         reonboard_book("b1", storage)
-        rows = storage.execute_query(
-            "SELECT id FROM chapter WHERE book_id = 'b1'"
-        )
+        rows = storage.execute_query("SELECT id FROM chapter WHERE book_id = 'b1'")
         assert len(rows) == 2
 
     def test_preserves_book_chapter_edges(self, storage):
@@ -369,7 +391,7 @@ class TestReonboardPreservesTreeStructure:
 
     def test_paragraphs_disconnected_from_scenes(self, storage):
         """After reonboard, paragraphs exist but scene_paragraph edges are gone.
-        
+
         Scenes are walk-created and deleted during reonboard. The scene_paragraph
         edges must also be deleted (FK constraint), so paragraphs become
         disconnected from the scene layer. This is expected — walks will
@@ -396,15 +418,15 @@ class TestReonboardPreservesCharacters:
     def test_preserves_character_rows(self, storage):
         """Character rows are NOT deleted — they may be shared across books."""
         reonboard_book("b1", storage)
-        rows = storage.execute_query("SELECT id FROM character WHERE id IN ('c1', 'c2')")
+        rows = storage.execute_query(
+            "SELECT id FROM character WHERE id IN ('c1', 'c2')"
+        )
         assert len(rows) == 2
 
     def test_preserves_character_names(self, storage):
         """Character names are preserved (not modified by reonboard)."""
         reonboard_book("b1", storage)
-        rows = storage.execute_query(
-            "SELECT name FROM character WHERE id = 'c1'"
-        )
+        rows = storage.execute_query("SELECT name FROM character WHERE id = 'c1'")
         assert rows[0]["name"] == "Alice"
 
 
@@ -465,7 +487,10 @@ class TestReonboardEmptyBook:
             "character_scene_absence",
             "boundary_override",
         ):
-            assert storage.execute_query(f"SELECT * FROM {table} WHERE book_id = 'b1'") == []
+            assert (
+                storage.execute_query(f"SELECT * FROM {table} WHERE book_id = 'b1'")
+                == []
+            )
 
     def test_reonboard_book_with_chapters_but_no_scenes(self):
         """A book with chapters but no scenes still works."""
@@ -475,9 +500,7 @@ class TestReonboardEmptyBook:
         s.execute_insert(
             "INSERT INTO book (id, series_id, position) VALUES ('b1', 's1', 1)"
         )
-        s.execute_insert(
-            "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-        )
+        s.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
         s.execute_insert(
             "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
         )
