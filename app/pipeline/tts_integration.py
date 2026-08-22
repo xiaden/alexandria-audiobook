@@ -225,7 +225,6 @@ def _build_voice_config(
             SELECT c.name AS character_name,
                    c.voice_assignment_id,
                    vc.id AS vc_id,
-                   vc.name AS vc_name,
                    vc.description AS vc_description,
                    vc.type AS vc_type,
                    vc.voice AS vc_voice,
@@ -254,7 +253,7 @@ def _build_voice_config(
             if info and info.get("voice_assignment_id") and info.get("vc_id"):
                 voice_config[speaker] = {
                     "type": info.get("vc_type") or "custom",
-                    "voice": info.get("vc_name") or "",
+                    "voice": info.get("vc_voice") or "",
                     "character_style": info.get("vc_character_style") or "",
                     "seed": info.get("vc_seed") or "-1",
                     "ref_audio": info.get("vc_ref_audio"),

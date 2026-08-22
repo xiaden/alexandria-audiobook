@@ -89,10 +89,10 @@ def _populate_storage(storage: InMemorySQLiteAdapter) -> None:
     """Insert a minimal but complete document spine with characters and voices."""
     # -- Voice config -------------------------------------------------------
     storage.execute_insert(
-        "INSERT INTO voice_config (id, name, description) VALUES ('vc1', 'Warm Female', 'A warm female voice')"
+        "INSERT INTO voice_config (id, name, voice, description) VALUES ('vc1', 'Warm Female', 'Ryan', 'A warm female voice')"
     )
     storage.execute_insert(
-        "INSERT INTO voice_config (id, name, description) VALUES ('vc2', 'Deep Male', 'A deep male voice')"
+        "INSERT INTO voice_config (id, name, voice, description) VALUES ('vc2', 'Deep Male', 'Adam', 'A deep male voice')"
     )
 
     # -- Series + Book ------------------------------------------------------
@@ -269,9 +269,10 @@ class TestCharacterVoiceConfig:
         render_audiobook("b1", storage, fake_engine)
 
         voice_config = fake_engine.batch_calls[0]["voice_config"]
-        # Alice has voice_assignment_id = 'vc1' → voice_config name = 'Warm Female'
+        # Alice has voice_assignment_id = 'vc1' → backend voice = 'Ryan'
         assert "Alice" in voice_config
-        assert voice_config["Alice"]["voice"] == "Warm Female"
+        assert voice_config["Alice"]["voice"] == "Ryan"
+        assert voice_config["Alice"]["voice"] != "Warm Female"
         assert voice_config["Alice"]["type"] == "custom"
 
     def test_character_voice_description_included(self, storage, fake_engine):
@@ -288,7 +289,7 @@ class TestCharacterVoiceConfig:
 
         voice_config = fake_engine.batch_calls[0]["voice_config"]
         assert "Bob" in voice_config
-        assert voice_config["Bob"]["voice"] == "Deep Male"
+        assert voice_config["Bob"]["voice"] == "Adam"
 
 
 # ---------------------------------------------------------------------------
@@ -763,8 +764,8 @@ class TestCloneVoiceIntegration:
         # -- Clone voice config -----------------------------------------------
         storage.execute_insert(
             "INSERT INTO voice_config "
-            "(id, name, description, type, ref_audio, ref_text) "
-            "VALUES ('clone-vc', 'CloneVoice', 'A cloned voice', 'clone', "
+            "(id, name, voice, description, type, ref_audio, ref_text) "
+            "VALUES ('clone-vc', 'CloneVoice', 'CloneBackendVoice', 'A cloned voice', 'clone', "
             "'refs/alice.wav', 'Alice reference text')"
         )
 
@@ -826,7 +827,7 @@ class TestCloneVoiceIntegration:
         voice_config = fake_engine.batch_calls[0]["voice_config"]
         assert "Alice" in voice_config
         assert voice_config["Alice"]["type"] == "clone"
-        assert voice_config["Alice"]["voice"] == "CloneVoice"
+        assert voice_config["Alice"]["voice"] == "CloneBackendVoice"
         assert voice_config["Alice"]["ref_audio"] == "refs/alice.wav"
         assert voice_config["Alice"]["ref_text"] == "Alice reference text"
 
@@ -871,25 +872,25 @@ class TestVoiceTypeRouting:
             "'custom', 'CustomVoice')"
         )
         storage.execute_insert(
-            "INSERT INTO voice_config (id, name, description, type, "
+            "INSERT INTO voice_config (id, name, voice, description, type, "
             "ref_audio, ref_text) "
-            "VALUES ('vc-clone', 'CloneVoice', 'A cloned voice', 'clone', "
+            "VALUES ('vc-clone', 'CloneVoice', 'CloneBackendVoice', 'A cloned voice', 'clone', "
             "'refs/clone.wav', 'Clone reference text')"
         )
         storage.execute_insert(
-            "INSERT INTO voice_config (id, name, description, type, adapter_path) "
-            "VALUES ('vc-builtin-lora', 'BuiltinLoraVoice', 'A built-in LoRA voice', "
+            "INSERT INTO voice_config (id, name, voice, description, type, adapter_path) "
+            "VALUES ('vc-builtin-lora', 'BuiltinLoraVoice', 'BuiltinLoraBackendVoice', 'A built-in LoRA voice', "
             "'builtin_lora', 'builtin_lora/voice_alpha')"
         )
         storage.execute_insert(
-            "INSERT INTO voice_config (id, name, description, type, "
+            "INSERT INTO voice_config (id, name, voice, description, type, "
             "adapter_path, character_style) "
-            "VALUES ('vc-lora', 'LoraVoice', 'A trained LoRA voice', 'lora', "
+            "VALUES ('vc-lora', 'LoraVoice', 'LoraBackendVoice', 'A trained LoRA voice', 'lora', "
             "'adapters/voice_beta', 'neutral')"
         )
         storage.execute_insert(
-            "INSERT INTO voice_config (id, name, description, type) "
-            "VALUES ('vc-design', 'DesignVoice', 'A warm elderly male voice', "
+            "INSERT INTO voice_config (id, name, voice, description, type) "
+            "VALUES ('vc-design', 'DesignVoice', 'DesignBackendVoice', 'A warm elderly male voice', "
             "'design')"
         )
 
@@ -992,24 +993,24 @@ class TestVoiceTypeRouting:
             },
             "Clyde": {
                 "type": "clone",
-                "voice": "CloneVoice",
+                "voice": "CloneBackendVoice",
                 "ref_audio": "refs/clone.wav",
                 "ref_text": "Clone reference text",
             },
             "Billie": {
                 "type": "builtin_lora",
-                "voice": "BuiltinLoraVoice",
+                "voice": "BuiltinLoraBackendVoice",
                 "adapter_path": "builtin_lora/voice_alpha",
             },
             "Lorne": {
                 "type": "lora",
-                "voice": "LoraVoice",
+                "voice": "LoraBackendVoice",
                 "adapter_path": "adapters/voice_beta",
                 "character_style": "neutral",
             },
             "Delia": {
                 "type": "design",
-                "voice": "DesignVoice",
+                "voice": "DesignBackendVoice",
                 "description": "A warm elderly male voice",
             },
         }
@@ -1613,8 +1614,8 @@ class TestSingleSpeakerRenderBoundary:
         render_audiobook("b1", storage, fake_engine)
 
         voice_config = fake_engine.batch_calls[0]["voice_config"]
-        assert voice_config["Alice"]["voice"] == "Warm Female"
-        assert voice_config["Bob"]["voice"] == "Deep Male"
+        assert voice_config["Alice"]["voice"] == "Ryan"
+        assert voice_config["Bob"]["voice"] == "Adam"
         assert voice_config["NARRATOR"] == NARRATOR_VOICE
         assert len(voice_config) == 3
 
