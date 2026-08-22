@@ -18,10 +18,28 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from functools import wraps
+from typing import TYPE_CHECKING, Concatenate, ParamSpec, TypeVar
 
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _guarded_operation(
+    operation: Callable[Concatenate[OperationExecutor, P], R],
+) -> Callable[Concatenate[OperationExecutor, P], R]:
+    """Run a structural operation under the storage transaction guard."""
+
+    @wraps(operation)
+    def guarded(self: OperationExecutor, *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._storage.transaction():
+            return operation(self, *args, **kwargs)
+
+    return guarded
 
 
 _BOOK_SPAN_POSITION_SQL = """
@@ -83,7 +101,7 @@ class OperationExecutor:
         A ``PipelineStorage`` instance providing database access.
     """
 
-    def __init__(self, storage: "PipelineStorage") -> None:
+    def __init__(self, storage: PipelineStorage) -> None:
         self._storage = storage
 
     # -----------------------------------------------------------------------
@@ -229,6 +247,7 @@ class OperationExecutor:
     # Operations
     # -----------------------------------------------------------------------
 
+    @_guarded_operation
     def execute_split(
         self, book_id: str, presentation_index: int, split_point: int
     ) -> None:
@@ -268,13 +287,11 @@ class OperationExecutor:
             ).fetchone()
             if span_row is None:
                 raise ValueError(f"Span {span_id} not found")
-            span_type, instruct, span_text = span_row
+            span_type, _instruct, span_text = span_row
 
             # Validate split_point as a strict interior offset
             if span_text is None:
-                raise ValueError(
-                    f"Cannot split span {span_id}: text is NULL"
-                )
+                raise ValueError(f"Cannot split span {span_id}: text is NULL")
             if split_point <= 0 or split_point >= len(span_text):
                 raise ValueError(
                     f"split_point {split_point} must satisfy "
@@ -327,6 +344,7 @@ class OperationExecutor:
             conn.execute("RELEASE SAVEPOINT split_op")
             raise
 
+    @_guarded_operation
     def execute_merge(
         self,
         book_id: str,
@@ -463,6 +481,7 @@ class OperationExecutor:
             conn.execute("PRAGMA defer_foreign_keys = OFF")
             raise
 
+    @_guarded_operation
     def execute_move(
         self,
         book_id: str,
@@ -494,7 +513,7 @@ class OperationExecutor:
             )
 
             # Resolve target position
-            target_span_id, target_parent_id, target_position = (
+            _target_span_id, target_parent_id, target_position = (
                 self._get_span_position(conn, presentation_index_to, book_id=book_id)
             )
 
@@ -549,6 +568,7 @@ class OperationExecutor:
             conn.execute("RELEASE SAVEPOINT move_op")
             raise
 
+    @_guarded_operation
     def execute_delete(self, book_id: str, presentation_index: int) -> None:
         """Remove a span and its memberships, renumbering positions.
 
@@ -568,14 +588,10 @@ class OperationExecutor:
             )
 
             # Delete character_span memberships
-            conn.execute(
-                "DELETE FROM character_span WHERE span_id = ?", (span_id,)
-            )
+            conn.execute("DELETE FROM character_span WHERE span_id = ?", (span_id,))
 
             # Delete paragraph_span edge
-            conn.execute(
-                "DELETE FROM paragraph_span WHERE child_id = ?", (span_id,)
-            )
+            conn.execute("DELETE FROM paragraph_span WHERE child_id = ?", (span_id,))
 
             # Delete span
             conn.execute("DELETE FROM span WHERE id = ?", (span_id,))

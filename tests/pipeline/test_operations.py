@@ -13,12 +13,12 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
+import threading
 
 import pytest
 
-from app.pipeline.adapter import InMemorySQLiteAdapter
+from app.pipeline.adapter import ConcurrentTransactionError, InMemorySQLiteAdapter
 from app.pipeline.operations import OperationExecutor
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -98,7 +98,9 @@ def _populate_test_spine(conn: sqlite3.Connection) -> dict:
 
 def _add_character(conn: sqlite3.Connection, char_id: str, name: str) -> None:
     """Insert a character for testing."""
-    conn.execute(f"INSERT INTO character VALUES ('{char_id}', '{name}', '[]', NULL, NULL)")
+    conn.execute(
+        f"INSERT INTO character VALUES ('{char_id}', '{name}', '[]', NULL, NULL)"
+    )
 
 
 def _add_character_span(
@@ -195,17 +197,13 @@ def _get_character_memberships(
 
 def _get_span_text(conn: sqlite3.Connection, span_id: str) -> str | None:
     """Return text for a span, or None."""
-    row = conn.execute(
-        "SELECT text FROM span WHERE id = ?", (span_id,)
-    ).fetchone()
+    row = conn.execute("SELECT text FROM span WHERE id = ?", (span_id,)).fetchone()
     return row[0] if row else None
 
 
 def _get_span_instruct(conn: sqlite3.Connection, span_id: str) -> str | None:
     """Return instruct for a span, or None."""
-    row = conn.execute(
-        "SELECT instruct FROM span WHERE id = ?", (span_id,)
-    ).fetchone()
+    row = conn.execute("SELECT instruct FROM span WHERE id = ?", (span_id,)).fetchone()
     return row[0] if row else None
 
 
@@ -466,7 +464,9 @@ class TestExecuteMerge:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
 
         # sp2 should be deleted
         rows = conn.execute("SELECT COUNT(*) FROM span").fetchone()
@@ -477,7 +477,9 @@ class TestExecuteMerge:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
 
         positions = _get_span_positions(conn, "p1")
         # sp1=1, sp3=2 (was 3)
@@ -490,7 +492,9 @@ class TestExecuteMerge:
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
 
         order = _get_presentation_order(conn)
         # sp1, sp3, sp4
@@ -505,7 +509,9 @@ class TestExecuteMerge:
         _add_character_span(conn, "ch1", "sp1", "speaker", confidence=0.9)
         _add_character_span(conn, "ch2", "sp2", "mentioned", confidence=0.7)
 
-        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
 
         # sp1 should have both memberships
         memberships = _get_character_memberships(conn, "sp1")
@@ -535,7 +541,9 @@ class TestExecuteMerge:
         _add_character_span(conn, "ch1", "sp1", "speaker", confidence=0.6)
         _add_character_span(conn, "ch1", "sp2", "speaker", confidence=0.9)
 
-        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
 
         # sp1 should have ch1 with confidence 0.9 (higher)
         memberships = _get_character_memberships(conn, "sp1")
@@ -548,7 +556,9 @@ class TestExecuteMerge:
         _populate_test_spine(conn)
 
         with pytest.raises(ValueError, match="Cannot merge non-adjacent spans"):
-            executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=3)
+            executor.execute_merge(
+                book_id="b1", presentation_index_left=1, presentation_index_right=3
+            )
 
     def test_merge_different_parents_error(self, storage, executor):
         """Merge raises ValueError for spans with different parents."""
@@ -556,15 +566,21 @@ class TestExecuteMerge:
         _populate_test_spine(conn)
 
         # sp1 (p1) and sp4 (p2) have different parents
-        with pytest.raises(ValueError, match="Cannot merge spans with different parents"):
-            executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=4)
+        with pytest.raises(
+            ValueError, match="Cannot merge spans with different parents"
+        ):
+            executor.execute_merge(
+                book_id="b1", presentation_index_left=1, presentation_index_right=4
+            )
 
     def test_merge_no_memberships(self, storage, executor):
         """Merge works when spans have no character_span memberships."""
         conn = storage.get_connection()
         _populate_test_spine(conn)
 
-        executor.execute_merge(book_id="b1", presentation_index_left=1, presentation_index_right=2)
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
 
         # Should succeed without error
         order = _get_presentation_order(conn)
@@ -583,7 +599,9 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         # Move sp1 (position 1) to position 3
-        executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=3)
+        executor.execute_move(
+            book_id="b1", presentation_index_from=1, presentation_index_to=3
+        )
 
         positions = _get_span_positions(conn, "p1")
         # sp2=1, sp3=2, sp1=3
@@ -597,7 +615,9 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         # Move sp3 (position 3) to position 1
-        executor.execute_move(book_id="b1", presentation_index_from=3, presentation_index_to=1)
+        executor.execute_move(
+            book_id="b1", presentation_index_from=3, presentation_index_to=1
+        )
 
         positions = _get_span_positions(conn, "p1")
         # sp3=1, sp1=2, sp2=3
@@ -611,7 +631,9 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         positions_before = _get_span_positions(conn, "p1")
-        executor.execute_move(book_id="b1", presentation_index_from=2, presentation_index_to=2)
+        executor.execute_move(
+            book_id="b1", presentation_index_from=2, presentation_index_to=2
+        )
         positions_after = _get_span_positions(conn, "p1")
 
         assert positions_before == positions_after
@@ -622,7 +644,9 @@ class TestExecuteMove:
         _populate_test_spine(conn)
 
         # Move sp1 to position 3
-        executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=3)
+        executor.execute_move(
+            book_id="b1", presentation_index_from=1, presentation_index_to=3
+        )
 
         order = _get_presentation_order(conn)
         # sp2, sp3, sp1, sp4
@@ -635,7 +659,9 @@ class TestExecuteMove:
 
         # sp1 (p1) cannot move to sp4's position (p2)
         with pytest.raises(ValueError, match="Cannot move span to different parent"):
-            executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=4)
+            executor.execute_move(
+                book_id="b1", presentation_index_from=1, presentation_index_to=4
+            )
 
     def test_move_preserves_memberships(self, storage, executor):
         """Move does not affect character_span memberships."""
@@ -644,7 +670,9 @@ class TestExecuteMove:
         _add_character(conn, "ch1", "Alice")
         _add_character_span(conn, "ch1", "sp1", "speaker", confidence=0.9)
 
-        executor.execute_move(book_id="b1", presentation_index_from=1, presentation_index_to=3)
+        executor.execute_move(
+            book_id="b1", presentation_index_from=1, presentation_index_to=3
+        )
 
         memberships = _get_character_memberships(conn, "sp1")
         assert len(memberships) == 1
@@ -761,6 +789,29 @@ class TestExecuteDelete:
 
 
 class TestEdgeCases:
+    def test_structural_operation_respects_transaction_owner(self, storage, executor):
+        """A structural write from another thread is rejected by the guard."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        captured: dict[str, ConcurrentTransactionError] = {}
+
+        def delete_from_other_thread() -> None:
+            try:
+                executor.execute_delete(book_id="b1", presentation_index=1)
+            except ConcurrentTransactionError as exc:
+                captured["error"] = exc
+
+        with storage.transaction():
+            thread = threading.Thread(target=delete_from_other_thread)
+            thread.start()
+            thread.join()
+
+        assert isinstance(captured.get("error"), ConcurrentTransactionError)
+        assert (
+            conn.execute("SELECT COUNT(*) FROM span WHERE id = 'sp1'").fetchone()[0]
+            == 1
+        )
+
     def test_multiple_operations_sequence(self, storage, executor):
         """Multiple operations in sequence maintain consistency."""
         conn = storage.get_connection()
@@ -789,7 +840,9 @@ class TestEdgeCases:
         # Now: sp1, sp2, new_span, sp3, sp4
 
         # Merge sp2 and new_span
-        executor.execute_merge(book_id="b1", presentation_index_left=2, presentation_index_right=3)
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=2, presentation_index_right=3
+        )
         # Now: sp1, sp2, sp3, sp4
 
         order = _get_presentation_order(conn)

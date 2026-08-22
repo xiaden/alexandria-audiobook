@@ -37,7 +37,6 @@ from contextlib import contextmanager
 
 from app.pipeline.schema import create_schema
 
-
 # ---------------------------------------------------------------------------
 # Concurrency guard
 # ---------------------------------------------------------------------------
@@ -155,9 +154,7 @@ class PipelineStorage(ABC):
         """
 
     @abstractmethod
-    def insert_clone_reference(
-        self, record: dict[str, object]
-    ) -> None:
+    def insert_clone_reference(self, record: dict[str, object]) -> None:
         """Insert a new ``clone_reference`` row.
 
         *record* carries the full column set — ``reference_id``, ``voice_id``,
@@ -170,9 +167,7 @@ class PipelineStorage(ABC):
         """
 
     @abstractmethod
-    def list_clone_references(
-        self, voice_id: str, owner_id: str
-    ) -> list[dict]:
+    def list_clone_references(self, voice_id: str, owner_id: str) -> list[dict]:
         """Return active, owner-owned rows for *voice_id*.
 
         Tombstoned rows are retained for deletion history but are not part of
@@ -181,9 +176,7 @@ class PipelineStorage(ABC):
         """
 
     @abstractmethod
-    def get_clone_reference(
-        self, reference_id: str, owner_id: str
-    ) -> dict | None:
+    def get_clone_reference(self, reference_id: str, owner_id: str) -> dict | None:
         """Return the *owner_id*-owned row for *reference_id*, or ``None``.
 
         Owner-scoped: a row owned by a different principal is treated as
@@ -272,9 +265,7 @@ class PipelineStorage(ABC):
         dict, or ``None`` when no such revision exists."""
 
     @abstractmethod
-    def list_prompt_config_revisions(
-        self, book_id: str, task: str
-    ) -> list[dict]:
+    def list_prompt_config_revisions(self, book_id: str, task: str) -> list[dict]:
         """Return ``prompt_config_revision`` rows for ``(book_id, task)``,
         newest first (``ORDER BY created_ms DESC, revision_id DESC``)."""
 
@@ -863,8 +854,7 @@ class SQLiteAdapter(PipelineStorage):
         owner = self._txn_owner
         if owner is not None and owner != threading.get_ident():
             raise ConcurrentTransactionError(
-                "write from thread %s while transaction is owned by thread %s"
-                % (threading.get_ident(), owner)
+                f"write from thread {threading.get_ident()} while transaction is owned by thread {owner}"
             )
 
     @contextmanager
@@ -879,6 +869,10 @@ class SQLiteAdapter(PipelineStorage):
         ``ConcurrentTransactionError``.
         """
         tid = threading.get_ident()
+        if self._txn_owner is not None and self._txn_owner != tid:
+            raise ConcurrentTransactionError(
+                f"transaction is owned by thread {self._txn_owner}"
+            )
         if self._txn_depth == 0:
             self._txn_owner = tid
             try:
@@ -987,8 +981,7 @@ class SQLiteAdapter(PipelineStorage):
         Deleting an absent row is a no-op (``execute_delete`` returns 0).
         """
         self.execute_delete(
-            "DELETE FROM walk_override"
-            " WHERE book_id = ? AND walk_name = ? AND key = ?",
+            "DELETE FROM walk_override WHERE book_id = ? AND walk_name = ? AND key = ?",
             (book_id, walk_name, key),
         )
 
@@ -1044,9 +1037,7 @@ class SQLiteAdapter(PipelineStorage):
         name.
         """
         return (
-            self.execute_delete(
-                "DELETE FROM project_snapshot WHERE name = ?", (name,)
-            )
+            self.execute_delete("DELETE FROM project_snapshot WHERE name = ?", (name,))
             > 0
         )
 
@@ -1067,9 +1058,7 @@ class SQLiteAdapter(PipelineStorage):
 
     # -- clone_reference -----------------------------------------------------
 
-    def insert_clone_reference(
-        self, record: dict[str, object]
-    ) -> None:
+    def insert_clone_reference(self, record: dict[str, object]) -> None:
         """Insert a new ``clone_reference`` row (parameterized SQL).
 
         Mirrors the ABC contract — see ``PipelineStorage.insert_clone_reference``.
@@ -1094,9 +1083,7 @@ class SQLiteAdapter(PipelineStorage):
             ),
         )
 
-    def list_clone_references(
-        self, voice_id: str, owner_id: str
-    ) -> list[dict]:
+    def list_clone_references(self, voice_id: str, owner_id: str) -> list[dict]:
         """Owner-scoped ``clone_reference`` rows for *voice_id*.
 
         Mirrors the ABC contract — see
@@ -1111,9 +1098,7 @@ class SQLiteAdapter(PipelineStorage):
             (voice_id, owner_id),
         )
 
-    def get_clone_reference(
-        self, reference_id: str, owner_id: str
-    ) -> dict | None:
+    def get_clone_reference(self, reference_id: str, owner_id: str) -> dict | None:
         """Owner-scoped ``clone_reference`` row for *reference_id*.
 
         Mirrors the ABC contract — see ``PipelineStorage.get_clone_reference``.
@@ -1185,9 +1170,7 @@ class SQLiteAdapter(PipelineStorage):
 
     # -- persona_revision --------------------------------------------------
 
-    def insert_persona_revision(
-        self, record: dict[str, object]
-    ) -> None:
+    def insert_persona_revision(self, record: dict[str, object]) -> None:
         """Insert a new ``persona_revision`` row (parameterized SQL).
 
         Mirrors the ABC contract — see
@@ -1217,9 +1200,7 @@ class SQLiteAdapter(PipelineStorage):
             ),
         )
 
-    def get_persona_revision(
-        self, persona_id: str
-    ) -> dict | None:
+    def get_persona_revision(self, persona_id: str) -> dict | None:
         """Owner-agnostic ``persona_revision`` row for *persona_id*.
 
         Mirrors the ABC contract — see ``PipelineStorage.get_persona_revision``.
@@ -1233,9 +1214,7 @@ class SQLiteAdapter(PipelineStorage):
         )
         return rows[0] if rows else None
 
-    def list_persona_revisions(
-        self, character_id: str
-    ) -> list[dict]:
+    def list_persona_revisions(self, character_id: str) -> list[dict]:
         """``persona_revision`` rows for *character_id*, newest first.
 
         Mirrors the ABC contract — see
@@ -1250,25 +1229,20 @@ class SQLiteAdapter(PipelineStorage):
             (character_id,),
         )
 
-    def supersede_persona_revision(
-        self, persona_id: str, superseded_by: str
-    ) -> None:
+    def supersede_persona_revision(self, persona_id: str, superseded_by: str) -> None:
         """Mark the *persona_id* row as superseded by *superseded_by*.
 
         Mirrors the ABC contract — see
         ``PipelineStorage.supersede_persona_revision``.
         """
         self.execute_update(
-            "UPDATE persona_revision SET superseded_by = ?"
-            " WHERE persona_id = ?",
+            "UPDATE persona_revision SET superseded_by = ? WHERE persona_id = ?",
             (superseded_by, persona_id),
         )
 
     # -- prompt_config_revision --------------------------------------------
 
-    def insert_prompt_config_revision(
-        self, record: dict[str, object]
-    ) -> None:
+    def insert_prompt_config_revision(self, record: dict[str, object]) -> None:
         """Insert a new ``prompt_config_revision`` row (parameterized SQL).
 
         Mirrors the ABC contract — see
@@ -1295,9 +1269,7 @@ class SQLiteAdapter(PipelineStorage):
             ),
         )
 
-    def get_prompt_config_revision(
-        self, revision_id: str
-    ) -> dict | None:
+    def get_prompt_config_revision(self, revision_id: str) -> dict | None:
         """``prompt_config_revision`` row for *revision_id*.
 
         Mirrors the ABC contract — see
@@ -1312,9 +1284,7 @@ class SQLiteAdapter(PipelineStorage):
         )
         return rows[0] if rows else None
 
-    def list_prompt_config_revisions(
-        self, book_id: str, task: str
-    ) -> list[dict]:
+    def list_prompt_config_revisions(self, book_id: str, task: str) -> list[dict]:
         """``prompt_config_revision`` rows for ``(book_id, task)``, newest first.
 
         Mirrors the ABC contract — see
@@ -1338,8 +1308,7 @@ class SQLiteAdapter(PipelineStorage):
         ``PipelineStorage.supersede_prompt_config_revision``.
         """
         self.execute_update(
-            "UPDATE prompt_config_revision SET superseded_by = ?"
-            " WHERE revision_id = ?",
+            "UPDATE prompt_config_revision SET superseded_by = ? WHERE revision_id = ?",
             (superseded_by, revision_id),
         )
 
@@ -1436,8 +1405,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
         owner = self._txn_owner
         if owner is not None and owner != threading.get_ident():
             raise ConcurrentTransactionError(
-                "write from thread %s while transaction is owned by thread %s"
-                % (threading.get_ident(), owner)
+                f"write from thread {threading.get_ident()} while transaction is owned by thread {owner}"
             )
 
     @contextmanager
@@ -1452,6 +1420,10 @@ class InMemorySQLiteAdapter(PipelineStorage):
         ``ConcurrentTransactionError``.
         """
         tid = threading.get_ident()
+        if self._txn_owner is not None and self._txn_owner != tid:
+            raise ConcurrentTransactionError(
+                f"transaction is owned by thread {self._txn_owner}"
+            )
         if self._txn_depth == 0:
             self._txn_owner = tid
             try:
@@ -1557,8 +1529,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
         interface).  Deleting an absent row is a no-op.
         """
         self.execute_delete(
-            "DELETE FROM walk_override"
-            " WHERE book_id = ? AND walk_name = ? AND key = ?",
+            "DELETE FROM walk_override WHERE book_id = ? AND walk_name = ? AND key = ?",
             (book_id, walk_name, key),
         )
 
@@ -1614,9 +1585,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
         ``True`` when a row was removed, ``False`` for an unknown name.
         """
         return (
-            self.execute_delete(
-                "DELETE FROM project_snapshot WHERE name = ?", (name,)
-            )
+            self.execute_delete("DELETE FROM project_snapshot WHERE name = ?", (name,))
             > 0
         )
 
@@ -1637,9 +1606,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
 
     # -- clone_reference -----------------------------------------------------
 
-    def insert_clone_reference(
-        self, record: dict[str, object]
-    ) -> None:
+    def insert_clone_reference(self, record: dict[str, object]) -> None:
         """Insert a new ``clone_reference`` row (parameterized SQL).
 
         Mirror of ``SQLiteAdapter.insert_clone_reference`` (same schema and
@@ -1665,9 +1632,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
             ),
         )
 
-    def list_clone_references(
-        self, voice_id: str, owner_id: str
-    ) -> list[dict]:
+    def list_clone_references(self, voice_id: str, owner_id: str) -> list[dict]:
         """Owner-scoped ``clone_reference`` rows for *voice_id*.
 
         Mirror of ``SQLiteAdapter.list_clone_references`` (same schema and
@@ -1682,9 +1647,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
             (voice_id, owner_id),
         )
 
-    def get_clone_reference(
-        self, reference_id: str, owner_id: str
-    ) -> dict | None:
+    def get_clone_reference(self, reference_id: str, owner_id: str) -> dict | None:
         """Owner-scoped ``clone_reference`` row for *reference_id*.
 
         Mirror of ``SQLiteAdapter.get_clone_reference`` (same schema and
@@ -1753,9 +1716,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
 
     # -- persona_revision ---------------------------------------------------
 
-    def insert_persona_revision(
-        self, record: dict[str, object]
-    ) -> None:
+    def insert_persona_revision(self, record: dict[str, object]) -> None:
         """Insert a new ``persona_revision`` row (parameterized SQL).
 
         Mirror of ``SQLiteAdapter.insert_persona_revision`` (same schema and
@@ -1785,9 +1746,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
             ),
         )
 
-    def get_persona_revision(
-        self, persona_id: str
-    ) -> dict | None:
+    def get_persona_revision(self, persona_id: str) -> dict | None:
         """Owner-agnostic ``persona_revision`` row for *persona_id*.
 
         Mirror of ``SQLiteAdapter.get_persona_revision`` (same schema and
@@ -1802,9 +1761,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
         )
         return rows[0] if rows else None
 
-    def list_persona_revisions(
-        self, character_id: str
-    ) -> list[dict]:
+    def list_persona_revisions(self, character_id: str) -> list[dict]:
         """``persona_revision`` rows for *character_id*, newest first.
 
         Mirror of ``SQLiteAdapter.list_persona_revisions`` (same schema and
@@ -1819,25 +1776,20 @@ class InMemorySQLiteAdapter(PipelineStorage):
             (character_id,),
         )
 
-    def supersede_persona_revision(
-        self, persona_id: str, superseded_by: str
-    ) -> None:
+    def supersede_persona_revision(self, persona_id: str, superseded_by: str) -> None:
         """Mark the *persona_id* row as superseded by *superseded_by*.
 
         Mirror of ``SQLiteAdapter.supersede_persona_revision`` (same schema and
         interface).
         """
         self.execute_update(
-            "UPDATE persona_revision SET superseded_by = ?"
-            " WHERE persona_id = ?",
+            "UPDATE persona_revision SET superseded_by = ? WHERE persona_id = ?",
             (superseded_by, persona_id),
         )
 
     # -- prompt_config_revision ---------------------------------------------
 
-    def insert_prompt_config_revision(
-        self, record: dict[str, object]
-    ) -> None:
+    def insert_prompt_config_revision(self, record: dict[str, object]) -> None:
         """Insert a new ``prompt_config_revision`` row (parameterized SQL).
 
         Mirror of ``SQLiteAdapter.insert_prompt_config_revision`` (same schema
@@ -1864,9 +1816,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
             ),
         )
 
-    def get_prompt_config_revision(
-        self, revision_id: str
-    ) -> dict | None:
+    def get_prompt_config_revision(self, revision_id: str) -> dict | None:
         """``prompt_config_revision`` row for *revision_id*.
 
         Mirror of ``SQLiteAdapter.get_prompt_config_revision`` (same schema and
@@ -1881,9 +1831,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
         )
         return rows[0] if rows else None
 
-    def list_prompt_config_revisions(
-        self, book_id: str, task: str
-    ) -> list[dict]:
+    def list_prompt_config_revisions(self, book_id: str, task: str) -> list[dict]:
         """``prompt_config_revision`` rows for ``(book_id, task)``, newest first.
 
         Mirror of ``SQLiteAdapter.list_prompt_config_revisions`` (same schema
@@ -1907,8 +1855,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
         schema and interface).
         """
         self.execute_update(
-            "UPDATE prompt_config_revision SET superseded_by = ?"
-            " WHERE revision_id = ?",
+            "UPDATE prompt_config_revision SET superseded_by = ? WHERE revision_id = ?",
             (superseded_by, revision_id),
         )
 
