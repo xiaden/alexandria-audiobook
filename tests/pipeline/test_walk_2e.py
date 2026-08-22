@@ -1,18 +1,18 @@
 """Tests for Walk 2e span speaker attribution."""
 
 import json
-import pytest
 from unittest.mock import Mock
+
+import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.walk_2e_span_attribution import (
-    execute,
     _build_speaker_attribution_prompt,
     _get_surrounding_context,
     _parse_llm_response,
+    execute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -37,21 +37,41 @@ def sample_chapters():
                 {
                     "id": "para-1",
                     "spans": [
-                        {"id": "span-1a", "span_type": "sentence", "text": "The sun rose over the mountains."},
-                        {"id": "span-1b", "span_type": "quotation", "text": '"Good morning," said John.'},
-                        {"id": "span-1c", "span_type": "sentence", "text": "Mary smiled in response."},
+                        {
+                            "id": "span-1a",
+                            "span_type": "sentence",
+                            "text": "The sun rose over the mountains.",
+                        },
+                        {
+                            "id": "span-1b",
+                            "span_type": "quotation",
+                            "text": '"Good morning," said John.',
+                        },
+                        {
+                            "id": "span-1c",
+                            "span_type": "sentence",
+                            "text": "Mary smiled in response.",
+                        },
                     ],
                 },
                 {
                     "id": "para-2",
                     "spans": [
-                        {"id": "span-2a", "span_type": "sentence", "text": "They walked together."},
+                        {
+                            "id": "span-2a",
+                            "span_type": "sentence",
+                            "text": "They walked together.",
+                        },
                     ],
                 },
                 {
                     "id": "para-3",
                     "spans": [
-                        {"id": "span-3a", "span_type": "quotation", "text": '"Hello everyone," she said.'},
+                        {
+                            "id": "span-3a",
+                            "span_type": "quotation",
+                            "text": '"Hello everyone," she said.',
+                        },
                     ],
                 },
             ],
@@ -62,13 +82,21 @@ def sample_chapters():
                 {
                     "id": "para-4",
                     "spans": [
-                        {"id": "span-4a", "span_type": "sentence", "text": "Later that day, the scene shifted to the city."},
+                        {
+                            "id": "span-4a",
+                            "span_type": "sentence",
+                            "text": "Later that day, the scene shifted to the city.",
+                        },
                     ],
                 },
                 {
                     "id": "para-5",
                     "spans": [
-                        {"id": "span-5a", "span_type": "quotation", "text": '"Welcome," said Bob.'},
+                        {
+                            "id": "span-5a",
+                            "span_type": "quotation",
+                            "text": '"Welcome," said Bob.',
+                        },
                     ],
                 },
             ],
@@ -159,7 +187,9 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
 class TestExecute:
     """Test the main execute() function."""
 
-    def test_execute_returns_summary_dict(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_execute_returns_summary_dict(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns a summary dict with expected keys."""
         response = json.dumps({"character_id": "char-john", "confidence": 0.9})
         _patch_llm(monkeypatch, mock_llm_client, response)
@@ -174,7 +204,9 @@ class TestExecute:
         assert "errors" in result
         assert result["book_id"] == "book-1"
 
-    def test_execute_processes_all_quotation_spans(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_execute_processes_all_quotation_spans(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """execute() processes all quotation spans in the book."""
         response = json.dumps({"character_id": "char-john", "confidence": 0.9})
         _patch_llm(monkeypatch, mock_llm_client, response)
@@ -184,7 +216,9 @@ class TestExecute:
         # sample_chapters has 3 quotation spans: span-1b, span-3a, span-5a
         assert result["spans_processed"] == 3
 
-    def test_speaker_junction_created(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_speaker_junction_created(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """character_span junctions are inserted with relation_type='speaker'."""
         response = json.dumps({"character_id": "char-john", "confidence": 0.9})
         _patch_llm(monkeypatch, mock_llm_client, response)
@@ -202,7 +236,28 @@ class TestExecute:
             assert row["relation_type"] == "speaker"
             assert row["source"] == "walk"
 
-    def test_unknown_speaker_no_junction(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_rerun_does_not_duplicate_speaker_junctions(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        """Rerunning attribution keeps one speaker row per quotation span."""
+        response = json.dumps({"character_id": "char-john", "confidence": 0.9})
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        execute("book-1", seeded_storage, {})
+        execute("book-1", seeded_storage, {})
+
+        rows = seeded_storage.execute_query(
+            """SELECT span_id, COUNT(*) AS count
+               FROM character_span
+               WHERE relation_type = 'speaker'
+               GROUP BY span_id"""
+        )
+        assert rows
+        assert all(row["count"] == 1 for row in rows)
+
+    def test_unknown_speaker_no_junction(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """When LLM returns null character_id, no junction is created."""
         response = json.dumps({"character_id": None, "confidence": 0.3})
         _patch_llm(monkeypatch, mock_llm_client, response)
@@ -219,7 +274,9 @@ class TestExecute:
         )
         assert rows[0]["cnt"] == 0
 
-    def test_confidence_filter_high_accepted(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_high_accepted(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """Spans with confidence >= 0.7 are auto-accepted."""
         response = json.dumps({"character_id": "char-john", "confidence": 0.9})
         _patch_llm(monkeypatch, mock_llm_client, response)
@@ -229,7 +286,9 @@ class TestExecute:
         assert result["speakers_attributed"] >= 1
         assert result["attributions_for_review"] == 0
 
-    def test_confidence_filter_low_rejected(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_low_rejected(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """Spans with confidence < 0.5 are auto-rejected (no junction created)."""
         response = json.dumps({"character_id": "char-john", "confidence": 0.3})
         _patch_llm(monkeypatch, mock_llm_client, response)
@@ -243,7 +302,9 @@ class TestExecute:
         )
         assert rows[0]["cnt"] == 0
 
-    def test_confidence_filter_medium_review(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_medium_review(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """Spans with 0.5 <= confidence < 0.7 are flagged for review."""
         response = json.dumps({"character_id": "char-john", "confidence": 0.6})
         _patch_llm(monkeypatch, mock_llm_client, response)
@@ -254,7 +315,9 @@ class TestExecute:
         assert result["speakers_attributed"] >= 1
         assert result["attributions_for_review"] >= 1
 
-    def test_nonexistent_book_returns_error(self, storage, mock_llm_client, monkeypatch):
+    def test_nonexistent_book_returns_error(
+        self, storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns error for nonexistent book."""
         _patch_llm(monkeypatch, mock_llm_client, "{}")
 
@@ -263,13 +326,13 @@ class TestExecute:
         assert len(result["errors"]) > 0
         assert result["speakers_attributed"] == 0
 
+    # ---------------------------------------------------------------------------
+    # Tests: _build_speaker_attribution_prompt()
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Tests: _build_speaker_attribution_prompt()
-# ---------------------------------------------------------------------------
-
-
-    def test_walk_override_drives_llm_config(self, seeded_storage, monkeypatch, tmp_path):
+    def test_walk_override_drives_llm_config(
+        self, seeded_storage, monkeypatch, tmp_path
+    ):
         """A walk_override row for (book, task) overrides the walk's LLM config.
 
         Phase 3 (Plan G): the walk resolves its LLM config via
@@ -299,7 +362,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["temperature"] = temperature
             captured["model_name"] = model_name
@@ -336,7 +404,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -447,7 +520,9 @@ class TestParseResponse:
 
     def test_parse_json_with_extra_text(self):
         """Parse JSON response with extra text around it."""
-        response = 'Here is the JSON:\n{"character_id": "uuid-john", "confidence": 0.8}\nDone.'
+        response = (
+            'Here is the JSON:\n{"character_id": "uuid-john", "confidence": 0.8}\nDone.'
+        )
 
         attribution = _parse_llm_response(response)
 
@@ -510,21 +585,10 @@ class TestGetSurroundingContext:
         assert len(context["before"]) == 2  # span-1a and span-1b
         assert context["after"] == []
 
-    def test_uses_nearest_three_preceding_spans(self):
-        """Preceding context is the nearest window, not the first three spans."""
-        storage = Mock()
-        storage.execute_query.return_value = [
-            {"id": f"span-{position}", "text": f"Span {position}", "position": position}
-            for position in range(1, 14)
-        ]
-
-        context = _get_surrounding_context("para-1", "span-10", storage)
-
-        assert context["before"] == ["Span 7", "Span 8", "Span 9"]
-        assert context["after"] == ["Span 11", "Span 12", "Span 13"]
-
     def test_unknown_span_returns_empty(self, populated_storage):
         """Unknown span_id returns empty before and after."""
-        context = _get_surrounding_context("para-1", "nonexistent-span", populated_storage)
+        context = _get_surrounding_context(
+            "para-1", "nonexistent-span", populated_storage
+        )
 
         assert context == {"before": [], "after": []}

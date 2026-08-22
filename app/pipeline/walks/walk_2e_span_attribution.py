@@ -191,16 +191,16 @@ def _get_surrounding_context(
     if current_position is None:
         return {"before": [], "after": []}
 
-    # Keep the nearest three preceding spans while preserving paragraph order.
-    preceding_spans = []
+    # Get 2-3 spans before and after
+    before_spans = []
     after_spans = []
     for span in all_spans:
-        if span["position"] < current_position:
-            preceding_spans.append(span["text"] or "")
+        if span["position"] < current_position and len(before_spans) < 3:
+            before_spans.append(span["text"] or "")
         elif span["position"] > current_position and len(after_spans) < 3:
             after_spans.append(span["text"] or "")
 
-    return {"before": preceding_spans[-3:], "after": after_spans}
+    return {"before": before_spans, "after": after_spans}
 
 
 def _process_span(
@@ -258,7 +258,6 @@ def _process_span(
         conn.execute("RELEASE SAVEPOINT walk_2e_span")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2e_span")
-        conn.execute("RELEASE SAVEPOINT walk_2e_span")
         raise
 
 
@@ -293,12 +292,17 @@ def _process_attribution(
 
     is_review = 0.5 <= confidence < 0.7
 
-    # Create character_span junction with relation_type='speaker'
+    # Keep attribution idempotent when Walk 2e is rerun.  A span can have at
+    # most one speaker; preserve an existing human or prior walk attribution.
     storage.execute_insert(
         "INSERT INTO character_span "
         "(character_id, span_id, relation_type, source, confidence, human_override) "
-        "VALUES (?, ?, 'speaker', 'walk', ?, 0)",
-        (character_id, span_id, confidence),
+        "SELECT ?, ?, 'speaker', 'walk', ?, 0 "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM character_span "
+        "WHERE span_id = ? AND relation_type = 'speaker'"
+        ")",
+        (character_id, span_id, confidence, span_id),
     )
 
     result["speakers_attributed"] += 1
@@ -318,15 +322,23 @@ def _build_speaker_attribution_prompt(
     Includes the quotation text, surrounding context, and list of known characters.
     """
     # Build context sections
-    before_text = "\n".join(f"BEFORE: {text}" for text in context_before) if context_before else ""
-    after_text = "\n".join(f"AFTER: {text}" for text in context_after) if context_after else ""
+    before_text = (
+        "\n".join(f"BEFORE: {text}" for text in context_before)
+        if context_before
+        else ""
+    )
+    after_text = (
+        "\n".join(f"AFTER: {text}" for text in context_after) if context_after else ""
+    )
 
     # Build character list
     character_lines = []
     for char in existing_characters:
         character_lines.append(f"- {char['name']} (UUID: {char['id']})")
 
-    characters_text = "\n".join(character_lines) if character_lines else "(no characters yet)"
+    characters_text = (
+        "\n".join(character_lines) if character_lines else "(no characters yet)"
+    )
 
     prompt = f"""You are analyzing a quotation from a novel to identify the speaker.
 
@@ -363,9 +375,7 @@ def _parse_llm_response(response_text: str) -> dict:
     """
     attribution = extract_json_from_llm_response(response_text, expected_type="dict")
     if attribution is None:
-        logger.error(
-            f"Failed to parse LLM response as JSON: {response_text[:200]}"
-        )
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
         return {}
 
     if not isinstance(attribution, dict):

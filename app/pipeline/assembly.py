@@ -30,9 +30,7 @@ from __future__ import annotations
 from app.pipeline.adapter import PipelineStorage
 
 
-def export_annotated_script(
-    book_id: str, storage: PipelineStorage
-) -> list[dict]:
+def export_annotated_script(book_id: str, storage: PipelineStorage) -> list[dict]:
     """Export the annotated script for *book_id* in presentation order.
 
     The document spine is traversed using the same join chain as the
@@ -76,9 +74,21 @@ def export_annotated_script(
             ON scene_edge.parent_id = chapter_edge.child_id
         JOIN book
             ON chapter_edge.parent_id = book.id
-        LEFT JOIN character_span AS cs
-            ON span.id = cs.span_id
-           AND cs.relation_type = 'speaker'
+              LEFT JOIN character_span AS cs
+                  ON span.id = cs.span_id
+                 AND cs.relation_type = 'speaker'
+                 AND cs.rowid = (
+                     SELECT MIN(cs_existing.rowid)
+                     FROM character_span AS cs_existing
+                     WHERE cs_existing.span_id = span.id
+                       AND cs_existing.relation_type = 'speaker'
+                 )
+           AND cs.rowid = (
+               SELECT MIN(existing.rowid)
+               FROM character_span AS existing
+               WHERE existing.span_id = span.id
+                 AND existing.relation_type = 'speaker'
+           )
         LEFT JOIN character AS c
             ON cs.character_id = c.id
         WHERE book.id = ?
@@ -131,9 +141,7 @@ def get_book_version(book_id: str, storage: PipelineStorage) -> int:
     ValueError
         If no book with *book_id* exists.
     """
-    rows = storage.execute_query(
-        "SELECT version FROM book WHERE id = ?", (book_id,)
-    )
+    rows = storage.execute_query("SELECT version FROM book WHERE id = ?", (book_id,))
     if not rows:
         raise ValueError(f"Book '{book_id}' not found")
     return rows[0]["version"]
@@ -221,24 +229,35 @@ def _clear_memberships(
     character_ids:
         Pre-snapshot of character IDs linked to this book.
     """
-    # character_book: memberships NOT carried over — deleted entirely.
-    storage.execute_delete(
-        "DELETE FROM character_book WHERE book_id = ?", (book_id,)
-    )
-
-    # character_metadata: clear for characters linked to this book.
+    # Clear metadata and voice assignments only for characters that will no
+    # longer belong to any book after this membership is removed.  Character
+    # metadata and voice assignments are shared character state, so preserve
+    # them when another book still references the character.
     if character_ids:
         placeholders = ",".join("?" for _ in character_ids)
         storage.execute_delete(
-            f"DELETE FROM character_metadata WHERE character_id IN ({placeholders})",
-            tuple(character_ids),
+            f"""DELETE FROM character_metadata
+                WHERE character_id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM character_book
+                      WHERE character_book.character_id = character_metadata.character_id
+                        AND character_book.book_id != ?
+                  )""",
+            (*character_ids, book_id),
         )
-        # Reset voice_assignment_id for those characters.
         storage.execute_update(
             f"""UPDATE character SET voice_assignment_id = NULL
-                WHERE id IN ({placeholders})""",
-            tuple(character_ids),
+                WHERE id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM character_book
+                      WHERE character_book.character_id = character.id
+                        AND character_book.book_id != ?
+                  )""",
+            (*character_ids, book_id),
         )
+
+    # character_book: memberships NOT carried over — deleted entirely.
+    storage.execute_delete("DELETE FROM character_book WHERE book_id = ?", (book_id,))
 
 
 def _clear_scene_entities(
@@ -306,12 +325,12 @@ def reonboard_book(book_id: str, storage: PipelineStorage) -> int:
     * ``character_scene`` rows for the book's scenes
     * ``character_book`` rows for the book (**memberships are NOT
       carried over** — they must be re-created by the next walk run)
-    * ``character_metadata`` rows for characters linked to this book
+    * ``character_metadata`` rows for characters no longer linked to any book
     * ``chapter_scene`` edges for the book's chapters
     * ``scene`` rows that belong to this book
     * ``span.instruct`` reset to NULL for the book's spans
-    * ``character.voice_assignment_id`` reset to NULL for characters
-      linked to this book
+    * ``character.voice_assignment_id`` reset to NULL for characters no
+      longer linked to any book
 
     Characters themselves are **not** deleted — they may be shared
     across books in a series.

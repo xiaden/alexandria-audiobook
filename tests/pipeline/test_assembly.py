@@ -15,7 +15,6 @@ import pytest
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.assembly import export_annotated_script
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -315,3 +314,14 @@ class TestMixedSpeakerAndNarrator:
             "text": "No one spoke.",
             "instruct": "",
         }
+
+    def test_duplicate_speaker_rows_do_not_duplicate_export(self, storage):
+        """Export remains one entry per span even with legacy duplicate rows."""
+        storage.get_connection().execute("DROP INDEX idx_character_span_speaker_unique")
+        storage.execute_insert(
+            "INSERT INTO character_span "
+            "(character_id, span_id, relation_type, source, confidence) "
+            "VALUES ('c2', 'sp1', 'speaker', 'walk', 0.8)"
+        )
+        script = export_annotated_script("b1", storage)
+        assert [entry["id"] for entry in script] == ["sp1", "sp2", "sp3", "sp4"]

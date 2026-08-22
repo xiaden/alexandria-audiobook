@@ -17,7 +17,6 @@ from __future__ import annotations
 import sqlite3
 import time
 
-
 # ---------------------------------------------------------------------------
 # Graph 1 — TREE (document spine)
 # ---------------------------------------------------------------------------
@@ -164,6 +163,12 @@ CREATE TABLE IF NOT EXISTS character_span (
     confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
     human_override INTEGER DEFAULT 0
 );
+"""
+
+_SPEAKER_UNIQUE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_character_span_speaker_unique
+    ON character_span (span_id, relation_type)
+    WHERE relation_type = 'speaker';
 """
 
 # ---------------------------------------------------------------------------
@@ -641,6 +646,18 @@ def create_schema(connection: sqlite3.Connection) -> None:
         + _WORKBENCH_DDL
         + _VOICE_PERSONA_PROMPT_DDL
     )
+    # Remove legacy duplicate speaker rows before enforcing rerun idempotency.
+    connection.execute(
+        """DELETE FROM character_span
+           WHERE relation_type = 'speaker'
+             AND rowid NOT IN (
+                 SELECT MIN(rowid)
+                 FROM character_span
+                 WHERE relation_type = 'speaker'
+                 GROUP BY span_id
+             )"""
+    )
+    connection.executescript(_SPEAKER_UNIQUE_INDEX)
     _ensure_book_single_speaker_column(connection)
     _ensure_book_pause_columns(connection)
     _ensure_span_pause_column(connection)

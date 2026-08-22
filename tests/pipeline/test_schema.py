@@ -15,7 +15,6 @@ import pytest
 
 from app.pipeline.schema import create_schema
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -39,9 +38,7 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
 
 
 def _view_names(conn: sqlite3.Connection) -> set[str]:
-    rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='view'"
-    ).fetchall()
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type='view'").fetchall()
     return {r[0] for r in rows}
 
 
@@ -134,11 +131,17 @@ class TestGraph1TreeColumns:
     def test_book_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "book")}
         assert set(cols.keys()) == {
-            "id", "series_id", "book_number", "version", "position", "single_speaker",
-            "pause_between_speakers_ms", "pause_same_speaker_ms",
+            "id",
+            "series_id",
+            "book_number",
+            "version",
+            "position",
+            "single_speaker",
+            "pause_between_speakers_ms",
+            "pause_same_speaker_ms",
         }
         # version DEFAULT 1
-        assert cols["version"][4] == '1'  # dflt_value (returned as string)
+        assert cols["version"][4] == "1"  # dflt_value (returned as string)
         # single_speaker INTEGER NOT NULL DEFAULT 0 (guarded ALTER)
         assert cols["single_speaker"][2] == "INTEGER"
         assert cols["single_speaker"][3] == 1  # notnull
@@ -158,7 +161,13 @@ class TestGraph1TreeColumns:
 
     def test_span_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "span")}
-        assert set(cols.keys()) == {"id", "span_type", "instruct", "text", "pause_after_ms"}
+        assert set(cols.keys()) == {
+            "id",
+            "span_type",
+            "instruct",
+            "text",
+            "pause_after_ms",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +178,13 @@ class TestGraph1TreeColumns:
 class TestGraph2CharacterColumns:
     def test_character_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "character")}
-        assert set(cols.keys()) == {"id", "name", "aliases", "voice_assignment_id", "description"}
+        assert set(cols.keys()) == {
+            "id",
+            "name",
+            "aliases",
+            "voice_assignment_id",
+            "description",
+        }
 
     def test_character_aliases_default(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "character")}
@@ -183,9 +198,18 @@ class TestGraph2CharacterColumns:
     def test_voice_config_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "voice_config")}
         assert set(cols.keys()) == {
-            "id", "name", "description",
-            "type", "voice", "character_style", "seed",
-            "ref_audio", "ref_text", "adapter_id", "adapter_path", "alias_of",
+            "id",
+            "name",
+            "description",
+            "type",
+            "voice",
+            "character_style",
+            "seed",
+            "ref_audio",
+            "ref_text",
+            "adapter_id",
+            "adapter_path",
+            "alias_of",
         }
 
 
@@ -210,11 +234,35 @@ class TestEdgeTableColumns:
 
 
 class TestEdgeUniqueConstraints:
+    def test_one_speaker_per_span(self, conn):
+        """Speaker attribution is unique per span for rerun idempotency."""
+        conn.execute(
+            "INSERT INTO character VALUES ('char-1', 'Alice', '[]', NULL, NULL)"
+        )
+        conn.execute("INSERT INTO character VALUES ('char-2', 'Bob', '[]', NULL, NULL)")
+        conn.execute("INSERT INTO span (id, span_type) VALUES ('sp1', 'quotation')")
+        conn.execute(
+            "INSERT INTO character_span "
+            "(character_id, span_id, relation_type, source, confidence) "
+            "VALUES ('char-1', 'sp1', 'speaker', 'walk', 0.8)"
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO character_span "
+                "(character_id, span_id, relation_type, source, confidence) "
+                "VALUES ('char-2', 'sp1', 'speaker', 'walk', 0.9)"
+            )
+
     def test_child_id_unique_book_chapter(self, conn):
         """Each child can only appear once (UNIQUE on child_id)."""
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b2', 's1', 2, 1, 2, 0)")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+        )
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b2', 's1', 2, 1, 2, 0)"
+        )
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
 
         # Insert first edge
@@ -226,7 +274,9 @@ class TestEdgeUniqueConstraints:
 
     def test_child_id_unique_chapter_scene(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+        )
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
@@ -238,7 +288,9 @@ class TestEdgeUniqueConstraints:
 
     def test_child_id_unique_scene_paragraph(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+        )
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
         conn.execute("INSERT INTO scene VALUES ('sc2')")
@@ -252,7 +304,9 @@ class TestEdgeUniqueConstraints:
     def test_child_id_unique_paragraph_span(self, conn):
         conn.execute("INSERT INTO paragraph VALUES ('p1')")
         conn.execute("INSERT INTO paragraph VALUES ('p2')")
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+        )
 
         conn.execute("INSERT INTO paragraph_span VALUES ('sp1', 'p1', 1)")
 
@@ -262,7 +316,9 @@ class TestEdgeUniqueConstraints:
     def test_parent_position_unique_book_chapter(self, conn):
         """Same parent cannot have two children at the same position."""
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+        )
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
 
@@ -273,7 +329,9 @@ class TestEdgeUniqueConstraints:
 
     def test_parent_position_unique_chapter_scene(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+        )
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         conn.execute("INSERT INTO scene VALUES ('sc1')")
         conn.execute("INSERT INTO scene VALUES ('sc2')")
@@ -295,8 +353,12 @@ class TestEdgeUniqueConstraints:
 
     def test_parent_position_unique_paragraph_span(self, conn):
         conn.execute("INSERT INTO paragraph VALUES ('p1')")
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp2', 'sentence', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp2', 'sentence', NULL, NULL)"
+        )
 
         conn.execute("INSERT INTO paragraph_span VALUES ('sp1', 'p1', 1)")
 
@@ -311,14 +373,20 @@ class TestEdgeUniqueConstraints:
 
 class TestCheckConstraints:
     def test_span_type_check_sentence(self, conn):
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+        )
 
     def test_span_type_check_quotation(self, conn):
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'quotation', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'quotation', NULL, NULL)"
+        )
 
     def test_span_type_check_invalid(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'invalid', NULL, NULL)")
+            conn.execute(
+                "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'invalid', NULL, NULL)"
+            )
 
     def test_source_check_walk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
@@ -402,28 +470,36 @@ class TestCheckConstraints:
             )
 
     def test_character_span_relation_type_speaker(self, conn):
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'quotation', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'quotation', NULL, NULL)"
+        )
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         conn.execute(
             "INSERT INTO character_span VALUES ('ch1', 'sp1', 'speaker', 'walk', 0.9, 0)"
         )
 
     def test_character_span_relation_type_mentioned(self, conn):
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+        )
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         conn.execute(
             "INSERT INTO character_span VALUES ('ch1', 'sp1', 'mentioned', 'walk', 0.7, 0)"
         )
 
     def test_character_span_relation_type_present(self, conn):
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+        )
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         conn.execute(
             "INSERT INTO character_span VALUES ('ch1', 'sp1', 'present', 'walk', 0.6, 0)"
         )
 
     def test_character_span_relation_type_invalid(self, conn):
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+        )
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
@@ -443,7 +519,9 @@ class TestNotNullConstraints:
 
     def test_span_type_not_null(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', NULL, NULL, NULL)")
+            conn.execute(
+                "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', NULL, NULL, NULL)"
+            )
 
     def test_source_not_null(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
@@ -512,20 +590,20 @@ class TestForeignKeyConstraints:
 
     def test_book_chapter_child_fk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+        )
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO book_chapter VALUES ('nonexistent', 'b1', 1)"
-            )
+            conn.execute("INSERT INTO book_chapter VALUES ('nonexistent', 'b1', 1)")
 
     def test_book_chapter_parent_fk(self, conn):
         conn.execute("INSERT INTO series VALUES ('s1')")
-        conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
+        conn.execute(
+            "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+        )
         conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO book_chapter VALUES ('c1', 'nonexistent', 1)"
-            )
+            conn.execute("INSERT INTO book_chapter VALUES ('c1', 'nonexistent', 1)")
 
     def test_character_voice_assignment_fk(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
@@ -534,9 +612,7 @@ class TestForeignKeyConstraints:
             )
 
     def test_character_voice_assignment_nullable(self, conn):
-        conn.execute(
-            "INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)"
-        )
+        conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
 
     def test_character_metadata_character_fk(self, conn):
         with pytest.raises(sqlite3.IntegrityError):
@@ -559,7 +635,9 @@ class TestForeignKeyConstraints:
             )
 
     def test_character_span_character_fk(self, conn):
-        conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
+        conn.execute(
+            "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+        )
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO character_span VALUES ('nonexistent', 'sp1', 'speaker', 'walk', 0.9, 0)"
@@ -581,23 +659,15 @@ class TestForeignKeyConstraints:
 class TestCharacterMetadataUnique:
     def test_unique_character_key(self, conn):
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
-        conn.execute(
-            "INSERT INTO character_metadata VALUES ('ch1', 'age', '30')"
-        )
+        conn.execute("INSERT INTO character_metadata VALUES ('ch1', 'age', '30')")
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO character_metadata VALUES ('ch1', 'age', '31')"
-            )
+            conn.execute("INSERT INTO character_metadata VALUES ('ch1', 'age', '31')")
 
     def test_same_key_different_characters(self, conn):
         conn.execute("INSERT INTO character VALUES ('ch1', 'Alice', '[]', NULL, NULL)")
         conn.execute("INSERT INTO character VALUES ('ch2', 'Bob', '[]', NULL, NULL)")
-        conn.execute(
-            "INSERT INTO character_metadata VALUES ('ch1', 'age', '30')"
-        )
-        conn.execute(
-            "INSERT INTO character_metadata VALUES ('ch2', 'age', '25')"
-        )
+        conn.execute("INSERT INTO character_metadata VALUES ('ch1', 'age', '30')")
+        conn.execute("INSERT INTO character_metadata VALUES ('ch2', 'age', '25')")
 
 
 # ---------------------------------------------------------------------------
@@ -629,8 +699,12 @@ def _populate_spine(conn: sqlite3.Connection):
                 span sp5 (position=1, quotation)
     """
     conn.execute("INSERT INTO series VALUES ('s1')")
-    conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)")
-    conn.execute("INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b2', 's1', 2, 1, 2, 0)")
+    conn.execute(
+        "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b1', 's1', 1, 1, 1, 0)"
+    )
+    conn.execute(
+        "INSERT INTO book (id, series_id, book_number, version, position, single_speaker) VALUES ('b2', 's1', 2, 1, 2, 0)"
+    )
     conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
     conn.execute("INSERT INTO chapter VALUES ('c2', 'b1')")
     conn.execute("INSERT INTO chapter VALUES ('c3', 'b2')")
@@ -641,11 +715,21 @@ def _populate_spine(conn: sqlite3.Connection):
     conn.execute("INSERT INTO paragraph VALUES ('p2')")
     conn.execute("INSERT INTO paragraph VALUES ('p3')")
     conn.execute("INSERT INTO paragraph VALUES ('p4')")
-    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp2', 'quotation', 'angrily', NULL)")
-    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp3', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp4', 'sentence', NULL, NULL)")
-    conn.execute("INSERT INTO span (id, span_type, instruct, text) VALUES ('sp5', 'quotation', 'softly', NULL)")
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp1', 'sentence', NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp2', 'quotation', 'angrily', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp3', 'sentence', NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp4', 'sentence', NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO span (id, span_type, instruct, text) VALUES ('sp5', 'quotation', 'softly', NULL)"
+    )
 
     # Edge tables
     conn.execute("INSERT INTO book_chapter VALUES ('c1', 'b1', 1)")
@@ -727,7 +811,7 @@ class TestSpanPresentationView:
             "SELECT id, global_index FROM span_presentation ORDER BY global_index"
         ).fetchall()
         # sp5 is in b2, should have the highest global_index
-        sp5_index = [r[1] for r in rows if r[0] == "sp5"][0]
+        sp5_index = next(r[1] for r in rows if r[0] == "sp5")
         assert sp5_index == 5
 
     def test_view_cross_chapter_ordering(self, conn):
@@ -798,6 +882,7 @@ class TestNoForbiddenFields:
         cols = {row[1] for row in _column_info(conn, "scene")}
         assert "chapter_id" not in cols
 
+
 # ---------------------------------------------------------------------------
 # Universal Upgrade schema (Plan A) — 6 tables, 3 indices, book.single_speaker
 # ---------------------------------------------------------------------------
@@ -809,9 +894,16 @@ class TestUniversalUpgradeColumns:
     def test_render_job_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "render_job")}
         assert set(cols.keys()) == {
-            "job_id", "book_id", "mode", "status",
-            "error", "output_dir", "output_artifact_path",
-            "created_ms", "started_ms", "finished_ms",
+            "job_id",
+            "book_id",
+            "mode",
+            "status",
+            "error",
+            "output_dir",
+            "output_artifact_path",
+            "created_ms",
+            "started_ms",
+            "finished_ms",
         }
         # job_id TEXT PK; unix-ms timestamps are INTEGER (new tables only)
         assert cols["job_id"][2] == "TEXT"
@@ -826,8 +918,16 @@ class TestUniversalUpgradeColumns:
     def test_walk_run_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "walk_run")}
         assert set(cols.keys()) == {
-            "run_id", "book_id", "walk_name", "status", "cancel_requested",
-            "heartbeat_ms", "result_json", "error", "created_ms", "finished_ms",
+            "run_id",
+            "book_id",
+            "walk_name",
+            "status",
+            "cancel_requested",
+            "heartbeat_ms",
+            "result_json",
+            "error",
+            "created_ms",
+            "finished_ms",
         }
         assert cols["run_id"][2] == "TEXT"
         assert cols["cancel_requested"][2] == "INTEGER"
@@ -838,8 +938,15 @@ class TestUniversalUpgradeColumns:
     def test_walk_review_item_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "walk_review_item")}
         assert set(cols.keys()) == {
-            "id", "book_id", "run_id", "kind", "target_table",
-            "target_id", "prior_value", "status", "created_ms",
+            "id",
+            "book_id",
+            "run_id",
+            "kind",
+            "target_table",
+            "target_id",
+            "prior_value",
+            "status",
+            "created_ms",
         }
         assert cols["id"][2] == "TEXT"
         assert cols["created_ms"][2] == "INTEGER"
@@ -879,7 +986,15 @@ class TestUniversalUpgradeCheckConstraints:
 
     @pytest.mark.parametrize(
         "status",
-        ["pending", "running", "completed", "failed", "cancelled", "interrupted", "expired"],
+        [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "expired",
+        ],
     )
     def test_render_job_status_valid(self, conn, status):
         conn.execute(
@@ -1045,9 +1160,7 @@ class TestBookSingleSpeaker:
             "INSERT INTO book (id, series_id, book_number, position) "
             "VALUES ('b1', 's1', 1, 1)"
         )
-        row = conn.execute(
-            "SELECT single_speaker FROM book WHERE id='b1'"
-        ).fetchone()
+        row = conn.execute("SELECT single_speaker FROM book WHERE id='b1'").fetchone()
         assert row[0] == 0
 
     def test_single_speaker_not_null(self, conn):
@@ -1153,7 +1266,11 @@ class TestParityTablePresence:
 
     def test_parity_tables_present(self, conn):
         tables = _table_names(conn)
-        assert {"clone_reference", "persona_revision", "prompt_config_revision"} <= tables
+        assert {
+            "clone_reference",
+            "persona_revision",
+            "prompt_config_revision",
+        } <= tables
 
     def test_parity_tables_in_expected_set(self, conn):
         assert "clone_reference" in EXPECTED_TABLES
@@ -1171,9 +1288,17 @@ class TestCloneReferenceColumns:
     def test_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "clone_reference")}
         assert set(cols.keys()) == {
-            "reference_id", "voice_id", "owner_id", "relative_path",
-            "original_filename", "media_type", "byte_size", "duration_ms",
-            "sha256", "created_ms", "deleted_ms",
+            "reference_id",
+            "voice_id",
+            "owner_id",
+            "relative_path",
+            "original_filename",
+            "media_type",
+            "byte_size",
+            "duration_ms",
+            "sha256",
+            "created_ms",
+            "deleted_ms",
         }
         assert cols["reference_id"][2] == "TEXT"
         assert cols["byte_size"][2] == "INTEGER"
@@ -1236,9 +1361,19 @@ class TestPersonaRevisionColumns:
     def test_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "persona_revision")}
         assert set(cols.keys()) == {
-            "persona_id", "character_id", "book_id", "revision", "fields_json",
-            "evidence_json", "aliases_json", "scene_scope", "review_state",
-            "protected", "voice_consequences_json", "author_id", "created_ms",
+            "persona_id",
+            "character_id",
+            "book_id",
+            "revision",
+            "fields_json",
+            "evidence_json",
+            "aliases_json",
+            "scene_scope",
+            "review_state",
+            "protected",
+            "voice_consequences_json",
+            "author_id",
+            "created_ms",
             "superseded_by",
         }
         # protected defaults to 0 (not protected).
@@ -1267,9 +1402,7 @@ class TestPersonaRevisionConstraints:
         with pytest.raises(sqlite3.IntegrityError):
             _insert_persona_revision(conn, scene_scope="chapters")
 
-    @pytest.mark.parametrize(
-        "state", ["draft", "needs_review", "accepted", "rejected"]
-    )
+    @pytest.mark.parametrize("state", ["draft", "needs_review", "accepted", "rejected"])
     def test_review_state_valid(self, conn, state):
         _seed_character(conn)
         _insert_persona_revision(conn, review_state=state)
@@ -1309,9 +1442,18 @@ class TestPromptConfigRevisionColumns:
     def test_columns(self, conn):
         cols = {row[1]: row for row in _column_info(conn, "prompt_config_revision")}
         assert set(cols.keys()) == {
-            "revision_id", "book_id", "task", "base_revision",
-            "source_layers_json", "effective_prompt", "settings_json", "raw_json",
-            "validation_json", "author_id", "created_ms", "superseded_by",
+            "revision_id",
+            "book_id",
+            "task",
+            "base_revision",
+            "source_layers_json",
+            "effective_prompt",
+            "settings_json",
+            "raw_json",
+            "validation_json",
+            "author_id",
+            "created_ms",
+            "superseded_by",
         }
         # nullable columns
         assert cols["base_revision"][3] == 0
