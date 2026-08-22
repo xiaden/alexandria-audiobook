@@ -561,6 +561,18 @@ def _run_dir_is_referenced(run_dir: str, references: set[str]) -> bool:
     return any(ref == run_dir_abs or ref.startswith(prefix) for ref in references)
 
 
+def _run_dir_is_within_render_root(run_dir: str, render_root: str) -> bool:
+    """Return whether *run_dir* is a strict, resolved child of *render_root*."""
+    root_abs = os.path.realpath(render_root)
+    run_dir_abs = os.path.realpath(run_dir)
+    if run_dir_abs == root_abs:
+        return False
+    try:
+        return os.path.commonpath((root_abs, run_dir_abs)) == root_abs
+    except ValueError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # GC sweep
 # ---------------------------------------------------------------------------
@@ -614,11 +626,12 @@ def _gc_sweep(
     them).  ``run_dirs_deleted`` counts swept run dirs, whether or not the
     dir still existed at sweep time.
 
-    Trust boundary: GC deletes the row-recorded ``output_dir`` tree.  That
-    path originates from the RenderRequest body (Plan B contract), so any
-    client with render access can influence what is removed after retention
-    — the deletion path is not further validated.  The ``project_snapshot``
-    reference union protects snapshotted artifacts from collection.
+    The row-recorded ``output_dir`` originates from the RenderRequest body,
+    so GC validates its resolved path as a strict child of ``render_root``
+    before adding it to the destructive sweep.  Unsafe paths are left
+    untouched; their rows remain ``completed`` and are re-checked on each
+    sweep, with no automatic correction.  The ``project_snapshot`` reference
+    union protects snapshotted artifacts.
 
     Runs in the same transaction style as ``_reconcile_stale_runs``: UPDATEs
     join an open transaction when one is owned by the caller (owner-thread
@@ -626,6 +639,7 @@ def _gc_sweep(
 
     Returns ``{"run_dirs_deleted": int, "chunks_evicted": int,
     "jobs_expired": int, "skipped_snapshot_referenced": list[str]}``.
+    Rows failing containment are skipped and not counted.
     Safe to call on an empty database.
     """
     job_days = _gc_retention_days("JOB_RETENTION_DAYS", job_retention_days)
@@ -651,6 +665,10 @@ def _gc_sweep(
         )
         if _run_dir_is_referenced(run_dir, references):
             skipped.append(row["job_id"])
+        elif not _run_dir_is_within_render_root(run_dir, render_root):
+            # output_dir is request-controlled; never let a poisoned row turn
+            # GC into an arbitrary recursive deletion primitive.
+            continue
         else:
             candidates.append((row, run_dir))
 
@@ -1362,6 +1380,7 @@ class SQLiteAdapter(PipelineStorage):
         are never time-deleted (chunks ``evicted``, job ``expired``).
         Returns ``{"run_dirs_deleted": int, "chunks_evicted": int,
         "jobs_expired": int, "skipped_snapshot_referenced": list[str]}``.
+        Rows failing containment are skipped and not counted.
         """
         self._ensure_owner_thread()
         return _gc_sweep(
@@ -1924,7 +1943,7 @@ class InMemorySQLiteAdapter(PipelineStorage):
         Mirror of ``SQLiteAdapter.gc_expired_artifacts`` (same schema and
         interface).  Returns ``{"run_dirs_deleted": int, "chunks_evicted":
         int, "jobs_expired": int, "skipped_snapshot_referenced":
-        list[str]}``.
+        list[str]}``. Rows failing containment are skipped and not counted.
         """
         self._ensure_owner_thread()
         return _gc_sweep(

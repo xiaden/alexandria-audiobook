@@ -2255,6 +2255,62 @@ class TestGCSweep:
         finally:
             adapter.close()
 
+    def test_sweep_does_not_delete_output_dir_outside_render_root(self, tmp_path):
+        """A request-controlled output_dir cannot make GC delete elsewhere."""
+        root = str(tmp_path / "render_root")
+        outside_dir = str(tmp_path / "outside")
+        os.makedirs(outside_dir)
+        marker = os.path.join(outside_dir, "must-survive.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("keep")
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-unsafe",
+                mode="individual",
+                output_dir=outside_dir,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 0
+            assert os.path.isfile(marker)
+            assert (
+                adapter.execute_query(
+                    "SELECT status FROM render_job WHERE job_id = 'job-unsafe'"
+                )[0]["status"]
+                == "completed"
+            )
+        finally:
+            adapter.close()
+
+    def test_sweep_does_not_delete_render_root_itself(self, tmp_path):
+        """The root itself is not a valid run directory."""
+        root = str(tmp_path / "render_root")
+        os.makedirs(root)
+        marker = os.path.join(root, "must-survive.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("keep")
+        adapter = self._open(str(tmp_path / "gc.db"))
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-root",
+                mode="individual",
+                output_dir=root,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert summary["run_dirs_deleted"] == 0
+            assert os.path.isfile(marker)
+        finally:
+            adapter.close()
+
     def test_sweep_mixed_scenario_counts(self, tmp_path):
         """Old individual + old batch swept, young + snapshot-referenced kept."""
         root = str(tmp_path / "render_root")
@@ -2352,6 +2408,54 @@ class TestGCSweep:
             assert summary["chunks_evicted"] == 2
             assert summary["jobs_expired"] == 1
             assert not os.path.isdir(run_dir)
+        finally:
+            adapter.close()
+
+    def test_sweep_skips_run_dir_escaping_through_symlink(self, tmp_path):
+        """A run_dir that resolves THROUGH a symlink outside root is not swept.
+
+        realpath resolves the lexical parent-link chain to an outside dir, so
+        commonpath fails and GC skips the row (no arbitrary recursive delete).
+        """
+        root = str(tmp_path / "render_root")
+        os.makedirs(root)
+        outside_dir = str(tmp_path / "outside")
+        os.makedirs(outside_dir)
+        marker = os.path.join(outside_dir, "must-survive.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("keep")
+
+        link_parent = os.path.join(root, "book-b1")
+        os.makedirs(link_parent)
+        run_dir = os.path.join(link_parent, "job-old")
+        try:
+            os.symlink(outside_dir, run_dir)
+        except OSError:
+            pytest.skip("symlink not supported on this platform")
+
+        db_path = str(tmp_path / "gc.db")
+        adapter = self._open(db_path)
+        try:
+            _insert_completed_render_job(
+                adapter,
+                "job-link",
+                mode="individual",
+                output_dir=run_dir,
+                finished_ms=int(time.time() * 1000) - 8 * _DAY_MS,
+            )
+
+            summary = adapter.gc_expired_artifacts(root)
+
+            assert os.path.islink(run_dir)
+            assert summary["run_dirs_deleted"] == 0
+            assert summary["jobs_expired"] == 0
+            assert os.path.isfile(marker)
+            assert (
+                adapter.execute_query(
+                    "SELECT status FROM render_job WHERE job_id = 'job-link'"
+                )[0]["status"]
+                == "completed"
+            )
         finally:
             adapter.close()
 
