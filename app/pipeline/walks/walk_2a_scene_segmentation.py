@@ -156,6 +156,16 @@ def _process_chapter(
     # Parse response
     scenes = _parse_llm_response(response_text, paragraphs)
 
+    # Validate the complete proposal before moving any paragraphs.  Rejected
+    # low-confidence scenes do not participate in the partition: their
+    # paragraphs intentionally remain in the placeholder scene.
+    if not _validate_scene_partition(scenes, paragraphs):
+        logger.warning(
+            "Rejecting malformed scene segmentation proposal for chapter %s",
+            chapter_id,
+        )
+        return
+
     # Apply confidence filter and create scenes
     for scene_data in scenes:
         confidence = scene_data.get("confidence", 0.0)
@@ -245,9 +255,61 @@ def _parse_llm_response(response_text: str, paragraphs: list[dict]) -> list[dict
                 logger.warning(f"Unknown paragraph index: {idx}")
 
         if paragraph_ids:
-            result.append({
-                "paragraph_ids": paragraph_ids,
-                "confidence": scene_data.get("confidence", 0.5),
-            })
+            result.append(
+                {
+                    "paragraph_ids": paragraph_ids,
+                    "confidence": scene_data.get("confidence", 0.5),
+                }
+            )
 
     return result
+
+
+def _validate_scene_partition(scenes: list[dict], paragraphs: list[dict]) -> bool:
+    """Validate the accepted/review portion of a segmentation proposal.
+
+    Low-confidence scenes are deliberately excluded from validation because
+    their paragraphs remain in the placeholder scene.  Every accepted or
+    review scene must nevertheless be a contiguous slice of the original
+    paragraph order, and accepted/review scenes must be disjoint and ordered.
+    """
+    paragraph_positions = {
+        para["paragraph_id"]: position for position, para in enumerate(paragraphs)
+    }
+    seen: set[str] = set()
+    previous_end = -1
+
+    for scene_data in scenes:
+        if scene_data.get("confidence", 0.0) < 0.5:
+            continue
+
+        paragraph_ids = scene_data.get("paragraph_ids", [])
+        if not paragraph_ids:
+            continue
+
+        positions = [
+            paragraph_positions.get(paragraph_id) for paragraph_id in paragraph_ids
+        ]
+        if any(position is None for position in positions):
+            return False
+        if len(set(paragraph_ids)) != len(paragraph_ids):
+            return False
+        if seen.intersection(paragraph_ids):
+            return False
+
+        resolved_positions = [
+            position for position in positions if position is not None
+        ]
+        if resolved_positions != list(
+            range(
+                resolved_positions[0], resolved_positions[0] + len(resolved_positions)
+            )
+        ):
+            return False
+        if resolved_positions[0] <= previous_end:
+            return False
+
+        seen.update(paragraph_ids)
+        previous_end = resolved_positions[-1]
+
+    return True

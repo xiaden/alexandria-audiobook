@@ -10,6 +10,7 @@ from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.walk_2a_scene_segmentation import (
     _build_scene_segmentation_prompt,
     _parse_llm_response,
+    _validate_scene_partition,
     execute,
 )
 
@@ -536,3 +537,39 @@ class TestParseResponse:
 
         # Should only include P1, not P99
         assert scenes[0]["paragraph_ids"] == ["para-1"]
+
+
+class TestValidateScenePartition:
+    """Test whole-response scene partition validation."""
+
+    @pytest.fixture
+    def paragraphs(self):
+        return [{"paragraph_id": f"para-{i}"} for i in range(1, 5)]
+
+    @pytest.mark.parametrize(
+        "scenes",
+        [
+            [
+                {"paragraph_ids": ["para-1", "para-2"], "confidence": 0.9},
+                {"paragraph_ids": ["para-2", "para-3"], "confidence": 0.9},
+            ],
+            [{"paragraph_ids": ["para-1", "para-1"], "confidence": 0.9}],
+            [
+                {"paragraph_ids": ["para-3"], "confidence": 0.9},
+                {"paragraph_ids": ["para-1", "para-2"], "confidence": 0.9},
+            ],
+            [{"paragraph_ids": ["para-1", "para-3"], "confidence": 0.9}],
+        ],
+        ids=["overlap", "duplicate", "out_of_order", "noncontiguous"],
+    )
+    def test_rejects_malformed_partition(self, paragraphs, scenes):
+        assert not _validate_scene_partition(scenes, paragraphs)
+
+    def test_retains_omitted_low_confidence_paragraphs(self, paragraphs):
+        scenes = [
+            {"paragraph_ids": ["para-1"], "confidence": 0.9},
+            {"paragraph_ids": ["para-2"], "confidence": 0.3},
+            {"paragraph_ids": ["para-3", "para-4"], "confidence": 0.9},
+        ]
+
+        assert _validate_scene_partition(scenes, paragraphs)
