@@ -29,6 +29,31 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
+def reconstruct_paragraph_text(conn: sqlite3.Connection, paragraph_id: str) -> None:
+    """Refresh a paragraph's derived text from its ordered spans.
+
+    ``span.text`` and ``paragraph_span.position`` are authoritative; the
+    stored paragraph text is kept as a projection for readers that need it.
+    """
+    row = conn.execute(
+        """
+        SELECT COALESCE(GROUP_CONCAT(text, ' '), '')
+        FROM (
+            SELECT span.text
+            FROM span
+            JOIN paragraph_span ON paragraph_span.child_id = span.id
+            WHERE paragraph_span.parent_id = ?
+            ORDER BY paragraph_span.position
+        )
+        """,
+        (paragraph_id,),
+    ).fetchone()
+    conn.execute(
+        "UPDATE paragraph SET text = ? WHERE id = ?",
+        (row[0] if row is not None else "", paragraph_id),
+    )
+
+
 def _guarded_operation(
     operation: Callable[Concatenate[OperationExecutor, P], R],
 ) -> Callable[Concatenate[OperationExecutor, P], R]:
@@ -329,6 +354,8 @@ class OperationExecutor:
                 (new_span_id, parent_id, old_position + 1),
             )
 
+            reconstruct_paragraph_text(conn, parent_id)
+
             # Copy character_span memberships from original to new span
             conn.execute(
                 "INSERT INTO character_span (character_id, span_id, relation_type, "
@@ -473,6 +500,8 @@ class OperationExecutor:
                 conn, "paragraph_span", left_parent_id, right_position, delta=-1
             )
 
+            reconstruct_paragraph_text(conn, left_parent_id)
+
             conn.execute("RELEASE SAVEPOINT merge_op")
             # Reset FK defer setting
             conn.execute("PRAGMA defer_foreign_keys = OFF")
@@ -562,6 +591,8 @@ class OperationExecutor:
                 (target_position, span_id),
             )
 
+            reconstruct_paragraph_text(conn, parent_id)
+
             conn.execute("RELEASE SAVEPOINT move_op")
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT move_op")
@@ -600,6 +631,8 @@ class OperationExecutor:
             self._two_phase_reindex(
                 conn, "paragraph_span", parent_id, position, delta=-1
             )
+
+            reconstruct_paragraph_text(conn, parent_id)
 
             conn.execute("RELEASE SAVEPOINT delete_op")
         except Exception:

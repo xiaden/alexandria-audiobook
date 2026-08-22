@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS scene (
 );
 
 CREATE TABLE IF NOT EXISTS paragraph (
-    id TEXT PRIMARY KEY
+    id TEXT PRIMARY KEY,
+    text TEXT
 );
 
 CREATE TABLE IF NOT EXISTS span (
@@ -497,8 +498,7 @@ def _migrate_walk_review_item_kind(connection: sqlite3.Connection) -> None:
     deleted or rewritten.
     """
     row = connection.execute(
-        "SELECT sql FROM sqlite_master"
-        " WHERE type='table' AND name='walk_review_item'"
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='walk_review_item'"
     ).fetchone()
     if row is None or row[0] is None:
         return
@@ -574,14 +574,20 @@ def _ensure_book_single_speaker_column(connection: sqlite3.Connection) -> None:
     Guarded via ``PRAGMA table_info`` so ``create_schema`` stays idempotent
     on existing databases (same pattern as populate.py ``_ensure_*_column``).
     """
-    cols = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(book)").fetchall()
-    }
+    cols = {row[1] for row in connection.execute("PRAGMA table_info(book)").fetchall()}
     if "single_speaker" not in cols:
         connection.execute(
             "ALTER TABLE book ADD COLUMN single_speaker INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _ensure_paragraph_text_column(connection: sqlite3.Connection) -> None:
+    """Add the derived paragraph-text projection to existing databases."""
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(paragraph)").fetchall()
+    }
+    if "text" not in columns:
+        connection.execute("ALTER TABLE paragraph ADD COLUMN text TEXT")
 
 
 def _ensure_book_pause_columns(connection: sqlite3.Connection) -> None:
@@ -596,10 +602,7 @@ def _ensure_book_pause_columns(connection: sqlite3.Connection) -> None:
     ``NULL`` (no override) — nothing is silently coerced to 0.  Guarded via
     ``PRAGMA table_info`` so ``create_schema`` stays idempotent.
     """
-    cols = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(book)").fetchall()
-    }
+    cols = {row[1] for row in connection.execute("PRAGMA table_info(book)").fetchall()}
     for col, ddl in (
         ("pause_between_speakers_ms", "pause_between_speakers_ms INTEGER NULL"),
         ("pause_same_speaker_ms", "pause_same_speaker_ms INTEGER NULL"),
@@ -619,10 +622,7 @@ def _ensure_span_pause_column(connection: sqlite3.Connection) -> None:
     rows migrate with ``NULL``.  Guarded via ``PRAGMA table_info`` so
     ``create_schema`` stays idempotent.
     """
-    cols = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(span)").fetchall()
-    }
+    cols = {row[1] for row in connection.execute("PRAGMA table_info(span)").fetchall()}
     if "pause_after_ms" not in cols:
         connection.execute(
             "ALTER TABLE span ADD COLUMN pause_after_ms INTEGER NULL"
@@ -659,6 +659,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     )
     connection.executescript(_SPEAKER_UNIQUE_INDEX)
     _ensure_book_single_speaker_column(connection)
+    _ensure_paragraph_text_column(connection)
     _ensure_book_pause_columns(connection)
     _ensure_span_pause_column(connection)
     _migrate_walk_review_item_kind(connection)

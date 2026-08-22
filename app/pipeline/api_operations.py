@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
 from app.pipeline.assembly import export_annotated_script, get_book_version
-from app.pipeline.operations import OperationExecutor
+from app.pipeline.operations import OperationExecutor, reconstruct_paragraph_text
 from app.pipeline.tts_integration import (
     get_render_root,
     validate_pause_ms,
@@ -182,7 +182,14 @@ async def update_span_text(
     if not rows:
         raise HTTPException(status_code=404, detail=f"Span '{span_id}' not found")
 
-    storage.execute_update("UPDATE span SET text = ? WHERE id = ?", (text, span_id))
+    with storage.transaction():
+        conn = storage.get_connection()
+        conn.execute("UPDATE span SET text = ? WHERE id = ?", (text, span_id))
+        paragraph_row = conn.execute(
+            "SELECT parent_id FROM paragraph_span WHERE child_id = ?", (span_id,)
+        ).fetchone()
+        if paragraph_row is not None:
+            reconstruct_paragraph_text(conn, paragraph_row[0])
     return {"status": "ok", "span_id": span_id}
 
 

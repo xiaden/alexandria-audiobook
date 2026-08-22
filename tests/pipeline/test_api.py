@@ -86,9 +86,7 @@ def _populate_storage(storage: InMemorySQLiteAdapter) -> None:
     )
 
     # -- Chapters -----------------------------------------------------------
-    storage.execute_insert(
-        "INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')"
-    )
+    storage.execute_insert("INSERT INTO chapter (id, book_id) VALUES ('ch1', 'b1')")
     storage.execute_insert(
         "INSERT INTO book_chapter (child_id, parent_id, position) VALUES ('ch1', 'b1', 1)"
     )
@@ -261,7 +259,12 @@ def tts_engine():
 
 @pytest.fixture()
 def client(
-    storage, walk_runner, review_manager, operation_executor, character_ledger, tts_engine
+    storage,
+    walk_runner,
+    review_manager,
+    operation_executor,
+    character_ledger,
+    tts_engine,
 ):
     """FastAPI TestClient with dependency overrides."""
     from fastapi import FastAPI
@@ -282,7 +285,12 @@ def client(
 
 @pytest.fixture()
 def real_client(
-    storage, walk_runner, review_manager, operation_executor, character_ledger, tts_engine
+    storage,
+    walk_runner,
+    review_manager,
+    operation_executor,
+    character_ledger,
+    tts_engine,
 ):
     """TestClient over the REAL ``app.app`` (Plan K exception handler live).
 
@@ -304,7 +312,9 @@ def real_client(
     real_app.app.dependency_overrides[get_storage] = lambda: storage
     real_app.app.dependency_overrides[get_walk_runner] = lambda: walk_runner
     real_app.app.dependency_overrides[get_review_manager] = lambda: review_manager
-    real_app.app.dependency_overrides[get_operation_executor] = lambda: operation_executor
+    real_app.app.dependency_overrides[get_operation_executor] = lambda: (
+        operation_executor
+    )
     real_app.app.dependency_overrides[get_character_ledger] = lambda: character_ledger
     real_app.app.dependency_overrides[get_tts_engine] = lambda: tts_engine
 
@@ -332,9 +342,10 @@ class TestOnboardEndpoint:
     def test_onboard_accepts_epub(self, client, storage):
         """EPUB files are accepted and processed."""
         # Mock extract_epub_text and populate_spine
-        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract, patch(
-            "app.pipeline.api_onboard.populate_spine"
-        ) as mock_populate:
+        with (
+            patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract,
+            patch("app.pipeline.api_onboard.populate_spine") as mock_populate,
+        ):
             mock_extract.return_value = {
                 "series_id": "s-test",
                 "book_id": "b-test",
@@ -344,7 +355,9 @@ class TestOnboardEndpoint:
 
             response = client.post(
                 "/api/pipeline/onboard",
-                files={"file": ("test.epub", b"fake epub content", "application/epub+zip")},
+                files={
+                    "file": ("test.epub", b"fake epub content", "application/epub+zip")
+                },
             )
 
             assert response.status_code == 200
@@ -374,10 +387,12 @@ class TestOnboardEndpoint:
             if escaped_path == "parent"
             else Path(filename)
         )
-        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract, patch(
-            "app.pipeline.api_onboard.populate_spine"
-        ) as mock_populate, patch(
-            "app.pipeline.api_onboard.tempfile.mkdtemp", return_value=str(tmp_path)
+        with (
+            patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract,
+            patch("app.pipeline.api_onboard.populate_spine") as mock_populate,
+            patch(
+                "app.pipeline.api_onboard.tempfile.mkdtemp", return_value=str(tmp_path)
+            ),
         ):
             mock_extract.return_value = {
                 "series_id": "s-test",
@@ -387,7 +402,9 @@ class TestOnboardEndpoint:
 
             response = client.post(
                 "/api/pipeline/onboard",
-                files={"file": (filename, b"fake epub content", "application/epub+zip")},
+                files={
+                    "file": (filename, b"fake epub content", "application/epub+zip")
+                },
             )
 
         assert response.status_code == 200
@@ -403,7 +420,9 @@ class TestOnboardEndpoint:
 
             response = client.post(
                 "/api/pipeline/onboard",
-                files={"file": ("test.epub", b"fake epub content", "application/epub+zip")},
+                files={
+                    "file": ("test.epub", b"fake epub content", "application/epub+zip")
+                },
             )
 
             assert response.status_code == 400
@@ -411,9 +430,10 @@ class TestOnboardEndpoint:
 
     def test_onboard_handles_populate_spine_failure(self, client):
         """populate_spine failures return 500."""
-        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract, patch(
-            "app.pipeline.api_onboard.populate_spine"
-        ) as mock_populate:
+        with (
+            patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract,
+            patch("app.pipeline.api_onboard.populate_spine") as mock_populate,
+        ):
             mock_extract.return_value = {
                 "series_id": "s-test",
                 "book_id": "b-test",
@@ -423,7 +443,9 @@ class TestOnboardEndpoint:
 
             response = client.post(
                 "/api/pipeline/onboard",
-                files={"file": ("test.epub", b"fake epub content", "application/epub+zip")},
+                files={
+                    "file": ("test.epub", b"fake epub content", "application/epub+zip")
+                },
             )
 
             assert response.status_code == 500
@@ -451,7 +473,10 @@ class TestRunWalkEndpoint:
         with patch.object(walk_runner, "_load_walk_module") as mock_load:
             mock_module = MagicMock()
             mock_module.execute = MagicMock(
-                return_value={"status": "completed", "walk": "walk_2a_scene_segmentation"}
+                return_value={
+                    "status": "completed",
+                    "walk": "walk_2a_scene_segmentation",
+                }
             )
             mock_load.return_value = mock_module
 
@@ -508,8 +533,10 @@ class TestRunAllWalksEndpoint:
     def test_run_all_walks(self, client, walk_runner):
         """Background execution returns immediately with 'started' status."""
         # Mock the walk module loading and verification to avoid actual walk execution
-        with patch.object(walk_runner, "_load_walk_module") as mock_load, \
-             patch.object(walk_runner, "_run_verification", return_value=True):
+        with (
+            patch.object(walk_runner, "_load_walk_module") as mock_load,
+            patch.object(walk_runner, "_run_verification", return_value=True),
+        ):
             mock_module = MagicMock()
             mock_module.execute = MagicMock(return_value={"status": "completed"})
             mock_load.return_value = mock_module
@@ -640,9 +667,7 @@ class TestReservationFailureContract:
     """Allocation/insertion failure marks the affected pending run(s) failed,
     never executes a reserved runner, and returns the existing error shape."""
 
-    def test_run_walk_allocation_failure_marks_failed_and_no_execute(
-        self, monkeypatch
-    ):
+    def test_run_walk_allocation_failure_marks_failed_and_no_execute(self, monkeypatch):
         from app.pipeline.walks import runner as _runner_mod
 
         runner = _RecordingRunner()
@@ -757,7 +782,13 @@ class TestWalkStatusEndpoint:
         # Each walk name should be a key with a valid status value
         for walk_name in WALK_ORDER:
             assert walk_name in result
-            assert result[walk_name] in ("pending", "running", "completed", "failed", "cancelled")
+            assert result[walk_name] in (
+                "pending",
+                "running",
+                "completed",
+                "failed",
+                "cancelled",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +960,10 @@ class TestReviewOverrideEndpoint:
         """Overriding an invalid item_id returns 400."""
         response = client.post(
             "/api/pipeline/review/override",
-            json={"item_id": "invalid:item:id", "new_value": {"relation_type": "speaker"}},
+            json={
+                "item_id": "invalid:item:id",
+                "new_value": {"relation_type": "speaker"},
+            },
         )
         assert response.status_code == 400
         # Error can be either format error or unknown junction table
@@ -1200,7 +1234,9 @@ class TestReviewActionRollback:
     and the target row keeps the walk's value.
     """
 
-    def test_restore_failure_rolls_back_via_api(self, real_client, storage, monkeypatch):
+    def test_restore_failure_rolls_back_via_api(
+        self, real_client, storage, monkeypatch
+    ):
         """The restore write SUCCEEDS inside the txn, then the status UPDATE
         fails — the API surfaces the transient write failure as 503 +
         Retry-After (Plan K live contract, was re-raise) and BOTH writes are
@@ -1288,9 +1324,7 @@ class TestConcurrentTransactionErrorMapping:
             raise ConcurrentTransactionError("simulated cancel-write contention")
 
         monkeypatch.setattr(storage, "execute_update", failing_cancel_update)
-        resp = real_client.post(
-            "/api/pipeline/cancel_walks", json={"book_id": "b1"}
-        )
+        resp = real_client.post("/api/pipeline/cancel_walks", json={"book_id": "b1"})
 
         assert resp.status_code == 503
         assert resp.headers["retry-after"] == "5"
@@ -1476,7 +1510,10 @@ class TestOperationEndpoint:
         )
         assert response.status_code == 400
         # Should report the missing index
-        assert "not found" in response.json()["detail"].lower() or "9999" in response.json()["detail"]
+        assert (
+            "not found" in response.json()["detail"].lower()
+            or "9999" in response.json()["detail"]
+        )
 
     def test_operation_delete_invalid_index(self, client):
         """Delete with non-existent presentation index returns 400."""
@@ -1489,7 +1526,10 @@ class TestOperationEndpoint:
             },
         )
         assert response.status_code == 400
-        assert "not found" in response.json()["detail"].lower() or "9999" in response.json()["detail"]
+        assert (
+            "not found" in response.json()["detail"].lower()
+            or "9999" in response.json()["detail"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1519,6 +1559,25 @@ class TestSpanTextEditEndpoint:
         rows = storage.execute_query("SELECT text FROM span WHERE id = 'sp_edit_1'")
         assert len(rows) == 1
         assert rows[0]["text"] == "updated text"
+
+    def test_update_span_text_updates_paragraph_projection(self, client, storage):
+        storage.execute_insert(
+            "INSERT INTO paragraph (id, text) VALUES ('p_edit', 'old text')"
+        )
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type, text, instruct) VALUES (?, ?, ?, ?)",
+            ("sp_edit_1b", "sentence", "old text", None),
+        )
+        storage.execute_insert(
+            "INSERT INTO paragraph_span (child_id, parent_id, position) VALUES (?, ?, ?)",
+            ("sp_edit_1b", "p_edit", 1),
+        )
+        response = client.put(
+            "/api/pipeline/span/sp_edit_1b/text", json={"text": "new text"}
+        )
+        assert response.status_code == 200
+        rows = storage.execute_query("SELECT text FROM paragraph WHERE id = 'p_edit'")
+        assert rows[0]["text"] == "new text"
 
     def test_update_span_text_empty_rejected(self, client, storage):
         """PUT with empty text returns 400."""
@@ -1599,9 +1658,7 @@ class TestSingleSpeakerFlagEndpoint:
         }
 
         # Persisted in the DB
-        rows = storage.execute_query(
-            "SELECT single_speaker FROM book WHERE id = 'b1'"
-        )
+        rows = storage.execute_query("SELECT single_speaker FROM book WHERE id = 'b1'")
         assert rows[0]["single_speaker"] == 1
 
         # Round trip via the API
@@ -1618,9 +1675,7 @@ class TestSingleSpeakerFlagEndpoint:
         )
         assert response.status_code == 200
         assert response.json()["single_speaker"] == 0
-        rows = storage.execute_query(
-            "SELECT single_speaker FROM book WHERE id = 'b1'"
-        )
+        rows = storage.execute_query("SELECT single_speaker FROM book WHERE id = 'b1'")
         assert rows[0]["single_speaker"] == 0
 
     def test_get_unknown_book_404(self, client):
@@ -1781,9 +1836,7 @@ class TestSpanPauseAfterEndpoint:
             "span_id": "sp1",
             "pause_after_ms": 120,
         }
-        rows = storage.execute_query(
-            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
-        )
+        rows = storage.execute_query("SELECT pause_after_ms FROM span WHERE id = 'sp1'")
         assert rows[0]["pause_after_ms"] == 120
         assert (
             client.get("/api/pipeline/span/sp1/pause_after").json()["pause_after_ms"]
@@ -1796,9 +1849,7 @@ class TestSpanPauseAfterEndpoint:
         )
         assert response.status_code == 200
         assert response.json()["pause_after_ms"] == 0
-        rows = storage.execute_query(
-            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
-        )
+        rows = storage.execute_query("SELECT pause_after_ms FROM span WHERE id = 'sp1'")
         assert rows[0]["pause_after_ms"] == 0
 
     def test_put_null_clears(self, client, storage):
@@ -1808,9 +1859,7 @@ class TestSpanPauseAfterEndpoint:
         )
         assert response.status_code == 200
         assert response.json()["pause_after_ms"] is None
-        rows = storage.execute_query(
-            "SELECT pause_after_ms FROM span WHERE id = 'sp1'"
-        )
+        rows = storage.execute_query("SELECT pause_after_ms FROM span WHERE id = 'sp1'")
         assert rows[0]["pause_after_ms"] is None
 
     def test_get_unknown_span_404(self, client):
@@ -1872,7 +1921,9 @@ class TestPauseSettingsConcurrentMapping:
 
 
 class TestRenderStatusPauseContract:
-    def test_render_status_exposes_resolved_pause_and_pending_state(self, client, storage):
+    def test_render_status_exposes_resolved_pause_and_pending_state(
+        self, client, storage
+    ):
         """A book override resolves through config defaults; assembly runs at
         render Step 6 (P3) but render_status conservatively reports 'pending';
         the truthful applied/failed tri-state is attached on export_m4b (P4)."""
@@ -1894,9 +1945,7 @@ class TestRenderStatusPauseContract:
         assert data["pauses_error"] is None
 
     def test_render_status_counts_span_overrides(self, client, storage):
-        storage.execute_update(
-            "UPDATE span SET pause_after_ms = 120 WHERE id = 'sp1'"
-        )
+        storage.execute_update("UPDATE span SET pause_after_ms = 120 WHERE id = 'sp1'")
         storage.execute_insert(
             "INSERT INTO render_job (job_id, book_id, mode, status) "
             "VALUES ('rs-c', 'b1', 'batch', 'running')",
@@ -1944,7 +1993,9 @@ class TestRenderEndpoint:
 
         app = FastAPI()
         app.include_router(router)
-        app.dependency_overrides[get_storage] = lambda: client.app.dependency_overrides[get_storage]()
+        app.dependency_overrides[get_storage] = lambda: client.app.dependency_overrides[
+            get_storage
+        ]()
         app.dependency_overrides[get_tts_engine] = lambda: None
 
         test_client = TestClient(app)
@@ -2032,7 +2083,9 @@ class TestBackgroundRender:
         elapsed = time.time() - start
 
         # Should return almost immediately (not block on render)
-        assert elapsed < 0.5, f"Render blocked for {elapsed}s instead of returning immediately"
+        assert elapsed < 0.5, (
+            f"Render blocked for {elapsed}s instead of returning immediately"
+        )
         assert response.status_code == 200
         result = response.json()
         assert result["status"] == "started"
@@ -2055,6 +2108,7 @@ class TestBackgroundRender:
 
         # Poll until terminal state (with timeout)
         import time
+
         for _ in range(50):  # 5 seconds max
             status_resp = client.get(f"/api/pipeline/render_status/{job_id}")
             status = status_resp.json()["status"]
@@ -2092,9 +2146,7 @@ class TestRenderTTSConfigPassthrough:
     so the background render has completed by the time ``client.post`` returns.
     """
 
-    def test_configured_pause_values_reach_render_audiobook(
-        self, client, tts_engine
-    ):
+    def test_configured_pause_values_reach_render_audiobook(self, client, tts_engine):
         """Configured config.json pause values flow through the whole chain."""
         from app.pipeline import api_export
 
@@ -2260,6 +2312,7 @@ class TestCancellation:
 
         # Wait for completion (TestClient runs background tasks synchronously)
         import time
+
         for _ in range(50):
             status_resp = client.get(f"/api/pipeline/render_status/{job_id}")
             if status_resp.json()["status"] == "completed":
@@ -2311,7 +2364,10 @@ class TestReonboardEndpoint:
             json={"book_id": "nonexistent"},
         )
         assert response.status_code == 404
-        assert "not found" in response.json()["detail"].lower() or "nonexistent" in response.json()["detail"]
+        assert (
+            "not found" in response.json()["detail"].lower()
+            or "nonexistent" in response.json()["detail"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2435,11 +2491,16 @@ class TestMergeEndpoint:
             wav_path = output_dir / f"chunk_{i:04d}.wav"
             subprocess.run(
                 [
-                    "ffmpeg", "-y",
-                    "-f", "lavfi",
-                    "-i", "sine=frequency=440:duration=0.1",
-                    "-ar", "22050",
-                    "-ac", "1",
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=0.1",
+                    "-ar",
+                    "22050",
+                    "-ac",
+                    "1",
                     str(wav_path),
                 ],
                 capture_output=True,
@@ -2464,6 +2525,7 @@ class TestMergeEndpoint:
 
         # Verify the M4B file was created
         import os
+
         assert os.path.exists(result["output_path"])
         assert os.path.getsize(result["output_path"]) > 0
 
@@ -2654,6 +2716,7 @@ class TestCancelRenderPersistence:
             "status": "already_finished",
             "job_id": job_id,
         }
+
 
 class TestCancelWalksPersistence:
     """POST /cancel_walks persists walk_run.cancel_requested=1 on active rows."""

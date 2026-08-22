@@ -64,8 +64,8 @@ def _populate_test_spine(conn: sqlite3.Connection) -> dict:
     )
     conn.execute("INSERT INTO chapter VALUES ('c1', 'b1')")
     conn.execute("INSERT INTO scene VALUES ('sc1')")
-    conn.execute("INSERT INTO paragraph VALUES ('p1')")
-    conn.execute("INSERT INTO paragraph VALUES ('p2')")
+    conn.execute("INSERT INTO paragraph (id, text) VALUES ('p1', 'stale')")
+    conn.execute("INSERT INTO paragraph (id, text) VALUES ('p2', 'stale')")
     conn.execute(
         "INSERT INTO span (id, span_type, instruct, text) "
         "VALUES ('sp1', 'sentence', NULL, NULL)"
@@ -136,6 +136,13 @@ def _get_span_positions(conn: sqlite3.Connection, parent_id: str) -> dict[str, i
     return {r[0]: r[1] for r in rows}
 
 
+def _get_paragraph_text(conn: sqlite3.Connection, paragraph_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT text FROM paragraph WHERE id = ?", (paragraph_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
 def _add_second_book(conn: sqlite3.Connection) -> None:
     """Add a second book 'b2' with its own spans for cross-book testing.
 
@@ -153,7 +160,7 @@ def _add_second_book(conn: sqlite3.Connection) -> None:
     )
     conn.execute("INSERT INTO chapter VALUES ('c2', 'b2')")
     conn.execute("INSERT INTO scene VALUES ('sc2')")
-    conn.execute("INSERT INTO paragraph VALUES ('p2b')")
+    conn.execute("INSERT INTO paragraph (id, text) VALUES ('p2b', 'Book 2 text')")
     conn.execute(
         "INSERT INTO span (id, span_type, instruct, text) "
         "VALUES ('sp2_1', 'sentence', NULL, 'Book 2 text')"
@@ -342,6 +349,12 @@ class TestExecuteSplit:
             "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
         ).fetchone()[0]
         assert _get_span_text(conn, new_id) == "llo"
+
+    def test_split_updates_paragraph_text(self, storage, executor):
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
+        assert _get_paragraph_text(conn, "p1") == "He llo"
 
     def test_split_preserves_instruct_on_left(self, storage, executor):
         """Left span (original) keeps its instruct value."""
@@ -532,6 +545,7 @@ class TestExecuteMerge:
 
         assert _get_span_text(conn, "sp1") == "Hello world"
         assert _get_span_text(conn, "sp2") is None
+        assert _get_paragraph_text(conn, "p1") == "Hello world"
 
     def test_merge_confidence_tiebreak(self, storage, executor):
         """Merge keeps higher confidence for duplicate (character_id, relation_type)."""
@@ -652,6 +666,17 @@ class TestExecuteMove:
         # sp2, sp3, sp1, sp4
         assert order == ["sp2", "sp3", "sp1", "sp4"]
 
+    def test_move_updates_paragraph_text(self, storage, executor):
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        conn.execute("UPDATE span SET text = 'one' WHERE id = 'sp1'")
+        conn.execute("UPDATE span SET text = 'two' WHERE id = 'sp2'")
+        conn.execute("UPDATE span SET text = 'three' WHERE id = 'sp3'")
+        executor.execute_move(
+            book_id="b1", presentation_index_from=1, presentation_index_to=3
+        )
+        assert _get_paragraph_text(conn, "p1") == "two three one"
+
     def test_move_different_parents_error(self, storage, executor):
         """Move raises ValueError for different parent paragraphs."""
         conn = storage.get_connection()
@@ -718,6 +743,15 @@ class TestExecuteDelete:
         order = _get_presentation_order(conn)
         # sp1, sp3, sp4
         assert order == ["sp1", "sp3", "sp4"]
+
+    def test_delete_updates_paragraph_text(self, storage, executor):
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        conn.execute("UPDATE span SET text = 'one' WHERE id = 'sp1'")
+        conn.execute("UPDATE span SET text = 'two' WHERE id = 'sp2'")
+        conn.execute("UPDATE span SET text = 'three' WHERE id = 'sp3'")
+        executor.execute_delete(book_id="b1", presentation_index=2)
+        assert _get_paragraph_text(conn, "p1") == "one three"
 
     def test_delete_removes_memberships(self, storage, executor):
         """Delete removes character_span memberships for deleted span."""
