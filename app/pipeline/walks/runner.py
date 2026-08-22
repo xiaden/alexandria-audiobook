@@ -212,11 +212,13 @@ def _retry_write(write_fn: Callable[[], int]) -> int:
 
 
 def _verify_walk_2a(book_id: str, storage: PipelineStorage) -> bool:
-    """Verify that walk_2a_scene_segmentation produced scenes for chapters."""
+    """Verify that walk 2a produced at least one non-placeholder scene."""
     rows = storage.execute_query(
         "SELECT COUNT(*) AS cnt FROM chapter_scene "
         "WHERE parent_id IN "
-        "(SELECT id FROM chapter WHERE book_id = ?)",
+        "(SELECT id FROM chapter WHERE book_id = ?) "
+        # populate.py reserves position 1 for each chapter's placeholder.
+        "AND position > 1",
         (book_id,),
     )
     scene_count = rows[0]["cnt"] if rows else 0

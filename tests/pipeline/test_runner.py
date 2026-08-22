@@ -292,6 +292,32 @@ class TestErrorHandling:
 
 
 class TestVerification:
+    def test_verification_failure_with_placeholder_scene(self, storage):
+        """A placeholder chapter_scene row does not satisfy Walk 2a verification."""
+        runner = WalkRunner(storage)
+        storage.execute_insert("INSERT INTO series (id) VALUES (?)", ("series-1",))
+        storage.execute_insert(
+            "INSERT INTO book (id, series_id, book_number, version, position) VALUES (?, ?, 1, 1, 1)",
+            ("book-1", "series-1"),
+        )
+        storage.execute_insert(
+            "INSERT INTO chapter (id, book_id) VALUES (?, ?)",
+            ("chapter-1", "book-1"),
+        )
+        storage.execute_insert("INSERT INTO scene (id) VALUES (?)", ("placeholder",))
+        storage.execute_insert(
+            "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES (?, ?, ?)",
+            ("placeholder", "chapter-1", 1),
+        )
+        mock_module = _make_mock_walk_module(
+            MagicMock(return_value={"status": "completed"})
+        )
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            result = runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
+        assert result["status"] == "failed"
+        assert "Verification failed" in result["error"]
+        assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
+
     def test_verification_failure_marks_failed(self, storage):
         """If verification fails, status is 'failed' even though execute() succeeded."""
         runner = WalkRunner(storage)
@@ -318,7 +344,7 @@ class TestVerification:
         assert runner.get_walk_status("book-1", "walk_2a_scene_segmentation") == "failed"
 
     def test_verification_passes_with_scenes(self, storage):
-        """Verification passes when chapter_scene rows exist for the book."""
+        """Verification passes when a non-placeholder scene exists."""
         runner = WalkRunner(storage)
         # Set up minimal data with a scene
         storage.execute_insert("INSERT INTO series (id) VALUES (?)", ("series-1",))
@@ -333,7 +359,7 @@ class TestVerification:
         storage.execute_insert("INSERT INTO scene (id) VALUES (?)", ("scene-1",))
         storage.execute_insert(
             "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES (?, ?, ?)",
-            ("scene-1", "chapter-1", 1),
+            ("scene-1", "chapter-1", 2),
         )
         mock_module = _make_mock_walk_module(
             MagicMock(return_value={"status": "completed"})
