@@ -11,7 +11,7 @@ For each scene, the walk:
 2. Queries scene paragraphs (text).
 3. Sends both to the LLM asking which characters are present.
 4. Parses the response (list of character UUIDs with confidence).
-5. Creates missing ``character_scene`` junctions (skips existing ones).
+5. Reconciles generated ``character_scene`` junctions with the complete result.
 
 Confidence filter:
 - ≥0.7: auto-accept (junction created)
@@ -230,9 +230,7 @@ def _load_existing_characters(
     return [{"id": row["id"], "name": row["name"]} for row in rows]
 
 
-def _load_existing_junctions(
-    scene_id: str, storage: PipelineStorage
-) -> set[str]:
+def _load_existing_junctions(scene_id: str, storage: PipelineStorage) -> set[str]:
     """Load existing character_ids that already have a character_scene junction for this scene."""
     rows = storage.execute_query(
         "SELECT character_id FROM character_scene WHERE scene_id = ?",
@@ -296,9 +294,27 @@ def _process_scene(
     conn = storage.get_connection()
     conn.execute("SAVEPOINT walk_2d_scene")
     try:
+        accepted_presence: dict[str, float] = {}
         for presence_data in presence_list:
+            character_id = presence_data.get("character_id", "").strip()
+            confidence = presence_data.get("confidence", 0.8)
+            if not isinstance(confidence, (int, float)):
+                confidence = 0.8
+            confidence = max(0.0, min(1.0, float(confidence)))
+            if character_id and confidence >= 0.5:
+                accepted_presence[character_id] = confidence
+
+        # The model returns positives only. Reconcile all existing walk-owned
+        # rows so an earlier false positive cannot survive a later run.
+        _remove_omitted_generated_presence(
+            scene_id=scene_id,
+            book_id=book_id,
+            storage=storage,
+            accepted_character_ids=set(accepted_presence),
+        )
+        for character_id, confidence in accepted_presence.items():
             _process_presence(
-                presence_data=presence_data,
+                presence_data={"character_id": character_id, "confidence": confidence},
                 scene_id=scene_id,
                 book_id=book_id,
                 storage=storage,
@@ -331,41 +347,79 @@ def _process_presence(
     confidence = presence_data.get("confidence", 0.8)
     if not isinstance(confidence, (int, float)):
         confidence = 0.8
-    # Clamp to [0, 1]
     confidence = max(0.0, min(1.0, float(confidence)))
-
-    # Confidence filter
     if confidence < 0.5:
-        # Auto-reject
         return
 
-    is_review = 0.5 <= confidence < 0.7
+    is_review = confidence < 0.7
 
-    # Skip if junction already exists for this character+scene
-    if character_id in existing_junctions:
-        return
-
-    # Never re-add an active human absence as a generated presence.
     if _active_absence(storage, book_id, scene_id, character_id):
         return
+    if _has_manual_presence(storage, book_id, scene_id, character_id):
+        return
 
-    # Create character_scene junction with relation_type='present'
+    if character_id in existing_junctions:
+        storage.execute_update(
+            "UPDATE character_scene SET confidence = ? "
+            "WHERE scene_id = ? AND character_id = ? AND source = 'walk' "
+            "AND human_override = 0",
+            (confidence, scene_id, character_id),
+        )
+        _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence)
+        return
+
     storage.execute_insert(
         "INSERT INTO character_scene "
         "(character_id, scene_id, relation_type, source, confidence, human_override) "
         "VALUES (?, ?, 'present', 'walk', ?, 0)",
         (character_id, scene_id, confidence),
     )
-    _upsert_generated_presence(
-        storage, book_id, character_id, scene_id, confidence
-    )
-
-    # Track this junction so we don't create duplicates within this walk
+    _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence)
     existing_junctions.add(character_id)
     result["junctions_created"] += 1
-
     if is_review:
         result["junctions_for_review"] += 1
+
+
+def _has_manual_presence(storage, book_id, scene_id, character_id):
+    """True when a human presence decision protects this pair."""
+    rows = storage.execute_query(
+        "SELECT 1 FROM character_scene_manual "
+        "WHERE book_id = ? AND scene_id = ? AND character_id = ? "
+        "AND relation_type IN ('present', 'speaker')",
+        (book_id, scene_id, character_id),
+    )
+    return bool(rows)
+
+
+def _remove_omitted_generated_presence(
+    scene_id, book_id, storage, accepted_character_ids: set[str]
+):
+    """Remove omitted walk-owned presence while preserving human decisions."""
+    rows = storage.execute_query(
+        "SELECT character_id FROM character_scene_generated "
+        "WHERE book_id = ? AND scene_id = ? AND relation_type = 'present'",
+        (book_id, scene_id),
+    )
+    for row in rows:
+        character_id = row["character_id"]
+        if character_id in accepted_character_ids:
+            continue
+        if _has_manual_presence(
+            storage, book_id, scene_id, character_id
+        ) or _active_absence(storage, book_id, scene_id, character_id):
+            continue
+        storage.execute_update(
+            "DELETE FROM character_scene_generated "
+            "WHERE book_id = ? AND scene_id = ? AND character_id = ? "
+            "AND relation_type = 'present'",
+            (book_id, scene_id, character_id),
+        )
+        storage.execute_update(
+            "DELETE FROM character_scene WHERE scene_id = ? AND character_id = ? "
+            "AND source = 'walk' AND human_override = 0",
+            (scene_id, character_id),
+        )
 
 
 def _build_prompt(
@@ -388,7 +442,9 @@ def _build_prompt(
     for char in existing_characters:
         character_lines.append(f"- {char['name']} (UUID: {char['id']})")
 
-    characters_text = "\n".join(character_lines) if character_lines else "(no characters yet)"
+    characters_text = (
+        "\n".join(character_lines) if character_lines else "(no characters yet)"
+    )
 
     prompt = f"""You are analyzing a scene from a novel to identify which characters are present.
 
@@ -414,9 +470,7 @@ def _parse_llm_response(response_text: str) -> list[dict]:
     """Parse the LLM response into a list of presence dicts."""
     presence_list = extract_json_from_llm_response(response_text, expected_type="list")
     if presence_list is None:
-        logger.error(
-            f"Failed to parse LLM response as JSON: {response_text[:200]}"
-        )
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
         return []
 
     if not isinstance(presence_list, list):
